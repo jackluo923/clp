@@ -1,6 +1,9 @@
 #include "run.hpp"
 
+#include <memory>
 #include <unordered_set>
+
+#include <unistd.h>
 
 #include <log_surgeon/LogParser.hpp>
 #include <spdlog/sinks/stdout_sinks.h>
@@ -10,6 +13,7 @@
 #include "../Utils.hpp"
 #include "CommandLineArguments.hpp"
 #include "compression.hpp"
+#include "CpuUsageController.hpp"
 #include "decompression.hpp"
 #include "utils.hpp"
 
@@ -18,6 +22,18 @@ using std::unordered_set;
 using std::vector;
 
 namespace clp::clp {
+namespace {
+    class ChildProcessCleaner {
+    public:
+        ChildProcessCleaner(int pid) : m_pid{pid} {};
+
+        ~ChildProcessCleaner() { kill(m_pid, SIGTERM); }
+
+    private:
+        int m_pid;
+    };
+}
+
 int run(int argc, char const* argv[]) {
     // Program-wide initialization
     try {
@@ -55,7 +71,18 @@ int run(int argc, char const* argv[]) {
     }
 
     auto command = command_line_args.get_command();
+    std::unique_ptr<ChildProcessCleaner> child_process_cleaner;
     if (CommandLineArguments::Command::Compress == command) {
+        auto const cpu_usage_bound{command_line_args.get_cpu_usage_bound()};
+        if (cpu_usage_bound.has_value()) {
+            auto const child_pid{fork()};
+            if (0 == child_pid) {
+                CpuUsageController(getppid(), cpu_usage_bound.value()).start();
+                // Never return
+            }
+            child_process_cleaner = std::make_unique<ChildProcessCleaner>(child_pid);
+        }
+
         /// TODO: make this not a unique_ptr and test performance difference
         std::unique_ptr<log_surgeon::ReaderParser> reader_parser;
         if (!command_line_args.get_use_heuristic()) {

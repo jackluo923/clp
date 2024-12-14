@@ -154,6 +154,8 @@ set(
         CommandLineArguments.hpp
         compression.cpp
         compression.hpp
+        CpuUsageController.cpp
+        CpuUsageController.hpp
         decompression.cpp
         decompression.hpp
         FileCompressor.cpp

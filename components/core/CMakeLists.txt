@@ -342,6 +342,8 @@ set(SOURCE_FILES_unitTest
         src/clp/clp/CommandLineArguments.hpp
         src/clp/clp/compression.cpp
         src/clp/clp/compression.hpp
+        src/clp/clp/CpuUsageController.cpp
+        src/clp/clp/CpuUsageController.hpp
         src/clp/clp/decompression.cpp
         src/clp/clp/decompression.hpp
         src/clp/clp/FileCompressor.cpp

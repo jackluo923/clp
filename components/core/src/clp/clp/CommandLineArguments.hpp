@@ -1,6 +1,7 @@
 #ifndef CLP_CLP_COMMANDLINEARGUMENTS_HPP
 #define CLP_CLP_COMMANDLINEARGUMENTS_HPP
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -77,6 +78,10 @@ public:
 
     GlobalMetadataDBConfig const& get_metadata_db_config() const { return m_metadata_db_config; }
 
+    [[nodiscard]] auto get_cpu_usage_bound() const -> std::optional<double> {
+        return m_cpu_usage_bound;
+    }
+
 private:
     // Methods
     void print_basic_usage() const override;
@@ -104,6 +109,7 @@ private:
     std::string m_archives_dir;
     std::vector<std::string> m_input_paths;
     GlobalMetadataDBConfig m_metadata_db_config;
+    std::optional<double> m_cpu_usage_bound;
 };
 }  // namespace clp::clp
 

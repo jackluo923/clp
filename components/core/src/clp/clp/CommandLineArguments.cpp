@@ -328,6 +328,8 @@ CommandLineArguments::parse_arguments(int argc, char const* argv[]) {
             compression_positional_options_description.add("input-paths", -1);
 
             // Define compression-specific options
+            constexpr double cCpuUsageBoundMax{1.0};
+            double cpu_usage_bound{};
             po::options_description options_compression("Compression Options");
             // boost::program_options doesn't support boolean flags which can be set to false, so
             // we use a string argument to set the flag manually.
@@ -384,6 +386,10 @@ CommandLineArguments::parse_arguments(int argc, char const* argv[]) {
                             ->default_value(m_schema_file_path),
                     "Path to a schema file. If not specified, heuristics are used to determine "
                     "dictionary variables. See README-Schema.md for details."
+            )(
+                    "cpu-usage-bound",
+                    po::value<double>(&cpu_usage_bound)->value_name("FLOAT")->default_value(cCpuUsageBoundMax),
+                    "CPU usage bound for compression. Valid range: (0, 1), inclusive."
             );
 
             po::options_description all_compression_options;
@@ -462,6 +468,15 @@ CommandLineArguments::parse_arguments(int argc, char const* argv[]) {
                             + "' is not a regular file."
                     );
                 }
+            }
+
+            if (cCpuUsageBoundMax != cpu_usage_bound) {
+                if (0 >= cpu_usage_bound || cCpuUsageBoundMax < cpu_usage_bound) {
+                    throw invalid_argument(
+                            "Invalid CPU usage bound: " + std::to_string(cpu_usage_bound)
+                    );
+                }
+                m_cpu_usage_bound.emplace(cpu_usage_bound);
             }
         }
 
