@@ -16,106 +16,124 @@ set(libarchive_LIBNAME "archive")
 
 include(cmake/Modules/FindLibraryDependencies.cmake)
 
-# On macOS, libarchive installed through brew is not linked into prefix by default.
-# So it cannot be found by pkg-config and we need to manually find it.
-# For more details, see https://github.com/Homebrew/homebrew-core/issues/117642
-# Find and setup libarchive
-if(APPLE)
-    execute_process(COMMAND brew --prefix libarchive OUTPUT_VARIABLE libarchive_MACOS_PREFIX)
-    string(STRIP "${libarchive_MACOS_PREFIX}" libarchive_MACOS_PREFIX)
-    set(ENV{libarchive_PREV_CMAKE_PATH} "$ENV{CMAKE_PREFIX_PATH}")  # save it so we can revert it later
-    set(ENV{CMAKE_PREFIX_PATH} "${libarchive_MACOS_PREFIX};$ENV{CMAKE_PREFIX_PATH}")
-endif()
+file(REAL_PATH "${CMAKE_SOURCE_DIR}/../../build/deps/core/lib${libarchive_LIBNAME}-install/lib/pkgconfig/"
+        libarchive_PKGCONFIG_ABS_PATH)
+set(ENV{PKG_CONFIG_PATH} "${libarchive_PKGCONFIG_ABS_PATH};$ENV{PKG_CONFIG_PATH}")
 
-# Run pkg-config
+### Run pkg-config
 find_package(PkgConfig)
-pkg_check_modules(libarchive_PKGCONF QUIET "lib${libarchive_LIBNAME}")
+pkg_check_modules(LibArchive_LIBRARY REQUIRED IMPORTED_TARGET "lib${libarchive_LIBNAME}")
 
-# Set include directory
-find_path(LibArchive_INCLUDE_DIR archive.h
-        HINTS ${libarchive_PKGCONF_INCLUDEDIR}
-        PATH_SUFFIXES include
-        )
+message(STATUS "######### FOUND: ${LibArchive_LIBRARY_FOUND}")
+message(STATUS "######### VERSION: ${LibArchive_LIBRARY_VERSION}")
 
-# Handle static libraries
-if(LibArchive_USE_STATIC_LIBS)
-    # Save current value of CMAKE_FIND_LIBRARY_SUFFIXES
-    set(libarchive_ORIG_CMAKE_FIND_LIBRARY_SUFFIXES ${CMAKE_FIND_LIBRARY_SUFFIXES})
+#if(LibArchive_USE_STATIC_LIBS)
+#    # Save current value of CMAKE_FIND_LIBRARY_SUFFIXES
+#    set(libarchive_ORIG_CMAKE_FIND_LIBRARY_SUFFIXES ${CMAKE_FIND_LIBRARY_SUFFIXES})
+#
+#    # Temporarily change CMAKE_FIND_LIBRARY_SUFFIXES to static library suffix
+#    set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
+#endif()
 
-    # Temporarily change CMAKE_FIND_LIBRARY_SUFFIXES to static library suffix
-    set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
-endif()
+#if(PKG_CONFIG_FOUND)
+#    set(LibArchive_FOUND ON)
+#    set(LibArchive_VERSION ${PKG_CONFIG_VERSION_STRING})
+#endif()
 
-# Find library
-find_library(LibArchive_LIBRARY
-        NAMES ${libarchive_LIBNAME}
-        HINTS ${libarchive_PKGCONF_LIBDIR}
-        PATH_SUFFIXES lib
-        )
-if (LibArchive_LIBRARY)
-    # NOTE: This must be set for find_package_handle_standard_args to work
-    set(LibArchive_FOUND ON)
-endif()
 
-if(LibArchive_USE_STATIC_LIBS)
-    FindStaticLibraryDependencies(${libarchive_LIBNAME} libarchive
-                                  "${libarchive_PKGCONF_STATIC_LIBRARIES}")
 
-    # Restore original value of CMAKE_FIND_LIBRARY_SUFFIXES
-    set(CMAKE_FIND_LIBRARY_SUFFIXES ${libarchive_ORIG_CMAKE_FIND_LIBRARY_SUFFIXES})
-    unset(libarchive_ORIG_CMAKE_FIND_LIBRARY_SUFFIXES)
-endif()
+#
+#message(STATUS "##### DEBUG-0: ${LibArchive_LIBRARY}")
+### Run pkg-config
+##find_package(PkgConfig)
+##pkg_check_modules(libarchive_PKGCONF QUIET "lib${libarchive_LIBNAME}")
+#
+## Set include directory
+#find_path(LibArchive_INCLUDE_DIR archive.h
+#        HINTS ${libarchive_PKGCONF_INCLUDEDIR}
+#        PATH_SUFFIXES include
+#        )
+#message(STATUS "##### DEBUG-1: ${libarchive_PKGCONF}")
+## Handle static libraries
+#if(LibArchive_USE_STATIC_LIBS)
+#    # Save current value of CMAKE_FIND_LIBRARY_SUFFIXES
+#    set(libarchive_ORIG_CMAKE_FIND_LIBRARY_SUFFIXES ${CMAKE_FIND_LIBRARY_SUFFIXES})
+#
+#    # Temporarily change CMAKE_FIND_LIBRARY_SUFFIXES to static library suffix
+#    set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
+#endif()
+#
+## Find library
+#find_library(LibArchive_LIBRARY
+#        NAMES ${libarchive_LIBNAME}
+#        HINTS ${libarchive_PKGCONF_LIBDIR}
+#        PATH_SUFFIXES lib
+#        )
+#
+#if (LibArchive_LIBRARY)
+#    # NOTE: This must be set for find_package_handle_standard_args to work
+#    set(LibArchive_FOUND ON)
+#endif()
+#
+#if(LibArchive_USE_STATIC_LIBS)
+#    FindStaticLibraryDependencies(${libarchive_LIBNAME} libarchive
+#                                  "${libarchive_PKGCONF_STATIC_LIBRARIES}")
+#
+#    # Restore original value of CMAKE_FIND_LIBRARY_SUFFIXES
+#    set(CMAKE_FIND_LIBRARY_SUFFIXES ${libarchive_ORIG_CMAKE_FIND_LIBRARY_SUFFIXES})
+#    unset(libarchive_ORIG_CMAKE_FIND_LIBRARY_SUFFIXES)
+#endif()
+#
+#FindDynamicLibraryDependencies(libarchive "${libarchive_DYNAMIC_LIBS}")
 
-FindDynamicLibraryDependencies(libarchive "${libarchive_DYNAMIC_LIBS}")
-
-# Set version
-set(LibArchive_VERSION ${libarchive_PKGCONF_VERSION})
-
-include(FindPackageHandleStandardArgs)
-find_package_handle_standard_args(LibArchive
-        REQUIRED_VARS LibArchive_INCLUDE_DIR
-        VERSION_VAR LibArchive_VERSION
-        )
-
-if(NOT TARGET LibArchive::LibArchive)
-    # Add library to build
-    if (LibArchive_FOUND)
-        if (LibArchive_USE_STATIC_LIBS)
-            add_library(LibArchive::LibArchive STATIC IMPORTED)
-        else()
-            # NOTE: We use UNKNOWN so that if the user doesn't have the SHARED
-            # libraries installed, we can still use the STATIC libraries
-            add_library(LibArchive::LibArchive UNKNOWN IMPORTED)
-        endif()
-    endif()
-
-    # Set include directories for library
-    if(LibArchive_INCLUDE_DIR)
-        set_target_properties(LibArchive::LibArchive
-                PROPERTIES
-                INTERFACE_INCLUDE_DIRECTORIES "${LibArchive_INCLUDE_DIR}"
-                )
-    endif()
-
-    # Set location of library
-    if(EXISTS "${LibArchive_LIBRARY}")
-        set_target_properties(LibArchive::LibArchive
-                PROPERTIES
-                IMPORTED_LINK_INTERFACE_LANGUAGES "C"
-                IMPORTED_LOCATION "${LibArchive_LIBRARY}"
-                )
-
-        # Add component's dependencies for linking
-        if(libarchive_LIBRARY_DEPENDENCIES)
-            set_target_properties(LibArchive::LibArchive
-                    PROPERTIES
-                    INTERFACE_LINK_LIBRARIES "${libarchive_LIBRARY_DEPENDENCIES}"
-                    )
-        endif()
-    endif()
-endif()
-
-if(APPLE)
-    # remove LibArchive-specific path
-    set(ENV{CMAKE_PREFIX_PATH} "$ENV{libarchive_PREV_CMAKE_PATH}")
-endif()
+## Set version
+#set(LibArchive_VERSION ${libarchive_PKGCONF_VERSION})
+#
+#include(FindPackageHandleStandardArgs)
+#find_package_handle_standard_args(LibArchive
+#        REQUIRED_VARS LibArchive_INCLUDE_DIR
+#        VERSION_VAR LibArchive_VERSION
+#        )
+#
+#if(NOT TARGET LibArchive::LibArchive)
+#    # Add library to build
+#    if (LibArchive_FOUND)
+#        if (LibArchive_USE_STATIC_LIBS)
+#            add_library(LibArchive::LibArchive STATIC IMPORTED)
+#        else()
+#            # NOTE: We use UNKNOWN so that if the user doesn't have the SHARED
+#            # libraries installed, we can still use the STATIC libraries
+#            add_library(LibArchive::LibArchive UNKNOWN IMPORTED)
+#        endif()
+#    endif()
+#
+#    # Set include directories for library
+#    if(LibArchive_INCLUDE_DIR)
+#        set_target_properties(LibArchive::LibArchive
+#                PROPERTIES
+#                INTERFACE_INCLUDE_DIRECTORIES "${LibArchive_INCLUDE_DIR}"
+#                )
+#    endif()
+#
+#    # Set location of library
+#    if(EXISTS "${LibArchive_LIBRARY}")
+#        set_target_properties(LibArchive::LibArchive
+#                PROPERTIES
+#                IMPORTED_LINK_INTERFACE_LANGUAGES "C"
+#                IMPORTED_LOCATION "${LibArchive_LIBRARY}"
+#                )
+#
+#        # Add component's dependencies for linking
+#        if(libarchive_LIBRARY_DEPENDENCIES)
+#            set_target_properties(LibArchive::LibArchive
+#                    PROPERTIES
+#                    INTERFACE_LINK_LIBRARIES "${libarchive_LIBRARY_DEPENDENCIES}"
+#                    )
+#        endif()
+#    endif()
+#endif()
+#
+#if(APPLE)
+#    # remove LibArchive-specific path
+#    set(ENV{CMAKE_PREFIX_PATH} "$ENV{libarchive_PREV_CMAKE_PATH}")
+#endif()

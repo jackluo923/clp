@@ -9,9 +9,7 @@ dnf install -y \
     jq \
     libcurl-devel \
     mariadb-connector-c-devel \
-    openssl-devel \
-    zlib-devel \
-    zlib-static
+    openssl-devel
 
 # Determine architecture for `task` release to install
 rpm_arch=$(rpm --eval "%{_arch}")

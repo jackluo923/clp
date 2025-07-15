@@ -40,13 +40,9 @@ brew install \
   coreutils \
   gcc \
   java11 \
-  libarchive \
   llvm@16 \
-  lz4 \
   mariadb-connector-c \
-  msgpack-cxx \
-  xz \
-  zstd
+  msgpack-cxx
 
 # Install pkg-config if it isn't already installed
 # NOTE: We might expect that pkg-config is installed through brew, so trying to install it again
