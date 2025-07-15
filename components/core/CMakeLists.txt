@@ -768,7 +768,6 @@ if(CLP_BUILD_TESTING)
             yaml-cpp
             ystdlib::containers
             ystdlib::error_handling
-            ${LIBLZMA_LIBRARIES}
             zstd::libzstd
             )
     target_compile_features(unitTest

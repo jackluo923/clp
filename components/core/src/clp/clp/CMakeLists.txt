@@ -171,8 +171,6 @@ if(CLP_BUILD_EXECUTABLES)
         target_include_directories(clp
                 PRIVATE
                 "${CLP_SQLITE3_INCLUDE_DIRECTORY}"
-                ${LibArchive_INCLUDE_DIRS}
-
         )
         message(STATUS "LibArchive_INCLUDE_DIRS=${LibArchive_INCLUDE_DIRS}")
         target_link_libraries(clp
