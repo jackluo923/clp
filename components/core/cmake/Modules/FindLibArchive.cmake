@@ -21,12 +21,6 @@ if(LibArchive_USE_STATIC_LIBS)
     set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
 endif()
 
-message(STATUS "##### DEBUG-1: ${LibArchive_FOUND}")
-message(STATUS "##### DEBUG-1: ${LibArchive_LIBRARIES}")
-message(STATUS "##### DEBUG-1: ${LibArchive_LINK_LIBRARIES}")
-message(STATUS "##### DEBUG LibArchive_LIBRARY_DIRS: ${LibArchive_LIBRARY_DIRS}")
-message(STATUS "##### DEBUG LibArchive_INCLUDE_DIRS: ${LibArchive_INCLUDE_DIRS}")
-
 # Set include directory
 find_path(LibArchive_INCLUDE_DIR archive.h
         HINTS ${libarchive_PKGCONF_INCLUDEDIR}

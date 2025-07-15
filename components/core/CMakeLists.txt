@@ -302,7 +302,6 @@ if(CLP_NEED_ZSTD)
 endif()
 
 # Find and setup LZMA Library
-# TODO: Add a script in ./cmake/Modules to properly import LZMA in find_package()'s module mode
 if(CLP_NEED_LZMA)
     if(CLP_USE_STATIC_LIBS)
         set(LIBLZMA_USE_STATIC_LIBS ON)
@@ -310,20 +309,18 @@ if(CLP_NEED_LZMA)
     find_package(liblzma REQUIRED)
 
     if(liblzma_FOUND)
-        message(STATUS "DEBUG-4: ${liblzma_FOUND}")
-        message(STATUS "###Found Lzma ${liblzma_VERSION_STRING}")
-        message(STATUS "###Lzma library location: ${liblzma_LIBRARIES}")
-        message(STATUS "###Lzma Include Dir: ${liblzma_INCLUDE_DIRS}")
-
         # Version 5.8.1 and above address CVE-2024-3094 and CVE-2025-31115.
-#        set(REQUIRED_LIBLZMA_VERSION "5.8.1")
-#        if(LIBLZMA_VERSION_STRING VERSION_LESS ${REQUIRED_LIBLZMA_VERSION})
-#            message(
-#                FATAL_ERROR
-#                "Detected LibLZMA version ${LIBLZMA_VERSION_STRING} is older than required"
-#                " ${REQUIRED_LIBLZMA_VERSION}"
-#            )
-#        endif()
+        set(REQUIRED_LIBLZMA_VERSION_HEX 0x050801)  # (5 << 16) + (8 << 8) + 1
+        if(LZMA_VERSION LESS REQUIRED_LIBLZMA_VERSION_HEX)
+            math(EXPR LIBLZMA_MAJOR "(${LZMA_VERSION} >> 16) & 0xFF")
+            math(EXPR LIBLZMA_MINOR "(${LZMA_VERSION} >> 8) & 0xFF")
+            math(EXPR LIBLZMA_PATCH "${LZMA_VERSION} & 0xFF")
+            message(
+                FATAL_ERROR
+                "Detected LibLZMA version ${LIBLZMA_VERSION_STRING} is older than required"
+                " ${REQUIRED_LIBLZMA_VERSION}"
+            )
+        endif()
     else()
         message(FATAL_ERROR "Could not find ${CLP_LIBS_STRING} libraries for Lzma")
     endif()
