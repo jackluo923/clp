@@ -233,7 +233,6 @@ tasks:
             - "-DCMAKE_INSTALL_LIBDIR=lib"
             - "-DCMAKE_BUILD_TYPE=Release"
             - "-DCMAKE_INSTALL_MESSAGE=LAZY"
-            - "-DBUILD_SHARED_LIBS=ON"
             - "-DENABLE_EXPAT=OFF"
             - "-DENABLE_OPENSSL=OFF"
           LIB_NAME: "libarchive"

@@ -171,7 +171,10 @@ if(CLP_BUILD_EXECUTABLES)
         target_include_directories(clp
                 PRIVATE
                 "${CLP_SQLITE3_INCLUDE_DIRECTORY}"
+                ${LibArchive_INCLUDE_DIRS}
+
         )
+        message(STATUS "LibArchive_INCLUDE_DIRS=${LibArchive_INCLUDE_DIRS}")
         target_link_libraries(clp
                 PRIVATE
                 Boost::filesystem Boost::program_options
@@ -180,7 +183,7 @@ if(CLP_BUILD_EXECUTABLES)
                 log_surgeon::log_surgeon
                 spdlog::spdlog
                 ${sqlite_LIBRARY_DEPENDENCIES}
-                LibArchive::LibArchive
+                PkgConfig::LibArchive
                 MariaDBClient::MariaDBClient
                 nlohmann_json::nlohmann_json
                 ${STD_FS_LIBS}
@@ -188,7 +191,7 @@ if(CLP_BUILD_EXECUTABLES)
                 yaml-cpp
                 ystdlib::containers
                 ystdlib::error_handling
-                ZStd::ZStd
+                zstd::libzstd
         )
         # Put the built executable at the root of the build directory
         set_target_properties(

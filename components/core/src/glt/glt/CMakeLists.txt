@@ -185,14 +185,14 @@ if(CLP_BUILD_EXECUTABLES)
                 fmt::fmt
                 spdlog::spdlog
                 ${sqlite_LIBRARY_DEPENDENCIES}
-                LibArchive::LibArchive
+                PkgConfig::LibArchive
                 MariaDBClient::MariaDBClient
                 nlohmann_json::nlohmann_json
                 ${STD_FS_LIBS}
                 clp::string_utils
                 yaml-cpp
                 ystdlib::error_handling
-                ZStd::ZStd
+                zstd::libzstd
         )
         # Put the built executable at the root of the build directory
         set_target_properties(
