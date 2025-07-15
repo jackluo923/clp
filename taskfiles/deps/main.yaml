@@ -223,7 +223,7 @@ tasks:
     run: "once"
     deps:
       - "lz4"
-      - "xz"
+      - "liblzma"
       - "zlib"
       - "zstd"
     cmds:
@@ -396,7 +396,7 @@ tasks:
         CLP_UTFCPP_INCLUDE_DIRECTORY \"{{.UTFCPP_OUTPUT_DIR}}\"
         )" > "{{.G_DEPS_CORE_CMAKE_SETTINGS_DIR}}/{{.LIB_NAME}}.cmake"
 
-  xz:
+  liblzma:
     internal: true
     run: "once"
     cmds:
@@ -405,7 +405,8 @@ tasks:
           CMAKE_GEN_ARGS:
             - "-DCMAKE_BUILD_TYPE=Release"
             - "-DCMAKE_INSTALL_MESSAGE=LAZY"
-          LIB_NAME: "xz"
+            - "-DBUILD_SHARED_LIBS=OFF"
+          LIB_NAME: "liblzma"
           TARBALL_SHA256: "507825b599356c10dca1cd720c9d0d0c9d5400b9de300af00e4d1ea150795543"
           TARBALL_URL: "https://github.com/tukaani-project/xz/releases/download/v5.8.1/xz-5.8.1.tar.gz"
 

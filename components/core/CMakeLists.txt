@@ -303,17 +303,19 @@ endif()
 
 # Find and setup LZMA Library
 # TODO: Add a script in ./cmake/Modules to properly import LZMA in find_package()'s module mode
-#if(CLP_NEED_LZMA)
-#    if(CLP_USE_STATIC_LIBS)
-#        set(LIBLZMA_USE_STATIC_LIBS ON)
-#    endif()
-#    find_package(LIBLZMA REQUIRED)
-#    if(LIBLZMA_FOUND)
-#        message(STATUS "Found Lzma ${LIBLZMA_VERSION_STRING}")
-#        message(STATUS "Lzma library location: ${LIBLZMA_LIBRARIES}")
-#        message(STATUS "Lzma Include Dir: ${LIBLZMA_INCLUDE_DIRS}")
-#
-#        # Version 5.8.1 and above address CVE-2024-3094 and CVE-2025-31115.
+if(CLP_NEED_LZMA)
+    if(CLP_USE_STATIC_LIBS)
+        set(LIBLZMA_USE_STATIC_LIBS ON)
+    endif()
+    find_package(liblzma REQUIRED)
+
+    if(liblzma_FOUND)
+        message(STATUS "DEBUG-4: ${liblzma_FOUND}")
+        message(STATUS "###Found Lzma ${liblzma_VERSION_STRING}")
+        message(STATUS "###Lzma library location: ${liblzma_LIBRARIES}")
+        message(STATUS "###Lzma Include Dir: ${liblzma_INCLUDE_DIRS}")
+
+        # Version 5.8.1 and above address CVE-2024-3094 and CVE-2025-31115.
 #        set(REQUIRED_LIBLZMA_VERSION "5.8.1")
 #        if(LIBLZMA_VERSION_STRING VERSION_LESS ${REQUIRED_LIBLZMA_VERSION})
 #            message(
@@ -322,11 +324,11 @@ endif()
 #                " ${REQUIRED_LIBLZMA_VERSION}"
 #            )
 #        endif()
-#    else()
-#        message(FATAL_ERROR "Could not find ${CLP_LIBS_STRING} libraries for Lzma")
-#    endif()
-#    include_directories(${LIBLZMA_INCLUDE_DIRS})
-#endif()
+    else()
+        message(FATAL_ERROR "Could not find ${CLP_LIBS_STRING} libraries for Lzma")
+    endif()
+    include_directories(${LIBLZMA_INCLUDE_DIRS})
+endif()
 
 # sqlite dependencies
 if(CLP_NEED_SQLITE)
@@ -754,6 +756,7 @@ if(CLP_BUILD_TESTING)
             date::date
             fmt::fmt
             log_surgeon::log_surgeon
+            LibLZMA::LibLZMA
             PkgConfig::LibArchive
             MariaDBClient::MariaDBClient
             ${MONGOCXX_TARGET}
