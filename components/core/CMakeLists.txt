@@ -280,16 +280,20 @@ endif()
 
 # Find and setup ZStd Library
 if(CLP_NEED_ZSTD)
-    if(CLP_USE_STATIC_LIBS)
-        set(zstd_USE_STATIC_LIBS ON)
-    endif()
     find_package(zstd 1.4.4 REQUIRED)
     if(zstd_FOUND)
         message(STATUS "Found zstd ${zstd_VERSION}")
+        if(CLP_USE_STATIC_LIBS)
+            set(CLP_LIBZSTD zstd::libzstd_static)
+        else()
+            set(CLP_LIBZSTD zstd::libzstd_shared)
+        endif()
     else()
         message(FATAL_ERROR "Could not find ${CLP_LIBS_STRING} libraries for zstd")
     endif()
 endif()
+
+
 
 # Find and setup LZMA Library
 if(CLP_NEED_LZMA)
@@ -758,7 +762,7 @@ if(CLP_BUILD_TESTING)
             yaml-cpp
             ystdlib::containers
             ystdlib::error_handling
-            zstd::libzstd
+            ${CLP_LIBZSTD}
             )
     target_compile_features(unitTest
             PRIVATE cxx_std_20

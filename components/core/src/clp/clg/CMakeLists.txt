@@ -142,10 +142,11 @@ if(CLP_BUILD_EXECUTABLES)
                 ${sqlite_LIBRARY_DEPENDENCIES}
                 ${STD_FS_LIBS}
                 clp::string_utils
+                ${CLP_LIBZSTD}
                 yaml-cpp
                 ystdlib::containers
                 ystdlib::error_handling
-                zstd::libzstd
+
         )
         # Put the built executable at the root of the build directory
         set_target_properties(

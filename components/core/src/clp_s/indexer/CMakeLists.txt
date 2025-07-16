@@ -97,7 +97,7 @@ if(CLP_BUILD_EXECUTABLES)
                 spdlog::spdlog
                 yaml-cpp
                 ystdlib::containers
-                zstd::libzstd
+                ${CLP_LIBZSTD}
         )
         # Put the built executable at the root of the build directory
         set_target_properties(
