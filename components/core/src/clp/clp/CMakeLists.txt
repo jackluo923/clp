@@ -181,10 +181,10 @@ if(CLP_BUILD_EXECUTABLES)
                 log_surgeon::log_surgeon
                 spdlog::spdlog
                 ${sqlite_LIBRARY_DEPENDENCIES}
-                PkgConfig::LibArchive
                 MariaDBClient::MariaDBClient
                 nlohmann_json::nlohmann_json
                 ${STD_FS_LIBS}
+                ${CLP_LIBARCHIVE}
                 clp::string_utils
                 yaml-cpp
                 ystdlib::containers
