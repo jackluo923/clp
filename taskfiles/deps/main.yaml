@@ -185,7 +185,6 @@ tasks:
           CMAKE_GEN_ARGS:
             - "-DBUILD_TESTING=OFF"
             - "-DCMAKE_BUILD_TYPE=Release"
-            - "mak"
           LIB_NAME: "Catch2"
           TARBALL_SHA256: "3cdb4138a072e4c0290034fe22d9f0a80d3bcfb8d7a8a5c49ad75d3a5da24fae"
           TARBALL_URL: "https://github.com/catchorg/Catch2/archive/refs/tags/v2.13.7.tar.gz"
