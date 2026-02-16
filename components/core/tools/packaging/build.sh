@@ -204,10 +204,24 @@ for cur_format in "${format_list[@]}"; do
 
     # Clean if requested (once per build family, before iterating architectures).
     # deb and rpm share manylinux_2_28 — skip if already cleaned this run.
+    # Only clean the current family's directories (other families may have
+    # root-owned files from Docker that would cause permission errors).
     if [[ "${clean}" == "true" ]] && [[ ! " ${cleaned_families:-} " =~ \ ${base_image_family}\  ]]; then
-        echo "==> Cleaning build artifacts..."
-        rm -rf "${repo_root}/build" "${repo_root}/.task"
-        rm -rf "${repo_root}"/build-* "${repo_root}"/.task-*
+        echo "==> Cleaning build artifacts for ${base_image_family}..."
+        # Docker runs as root, so build dirs may contain root-owned files.
+        # Use a container to clean them to avoid requiring sudo on the host.
+        if [[ -d "${repo_root}/build-${base_image_family}" ]] || [[ -d "${repo_root}/.task-${base_image_family}" ]]; then
+            docker run --rm -v "${repo_root}:/clp" -w /clp alpine:3.20 \
+                sh -c "rm -rf /clp/build-${base_image_family} /clp/.task-${base_image_family}" \
+                2>/dev/null || rm -rf "${repo_root}/build-${base_image_family}" "${repo_root}/.task-${base_image_family}"
+        fi
+        # Remove symlinks if they point to the family being cleaned
+        for dir_name in build .task; do
+            local_target="${repo_root}/${dir_name}"
+            if [[ -L "${local_target}" ]]; then
+                rm -f "${local_target}"
+            fi
+        done
         activate_build_family "${base_image_family}"
         cleaned_families="${cleaned_families:-} ${base_image_family}"
     fi

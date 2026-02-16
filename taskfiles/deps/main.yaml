@@ -19,7 +19,7 @@ vars:
   G_DEPS_CPP_CMAKE_SETTINGS_DIR: "{{.G_DEPS_CPP_DIR}}/cmake-settings"
 
   # Library names
-  G_BOOST_LIB_NAME: "boost"
+  G_BOOST_LIB_NAME: "Boost"
   G_FMT_LIB_NAME: "fmt"
   G_GSL_LIB_NAME: "Microsoft.GSL"
   G_YSTDLIB_LIB_NAME: "ystdlib"
