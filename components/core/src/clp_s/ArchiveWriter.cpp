@@ -336,6 +336,9 @@ void ArchiveWriter::initialize_schema_writer(SchemaWriter* writer, Schema const&
                         std::make_unique<ClpStringColumnWriter>(id, m_var_dict, m_array_dict)
                 );
                 break;
+            case NodeType::DateString:
+                writer->append_column(std::make_unique<DateStringColumnWriter>(id));
+                break;
             case NodeType::DeltaInteger:
                 writer->append_column(std::make_unique<DeltaEncodedInt64ColumnWriter>(id));
                 break;
