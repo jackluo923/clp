@@ -15,6 +15,8 @@ set(
         EvaluateRangeIndexFilters.hpp
         EvaluateTimestampIndex.cpp
         EvaluateTimestampIndex.hpp
+        FieldResolver.cpp
+        FieldResolver.hpp
         NaturalLanguageParser.cpp
         NaturalLanguageParser.hpp
         OnnxEmbedder.cpp

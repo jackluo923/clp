@@ -27,10 +27,10 @@
 #include "OutputHandlerImpl.hpp"
 #include "search/AddTimestampConditions.hpp"
 #include "search/ast/ConvertToExists.hpp"
-#include "search/ast/FilterExpr.hpp"
-#include "search/ast/FilterOperation.hpp"
 #include "search/ast/EmptyExpr.hpp"
 #include "search/ast/Expression.hpp"
+#include "search/ast/FilterExpr.hpp"
+#include "search/ast/FilterOperation.hpp"
 #include "search/ast/NarrowTypes.hpp"
 #include "search/ast/OrOfAndForm.hpp"
 #include "search/ast/SearchUtils.hpp"
@@ -42,9 +42,9 @@
 #include "search/NaturalLanguageParser.hpp"
 #include "search/OnnxEmbedder.hpp"
 #include "search/Output.hpp"
-#include "search/QueryRunner.hpp"
 #include "search/OutputHandler.hpp"
 #include "search/Projection.hpp"
+#include "search/QueryRunner.hpp"
 #include "search/SchemaMatch.hpp"
 #include "SingleFileArchiveDefs.hpp"
 
@@ -392,24 +392,11 @@ int main(int argc, char const* argv[]) {
         auto const& query = command_line_arguments.get_query();
         auto query_stream = std::istringstream(query);
         auto expr = kql::parse_kql_expression(query_stream);
-        if (nullptr == expr) {
-            // KQL parse failed — try natural language interpretation
-            expr = nl::parse_natural_language(
-                    query,
-                    command_line_arguments.get_semantic_top_k()
-            );
-            if (nullptr == expr) {
-                SPDLOG_ERROR(
-                        "Query '{}' is not valid KQL and could not be interpreted as"
-                        " natural language",
-                        query
-                );
-                return 1;
-            }
-            SPDLOG_INFO("Interpreting query as natural language search");
-        }
+        bool const is_nl_query = (nullptr == expr);
 
-        if (std::dynamic_pointer_cast<ast::EmptyExpr>(expr)) {
+        if (is_nl_query) {
+            SPDLOG_INFO("Interpreting query as natural language search");
+        } else if (std::dynamic_pointer_cast<ast::EmptyExpr>(expr)) {
             SPDLOG_ERROR("Query '{}' is logically false", query);
             return 1;
         }
@@ -429,34 +416,49 @@ int main(int argc, char const* argv[]) {
             }
         }
 
-        // Build semantic config if the query contains semantic() expressions
-        std::optional<SemanticSearchConfig> semantic_config;
-        if (detect_semantic_expressions(expr)
-            && false == command_line_arguments.get_semantic_model_dir().empty())
-        {
+        // Initialize embedder once outside the archive loop — shared for both
+        // field resolution (NL parsing) and logtype-level semantic search.
+        std::shared_ptr<OnnxEmbedder> shared_embedder;
+        if (false == command_line_arguments.get_semantic_model_dir().empty()) {
             auto const& model_dir = command_line_arguments.get_semantic_model_dir();
             try {
-                auto embedder = std::make_shared<OnnxEmbedder>(model_dir);
-                semantic_config = SemanticSearchConfig{
-                        std::move(embedder),
-                        command_line_arguments.get_semantic_top_k(),
-                        command_line_arguments.get_semantic_threshold()
-                };
+                shared_embedder = std::make_shared<OnnxEmbedder>(model_dir);
             } catch (std::exception const& e) {
                 SPDLOG_ERROR("Failed to initialize ONNX embedder - {}", e.what());
                 return 1;
             }
-        } else if (detect_semantic_expressions(expr)) {
-            SPDLOG_ERROR(
-                    "Query contains semantic() expressions but --semantic-model-dir was not"
-                    " specified"
-            );
-            return 1;
+        }
+
+        // For KQL queries, build semantic config upfront if needed
+        std::optional<SemanticSearchConfig> semantic_config;
+        if (false == is_nl_query && detect_semantic_expressions(expr)) {
+            if (nullptr == shared_embedder) {
+                SPDLOG_ERROR(
+                        "Query contains semantic() expressions but --semantic-model-dir was not"
+                        " specified"
+                );
+                return 1;
+            }
+            semantic_config = SemanticSearchConfig{
+                    shared_embedder,
+                    command_line_arguments.get_semantic_top_k(),
+                    command_line_arguments.get_semantic_threshold()
+            };
         }
 
         auto archive_reader = std::make_shared<clp_s::ArchiveReader>();
         for (auto const& input_path : command_line_arguments.get_input_paths()) {
             if (std::string::npos != input_path.path.find(clp::ir::cIrFileExtension)) {
+                if (is_nl_query) {
+                    // NL queries require a schema tree which IR streams don't provide
+                    SPDLOG_WARN(
+                            "Skipping IR stream '{}' for natural language query"
+                            " (schema tree not available)",
+                            input_path.path
+                    );
+                    continue;
+                }
+
                 auto const result{clp_s::search_kv_ir_stream(
                         input_path,
                         command_line_arguments,
@@ -479,11 +481,6 @@ int main(int argc, char const* argv[]) {
                     || KvIrSearchError{KvIrSearchErrorEnum::UnsupportedOutputHandlerType} == error
                     || KvIrSearchError{KvIrSearchErrorEnum::CountSupportNotImplemented} == error)
                 {
-                    // These errors are treated as non-fatal because they result from unsupported
-                    // features. However, this approach may cause archives with this extension to be
-                    // skipped if the search uses advanced features that are not yet implemented. To
-                    // mitigate this, we log a warning and proceed to search the input as an
-                    // archive.
                     SPDLOG_WARN(
                             "Attempted to search an IR stream using unsupported features. Falling"
                             " back to searching the input as an archive."
@@ -491,9 +488,6 @@ int main(int argc, char const* argv[]) {
                 } else if (KvIrSearchError{KvIrSearchErrorEnum::DeserializerCreationFailure}
                            != error)
                 {
-                    // If the error is `DeserializerCreationFailure`, we may continue to treat the
-                    // input as an archive and retry. Otherwise, it should be considered as a
-                    // non-recoverable failure and return directly.
                     SPDLOG_ERROR(
                             "Failed to search '{}' as an IR stream, error_category={}, error={}",
                             input_path.path,
@@ -510,13 +504,57 @@ int main(int argc, char const* argv[]) {
                 SPDLOG_ERROR("Failed to open archive - {}", e.what());
                 return 1;
             }
+
+            // For NL queries, parse per-archive with schema tree access
+            std::shared_ptr<ast::Expression> archive_expr;
+            std::optional<SemanticSearchConfig> archive_semantic_config = semantic_config;
+
+            if (is_nl_query) {
+                auto const schema_tree = archive_reader->get_schema_tree();
+                archive_expr = nl::parse_natural_language(
+                        query,
+                        command_line_arguments.get_semantic_top_k(),
+                        schema_tree.get(),
+                        shared_embedder.get()
+                );
+                if (nullptr == archive_expr) {
+                    SPDLOG_ERROR(
+                            "Query '{}' is not valid KQL and could not be interpreted as"
+                            " natural language",
+                            query
+                    );
+                    archive_reader->close();
+                    return 1;
+                }
+
+                // Build semantic config for this archive if the NL-generated AST
+                // contains semantic() expressions
+                if (detect_semantic_expressions(archive_expr)) {
+                    if (nullptr == shared_embedder) {
+                        SPDLOG_ERROR(
+                                "Natural language query resolved to semantic() expressions but"
+                                " --semantic-model-dir was not specified"
+                        );
+                        archive_reader->close();
+                        return 1;
+                    }
+                    archive_semantic_config = SemanticSearchConfig{
+                            shared_embedder,
+                            command_line_arguments.get_semantic_top_k(),
+                            command_line_arguments.get_semantic_threshold()
+                    };
+                }
+            } else {
+                archive_expr = expr->copy();
+            }
+
             if (false
                 == search_archive(
                         command_line_arguments,
                         archive_reader,
-                        expr->copy(),
+                        std::move(archive_expr),
                         reducer_socket_fd,
-                        semantic_config
+                        archive_semantic_config
                 ))
             {
                 return 1;
