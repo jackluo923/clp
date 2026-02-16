@@ -18,6 +18,9 @@
 # Optional environment variables:
 #   LIB_INSTALL_DIR  Library install path inside the package
 #                    (default: /usr/lib/clp)
+#   MODEL_DIR        Path to the BGE model directory containing encoder.onnx,
+#                    tokenizer.onnx, and libortextensions.so. When set, these
+#                    files are bundled into the package for semantic search.
 
 set -o errexit
 set -o nounset
@@ -81,7 +84,7 @@ for bin in "${BINARIES[@]}"; do
         [[ -n "${lib_path}" && "${lib_path}" == /* ]] || continue
 
         lib_name=$(basename "${lib_path}")
-        echo "${lib_name}" | grep --quiet --extended-regexp "${EXCLUDE_PATTERN}" && continue
+        echo "${lib_name}" | grep -q -E "${EXCLUDE_PATTERN}" && continue
 
         if [[ ! -f "${STAGING_DIR}${lib_install_dir}/${lib_name}" ]]; then
             cp --dereference "${lib_path}" "${STAGING_DIR}${lib_install_dir}/${lib_name}"
@@ -89,6 +92,51 @@ for bin in "${BINARIES[@]}"; do
         fi
     done
 done
+
+# --- Bundle semantic search model files (optional) --------------------------
+
+if [[ -n "${MODEL_DIR:-}" ]]; then
+    if [[ ! -d "${MODEL_DIR}" ]]; then
+        echo "ERROR: Model directory not found: ${MODEL_DIR}" >&2
+        exit 1
+    fi
+
+    model_install_dir="/usr/share/clp/models/bge-small-en-v1.5"
+    mkdir -p "${STAGING_DIR}${model_install_dir}"
+
+    echo "==> Bundling semantic search model files..."
+    for model_file in encoder.onnx tokenizer.onnx libortextensions.so; do
+        if [[ ! -f "${MODEL_DIR}/${model_file}" ]]; then
+            echo "ERROR: Model file not found: ${MODEL_DIR}/${model_file}" >&2
+            exit 1
+        fi
+        cp "${MODEL_DIR}/${model_file}" "${STAGING_DIR}${model_install_dir}/${model_file}"
+        echo "    Bundled: ${model_file}"
+    done
+
+    # Collect shared library dependencies of libortextensions.so
+    ext_lib="${STAGING_DIR}${model_install_dir}/libortextensions.so"
+    ldd_output=$(ldd "${ext_lib}" 2>&1) || {
+        echo "ERROR: ldd failed for libortextensions.so" >&2
+        echo "${ldd_output}" >&2
+        exit 1
+    }
+    echo "${ldd_output}" | while read -r line; do
+        lib_path=$(echo "${line}" | awk '/=>/ {print $3}')
+        [[ -n "${lib_path}" && "${lib_path}" == /* ]] || continue
+
+        lib_name=$(basename "${lib_path}")
+        echo "${lib_name}" | grep -q -E "${EXCLUDE_PATTERN}" && continue
+
+        if [[ ! -f "${STAGING_DIR}${lib_install_dir}/${lib_name}" ]]; then
+            cp --dereference "${lib_path}" "${STAGING_DIR}${lib_install_dir}/${lib_name}"
+            echo "    Bundled (model dep): ${lib_name}"
+        fi
+    done
+
+    # Patch libortextensions.so RPATH so its shared deps resolve at runtime
+    patchelf --set-rpath "${lib_install_dir}" "${ext_lib}"
+fi
 
 # --- Patch bundled libraries' RPATH ------------------------------------------
 

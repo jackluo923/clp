@@ -9,4 +9,4 @@
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
-RUN apk add --no-cache patchelf alpine-sdk
+RUN apk add --no-cache patchelf alpine-sdk py3-pip

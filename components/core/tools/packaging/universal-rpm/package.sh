@@ -92,6 +92,7 @@ cp -a %{staging_dir}/* %{buildroot}/
 /usr/bin/log-converter
 /usr/bin/reducer-server
 /usr/lib/clp/
+/usr/share/clp/
 SPEC
 
 echo "==> Building rpm package..."

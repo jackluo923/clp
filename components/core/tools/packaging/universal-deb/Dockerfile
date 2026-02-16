@@ -12,5 +12,6 @@ ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
 RUN dnf install -y epel-release \
-    && dnf install -y dpkg patchelf rpm-build \
+    && dnf install -y dpkg patchelf rpm-build python3-pip \
+    && python3 -m pip install --upgrade pip \
     && dnf clean all

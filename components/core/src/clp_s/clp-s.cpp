@@ -419,8 +419,15 @@ int main(int argc, char const* argv[]) {
         // Initialize embedder once outside the archive loop — shared for both
         // field resolution (NL parsing) and logtype-level semantic search.
         std::shared_ptr<OnnxEmbedder> shared_embedder;
-        if (false == command_line_arguments.get_semantic_model_dir().empty()) {
-            auto const& model_dir = command_line_arguments.get_semantic_model_dir();
+        auto model_dir = command_line_arguments.get_semantic_model_dir();
+        if (model_dir.empty()) {
+            std::string const default_model_dir{"/usr/share/clp/models/bge-small-en-v1.5"};
+            if (std::filesystem::is_directory(default_model_dir)) {
+                model_dir = default_model_dir;
+                SPDLOG_INFO("Using default model directory: {}", model_dir);
+            }
+        }
+        if (false == model_dir.empty()) {
             try {
                 shared_embedder = std::make_shared<OnnxEmbedder>(model_dir);
             } catch (std::exception const& e) {
@@ -434,8 +441,9 @@ int main(int argc, char const* argv[]) {
         if (false == is_nl_query && detect_semantic_expressions(expr)) {
             if (nullptr == shared_embedder) {
                 SPDLOG_ERROR(
-                        "Query contains semantic() expressions but --semantic-model-dir was not"
-                        " specified"
+                        "Query contains semantic() expressions but no model directory is"
+                        " available. Use --semantic-model-dir or install models to"
+                        " /usr/share/clp/models/bge-small-en-v1.5/"
                 );
                 return 1;
             }
@@ -533,7 +541,8 @@ int main(int argc, char const* argv[]) {
                     if (nullptr == shared_embedder) {
                         SPDLOG_ERROR(
                                 "Natural language query resolved to semantic() expressions but"
-                                " --semantic-model-dir was not specified"
+                                " no model directory is available. Use --semantic-model-dir or"
+                                " install models to /usr/share/clp/models/bge-small-en-v1.5/"
                         );
                         archive_reader->close();
                         return 1;

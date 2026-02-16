@@ -305,6 +305,7 @@ for cur_format in "${format_list[@]}"; do
                 # builds into /clp/build/core).
                 echo "==> Packaging..."
                 BIN_DIR=/clp/build/core \
+                MODEL_DIR=/clp/build/deps/cpp/bge-small-en-v1.5 \
                 OUTPUT_DIR=/clp/build \
                     /clp/components/core/tools/packaging/'"${format_dir##*/}"'/package.sh
 
@@ -315,7 +316,7 @@ for cur_format in "${format_list[@]}"; do
         # Copy the package to the output directory (only the current format to
         # avoid leaking stale packages of other formats from the build directory)
         echo "==> Copying package to ${output_dir}..."
-        if ! find -L "${repo_root}/build" -maxdepth 1 -name "clp-core*.${cur_format}" | grep --quiet .; then
+        if ! find -L "${repo_root}/build" -maxdepth 1 -name "clp-core*.${cur_format}" | grep -q .; then
             echo "ERROR: No .${cur_format} package found in ${repo_root}/build" >&2
             exit 1
         fi
