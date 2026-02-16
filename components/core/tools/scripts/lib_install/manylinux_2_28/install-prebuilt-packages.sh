@@ -11,6 +11,8 @@ dnf install -y \
     libcurl-devel \
     mariadb-connector-c-devel \
     openssl-devel \
+    protobuf-devel \
+    python3-devel \
     zlib-devel \
     zlib-static
 

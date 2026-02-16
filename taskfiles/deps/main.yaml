@@ -19,7 +19,7 @@ vars:
   G_DEPS_CPP_CMAKE_SETTINGS_DIR: "{{.G_DEPS_CPP_DIR}}/cmake-settings"
 
   # Library names
-  G_BOOST_LIB_NAME: "Boost"
+  G_BOOST_LIB_NAME: "boost"
   G_FMT_LIB_NAME: "fmt"
   G_GSL_LIB_NAME: "Microsoft.GSL"
   G_YSTDLIB_LIB_NAME: "ystdlib"
@@ -592,9 +592,10 @@ tasks:
       - "curl -fSL -o '{{.MODEL_DIR}}/tokenizer.json' '{{.TOKENIZER_JSON_URL}}'"
       - "curl -fSL -o '{{.MODEL_DIR}}/vocab.txt' '{{.VOCAB_URL}}'"
       # Generate tokenizer.onnx from vocab.txt using onnxruntime-extensions Python
+      # Use modern Python from manylinux /opt/python instead of ancient system Python 3.6
       - |-
-        python3 -m pip install --quiet onnx onnxruntime onnxruntime-extensions transformers
-        python3 "{{.ROOT_DIR}}/components/core/tools/scripts/prepare_bge_model.py" \
+        /opt/python/cp311-cp311/bin/python3 -m pip install --quiet onnx onnxruntime onnxruntime-extensions transformers
+        /opt/python/cp311-cp311/bin/python3 "{{.ROOT_DIR}}/components/core/tools/scripts/prepare_bge_model.py" \
           --output-dir "{{.MODEL_DIR}}"
       # Copy libortextensions.so into the model directory so --semantic-model-dir is self-contained
       - |-
