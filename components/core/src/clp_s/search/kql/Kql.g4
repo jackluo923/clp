@@ -11,8 +11,9 @@ query
     ;
 
 expression
-    : column_range_expression 
+    : column_range_expression
     | column_value_expression
+    | semantic_expression
     | value_expression
     ;
 
@@ -34,6 +35,10 @@ value_expression
 
 list_of_values
     : '(' condition=(AND | OR | NOT)? (literals+=literal)* ')'
+    ;
+
+semantic_expression
+    : 'semantic(' query_text=QUOTED_STRING (',' top_k=UNQUOTED_LITERAL)? ')'
     ;
 
 timestamp_expression

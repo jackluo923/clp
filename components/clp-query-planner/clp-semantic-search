@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# clp-semantic-search — simple wrapper for semantic search over CLP archives
+#
+# Usage:
+#   clp-semantic-search <archive_path> "natural language query" [options...]
+#
+# Environment variables (all optional):
+#   CLP_S_BIN          Path to clp-s binary (default: auto-detect from repo)
+#   CLP_EMBED_URL      Embedding service URL (default: http://localhost:8080)
+#   CLP_LLM_URL        LLM API URL for complex queries (default: http://localhost:11434/v1)
+#   CLP_LLM_MODEL      LLM model name (default: server default)
+#   CLP_LLM_API_KEY    API key for the LLM endpoint
+#
+# Examples:
+#   clp-semantic-search /tmp/test_archive "authentication failures"
+#   clp-semantic-search /tmp/test_archive "504 gateway timeout" --dry-run
+#   clp-semantic-search /tmp/test_archive "errors from yesterday" --no-llm
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLANNER_DIR="$SCRIPT_DIR/clp_query_planner"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Auto-detect clp-s binary
+if [[ -n "${CLP_S_BIN:-}" ]]; then
+    CLP_S="$CLP_S_BIN"
+elif [[ -x "$REPO_ROOT/build/core/clp-s" ]]; then
+    CLP_S="$REPO_ROOT/build/core/clp-s"
+else
+    CLP_S="clp-s"
+fi
+
+EMBED_URL="${CLP_EMBED_URL:-http://localhost:8080}"
+
+exec env PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m clp_query_planner \
+    "$@" \
+    --clp-s-bin "$CLP_S" \
+    --embed-url "$EMBED_URL"

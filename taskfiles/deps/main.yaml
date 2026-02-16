@@ -80,6 +80,9 @@ tasks:
       - task: "mongocxx"
       - task: "msgpack-cxx"
       - task: "nlohmann_json"
+      - task: "onnxruntime"
+      - task: "onnxruntime-extensions"
+      - task: "bge-model"
       - task: "simdjson"
       - task: "spdlog"
       - task: "sqlite3"
@@ -471,6 +474,142 @@ tasks:
           # release tarball, since the latter is served from githubusercontent.com which is blocked
           # by some developers' firewalls. The contents of the former are a superset of the latter.
           TARBALL_URL: "https://github.com/nlohmann/json/archive/refs/tags/v3.11.3.tar.gz"
+
+  onnxruntime:
+    internal: true
+    vars:
+      LIB_NAME: "onnxruntime"
+      VERSION: "1.21.0"
+      ONNXRUNTIME_ARCH: '{{ if eq ARCH "arm64" }}aarch64{{ else }}x64{{ end }}'
+      DIR_NAME: "onnxruntime-linux-{{.ONNXRUNTIME_ARCH}}-{{.VERSION}}"
+      EXTRACTION_DIR: "{{.G_DEPS_CPP_DIR}}/{{.LIB_NAME}}-src"
+      CHECKSUM_FILE: "{{.G_DEPS_CPP_CHECKSUMS_DIR}}/{{.LIB_NAME}}.md5"
+    run: "once"
+    deps:
+      - task: "utils:init"
+      - task: "yscope-dev-utils:checksum:validate"
+        vars:
+          CHECKSUM_FILE: "{{.CHECKSUM_FILE}}"
+          INCLUDE_PATTERNS:
+            - "{{.EXTRACTION_DIR}}"
+    cmds:
+      - task: "yscope-dev-utils:remote:download-and-extract-tar"
+        vars:
+          CHECKSUM_FILE: "{{.CHECKSUM_FILE}}"
+          FILE_SHA256: "4508084bde1232ee1ab4b6fad2155be0ea2ccab1c1aae9910ddb3fb68a60805e"
+          OUTPUT_DIR: "{{.EXTRACTION_DIR}}"
+          URL: "https://github.com/microsoft/onnxruntime/releases/download/v{{.VERSION}}/\
+            {{.DIR_NAME}}.tgz"
+      - |-
+        echo 'set(CLP_ONNXRUNTIME_DIR "{{.EXTRACTION_DIR}}" CACHE PATH "")' \
+        > "{{.G_DEPS_CPP_CMAKE_SETTINGS_DIR}}/{{.LIB_NAME}}.cmake"
+
+      # This command must be last
+      - task: "yscope-dev-utils:checksum:compute"
+        vars:
+          CHECKSUM_FILE: "{{.CHECKSUM_FILE}}"
+          INCLUDE_PATTERNS:
+            - "{{.EXTRACTION_DIR}}"
+
+  onnxruntime-extensions:
+    internal: true
+    vars:
+      LIB_NAME: "onnxruntime-extensions"
+      VERSION: "0.14.0"
+      SOURCE_DIR: "{{.G_DEPS_CPP_DIR}}/{{.LIB_NAME}}-src"
+      BUILD_DIR: "{{.G_DEPS_CPP_DIR}}/{{.LIB_NAME}}-build"
+      INSTALL_DIR: "{{.G_DEPS_CPP_DIR}}/{{.LIB_NAME}}-install"
+      CHECKSUM_FILE: "{{.G_DEPS_CPP_CHECKSUMS_DIR}}/{{.LIB_NAME}}.md5"
+    run: "once"
+    deps:
+      - task: "onnxruntime"
+      - task: "utils:init"
+      - task: "yscope-dev-utils:checksum:validate"
+        vars:
+          CHECKSUM_FILE: "{{.CHECKSUM_FILE}}"
+          INCLUDE_PATTERNS:
+            - "{{.INSTALL_DIR}}"
+    cmds:
+      - task: "yscope-dev-utils:remote:download-and-extract-tar"
+        vars:
+          FILE_SHA256: "f7a72758c916baa427d47655ccaacb9d7c4f04d68d3a968b7417fc3d286a2bdf"
+          OUTPUT_DIR: "{{.SOURCE_DIR}}"
+          URL: "https://github.com/microsoft/onnxruntime-extensions/archive/refs/tags/\
+            v{{.VERSION}}.tar.gz"
+      - |-
+        cmake -S "{{.SOURCE_DIR}}" -B "{{.BUILD_DIR}}" \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DOCOS_BUILD_PYTHON=OFF \
+          -DOCOS_ENABLE_PYTHON=OFF \
+          -DOCOS_ENABLE_VISION=OFF \
+          -DOCOS_ENABLE_AUDIO=OFF \
+          -DOCOS_ENABLE_AZURE=OFF \
+          -DOCOS_ENABLE_MATH=OFF \
+          -DOCOS_ENABLE_DLIB=OFF \
+          -DOCOS_ENABLE_CV2=OFF \
+          -DOCOS_ENABLE_BERT_TOKENIZER=ON \
+          -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+          -DONNXRUNTIME_LIB_DIR="{{.G_DEPS_CPP_DIR}}/onnxruntime-src/lib" \
+          -DONNXRUNTIME_INCLUDE_DIR="{{.G_DEPS_CPP_DIR}}/onnxruntime-src/include"
+      - |-
+        cmake --build "{{.BUILD_DIR}}" --target extensions_shared \
+          -j "{{.G_CPP_MAX_PARALLELISM_PER_BUILD_TASK}}"
+      - |-
+        mkdir -p "{{.INSTALL_DIR}}/lib"
+        cp "{{.BUILD_DIR}}/lib/libortextensions.so" "{{.INSTALL_DIR}}/lib/"
+      - |-
+        echo 'set(CLP_ORTEXTENSIONS_DIR "{{.INSTALL_DIR}}" CACHE PATH "")' \
+        > "{{.G_DEPS_CPP_CMAKE_SETTINGS_DIR}}/{{.LIB_NAME}}.cmake"
+
+      # This command must be last
+      - task: "yscope-dev-utils:checksum:compute"
+        vars:
+          CHECKSUM_FILE: "{{.CHECKSUM_FILE}}"
+          INCLUDE_PATTERNS:
+            - "{{.INSTALL_DIR}}"
+
+  bge-model:
+    internal: true
+    vars:
+      LIB_NAME: "bge-small-en-v1.5"
+      MODEL_DIR: "{{.G_DEPS_CPP_DIR}}/{{.LIB_NAME}}"
+      CHECKSUM_FILE: "{{.G_DEPS_CPP_CHECKSUMS_DIR}}/{{.LIB_NAME}}.md5"
+      ENCODER_URL: "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx"
+      TOKENIZER_JSON_URL: "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/tokenizer.json"
+      VOCAB_URL: "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/vocab.txt"
+    run: "once"
+    deps:
+      - task: "onnxruntime-extensions"
+      - task: "utils:init"
+      - task: "yscope-dev-utils:checksum:validate"
+        vars:
+          CHECKSUM_FILE: "{{.CHECKSUM_FILE}}"
+          INCLUDE_PATTERNS:
+            - "{{.MODEL_DIR}}"
+    cmds:
+      - "mkdir -p '{{.MODEL_DIR}}'"
+      - "curl -fSL -o '{{.MODEL_DIR}}/encoder.onnx' '{{.ENCODER_URL}}'"
+      - "curl -fSL -o '{{.MODEL_DIR}}/tokenizer.json' '{{.TOKENIZER_JSON_URL}}'"
+      - "curl -fSL -o '{{.MODEL_DIR}}/vocab.txt' '{{.VOCAB_URL}}'"
+      # Generate tokenizer.onnx from vocab.txt using onnxruntime-extensions Python
+      - |-
+        python3 -m pip install --quiet onnx onnxruntime onnxruntime-extensions transformers
+        python3 "{{.ROOT_DIR}}/components/core/tools/scripts/prepare_bge_model.py" \
+          --output-dir "{{.MODEL_DIR}}"
+      # Copy libortextensions.so into the model directory so --semantic-model-dir is self-contained
+      - |-
+        cp "{{.G_DEPS_CPP_DIR}}/onnxruntime-extensions-install/lib/libortextensions.so" \
+          "{{.MODEL_DIR}}/"
+      - |-
+        echo 'set(CLP_BGE_MODEL_DIR "{{.MODEL_DIR}}" CACHE PATH "")' \
+        > "{{.G_DEPS_CPP_CMAKE_SETTINGS_DIR}}/{{.LIB_NAME}}.cmake"
+
+      # This command must be last
+      - task: "yscope-dev-utils:checksum:compute"
+        vars:
+          CHECKSUM_FILE: "{{.CHECKSUM_FILE}}"
+          INCLUDE_PATTERNS:
+            - "{{.MODEL_DIR}}"
 
   simdjson:
     internal: true

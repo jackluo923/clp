@@ -30,9 +30,16 @@
 #include "ast/FilterExpr.hpp"
 #include "ast/FilterOperation.hpp"
 #include "ast/Literal.hpp"
+#include "OnnxEmbedder.hpp"
 #include "SchemaMatch.hpp"
+#include "SemanticSearchUtils.hpp"
 
 namespace clp_s::search {
+struct SemanticSearchConfig {
+    std::shared_ptr<OnnxEmbedder> embedder;
+    size_t default_top_k;
+    double threshold;
+};
 /**
  * This class is a core component of the log search system responsible for executing parsed queries
  * represented as abstract syntax trees (ASTs). It sets up the necessary context for each schema and
@@ -47,12 +54,14 @@ public:
             std::shared_ptr<SchemaMatch> const& match,
             std::shared_ptr<ast::Expression> const& expr,
             std::shared_ptr<ArchiveReader> const& archive_reader,
-            bool ignore_case
+            bool ignore_case,
+            std::optional<SemanticSearchConfig> semantic_config = std::nullopt
     )
             : m_archive_reader(archive_reader),
               m_expr(expr),
               m_match(match),
               m_ignore_case(ignore_case),
+              m_semantic_config(std::move(semantic_config)),
               m_schema_tree(m_archive_reader->get_schema_tree()),
               m_var_dict(m_archive_reader->get_variable_dictionary()),
               m_log_dict(m_archive_reader->get_log_type_dictionary()),
@@ -114,6 +123,7 @@ private:
     std::shared_ptr<ast::Expression> m_expr;
     std::shared_ptr<SchemaMatch> m_match;
     bool m_ignore_case;
+    std::optional<SemanticSearchConfig> m_semantic_config;
 
     // variables for the current schema being filtered
     int32_t m_schema{-1};
@@ -402,6 +412,26 @@ private:
             int32_t column_id,
             std::shared_ptr<ast::Literal> const& operand
     ) -> bool;
+
+    /**
+     * Evaluates a semantic filter expression against the current message by checking all
+     * clp string column readers for matching logtype IDs.
+     * @param expr The semantic filter expression
+     * @param schema The current schema ID
+     * @return true if any reader's logtype ID is in the semantic match set
+     */
+    auto evaluate_semantic_filter(ast::FilterExpr* expr, int32_t schema) const -> bool;
+
+    /**
+     * Walks the AST to find SEMANTIC filter expressions, computes embeddings,
+     * and stores match results.
+     */
+    void populate_semantic_queries();
+
+    // Semantic match results keyed by (query_text, effective_top_k)
+    std::map<std::pair<std::string, size_t>, SemanticMatchResult> m_semantic_match_results;
+    // Map from filter expression pointer to its semantic match result
+    std::unordered_map<ast::Expression*, SemanticMatchResult const*> m_expr_semantic_match;
 
     /**
      * Populates the string queries

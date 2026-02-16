@@ -35,6 +35,8 @@ set(
     OrOfAndForm.hpp
     SearchUtils.cpp
     SearchUtils.hpp
+    SemanticLiteral.cpp
+    SemanticLiteral.hpp
     SetTimestampLiteralPrecision.cpp
     SetTimestampLiteralPrecision.hpp
     StringLiteral.cpp

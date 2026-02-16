@@ -30,8 +30,9 @@ public:
            std::shared_ptr<ast::Expression> const& expr,
            std::shared_ptr<ArchiveReader> const& archive_reader,
            std::unique_ptr<OutputHandler> output_handler,
-           bool ignore_case)
-            : m_query_runner(match, expr, archive_reader, ignore_case),
+           bool ignore_case,
+           std::optional<SemanticSearchConfig> semantic_config = std::nullopt)
+            : m_query_runner(match, expr, archive_reader, ignore_case, std::move(semantic_config)),
               m_archive_reader(archive_reader),
               m_expr(expr),
               m_match(match),

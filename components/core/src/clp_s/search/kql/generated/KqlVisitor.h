@@ -1,5 +1,5 @@
 
-// Generated from clp_s/search/kql/Kql.g4 by ANTLR 4.13.2
+// Generated from Kql.g4 by ANTLR 4.13.2
 
 #pragma once
 
@@ -43,6 +43,8 @@ public:
     virtual std::any visitValue_expression(KqlParser::Value_expressionContext *context) = 0;
 
     virtual std::any visitList_of_values(KqlParser::List_of_valuesContext *context) = 0;
+
+    virtual std::any visitSemantic_expression(KqlParser::Semantic_expressionContext *context) = 0;
 
     virtual std::any visitTimestamp_expression(KqlParser::Timestamp_expressionContext *context) = 0;
 

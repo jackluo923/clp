@@ -27,6 +27,8 @@
 #include "OutputHandlerImpl.hpp"
 #include "search/AddTimestampConditions.hpp"
 #include "search/ast/ConvertToExists.hpp"
+#include "search/ast/FilterExpr.hpp"
+#include "search/ast/FilterOperation.hpp"
 #include "search/ast/EmptyExpr.hpp"
 #include "search/ast/Expression.hpp"
 #include "search/ast/NarrowTypes.hpp"
@@ -37,7 +39,10 @@
 #include "search/EvaluateRangeIndexFilters.hpp"
 #include "search/EvaluateTimestampIndex.hpp"
 #include "search/kql/kql.hpp"
+#include "search/NaturalLanguageParser.hpp"
+#include "search/OnnxEmbedder.hpp"
 #include "search/Output.hpp"
+#include "search/QueryRunner.hpp"
 #include "search/OutputHandler.hpp"
 #include "search/Projection.hpp"
 #include "search/SchemaMatch.hpp"
@@ -71,14 +76,23 @@ void decompress_archive(clp_s::JsonConstructorOption const& json_constructor_opt
  * @param archive_reader
  * @param expr A copy of the search AST which may be modified
  * @param reducer_socket_fd
+ * @param semantic_config Optional semantic search configuration
  * @return Whether the search succeeded
  */
 bool search_archive(
         CommandLineArguments const& command_line_arguments,
         std::shared_ptr<clp_s::ArchiveReader> const& archive_reader,
         std::shared_ptr<ast::Expression> expr,
-        int reducer_socket_fd
+        int reducer_socket_fd,
+        std::optional<SemanticSearchConfig> const& semantic_config
 );
+
+/**
+ * Walks a search AST and returns true if any FilterExpr has SEMANTIC operation.
+ * @param expr The root expression to check
+ * @return true if any semantic filter is found
+ */
+bool detect_semantic_expressions(std::shared_ptr<ast::Expression> const& expr);
 
 bool compress(CommandLineArguments const& command_line_arguments) {
     auto archives_dir = std::filesystem::path(command_line_arguments.get_archives_dir());
@@ -129,7 +143,8 @@ bool search_archive(
         CommandLineArguments const& command_line_arguments,
         std::shared_ptr<clp_s::ArchiveReader> const& archive_reader,
         std::shared_ptr<ast::Expression> expr,
-        int reducer_socket_fd
+        int reducer_socket_fd,
+        std::optional<SemanticSearchConfig> const& semantic_config
 ) {
     auto const& query = command_line_arguments.get_query();
 
@@ -292,9 +307,26 @@ bool search_archive(
             expr,
             archive_reader,
             std::move(output_handler),
-            command_line_arguments.get_ignore_case()
+            command_line_arguments.get_ignore_case(),
+            semantic_config ? std::optional<SemanticSearchConfig>(*semantic_config) : std::nullopt
     );
     return output.filter();
+}
+
+bool detect_semantic_expressions(std::shared_ptr<ast::Expression> const& expr) {
+    if (expr->has_only_expression_operands()) {
+        for (auto const& op : expr->get_op_list()) {
+            if (detect_semantic_expressions(std::static_pointer_cast<ast::Expression>(op))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (auto filter = std::dynamic_pointer_cast<ast::FilterExpr>(expr)) {
+        return filter->get_operation() == ast::FilterOperation::SEMANTIC;
+    }
+    return false;
 }
 }  // namespace
 
@@ -361,7 +393,20 @@ int main(int argc, char const* argv[]) {
         auto query_stream = std::istringstream(query);
         auto expr = kql::parse_kql_expression(query_stream);
         if (nullptr == expr) {
-            return 1;
+            // KQL parse failed — try natural language interpretation
+            expr = nl::parse_natural_language(
+                    query,
+                    command_line_arguments.get_semantic_top_k()
+            );
+            if (nullptr == expr) {
+                SPDLOG_ERROR(
+                        "Query '{}' is not valid KQL and could not be interpreted as"
+                        " natural language",
+                        query
+                );
+                return 1;
+            }
+            SPDLOG_INFO("Interpreting query as natural language search");
         }
 
         if (std::dynamic_pointer_cast<ast::EmptyExpr>(expr)) {
@@ -382,6 +427,31 @@ int main(int argc, char const* argv[]) {
                 SPDLOG_ERROR("Failed to connect to reducer");
                 return 1;
             }
+        }
+
+        // Build semantic config if the query contains semantic() expressions
+        std::optional<SemanticSearchConfig> semantic_config;
+        if (detect_semantic_expressions(expr)
+            && false == command_line_arguments.get_semantic_model_dir().empty())
+        {
+            auto const& model_dir = command_line_arguments.get_semantic_model_dir();
+            try {
+                auto embedder = std::make_shared<OnnxEmbedder>(model_dir);
+                semantic_config = SemanticSearchConfig{
+                        std::move(embedder),
+                        command_line_arguments.get_semantic_top_k(),
+                        command_line_arguments.get_semantic_threshold()
+                };
+            } catch (std::exception const& e) {
+                SPDLOG_ERROR("Failed to initialize ONNX embedder - {}", e.what());
+                return 1;
+            }
+        } else if (detect_semantic_expressions(expr)) {
+            SPDLOG_ERROR(
+                    "Query contains semantic() expressions but --semantic-model-dir was not"
+                    " specified"
+            );
+            return 1;
         }
 
         auto archive_reader = std::make_shared<clp_s::ArchiveReader>();
@@ -445,7 +515,8 @@ int main(int argc, char const* argv[]) {
                         command_line_arguments,
                         archive_reader,
                         expr->copy(),
-                        reducer_socket_fd
+                        reducer_socket_fd,
+                        semantic_config
                 ))
             {
                 return 1;

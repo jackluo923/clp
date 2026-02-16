@@ -20,6 +20,7 @@
 #include "ast/Literal.hpp"
 #include "ast/OrExpr.hpp"
 #include "ast/SearchUtils.hpp"
+#include "ast/SemanticLiteral.hpp"
 #include "EvaluateTimestampIndex.hpp"
 
 using clp_s::search::ast::AndExpr;
@@ -40,11 +41,13 @@ namespace clp_s::search {
 void QueryRunner::global_init() {
     populate_internal_columns();
     populate_string_queries(m_expr);
+    populate_semantic_queries();
 }
 
 auto QueryRunner::schema_init(int32_t schema_id) -> EvaluatedValue {
     m_expr_clp_query.clear();
     m_expr_var_match_map.clear();
+    m_expr_semantic_match.clear();
     m_wildcard_to_searched_basic_columns.clear();
     m_wildcard_columns.clear();
     m_expr = m_match->get_query_for_schema(schema_id)->copy();
@@ -206,6 +209,10 @@ bool QueryRunner::evaluate(Expression* expr, int32_t schema) {
 }
 
 bool QueryRunner::evaluate_wildcard_filter(FilterExpr* expr, int32_t schema) {
+    if (expr->get_operation() == FilterOperation::SEMANTIC) {
+        return evaluate_semantic_filter(expr, schema);
+    }
+
     auto literal = expr->get_operand();
     auto* column = expr->get_column().get();
     auto op = expr->get_operation();
@@ -290,6 +297,10 @@ bool QueryRunner::evaluate_wildcard_filter(FilterExpr* expr, int32_t schema) {
 }
 
 bool QueryRunner::evaluate_filter(FilterExpr* expr, int32_t schema) {
+    if (expr->get_operation() == FilterOperation::SEMANTIC) {
+        return evaluate_semantic_filter(expr, schema);
+    }
+
     auto* column = expr->get_column().get();
     int32_t column_id = column->get_column_id();
     auto literal = expr->get_operand();
@@ -875,7 +886,8 @@ void QueryRunner::populate_string_queries(std::shared_ptr<Expression> const& exp
     auto filter = std::dynamic_pointer_cast<FilterExpr>(expr);
     if (filter != nullptr
         && !(filter->get_operation() == FilterOperation::EXISTS
-             || filter->get_operation() == FilterOperation::NEXISTS))
+             || filter->get_operation() == FilterOperation::NEXISTS
+             || filter->get_operation() == FilterOperation::SEMANTIC))
     {
         if (filter->get_column()->matches_type(LiteralType::ClpStringT)) {
             std::string query_string;
@@ -934,6 +946,79 @@ void QueryRunner::populate_string_queries(std::shared_ptr<Expression> const& exp
             }
         }
     }
+}
+
+namespace {
+void collect_semantic_filters(
+        std::shared_ptr<Expression> const& expr,
+        std::vector<FilterExpr*>& out
+) {
+    if (expr->has_only_expression_operands()) {
+        for (auto const& op : expr->get_op_list()) {
+            collect_semantic_filters(std::static_pointer_cast<Expression>(op), out);
+        }
+    } else if (auto filter = std::dynamic_pointer_cast<FilterExpr>(expr)) {
+        if (filter->get_operation() == FilterOperation::SEMANTIC) {
+            out.push_back(filter.get());
+        }
+    }
+}
+}  // namespace
+
+void QueryRunner::populate_semantic_queries() {
+    if (false == m_semantic_config.has_value()) {
+        return;
+    }
+
+    std::vector<FilterExpr*> semantic_filters;
+    collect_semantic_filters(m_expr, semantic_filters);
+    if (semantic_filters.empty()) {
+        return;
+    }
+
+    for (auto* filter : semantic_filters) {
+        auto const* sem_lit
+                = dynamic_cast<ast::SemanticLiteral const*>(filter->get_operand().get());
+        if (nullptr == sem_lit) {
+            continue;
+        }
+
+        auto const& query_text = sem_lit->get_query_text();
+        size_t effective_top_k
+                = sem_lit->get_top_k().value_or(m_semantic_config->default_top_k);
+        auto key = std::make_pair(query_text, effective_top_k);
+
+        if (0 == m_semantic_match_results.count(key)) {
+            m_semantic_match_results[key] = match_logtypes_semantically(
+                    query_text,
+                    *m_log_dict,
+                    *m_semantic_config->embedder,
+                    effective_top_k,
+                    m_semantic_config->threshold
+            );
+        }
+    }
+}
+
+auto QueryRunner::evaluate_semantic_filter(
+        ast::FilterExpr* expr,
+        int32_t schema
+) const -> bool {
+    auto it = m_expr_semantic_match.find(expr);
+    if (it == m_expr_semantic_match.end()) {
+        return false;
+    }
+
+    auto const* match_result = it->second;
+    for (auto const& [column_id, readers] : m_clp_string_readers) {
+        for (auto* reader : readers) {
+            auto const logtype_id = static_cast<uint64_t>(reader->get_encoded_id(m_cur_message));
+            if (match_result->matched_logtype_scores.count(logtype_id) > 0) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 void QueryRunner::populate_internal_columns() {
@@ -1053,6 +1138,25 @@ EvaluatedValue QueryRunner::constant_propagate(std::shared_ptr<Expression> const
         }
         return EvaluatedValue::Unknown;
     } else if (auto filter = std::dynamic_pointer_cast<FilterExpr>(expr)) {
+        if (filter->get_operation() == FilterOperation::SEMANTIC) {
+            // Re-map the semantic match result for this (possibly copied) expression
+            if (m_semantic_config.has_value()) {
+                auto const* sem_lit = dynamic_cast<ast::SemanticLiteral const*>(
+                        filter->get_operand().get()
+                );
+                if (nullptr != sem_lit) {
+                    size_t effective_top_k
+                            = sem_lit->get_top_k().value_or(m_semantic_config->default_top_k);
+                    auto key = std::make_pair(sem_lit->get_query_text(), effective_top_k);
+                    auto it = m_semantic_match_results.find(key);
+                    if (it != m_semantic_match_results.end()) {
+                        m_expr_semantic_match[expr.get()] = &it->second;
+                    }
+                }
+            }
+            return EvaluatedValue::Unknown;
+        }
+
         if ((filter->get_operation() == FilterOperation::EXISTS
              || filter->get_operation() == FilterOperation::NEXISTS)
             && (!filter->get_column()->has_unresolved_tokens()

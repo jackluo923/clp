@@ -97,6 +97,12 @@ public:
 
     bool get_ignore_case() const { return m_ignore_case; }
 
+    double get_semantic_threshold() const { return m_semantic_threshold; }
+
+    size_t get_semantic_top_k() const { return m_semantic_top_k; }
+
+    std::string const& get_semantic_model_dir() const { return m_semantic_model_dir; }
+
     std::string const& get_reducer_host() const { return m_reducer_host; }
 
     int get_reducer_port() const { return m_reducer_port; }
@@ -237,6 +243,9 @@ private:
     bool m_ignore_case{false};
     std::vector<std::string> m_projection_columns;
     std::string m_dataset;
+    double m_semantic_threshold{0.3};
+    size_t m_semantic_top_k{5};
+    std::string m_semantic_model_dir;
 
     // Search aggregation variables
     std::string m_reducer_host;

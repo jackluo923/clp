@@ -1,5 +1,5 @@
 
-// Generated from clp_s/search/kql/Kql.g4 by ANTLR 4.13.2
+// Generated from Kql.g4 by ANTLR 4.13.2
 
 #pragma once
 
@@ -62,6 +62,10 @@ public:
   }
 
   virtual std::any visitList_of_values(KqlParser::List_of_valuesContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitSemantic_expression(KqlParser::Semantic_expressionContext *ctx) override {
     return visitChildren(ctx);
   }
 

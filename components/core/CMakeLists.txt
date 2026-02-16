@@ -217,6 +217,28 @@ if(CLP_NEED_SIMDJSON)
     endif()
 endif()
 
+if(CLP_NEED_ONNXRUNTIME)
+    # Find ONNX Runtime (pre-built). CLP_ONNXRUNTIME_DIR should point to the extracted release
+    # tarball directory (e.g., onnxruntime-linux-aarch64-X.Y.Z/).
+    find_library(ONNXRUNTIME_LIB onnxruntime
+        HINTS "${CLP_ONNXRUNTIME_DIR}/lib"
+        REQUIRED
+    )
+    find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+        HINTS "${CLP_ONNXRUNTIME_DIR}/include"
+    )
+    if(ONNXRUNTIME_LIB AND ONNXRUNTIME_INCLUDE_DIR)
+        message(STATUS "Found onnxruntime: ${ONNXRUNTIME_LIB}")
+        add_library(onnxruntime::onnxruntime SHARED IMPORTED)
+        set_target_properties(onnxruntime::onnxruntime PROPERTIES
+            IMPORTED_LOCATION "${ONNXRUNTIME_LIB}"
+            INTERFACE_INCLUDE_DIRECTORIES "${ONNXRUNTIME_INCLUDE_DIR}"
+        )
+    else()
+        message(FATAL_ERROR "Could not find onnxruntime")
+    endif()
+endif()
+
 if(CLP_NEED_SPDLOG)
     find_package(spdlog REQUIRED)
     if(spdlog_FOUND)

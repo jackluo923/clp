@@ -22,6 +22,7 @@
 #include "../ast/NullLiteral.hpp"
 #include "../ast/OrExpr.hpp"
 #include "../ast/SearchUtils.hpp"
+#include "../ast/SemanticLiteral.hpp"
 #include "../ast/StringLiteral.hpp"
 #include "../ast/TimestampLiteral.hpp"
 #include "KqlBaseVisitor.h"
@@ -43,6 +44,7 @@ using clp_s::search::ast::Integral;
 using clp_s::search::ast::Literal;
 using clp_s::search::ast::NullLiteral;
 using clp_s::search::ast::OrExpr;
+using clp_s::search::ast::SemanticLiteral;
 using clp_s::search::ast::StringLiteral;
 using clp_s::search::ast::TimestampLiteral;
 
@@ -286,6 +288,28 @@ public:
         return FilterExpr::create(descriptor, op, lit);
     }
 
+    std::any visitSemantic_expression(KqlParser::Semantic_expressionContext* ctx) override {
+        if (nullptr == ctx->query_text) {
+            return std::any{};
+        }
+
+        auto const query_str{unquote_string(ctx->query_text->getText())};
+        std::optional<size_t> top_k;
+        if (nullptr != ctx->top_k) {
+            try {
+                top_k = std::stoull(ctx->top_k->getText());
+            } catch (std::exception const& e) {
+                SPDLOG_ERROR("Invalid top_k value: {}", ctx->top_k->getText());
+                return std::any{};
+            }
+        }
+
+        auto lit = SemanticLiteral::create(query_str, top_k);
+        auto descriptor
+                = ColumnDescriptor::create_from_escaped_tokens({"*"}, constants::cDefaultNamespace);
+        return FilterExpr::create(descriptor, FilterOperation::SEMANTIC, lit);
+    }
+
     std::any visitValue_expression(KqlParser::Value_expressionContext* ctx) override {
         auto lit{std::any_cast<std::shared_ptr<Literal>>(ctx->literal()->accept(this))};
 
@@ -345,10 +369,10 @@ std::shared_ptr<Expression> parse_kql_expression(std::istream& in) {
     KqlParser::StartContext* tree = parser.start();
 
     if (lexer_error_listener.error()) {
-        SPDLOG_ERROR("Lexer error: {}", lexer_error_listener.message());
+        SPDLOG_DEBUG("KQL lexer error: {}", lexer_error_listener.message());
         return {};
     } else if (parser_error_listener.error()) {
-        SPDLOG_ERROR("Parser error: {}", parser_error_listener.message());
+        SPDLOG_DEBUG("KQL parser error: {}", parser_error_listener.message());
         return {};
     }
 
