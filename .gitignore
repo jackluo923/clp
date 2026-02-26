@@ -4,5 +4,8 @@ __pycache__/
 .lint-venv/
 .rustfmt.toml
 .task/
+.task-*/
 build/
+build-*/
 dist/
+packages/
