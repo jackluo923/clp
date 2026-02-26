@@ -14,8 +14,8 @@ class  KqlLexer : public antlr4::Lexer {
 public:
   enum {
     T__0 = 1, T__1 = 2, T__2 = 3, T__3 = 4, T__4 = 5, T__5 = 6, T__6 = 7, 
-    AND = 8, OR = 9, NOT = 10, QUOTED_STRING = 11, UNQUOTED_LITERAL = 12, 
-    RANGE_OPERATOR = 13, SPACE = 14
+    T__7 = 8, AND = 9, OR = 10, NOT = 11, QUOTED_STRING = 12, UNQUOTED_LITERAL = 13, 
+    RANGE_OPERATOR = 14, SPACE = 15
   };
 
   explicit KqlLexer(antlr4::CharStream *input);

@@ -532,6 +532,23 @@ CommandLineArguments::parse_arguments(int argc, char const** argv) {
                 "Type of authentication required for network requests (s3 | none). Authentication"
                 " with s3 requires the AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment"
                 " variables, and optionally the AWS_SESSION_TOKEN environment variable."
+            )(
+                "semantic-top-k",
+                po::value<size_t>(&m_semantic_top_k)
+                    ->value_name("K")
+                    ->default_value(m_semantic_top_k),
+                "Return log events whose logtype is among the K nearest to the query."
+            )(
+                "semantic-threshold",
+                po::value<double>(&m_semantic_threshold)
+                    ->value_name("THRESHOLD")
+                    ->default_value(m_semantic_threshold),
+                "Optional minimum similarity floor for semantic matches (0.0 to 1.0)."
+            )(
+                "semantic-model-dir",
+                po::value<std::string>(&m_semantic_model_dir)
+                    ->value_name("DIR"),
+                "Directory containing the ONNX embedding model and ortextensions library."
             );
             // clang-format on
             search_options.add(match_options);
@@ -724,6 +741,12 @@ CommandLineArguments::parse_arguments(int argc, char const** argv) {
             {
                 throw std::invalid_argument(
                         "Timestamp range is invalid - begin timestamp is after end timestamp."
+                );
+            }
+
+            if (m_semantic_threshold < 0.0 || m_semantic_threshold > 1.0) {
+                throw std::invalid_argument(
+                        "semantic-threshold must be between 0.0 and 1.0."
                 );
             }
 

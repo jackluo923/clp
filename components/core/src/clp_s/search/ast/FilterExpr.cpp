@@ -53,6 +53,8 @@ auto FilterExpr::op_type_str(FilterOperation op) -> std::string {
             return "LTE";
         case FilterOperation::GTE:
             return "GTE";
+        case FilterOperation::SEMANTIC:
+            return "SEMANTIC";
         default:
             return "UNKNOWN";
     }

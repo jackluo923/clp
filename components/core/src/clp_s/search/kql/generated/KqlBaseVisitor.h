@@ -65,6 +65,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitSemantic_expression(KqlParser::Semantic_expressionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitTimestamp_expression(KqlParser::Timestamp_expressionContext *ctx) override {
     return visitChildren(ctx);
   }

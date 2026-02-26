@@ -38,7 +38,9 @@ std::shared_ptr<Expression> NarrowTypes::narrow(std::shared_ptr<Expression> cur)
         auto column = filter->get_column();
         auto op = filter->get_operation();
 
-        if (op == FilterOperation::EXISTS || op == FilterOperation::NEXISTS) {
+        if (op == FilterOperation::EXISTS || op == FilterOperation::NEXISTS
+            || op == FilterOperation::SEMANTIC)
+        {
             return cur;
         }
 

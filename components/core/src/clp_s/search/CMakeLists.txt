@@ -15,6 +15,12 @@ set(
         EvaluateRangeIndexFilters.hpp
         EvaluateTimestampIndex.cpp
         EvaluateTimestampIndex.hpp
+        FieldResolver.cpp
+        FieldResolver.hpp
+        NaturalLanguageParser.cpp
+        NaturalLanguageParser.hpp
+        OnnxEmbedder.cpp
+        OnnxEmbedder.hpp
         Output.cpp
         Output.hpp
         OutputHandler.hpp
@@ -24,6 +30,8 @@ set(
         QueryRunner.hpp
         SchemaMatch.cpp
         SchemaMatch.hpp
+        SemanticSearchUtils.cpp
+        SemanticSearchUtils.hpp
 )
 
 if(CLP_BUILD_CLP_S_SEARCH)
@@ -41,6 +49,7 @@ if(CLP_BUILD_CLP_S_SEARCH)
                 clp_s::archive_reader
                 clp_s::search::ast
                 log_surgeon::log_surgeon
+                onnxruntime::onnxruntime
                 simdjson::simdjson
                 PRIVATE
                 clp::string_utils

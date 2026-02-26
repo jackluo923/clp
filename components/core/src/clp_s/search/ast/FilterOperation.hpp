@@ -13,7 +13,8 @@ enum FilterOperation {
     LT,
     GT,
     LTE,
-    GTE
+    GTE,
+    SEMANTIC
 };
 }  // namespace clp_s::search::ast
 

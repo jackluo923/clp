@@ -217,6 +217,34 @@ if(CLP_NEED_SIMDJSON)
     endif()
 endif()
 
+if(CLP_NEED_ONNXRUNTIME)
+    # Find ONNX Runtime (pre-built). CLP_ONNXRUNTIME_DIR should point to the extracted release
+    # tarball directory (e.g., onnxruntime-linux-aarch64-X.Y.Z/).
+    find_library(ONNXRUNTIME_LIB onnxruntime
+        HINTS "${CLP_ONNXRUNTIME_DIR}/lib"
+        REQUIRED
+    )
+    find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+        HINTS "${CLP_ONNXRUNTIME_DIR}/include"
+    )
+    if(ONNXRUNTIME_LIB AND ONNXRUNTIME_INCLUDE_DIR)
+        message(STATUS "Found onnxruntime: ${ONNXRUNTIME_LIB}")
+        add_library(onnxruntime::onnxruntime SHARED IMPORTED)
+        get_filename_component(ONNXRUNTIME_LIB_DIR "${ONNXRUNTIME_LIB}" DIRECTORY)
+        set_target_properties(onnxruntime::onnxruntime PROPERTIES
+            IMPORTED_LOCATION "${ONNXRUNTIME_LIB}"
+            INTERFACE_INCLUDE_DIRECTORIES "${ONNXRUNTIME_INCLUDE_DIR}"
+            # Tell the linker where to find onnxruntime's transitive shared
+            # library dependencies (abseil, protobuf, re2, etc.) which live
+            # alongside it on musl builds. Harmless no-op on glibc where
+            # the pre-built tarball statically links its dependencies.
+            INTERFACE_LINK_OPTIONS "-Wl,-rpath-link,${ONNXRUNTIME_LIB_DIR}"
+        )
+    else()
+        message(FATAL_ERROR "Could not find onnxruntime")
+    endif()
+endif()
+
 if(CLP_NEED_SPDLOG)
     find_package(spdlog REQUIRED)
     if(spdlog_FOUND)
