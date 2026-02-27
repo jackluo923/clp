@@ -83,7 +83,11 @@ auto OnnxEmbedder::embed(std::vector<std::string> const& texts) const
         auto const* attention_mask_data = tok_outputs[2].GetTensorData<int64_t>();
 
         auto tok_shape = tok_outputs[0].GetTensorTypeAndShapeInfo().GetShape();
-        int64_t const seq_len = tok_shape[0];
+        // BERT models have a max positional embedding size of 512 tokens.
+        // Truncate longer sequences to avoid a broadcast error in the
+        // position embedding addition layer.
+        int64_t constexpr cMaxSeqLen = 512;
+        int64_t const seq_len = std::min(tok_shape[0], cMaxSeqLen);
 
         // Step 2: Encode - reshape to [1, seq_len] for the encoder
         int64_t const enc_shape[] = {1, seq_len};

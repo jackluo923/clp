@@ -297,6 +297,15 @@ The model directory should contain:
 
 ## Limitations and Future Work
 
+- **512-token truncation**: The BERT-based embedding model (bge-small-en-v1.5) has a maximum
+  positional embedding size of 512 tokens (~400 words). Logtypes that tokenize to more than 512
+  tokens are truncated — only the first 512 tokens contribute to the embedding, and any semantic
+  content beyond that point is ignored. In practice this rarely affects matching quality because the
+  semantically distinctive parts of a logtype (error type, component name, action) tend to appear
+  early, while the tail is often variable data (stack traces, long paths, hex dumps). For very long
+  structured logtypes where distinguishing information appears only at the end, semantic search may
+  miss relevant matches.
+
 - **CPU-only inference**: Uses single-threaded CPU inference. GPU acceleration
   via ONNX Runtime CUDA/TensorRT providers could improve throughput for
   archives with very large logtype dictionaries.
