@@ -994,7 +994,8 @@ void QueryRunner::populate_semantic_queries() {
                     *m_log_dict,
                     *m_semantic_config->embedder,
                     effective_top_k,
-                    m_semantic_config->threshold
+                    m_semantic_config->threshold,
+                    m_semantic_config->model_name
             );
         }
     }

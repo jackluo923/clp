@@ -141,6 +141,28 @@ void SQLitePreparedStatement::bind_text(
     bind_text(parameter_index, value, copy_parameter);
 }
 
+void SQLitePreparedStatement::bind_blob(
+        int parameter_index,
+        void const* data,
+        size_t size,
+        bool copy_parameter
+) {
+    auto return_value = sqlite3_bind_blob(
+            m_statement_handle,
+            parameter_index,
+            data,
+            size,
+            copy_parameter ? SQLITE_TRANSIENT : SQLITE_STATIC
+    );
+    if (SQLITE_OK != return_value) {
+        SPDLOG_ERROR(
+                "SQLitePreparedStatement: Failed to bind blob to statement - {}",
+                sqlite3_errmsg(m_db_handle)
+        );
+        throw OperationFailed(ErrorCode_Failure, __FILENAME__, __LINE__);
+    }
+}
+
 void SQLitePreparedStatement::reset() {
     // NOTE: sqlite3_reset can return an error but the docs seem to imply this is not a failure of
     // reset but rather a notification that the statement was not in a good state before reset.
@@ -187,5 +209,21 @@ void SQLitePreparedStatement::column_string(int parameter_index, std::string& va
             reinterpret_cast<char const*>(sqlite3_column_text(m_statement_handle, parameter_index)),
             sqlite3_column_bytes(m_statement_handle, parameter_index)
     );
+}
+
+void const* SQLitePreparedStatement::column_blob(int parameter_index) const {
+    if (false == m_row_ready) {
+        throw OperationFailed(ErrorCode_NotReady, __FILENAME__, __LINE__);
+    }
+
+    return sqlite3_column_blob(m_statement_handle, parameter_index);
+}
+
+int SQLitePreparedStatement::column_blob_size(int parameter_index) const {
+    if (false == m_row_ready) {
+        throw OperationFailed(ErrorCode_NotReady, __FILENAME__, __LINE__);
+    }
+
+    return sqlite3_column_bytes(m_statement_handle, parameter_index);
 }
 }  // namespace clp

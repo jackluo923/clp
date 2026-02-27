@@ -11,6 +11,8 @@ set(
         ../DictionaryWriter.hpp
         AddTimestampConditions.cpp
         AddTimestampConditions.hpp
+        EmbeddingCache.cpp
+        EmbeddingCache.hpp
         EvaluateRangeIndexFilters.cpp
         EvaluateRangeIndexFilters.hpp
         EvaluateTimestampIndex.cpp

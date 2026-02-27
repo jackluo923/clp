@@ -3,13 +3,16 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <spdlog/spdlog.h>
 
 #include "../../clp/ir/types.hpp"
+#include "EmbeddingCache.hpp"
 #include "OnnxEmbedder.hpp"
 
 namespace clp_s::search {
@@ -71,7 +74,8 @@ SemanticMatchResult match_logtypes_semantically(
         LogTypeDictionaryReader const& log_dict,
         OnnxEmbedder const& embedder,
         size_t top_k,
-        double threshold
+        double threshold,
+        std::string const& model_name
 ) {
     if (query.empty() || 0 == top_k) {
         SPDLOG_WARN("Semantic search skipped: empty query or top_k=0");
@@ -83,27 +87,78 @@ SemanticMatchResult match_logtypes_semantically(
         return {};
     }
 
-    // Build batch: [query, cleaned_logtype_0, cleaned_logtype_1, ...]
-    std::vector<std::string> texts;
-    texts.reserve(1 + entries.size());
-    texts.push_back(query);
+    // Step 1: Collect and clean all logtypes
+    std::vector<std::string> cleaned_logtypes;
+    cleaned_logtypes.reserve(entries.size());
     for (auto const& entry : entries) {
-        texts.push_back(clean_logtype_for_embedding(entry.get_value()));
+        cleaned_logtypes.push_back(clean_logtype_for_embedding(entry.get_value()));
     }
 
-    SPDLOG_INFO("Computing embeddings for query and {} logtypes", entries.size());
-
-    auto const embeddings = embedder.embed(texts);
-    if (embeddings.size() != texts.size()) {
-        throw std::runtime_error("Embedder returned unexpected number of embeddings");
+    // Step 2: Compute per-logtype hashes
+    std::vector<uint64_t> logtype_hashes;
+    logtype_hashes.reserve(cleaned_logtypes.size());
+    for (auto const& lt : cleaned_logtypes) {
+        logtype_hashes.push_back(fnv1a_hash(lt));
     }
 
-    // Compute similarity for all logtypes
-    auto const& query_embedding = embeddings[0];
+    // Step 3: Batch cache lookup
+    EmbeddingCache cache(model_name);
+    auto logtype_embeddings = cache.try_load_batch(logtype_hashes, embedder.embedding_dim());
+
+    // Step 4: Collect miss indices
+    std::vector<size_t> miss_indices;
+    for (size_t i = 0; i < logtype_embeddings.size(); ++i) {
+        if (logtype_embeddings[i].empty()) {
+            miss_indices.push_back(i);
+        }
+    }
+
+    if (false == miss_indices.empty()) {
+        // Step 5a: Embed only the missed logtypes
+        std::vector<std::string> missed_logtypes;
+        missed_logtypes.reserve(miss_indices.size());
+        for (size_t idx : miss_indices) {
+            missed_logtypes.push_back(cleaned_logtypes[idx]);
+        }
+
+        SPDLOG_INFO(
+                "Embedding cache: {}/{} hits, computing {} missed logtype embeddings",
+                entries.size() - miss_indices.size(),
+                entries.size(),
+                miss_indices.size()
+        );
+
+        auto const missed_embeddings = embedder.embed(missed_logtypes);
+        if (missed_embeddings.size() != miss_indices.size()) {
+            throw std::runtime_error("Embedder returned unexpected number of embeddings");
+        }
+
+        // Step 5b: Store missed embeddings in cache
+        std::vector<uint64_t> missed_hashes;
+        missed_hashes.reserve(miss_indices.size());
+        for (size_t idx : miss_indices) {
+            missed_hashes.push_back(logtype_hashes[idx]);
+        }
+        cache.store_batch(missed_hashes, missed_embeddings);
+
+        // Step 5c: Merge into result vector
+        for (size_t i = 0; i < miss_indices.size(); ++i) {
+            logtype_embeddings[miss_indices[i]] = missed_embeddings[i];
+        }
+    }
+
+    // Step 6: Always embed query fresh
+    auto const query_embeddings = embedder.embed({query});
+    if (query_embeddings.empty()) {
+        throw std::runtime_error("Embedder returned no embedding for query");
+    }
+    auto const& query_embedding = query_embeddings[0];
+
+    // Step 7: Compute similarity for all logtypes
     std::vector<std::pair<uint64_t, double>> scored;
     scored.reserve(entries.size());
     for (size_t i = 0; i < entries.size(); ++i) {
-        double const score = cosine_similarity(query_embedding, embeddings[i + 1]);
+        double const score = cosine_similarity(query_embedding, logtype_embeddings[i]);
         if (score >= threshold) {
             scored.emplace_back(static_cast<uint64_t>(i), score);
         }
@@ -123,7 +178,7 @@ SemanticMatchResult match_logtypes_semantically(
         result.matched_logtype_scores[scored[i].first] = scored[i].second;
     }
 
-    SPDLOG_INFO(
+    SPDLOG_DEBUG(
             "Semantic search matched top {} of {} logtypes (threshold floor {})",
             result.matched_logtype_scores.size(),
             entries.size(),

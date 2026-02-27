@@ -39,6 +39,7 @@ struct SemanticSearchConfig {
     std::shared_ptr<OnnxEmbedder> embedder;
     size_t default_top_k;
     double threshold;
+    std::string model_name;
 };
 /**
  * This class is a core component of the log search system responsible for executing parsed queries

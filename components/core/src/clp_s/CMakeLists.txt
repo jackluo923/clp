@@ -95,6 +95,10 @@ set(
         ../clp/ReadOnlyMemoryMappedFile.cpp
         ../clp/ReadOnlyMemoryMappedFile.hpp
         ../clp/spdlog_with_specializations.hpp
+        ../clp/SQLiteDB.cpp
+        ../clp/SQLiteDB.hpp
+        ../clp/SQLitePreparedStatement.cpp
+        ../clp/SQLitePreparedStatement.hpp
         ../clp/streaming_archive/ArchiveMetadata.cpp
         ../clp/streaming_archive/ArchiveMetadata.hpp
         ../clp/streaming_archive/Constants.hpp
@@ -123,10 +127,15 @@ if(CLP_BUILD_CLP_S_CLP_DEPENDENCIES)
         add_library(
                 clp_s_clp_dependencies
                 ${CLP_S_CLP_SOURCES}
+                "${CLP_SQLITE3_SOURCE_DIRECTORY}/sqlite3.c"
         )
         add_library(clp_s::clp_dependencies ALIAS clp_s_clp_dependencies)
         target_compile_features(clp_s_clp_dependencies PRIVATE cxx_std_20)
-        target_include_directories(clp_s_clp_dependencies PUBLIC ../)
+        target_include_directories(
+                clp_s_clp_dependencies
+                PUBLIC ../
+                PUBLIC "${CLP_SQLITE3_INCLUDE_DIRECTORY}"
+        )
         target_link_libraries(
                 clp_s_clp_dependencies
                 PUBLIC
@@ -142,6 +151,7 @@ if(CLP_BUILD_CLP_S_CLP_DEPENDENCIES)
                 nlohmann_json::nlohmann_json
                 OpenSSL::Crypto
                 spdlog::spdlog
+                ${sqlite_LIBRARY_DEPENDENCIES}
                 ystdlib::error_handling
         )
 endif()

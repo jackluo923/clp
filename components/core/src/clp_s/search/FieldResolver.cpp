@@ -326,7 +326,7 @@ auto resolve_fields(
         texts.push_back(field.rich_description());
     }
 
-    SPDLOG_INFO("Computing field resolution embeddings for query and {} fields", fields.size());
+    SPDLOG_DEBUG("Computing field resolution embeddings for query and {} fields", fields.size());
 
     auto const embeddings = embedder.embed(texts);
     if (embeddings.size() != texts.size()) {
@@ -354,7 +354,7 @@ auto resolve_fields(
     }
     scored.resize(n);
 
-    SPDLOG_INFO(
+    SPDLOG_DEBUG(
             "Field resolution matched top {} of {} fields (threshold {})",
             scored.size(),
             fields.size(),

@@ -389,7 +389,7 @@ int main(int argc, char const* argv[]) {
         bool const is_nl_query = (nullptr == expr);
 
         if (is_nl_query) {
-            SPDLOG_INFO("Interpreting query as natural language search");
+            SPDLOG_DEBUG("Interpreting query as natural language search");
         } else if (std::dynamic_pointer_cast<ast::EmptyExpr>(expr)) {
             SPDLOG_ERROR("Query '{}' is logically false", query);
             return 1;
@@ -418,7 +418,7 @@ int main(int argc, char const* argv[]) {
             std::string const default_model_dir{"/usr/share/clp/models/bge-small-en-v1.5"};
             if (std::filesystem::is_directory(default_model_dir)) {
                 model_dir = default_model_dir;
-                SPDLOG_INFO("Using default model directory: {}", model_dir);
+                SPDLOG_DEBUG("Using default model directory: {}", model_dir);
             }
         }
         if (false == model_dir.empty()) {
@@ -430,7 +430,14 @@ int main(int argc, char const* argv[]) {
             }
         }
 
+        // Extract model basename for cache key (e.g. "bge-small-en-v1.5").
+        // lexically_normal() strips trailing slashes so filename() doesn't return ".".
+        auto const model_name = model_dir.empty()
+                ? std::string{}
+                : std::filesystem::path(model_dir).lexically_normal().filename().string();
+
         // For KQL queries, build semantic config upfront if needed
+        // archive_dir is set per-archive in the loop below
         std::optional<SemanticSearchConfig> semantic_config;
         if (false == is_nl_query && detect_semantic_expressions(expr)) {
             if (nullptr == shared_embedder) {
@@ -444,7 +451,8 @@ int main(int argc, char const* argv[]) {
             semantic_config = SemanticSearchConfig{
                     shared_embedder,
                     command_line_arguments.get_semantic_top_k(),
-                    command_line_arguments.get_semantic_threshold()
+                    command_line_arguments.get_semantic_threshold(),
+                    model_name
             };
         }
 
@@ -544,7 +552,8 @@ int main(int argc, char const* argv[]) {
                     archive_semantic_config = SemanticSearchConfig{
                             shared_embedder,
                             command_line_arguments.get_semantic_top_k(),
-                            command_line_arguments.get_semantic_threshold()
+                            command_line_arguments.get_semantic_threshold(),
+                            model_name
                     };
                 }
             } else {

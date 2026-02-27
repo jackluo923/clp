@@ -1,6 +1,7 @@
 #ifndef CLP_SQLITEPREPAREDSTATEMENT_HPP
 #define CLP_SQLITEPREPAREDSTATEMENT_HPP
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -45,12 +46,15 @@ public:
     void bind_text(int parameter_index, std::string const& value, bool copy_parameter);
     void
     bind_text(std::string const& parameter_name, std::string const& value, bool copy_parameter);
+    void bind_blob(int parameter_index, void const* data, size_t size, bool copy_parameter);
     void reset();
 
     bool step();
     int column_int(int parameter_index) const;
     int64_t column_int64(int parameter_index) const;
     void column_string(int parameter_index, std::string& value) const;
+    void const* column_blob(int parameter_index) const;
+    int column_blob_size(int parameter_index) const;
 
     bool is_row_ready() const { return m_row_ready; }
 
