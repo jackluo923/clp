@@ -289,11 +289,23 @@ public:
     }
 
     std::any visitSemantic_expression(KqlParser::Semantic_expressionContext* ctx) override {
-        if (nullptr == ctx->query_text) {
+        if (ctx->query_words.empty()) {
             return std::any{};
         }
 
-        auto const query_str{unquote_string(ctx->query_text->getText())};
+        // Join all query tokens with spaces. For quoted strings, unquote them first.
+        std::string query_str;
+        for (auto* token_ctx : ctx->query_words) {
+            if (false == query_str.empty()) {
+                query_str += ' ';
+            }
+            if (nullptr != token_ctx->QUOTED_STRING()) {
+                query_str += unquote_string(token_ctx->QUOTED_STRING()->getText());
+            } else {
+                query_str += token_ctx->UNQUOTED_LITERAL()->getText();
+            }
+        }
+
         std::optional<size_t> top_k;
         if (nullptr != ctx->top_k) {
             try {

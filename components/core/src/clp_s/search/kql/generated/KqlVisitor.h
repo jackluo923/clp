@@ -46,6 +46,8 @@ public:
 
     virtual std::any visitSemantic_expression(KqlParser::Semantic_expressionContext *context) = 0;
 
+    virtual std::any visitSemantic_query_token(KqlParser::Semantic_query_tokenContext *context) = 0;
+
     virtual std::any visitTimestamp_expression(KqlParser::Timestamp_expressionContext *context) = 0;
 
     virtual std::any visitLiteral(KqlParser::LiteralContext *context) = 0;

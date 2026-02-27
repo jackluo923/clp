@@ -38,7 +38,12 @@ list_of_values
     ;
 
 semantic_expression
-    : 'semantic(' query_text=QUOTED_STRING (',' top_k=UNQUOTED_LITERAL)? ')'
+    : 'semantic(' query_words+=semantic_query_token+ (',' top_k=UNQUOTED_LITERAL)? ')'
+    ;
+
+semantic_query_token
+    : QUOTED_STRING
+    | UNQUOTED_LITERAL
     ;
 
 timestamp_expression

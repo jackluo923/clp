@@ -21,8 +21,8 @@ public:
   enum {
     RuleStart = 0, RuleQuery = 1, RuleExpression = 2, RuleColumn_range_expression = 3, 
     RuleColumn_value_expression = 4, RuleColumn = 5, RuleValue_expression = 6, 
-    RuleList_of_values = 7, RuleSemantic_expression = 8, RuleTimestamp_expression = 9, 
-    RuleLiteral = 10
+    RuleList_of_values = 7, RuleSemantic_expression = 8, RuleSemantic_query_token = 9, 
+    RuleTimestamp_expression = 10, RuleLiteral = 11
   };
 
   explicit KqlParser(antlr4::TokenStream *input);
@@ -51,6 +51,7 @@ public:
   class Value_expressionContext;
   class List_of_valuesContext;
   class Semantic_expressionContext;
+  class Semantic_query_tokenContext;
   class Timestamp_expressionContext;
   class LiteralContext; 
 
@@ -243,9 +244,25 @@ public:
 
   class  Semantic_expressionContext : public antlr4::ParserRuleContext {
   public:
-    antlr4::Token *query_text = nullptr;
+    KqlParser::Semantic_query_tokenContext *semantic_query_tokenContext = nullptr;
+    std::vector<Semantic_query_tokenContext *> query_words;
     antlr4::Token *top_k = nullptr;
     Semantic_expressionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    std::vector<Semantic_query_tokenContext *> semantic_query_token();
+    Semantic_query_tokenContext* semantic_query_token(size_t i);
+    antlr4::tree::TerminalNode *UNQUOTED_LITERAL();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+   
+  };
+
+  Semantic_expressionContext* semantic_expression();
+
+  class  Semantic_query_tokenContext : public antlr4::ParserRuleContext {
+  public:
+    Semantic_query_tokenContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
     antlr4::tree::TerminalNode *QUOTED_STRING();
     antlr4::tree::TerminalNode *UNQUOTED_LITERAL();
@@ -255,7 +272,7 @@ public:
    
   };
 
-  Semantic_expressionContext* semantic_expression();
+  Semantic_query_tokenContext* semantic_query_token();
 
   class  Timestamp_expressionContext : public antlr4::ParserRuleContext {
   public:
