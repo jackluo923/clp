@@ -82,6 +82,10 @@ bool Output::filter() {
     std::string message;
     auto const archive_id = m_archive_reader->get_archive_id();
     for (int32_t schema_id : matched_schemas) {
+        if (is_result_limit_reached()) {
+            break;
+        }
+
         if (EvaluatedValue::False == m_query_runner.schema_init(schema_id)) {
             continue;
         }
@@ -96,18 +100,23 @@ bool Output::filter() {
         if (m_output_handler->should_output_metadata()) {
             epochtime_t timestamp{};
             int64_t log_event_idx{};
-            while (reader.get_next_message_with_metadata(
-                    message,
-                    timestamp,
-                    log_event_idx,
-                    &m_query_runner
-            ))
+            while (false == is_result_limit_reached()
+                   && reader.get_next_message_with_metadata(
+                           message,
+                           timestamp,
+                           log_event_idx,
+                           &m_query_runner
+                   ))
             {
                 m_output_handler->write(message, timestamp, archive_id, log_event_idx);
+                ++m_result_count;
             }
         } else {
-            while (reader.get_next_message(message, &m_query_runner)) {
+            while (false == is_result_limit_reached()
+                   && reader.get_next_message(message, &m_query_runner))
+            {
                 m_output_handler->write(message);
+                ++m_result_count;
             }
         }
         auto ecode = m_output_handler->flush();

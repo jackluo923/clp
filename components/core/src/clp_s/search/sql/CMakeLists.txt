@@ -18,7 +18,7 @@ if(CLP_BUILD_CLP_S_SEARCH_SQL)
                 ../antlr_common/ErrorListener.hpp
                 sql.cpp
                 sql.hpp
-        )    
+        )
         add_library(clp_s::search::sql ALIAS clp_s_search_sql)
         target_compile_features(clp_s_search_sql PRIVATE cxx_std_20)
         target_include_directories(clp_s_search_sql
@@ -31,6 +31,7 @@ if(CLP_BUILD_CLP_S_SEARCH_SQL)
                 PRIVATE
                 antlr4_static
                 clp_s::search::ast
+                clp_s::timestamp_parser
                 spdlog::spdlog
         )
 endif()

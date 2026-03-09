@@ -393,6 +393,8 @@ set(SOURCE_FILES_clp_s_unitTest
     src/clp_s/search/EvaluateRangeIndexFilters.hpp
     src/clp_s/search/EvaluateTimestampIndex.cpp
     src/clp_s/search/EvaluateTimestampIndex.hpp
+    src/clp_s/search/LocalAggregateOutputHandler.cpp
+    src/clp_s/search/LocalAggregateOutputHandler.hpp
     src/clp_s/search/Output.cpp
     src/clp_s/search/Output.hpp
     src/clp_s/search/OutputHandler.hpp
@@ -400,6 +402,8 @@ set(SOURCE_FILES_clp_s_unitTest
     src/clp_s/search/Projection.hpp
     src/clp_s/search/QueryRunner.cpp
     src/clp_s/search/QueryRunner.hpp
+    src/clp_s/search/RenamingOutputHandler.cpp
+    src/clp_s/search/RenamingOutputHandler.hpp
     src/clp_s/search/SchemaMatch.cpp
     src/clp_s/search/SchemaMatch.hpp
     src/clp_s/test/test_InputConfig.cpp

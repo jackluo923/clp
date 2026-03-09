@@ -189,9 +189,16 @@ References for search syntax, command line tools, and so on.
 
 :::{grid-item-card}
 :link: reference-json-search-syntax
-`clp-json` search syntax
+`clp-json` KQL search syntax
 ^^^
-Syntax reference for `clp-json`'s (and `clp-s`') search syntax.
+KQL syntax reference for `clp-json`'s (and `clp-s`') search syntax.
+:::
+
+:::{grid-item-card}
+:link: reference-sql-search-syntax
+`clp-json` SQL search syntax
+^^^
+SQL syntax reference for `clp-json`'s (and `clp-s`') search syntax.
 :::
 
 :::{grid-item-card}
@@ -280,6 +287,7 @@ resources-datasets
 :caption: Reference
 
 reference-json-search-syntax
+reference-sql-search-syntax
 reference-text-search-syntax
 reference-sbin-scripts/index
 reference-unstructured-schema-file

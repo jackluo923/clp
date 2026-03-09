@@ -138,6 +138,7 @@ function(validate_clp_binaries_dependencies)
         CLP_BUILD_CLP_S_SEARCH
         CLP_BUILD_CLP_S_SEARCH_AST
         CLP_BUILD_CLP_S_SEARCH_KQL
+        CLP_BUILD_CLP_S_SEARCH_SQL
         CLP_BUILD_CLP_S_TIMESTAMP_PARSER
     )
 endfunction()
@@ -355,6 +356,7 @@ endfunction()
 function(validate_clp_s_search_sql_dependencies)
     validate_clp_dependencies_for_target(CLP_BUILD_CLP_S_SEARCH_SQL
         CLP_BUILD_CLP_S_SEARCH_AST
+        CLP_BUILD_CLP_S_TIMESTAMP_PARSER
     )
 endfunction()
 

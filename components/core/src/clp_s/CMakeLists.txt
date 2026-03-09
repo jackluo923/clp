@@ -485,6 +485,7 @@ if(CLP_BUILD_EXECUTABLES)
                 clp_s::search
                 clp_s::search::ast
                 clp_s::search::kql
+                clp_s::search::sql
                 ${MONGOCXX_TARGET}
                 msgpack-cxx
                 spdlog::spdlog

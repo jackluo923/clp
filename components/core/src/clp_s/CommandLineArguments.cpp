@@ -749,21 +749,25 @@ CommandLineArguments::parse_arguments(int argc, char const** argv) {
                 std::cerr << std::endl;
 
                 std::cerr << "Examples:" << std::endl;
-                std::cerr << "  # Search archives in archives-dir for logs matching a KQL query"
-                             R"( "level: INFO" and output to stdout)"
-                          << std::endl;
+                std::cerr << "  # KQL: Search for logs matching a KQL expression" << std::endl;
                 std::cerr << "  " << m_program_name << R"( s archives-dir "level: INFO")"
                           << std::endl;
                 std::cerr << std::endl;
 
-                std::cerr << "  # Search archives in archives-dir for logs matching a KQL query"
+                std::cerr << "  # SQL: Search using a SQL SELECT statement" << std::endl;
+                std::cerr << "  " << m_program_name
+                          << R"( s archives-dir "SELECT * FROM logs WHERE level = 'INFO' LIMIT 100")"
+                          << std::endl;
+                std::cerr << std::endl;
+
+                std::cerr << "  # Search for logs matching a query"
                              R"( "level: INFO" and output to a file)"
                           << std::endl;
                 std::cerr << "  " << m_program_name << R"( s archives-dir "level: INFO")"
                           << " " << cFileOutputHandlerName << " --path test.out" << std::endl;
                 std::cerr << std::endl;
 
-                std::cerr << "  # Search archives in archives-dir for logs matching a KQL query"
+                std::cerr << "  # Search archives in archives-dir for logs matching a query"
                              R"( "level: INFO" and output to the results cache)"
                           << std::endl;
                 std::cerr << "  " << m_program_name << R"( s archives-dir "level: INFO")"
@@ -773,7 +777,7 @@ CommandLineArguments::parse_arguments(int argc, char const** argv) {
                           << std::endl;
                 std::cerr << std::endl;
 
-                std::cerr << "  # Search archives in archives-dir for logs matching a KQL query"
+                std::cerr << "  # Search archives in archives-dir for logs matching a query"
                              R"( "level: INFO" and output to a network destination)"
                           << std::endl;
                 std::cerr << "  " << m_program_name << R"( s archives-dir "level: INFO")"
@@ -783,7 +787,7 @@ CommandLineArguments::parse_arguments(int argc, char const** argv) {
                           << std::endl;
                 std::cerr << std::endl;
 
-                std::cerr << "  # Search archives in archives-dir for logs matching a KQL query"
+                std::cerr << "  # Search archives in archives-dir for logs matching a query"
                              R"( "level: INFO" and output perform a count aggregation)"
                           << std::endl;
                 std::cerr << "  " << m_program_name << R"( s archives-dir "level: INFO")"
@@ -1037,8 +1041,21 @@ void CommandLineArguments::print_decompression_usage() const {
 
 void CommandLineArguments::print_search_usage() const {
     std::cerr << "Usage: " << m_program_name
-              << " s [OPTIONS] ARCHIVES_DIR KQL_QUERY"
+              << " s [OPTIONS] ARCHIVES_DIR QUERY"
                  " [OUTPUT_HANDLER [OUTPUT_HANDLER_OPTIONS]]"
+              << std::endl;
+    std::cerr << std::endl;
+    std::cerr << "QUERY is either a KQL expression or a SQL SELECT statement." << std::endl;
+    std::cerr << "SQL queries must start with SELECT (case-insensitive)." << std::endl;
+    std::cerr << "Supported SQL: SELECT [columns|*|CLP_GET_*(...)] [FROM <table>]"
+                 " [WHERE <conditions>] [LIMIT <n>]"
+              << std::endl;
+    std::cerr << "CLP functions: CLP_GET_INT, CLP_GET_FLOAT, CLP_GET_STRING,"
+                 " CLP_GET_BOOL, CLP_GET_JSON_STRING, CLP_WILDCARD_COLUMN"
+              << std::endl;
+    std::cerr << "CLP_WILDCARD_COLUMN() matches any column (equivalent to KQL's *)."
+              << std::endl;
+    std::cerr << "Timestamp literals: TIMESTAMP '2024-01-15 10:30:00', DATE '2024-01-15'"
               << std::endl;
 }
 }  // namespace clp_s

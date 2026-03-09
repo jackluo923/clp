@@ -1,12 +1,18 @@
+#include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include <mongocxx/instance.hpp>
 #include <nlohmann/json.hpp>
@@ -37,10 +43,13 @@
 #include "search/EvaluateRangeIndexFilters.hpp"
 #include "search/EvaluateTimestampIndex.hpp"
 #include "search/kql/kql.hpp"
+#include "search/LocalAggregateOutputHandler.hpp"
 #include "search/Output.hpp"
 #include "search/OutputHandler.hpp"
 #include "search/Projection.hpp"
+#include "search/RenamingOutputHandler.hpp"
 #include "search/SchemaMatch.hpp"
+#include "search/sql/sql.hpp"
 #include "SingleFileArchiveDefs.hpp"
 
 using namespace clp_s::search;
@@ -71,13 +80,21 @@ void decompress_archive(clp_s::JsonConstructorOption const& json_constructor_opt
  * @param archive_reader
  * @param expr A copy of the search AST which may be modified
  * @param reducer_socket_fd
+ * @param extra_projection_columns Additional projection columns (e.g., from SQL SELECT)
+ * @param result_limit Maximum number of results to return (e.g., from SQL LIMIT)
+ * @param aggregation_specs SQL aggregate functions to compute (e.g., COUNT(*), MIN, MAX)
+ * @param column_aliases SQL AS aliases for column renaming (original path → alias)
  * @return Whether the search succeeded
  */
 bool search_archive(
         CommandLineArguments const& command_line_arguments,
         std::shared_ptr<clp_s::ArchiveReader> const& archive_reader,
         std::shared_ptr<ast::Expression> expr,
-        int reducer_socket_fd
+        int reducer_socket_fd,
+        std::vector<std::string> const& extra_projection_columns = {},
+        std::optional<int64_t> result_limit = std::nullopt,
+        std::vector<sql::AggregateSpec> const& aggregation_specs = {},
+        std::unordered_map<std::string, std::string> const& column_aliases = {}
 );
 
 bool compress(CommandLineArguments const& command_line_arguments) {
@@ -129,7 +146,11 @@ bool search_archive(
         CommandLineArguments const& command_line_arguments,
         std::shared_ptr<clp_s::ArchiveReader> const& archive_reader,
         std::shared_ptr<ast::Expression> expr,
-        int reducer_socket_fd
+        int reducer_socket_fd,
+        std::vector<std::string> const& extra_projection_columns,
+        std::optional<int64_t> result_limit,
+        std::vector<sql::AggregateSpec> const& aggregation_specs,
+        std::unordered_map<std::string, std::string> const& column_aliases
 ) {
     auto const& query = command_line_arguments.get_query();
 
@@ -203,14 +224,18 @@ bool search_archive(
         return true;
     }
 
+    // Merge CLI and SQL-derived projection columns
+    auto const& cli_projection_columns = command_line_arguments.get_projection_columns();
+    auto const& effective_projection_columns
+            = cli_projection_columns.empty() ? extra_projection_columns : cli_projection_columns;
+
     // Populate projection
     auto projection = std::make_shared<Projection>(
-            command_line_arguments.get_projection_columns().empty()
-                    ? ProjectionMode::ReturnAllColumns
-                    : ProjectionMode::ReturnSelectedColumns
+            effective_projection_columns.empty() ? ProjectionMode::ReturnAllColumns
+                                                 : ProjectionMode::ReturnSelectedColumns
     );
     try {
-        for (auto const& column : command_line_arguments.get_projection_columns()) {
+        for (auto const& column : effective_projection_columns) {
             std::vector<std::string> descriptor_tokens;
             std::string descriptor_namespace;
             if (false
@@ -286,13 +311,25 @@ bool search_archive(
         return false;
     }
 
+    // Override with aggregate output handler if aggregation is requested
+    if (false == aggregation_specs.empty()) {
+        output_handler = std::make_unique<LocalAggregateOutputHandler>(aggregation_specs);
+    }
+
+    // Wrap with renaming handler if SQL AS aliases are present
+    if (false == column_aliases.empty()) {
+        output_handler
+                = std::make_unique<RenamingOutputHandler>(std::move(output_handler), column_aliases);
+    }
+
     // output result
     Output output(
             match_pass,
             expr,
             archive_reader,
             std::move(output_handler),
-            command_line_arguments.get_ignore_case()
+            command_line_arguments.get_ignore_case(),
+            result_limit
     );
     return output.filter();
 }
@@ -358,8 +395,72 @@ int main(int argc, char const* argv[]) {
         }
     } else {
         auto const& query = command_line_arguments.get_query();
-        auto query_stream = std::istringstream(query);
-        auto expr = kql::parse_kql_expression(query_stream);
+
+        // Auto-detect SQL syntax: check if query starts with "SELECT" (case-insensitive)
+        // followed by whitespace, after skipping any leading whitespace.
+        bool const is_sql_query = [&query]() {
+            constexpr std::string_view cSelectPrefix{"SELECT"};
+            // Skip leading whitespace
+            size_t offset = 0;
+            while (offset < query.size()
+                   && 0 != std::isspace(static_cast<unsigned char>(query[offset])))
+            {
+                ++offset;
+            }
+            if (query.size() - offset <= cSelectPrefix.size()) {
+                return false;
+            }
+            for (size_t i = 0; i < cSelectPrefix.size(); ++i) {
+                if (std::toupper(static_cast<unsigned char>(query[offset + i]))
+                    != cSelectPrefix[i])
+                {
+                    return false;
+                }
+            }
+            return 0
+                   != std::isspace(
+                           static_cast<unsigned char>(query[offset + cSelectPrefix.size()])
+                   );
+        }();
+
+        std::shared_ptr<ast::Expression> expr;
+        std::vector<std::string> sql_projection_columns;
+        std::optional<int64_t> sql_limit;
+        std::vector<sql::AggregateSpec> sql_aggregations;
+        std::unordered_map<std::string, std::string> sql_column_aliases;
+
+        if (is_sql_query) {
+            auto query_stream = std::istringstream(query);
+            auto sql_spec = sql::parse_sql_query(query_stream);
+            if (false == sql_spec.has_value()) {
+                SPDLOG_ERROR("Failed to parse SQL query.");
+                SPDLOG_ERROR(
+                        "Only SELECT statements are supported. Supported syntax:\n"
+                        "  SELECT [columns|*|CLP_GET_*(...)] [FROM <table>] [WHERE <cond>] "
+                        "[LIMIT <n>]\n"
+                        "Examples:\n"
+                        "  SELECT * FROM logs WHERE level = 'ERROR' LIMIT 100\n"
+                        "  SELECT CLP_GET_INT('status'), CLP_GET_STRING('msg') FROM "
+                        "logs\n"
+                        "  SELECT CLP_GET_JSON_STRING() FROM logs WHERE "
+                        "CLP_GET_INT('status') >= 500\n"
+                        "  SELECT * FROM logs WHERE CLP_WILDCARD_COLUMN() LIKE "
+                        "'%error%'\n"
+                        "  SELECT * FROM logs WHERE \"@timestamp\" > TIMESTAMP "
+                        "'2024-01-15 10:30:00'"
+                );
+                return 1;
+            }
+            expr = sql_spec->where_expr;
+            sql_projection_columns = sql_spec->select_columns;
+            sql_limit = sql_spec->limit;
+            sql_aggregations = sql_spec->aggregations;
+            sql_column_aliases = sql_spec->column_aliases;
+        } else {
+            auto query_stream = std::istringstream(query);
+            expr = kql::parse_kql_expression(query_stream);
+        }
+
         if (nullptr == expr) {
             return 1;
         }
@@ -445,7 +546,11 @@ int main(int argc, char const* argv[]) {
                         command_line_arguments,
                         archive_reader,
                         expr->copy(),
-                        reducer_socket_fd
+                        reducer_socket_fd,
+                        sql_projection_columns,
+                        sql_aggregations.empty() ? sql_limit : std::nullopt,
+                        sql_aggregations,
+                        sql_column_aliases
                 ))
             {
                 return 1;

@@ -102,17 +102,19 @@ Usage:
 Usage:
 
 ```shell
-./clp-s s [<options>] <archives-path> <kql-query>
+./clp-s s [<options>] <archives-path> <query>
 ```
 
 * `archives-path` is a directory containing archives, a path to an archive, or a URL pointing to a
   single-file archive.
-* `kql-query` is a [KQL](reference-json-search-syntax) query.
+* `query` is a [KQL](reference-json-search-syntax) or [SQL](reference-sql-search-syntax) query.
+  Queries starting with `SELECT` (case-insensitive) followed by whitespace are automatically parsed
+  as SQL; all other queries are parsed as KQL.
 * `options` allow you to specify things like a specific archive (from within `archives-path`, if it
   is a directory) to search (`--archive-id <archive-id>`).
   * For a complete list, run `./clp-s s --help`
 
-### Examples
+### KQL examples
 
 **Find all log events within a time range:**
 
@@ -142,6 +144,35 @@ compressed data:**
 
 ```shell
 ./clp-s s --ignore-case /mnt/data/archives1 'level: FATAL OR level: ERROR'
+```
+
+### SQL examples
+
+**Find ERROR log events:**
+
+```shell
+./clp-s s /mnt/data/archives1 "SELECT * FROM logs WHERE level = 'ERROR'"
+```
+
+**Find log events with high latency, returning specific columns:**
+
+```shell
+./clp-s s /mnt/data/archives1 \
+    "SELECT CLP_GET_STRING('level'), CLP_GET_INT('status') FROM logs WHERE latency_ms > 1000 LIMIT 100"
+```
+
+**Find log events after a specific timestamp:**
+
+```shell
+./clp-s s /mnt/data/archives1 \
+    "SELECT * FROM logs WHERE \"@timestamp\" > TIMESTAMP '2024-01-15 10:30:00'"
+```
+
+**Find log events containing a substring in any column:**
+
+```shell
+./clp-s s /mnt/data/archives1 \
+    "SELECT * FROM logs WHERE CLP_WILDCARD_COLUMN() LIKE '%timeout%'"
 ```
 
 ## Current limitations

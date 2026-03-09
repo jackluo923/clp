@@ -15,9 +15,13 @@ set(
         EvaluateRangeIndexFilters.hpp
         EvaluateTimestampIndex.cpp
         EvaluateTimestampIndex.hpp
+        LocalAggregateOutputHandler.cpp
+        LocalAggregateOutputHandler.hpp
         Output.cpp
         Output.hpp
         OutputHandler.hpp
+        RenamingOutputHandler.cpp
+        RenamingOutputHandler.hpp
         Projection.cpp
         Projection.hpp
         QueryRunner.cpp
@@ -41,6 +45,7 @@ if(CLP_BUILD_CLP_S_SEARCH)
                 clp_s::archive_reader
                 clp_s::search::ast
                 log_surgeon::log_surgeon
+                nlohmann_json::nlohmann_json
                 simdjson::simdjson
                 PRIVATE
                 clp::string_utils
