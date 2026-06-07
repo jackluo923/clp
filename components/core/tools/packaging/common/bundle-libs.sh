@@ -28,47 +28,22 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+
+# shellcheck source=core-binaries.sh
+. "${script_dir}/core-binaries.sh"
+# shellcheck source=bundle-inputs.sh
+. "${script_dir}/bundle-inputs.sh"
+
 # --- Validate inputs --------------------------------------------------------
-
-if [[ -z "${DESTDIR:-}" ]]; then
-    echo "ERROR: DESTDIR is required" >&2
-    exit 1
-fi
-
-if [[ "${DESTDIR}" != /* ]]; then
-    echo "ERROR: DESTDIR must be an absolute path, got: '${DESTDIR}'" >&2
-    exit 1
-fi
-
-if [[ "${DESTDIR}" == "/" ]]; then
-    echo "ERROR: DESTDIR must not be /" >&2
-    exit 1
-fi
-
-if [[ -z "${BIN_DIR:-}" ]]; then
-    echo "ERROR: BIN_DIR is required" >&2
-    exit 1
-fi
-
-if [[ ! -d "${BIN_DIR}" ]]; then
-    echo "ERROR: Binary directory not found: '${BIN_DIR}'" >&2
-    exit 1
-fi
 
 # PREFIX unset → /usr/local; PREFIX="" → empty (for tarballs).
 # Non-empty PREFIX must be an absolute path.
-prefix="${PREFIX-/usr/local}"
-if [[ -n "${prefix}" && "${prefix}" != /* ]]; then
-    echo "ERROR: PREFIX must start with '/' or be empty, got: '${prefix}'" >&2
-    exit 1
-fi
+clp_packaging_validate_bundle_inputs
+prefix="$(clp_packaging_resolve_bundle_prefix "/usr/local")"
 lib_install_dir="${prefix}/lib/clp"
 
 # --- Constants ---------------------------------------------------------------
-
-# Keep in sync with CMakeLists.txt build targets and the %files list in
-# universal-rpm/package.sh.
-BINARIES=(clg clo clp clp-s indexer log-converter reducer-server)
 
 # Libraries provided by the base system (libc, libstdc++, libgcc).
 # These must NOT be bundled — the target system's versions are used instead.
@@ -83,7 +58,7 @@ mkdir -p "${DESTDIR}${prefix}/bin" "${DESTDIR}${lib_install_dir}"
 # --- Collect shared library dependencies -------------------------------------
 
 echo "==> Collecting shared library dependencies..."
-for bin in "${BINARIES[@]}"; do
+for bin in "${CLP_CORE_BINARIES[@]}"; do
     bin_path="${BIN_DIR}/${bin}"
     if [[ ! -f "${bin_path}" ]]; then
         echo "ERROR: ${bin} not found at ${bin_path}" >&2
@@ -123,7 +98,7 @@ done
 # --- Install and patch binaries ----------------------------------------------
 
 echo "==> Installing binaries..."
-for bin in "${BINARIES[@]}"; do
+for bin in "${CLP_CORE_BINARIES[@]}"; do
     bin_path="${BIN_DIR}/${bin}"
     [[ -f "${bin_path}" ]] || continue
 
