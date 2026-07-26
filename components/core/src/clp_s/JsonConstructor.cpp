@@ -1,5 +1,6 @@
 #include "JsonConstructor.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <queue>
 #include <system_error>
@@ -45,8 +46,20 @@ void JsonConstructor::store() {
         );
     }
 
+    if (m_option.file_hierarchy && false == m_archive_reader->has_log_order()) {
+        throw OperationFailed(
+                ErrorCodeFailure,
+                __FILENAME__,
+                __LINE__,
+                "This archive is missing ordering information, so the original file hierarchy can"
+                " not be restored."
+        );
+    }
+
     m_archive_reader->open_packed_streams();
-    if (false == m_option.ordered || false == m_archive_reader->has_log_order()) {
+    if ((false == m_option.ordered && false == m_option.file_hierarchy)
+        || false == m_archive_reader->has_log_order())
+    {
         FileWriter writer;
         writer.open(
                 m_option.output_dir + "/original",
@@ -73,12 +86,96 @@ void JsonConstructor::construct_in_order() {
     // a given table
     tables.clear();
 
+    // In file-hierarchy mode every file's records are diverted away from the chunked JSONL
+    // output and written back to the file's original relative path.
+    struct DivertedRange {
+        size_t start_index;
+        size_t end_index;
+        std::string filename;
+        uint64_t split_number;
+    };
+    std::vector<DivertedRange> diverted_ranges;
+    if (m_option.file_hierarchy) {
+        for (auto const& entry : m_archive_reader->get_range_index()) {
+            auto const& fields = entry.fields;
+            DivertedRange range{entry.start_index, entry.end_index, {}, 0ULL};
+            if (auto const it = fields.find(std::string{constants::range_index::cFilename});
+                fields.end() != it && it->is_string())
+            {
+                range.filename = it->get<std::string>();
+            }
+            if (auto const it = fields.find(std::string{constants::range_index::cFileSplitNumber});
+                fields.end() != it && it->is_number())
+            {
+                range.split_number = it->get<uint64_t>();
+            }
+            diverted_ranges.push_back(std::move(range));
+        }
+        std::sort(
+                diverted_ranges.begin(),
+                diverted_ranges.end(),
+                [](auto const& left, auto const& right) {
+                    return left.start_index < right.start_index;
+                }
+        );
+    }
+    size_t cur_diverted_range{0ULL};
+    FileWriter hierarchy_writer;
+    bool hierarchy_writer_open{false};
+
     int64_t first_idx{};
     int64_t last_idx{};
     size_t chunk_size{};
     auto src_path = std::filesystem::path(m_option.output_dir) / m_archive_reader->get_archive_id();
     FileWriter writer;
     writer.open(src_path, FileWriter::OpenMode::CreateForWriting);
+
+    // Reproduces the original file's path under the output directory, refusing paths that would
+    // escape it.
+    auto resolve_output_path = [&](DivertedRange const& range) -> std::filesystem::path {
+        auto relative_path = std::filesystem::path{range.filename}.relative_path();
+        bool unsafe_path{relative_path.empty()};
+        for (auto const& part : relative_path) {
+            if (".." == part) {
+                unsafe_path = true;
+                break;
+            }
+        }
+        auto output_path = std::filesystem::path{m_option.output_dir};
+        if (unsafe_path) {
+            output_path /= std::string{m_archive_reader->get_archive_id()} + "_"
+                           + std::to_string(range.start_index) + ".jsonl";
+        } else {
+            output_path /= relative_path;
+        }
+        if (0ULL != range.split_number) {
+            // A file split across archives can only be partially reconstructed from one archive.
+            output_path += ".split_" + std::to_string(range.split_number);
+            SPDLOG_WARN(
+                    "File {} is split across archives; wrote partial split {}. All splits are"
+                    " required to reconstruct the original file.",
+                    range.filename,
+                    range.split_number
+            );
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(output_path.parent_path(), ec);
+        return output_path;
+    };
+
+    auto finalize_diverted_range = [&](DivertedRange const& range) {
+        if (hierarchy_writer_open) {
+            hierarchy_writer.close();
+            hierarchy_writer_open = false;
+        } else {
+            // A range that produced no records restores as an empty file.
+            hierarchy_writer.open(
+                    resolve_output_path(range).string(),
+                    FileWriter::OpenMode::CreateForWriting
+            );
+            hierarchy_writer.close();
+        }
+    };
 
     mongocxx::client client;
     mongocxx::collection collection;
@@ -151,13 +248,37 @@ void JsonConstructor::construct_in_order() {
     while (false == record_queue.empty()) {
         ReaderPointer next = record_queue.top();
         record_queue.pop();
-        last_idx = next->get_next_log_event_idx();
-        if (0 == chunk_size) {
-            first_idx = last_idx;
-        }
+        auto const idx = next->get_next_log_event_idx();
         next->get_next_message(buffer);
         if (false == next->done()) {
             record_queue.emplace(std::move(next));
+        }
+
+        // Records are streamed in log_event_idx order, so diverted ranges complete as soon as
+        // the first record past their end index appears.
+        while (cur_diverted_range < diverted_ranges.size()
+               && idx >= static_cast<int64_t>(diverted_ranges[cur_diverted_range].end_index))
+        {
+            finalize_diverted_range(diverted_ranges[cur_diverted_range]);
+            ++cur_diverted_range;
+        }
+        if (cur_diverted_range < diverted_ranges.size()
+            && idx >= static_cast<int64_t>(diverted_ranges[cur_diverted_range].start_index))
+        {
+            if (false == hierarchy_writer_open) {
+                hierarchy_writer.open(
+                        resolve_output_path(diverted_ranges[cur_diverted_range]).string(),
+                        FileWriter::OpenMode::CreateForWriting
+                );
+                hierarchy_writer_open = true;
+            }
+            hierarchy_writer.write(buffer.c_str(), buffer.length());
+            continue;
+        }
+
+        last_idx = idx;
+        if (0 == chunk_size) {
+            first_idx = last_idx;
         }
         writer.write(buffer.c_str(), buffer.length());
         chunk_size += buffer.length();
@@ -168,6 +289,11 @@ void JsonConstructor::construct_in_order() {
             finalize_chunk(true);
             chunk_size = 0;
         }
+    }
+
+    while (cur_diverted_range < diverted_ranges.size()) {
+        finalize_diverted_range(diverted_ranges[cur_diverted_range]);
+        ++cur_diverted_range;
     }
 
     if (chunk_size > 0) {

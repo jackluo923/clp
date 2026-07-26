@@ -89,6 +89,11 @@ Usage:
 * `output-dir` is the directory that decompressed logs should be written to.
 * `options` allow you to specify things like a specific archive (from within `archives-path`, if it
   is a directory) to decompress (`--archive-id <archive-id>`).
+  * `--file-hierarchy` restores the original input file hierarchy: each input file's log events are
+    written back to the file's original (relative) path under `output-dir`, instead of all log
+    events being written to a single file.
+    * This requires archives compressed with log-order recording (the default); archives compressed
+      with `--disable-log-order` are rejected.
   * For a complete list, run `./clp-s x --help`
 
 ### Examples
@@ -97,6 +102,12 @@ Usage:
 
 ```shell
 ./clp-s x /mnt/data/archives1 /mnt/data/archives1-decomp
+```
+
+**Decompress all logs, restoring each input file at its original relative path:**
+
+```shell
+./clp-s x --file-hierarchy /mnt/data/archives1 /mnt/data/archives1-decomp
 ```
 
 ## Search
@@ -152,8 +163,9 @@ compressed data:**
   commas or other JSON syntax errors.
 * Time zone information is not preserved.
 * The order of log events is not preserved.
-* The input directory structure is not preserved and during decompression all files are written to
-  the same file.
+* The input directory structure is not preserved by default and during decompression all files are
+  written to the same file; use `--file-hierarchy` during decompression to restore each input file
+  at its original relative path.
 * In addition, there are a few limitations, related to querying arrays, described in the search
   syntax [reference](reference-json-search-syntax).
 

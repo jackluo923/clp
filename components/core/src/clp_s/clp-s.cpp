@@ -447,6 +447,7 @@ int main(int argc, char const* argv[]) {
         clp_s::JsonConstructorOption option{};
         option.output_dir = command_line_arguments.get_output_dir();
         option.ordered = command_line_arguments.get_ordered_decompression();
+        option.file_hierarchy = command_line_arguments.get_file_hierarchy_decompression();
         option.target_ordered_chunk_size = command_line_arguments.get_target_ordered_chunk_size();
         option.print_ordered_chunk_stats = command_line_arguments.print_ordered_chunk_stats();
         option.network_auth = command_line_arguments.get_network_auth();

@@ -134,6 +134,8 @@ public:
 
     bool get_ordered_decompression() const { return m_ordered_decompression; }
 
+    bool get_file_hierarchy_decompression() const { return m_file_hierarchy_decompression; }
+
     size_t get_target_ordered_chunk_size() const { return m_target_ordered_chunk_size; }
 
     size_t get_minimum_table_size() const { return m_minimum_table_size; }
@@ -247,6 +249,7 @@ private:
     bool m_single_file_archive{false};
     bool m_structurize_arrays{false};
     bool m_ordered_decompression{false};
+    bool m_file_hierarchy_decompression{false};
     size_t m_target_ordered_chunk_size{};
     bool m_print_ordered_chunk_stats{false};
     size_t m_minimum_table_size{1ULL * 1024 * 1024};  // 1 MiB

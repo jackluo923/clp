@@ -559,6 +559,7 @@ if(CLP_BUILD_TESTING)
                 tests/test-clp_s-delta-encode-log-order.cpp
                 tests/test-clp_s-end_to_end.cpp
                 tests/test-clp_s-ffi_sfa_reader.cpp
+                tests/test-clp_s-file_hierarchy.cpp
                 tests/test-clp_s-range_index.cpp
                 tests/test-clp_s-search.cpp
                 tests/test-kql.cpp

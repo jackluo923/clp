@@ -591,6 +591,12 @@ CommandLineArguments::parse_arguments(int argc, char const** argv) {
                     po::bool_switch(&m_ordered_decompression),
                     "Enable decompression in log order for this archive"
             )(
+                    "file-hierarchy",
+                    po::bool_switch(&m_file_hierarchy_decompression),
+                    "Restore the original input file hierarchy: each input file's records are"
+                    " written to its original (relative) path under the output directory."
+                    " Requires an archive compressed with log-order recording (the default)."
+            )(
                     "target-ordered-chunk-size",
                     po::value<size_t>(&m_target_ordered_chunk_size)
                             ->default_value(m_target_ordered_chunk_size)
@@ -694,6 +700,10 @@ CommandLineArguments::parse_arguments(int argc, char const** argv) {
                             " decompression"
                     );
                 }
+            }
+
+            if (m_file_hierarchy_decompression && m_ordered_decompression) {
+                throw std::invalid_argument("file-hierarchy and ordered are mutually exclusive");
             }
 
             // We use xor to check that these arguments are either both specified or both
