@@ -38,7 +38,13 @@ auto column_descriptor_to_string(ast::ColumnDescriptor& column) -> std::string {
 
 auto Projection::add_column(std::shared_ptr<ast::ColumnDescriptor> column, NodeMask::Mode mode)
         -> void {
-    if (column->is_unresolved_descriptor()) {
+    // A pure wildcard is resolved against node types rather than key names, so it is the one
+    // unresolved descriptor `shape(...)`/`decompose(...)` accept.
+    auto const is_supported_wildcard{
+            column->is_pure_wildcard()
+            && (NodeMask::Mode::Shape == mode || NodeMask::Mode::Decompose == mode)
+    };
+    if (column->is_unresolved_descriptor() && false == is_supported_wildcard) {
         throw OperationFailed(ErrorCodeBadParam, __FILENAME__, __LINE__);
     }
     if (Mode::ReturnAllColumns == m_projection_mode) {
@@ -138,6 +144,14 @@ auto Projection::collect_structural_projections(
 
 auto Projection::resolve_columns(SchemaTree const& tree) -> void {
     for (auto& entry : m_columns) {
+        if (entry.m_column->is_pure_wildcard()) {
+            entry.m_matched_nodes = resolve_wildcard_column(tree);
+            // A wildcard requests every column that qualifies, so matching none is not an error.
+            static_cast<void>(
+                    collect_structural_projections(tree, entry.m_matched_nodes, entry.m_mode)
+            );
+            continue;
+        }
         entry.m_matched_nodes = resolve_column(tree, *entry.m_column);
         if (NodeMask::Mode::Decompose == entry.m_mode || NodeMask::Mode::Shape == entry.m_mode) {
             if (false == collect_structural_projections(tree, entry.m_matched_nodes, entry.m_mode))
@@ -180,6 +194,22 @@ auto Projection::resolve_columns(SchemaTree const& tree) -> void {
             }
         }
     }
+}
+
+auto Projection::resolve_wildcard_column(SchemaTree const& tree) -> std::vector<SchemaNode::id_t> {
+    std::vector<SchemaNode::id_t> matching_nodes_for_column;
+    auto const& nodes{tree.get_nodes()};
+    for (SchemaNode::id_t node_id{0}; node_id < static_cast<SchemaNode::id_t>(nodes.size());
+         ++node_id)
+    {
+        auto const type{nodes[node_id].get_type()};
+        if (NodeType::ClpString != type && NodeType::UnstructuredArray != type) {
+            continue;
+        }
+        m_matching_nodes.insert(node_id);
+        matching_nodes_for_column.emplace_back(node_id);
+    }
+    return matching_nodes_for_column;
 }
 
 auto Projection::resolve_column(SchemaTree const& tree, ast::ColumnDescriptor& column)
