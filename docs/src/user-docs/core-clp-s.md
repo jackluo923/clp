@@ -189,6 +189,16 @@ Empty groups are omitted:
 Projecting the column itself alongside `decompose(<column>)` outputs both, with the decomposed form
 under `<column>.decompose`.
 
+`shape()` and `decompose()` also apply to an array, which CLP encodes as a single string:
+
+```shell
+./clp-s s /mnt/data/archives1 'level: ERROR' --projection "decompose(tags)"
+```
+
+```json
+{"tags":{"shape":"[\"job %int% done in %float% s\",\"plain\"]","int":[9],"float":[2.5]}}
+```
+
 ## Current limitations
 
 * `clp-s` currently only supports *valid* JSON logs; it does not handle JSON logs with trailing
