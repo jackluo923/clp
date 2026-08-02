@@ -97,7 +97,8 @@ public:
      * Adds a column to the set of columns that should be included in the projected results.
      * @param column The column descriptor to project.
      * @param mode The projection output mode.
-     * @throws OperationFailed if `column` contains a wildcard
+     * @throws OperationFailed if `column` contains a wildcard, unless it is a pure wildcard being
+     * projected as a shape or decomposed form
      * @throws OperationFailed if this instance of Projection is in mode ReturnAllColumns
      * @throws OperationFailed if `column` is identical to a previously added column with the same
      * output mode.
@@ -109,7 +110,7 @@ public:
      * @param function_call The function call expression.
      * @throws OperationFailed if the function name is not recognized.
      * @throws OperationFailed if the argument is not a ColumnDescriptor.
-     * @throws OperationFailed if the column contains a wildcard.
+     * @throws OperationFailed if the column contains a wildcard other than a pure wildcard.
      * @throws OperationFailed if this instance of Projection is in mode ReturnAllColumns.
      * @throws OperationFailed if the column is identical to a previously added column with the same
      * output type.
@@ -203,6 +204,16 @@ private:
      * @return The list of schema node IDs matched by the column descriptor.
      */
     [[nodiscard]] auto resolve_column(SchemaTree const& tree, ast::ColumnDescriptor& column)
+            -> std::vector<SchemaNode::id_t>;
+
+    /**
+     * Resolves a pure wildcard column to every CLP-encoded string node in the tree, which is what
+     * `shape(*)`/`decompose(*)` project. Matched nodes are recorded as matching so they are
+     * emitted.
+     * @param tree
+     * @return The list of schema node IDs matched by the wildcard.
+     */
+    [[nodiscard]] auto resolve_wildcard_column(SchemaTree const& tree)
             -> std::vector<SchemaNode::id_t>;
 
     /**

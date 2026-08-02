@@ -199,6 +199,14 @@ under `<column>.decompose`.
 {"tags":{"shape":"[\"job %int% done in %float% s\",\"plain\"]","int":[9],"float":[2.5]}}
 ```
 
+A wildcard applies the function to every CLP-encoded column at once, which is useful when you do not know which columns hold log messages:
+
+```shell
+./clp-s s /mnt/data/archives1 'level: ERROR' --projection "decompose(*)"
+```
+
+Columns CLP did not encode as log messages, such as strings with no spaces, are not selected by the wildcard.
+
 ## Current limitations
 
 * `clp-s` currently only supports *valid* JSON logs; it does not handle JSON logs with trailing

@@ -253,6 +253,30 @@ TEST_CASE("clp-s-shape-decompose-projections", "[clp-s][shape-decompose]") {
         REQUIRE_THROWS_AS(project_single_record({"decompose(nospaces)"}), std::runtime_error);
     }
 
+    SECTION("shape(*) applies to every CLP-encoded string column") {
+        auto const record = project_single_record({"shape(*)"});
+        REQUIRE(cMsgShape == record.at("msg").get<std::string>());
+        REQUIRE(cInnerShape == record.at("nested").at("inner").get<std::string>());
+        REQUIRE(cArrShape == record.at("arr").get<std::string>());
+        // A VarString has no logtype, so the wildcard must not select it.
+        REQUIRE(false == record.contains("nospaces"));
+    }
+
+    SECTION("decompose(*) applies to every CLP-encoded string column") {
+        auto const record = project_single_record({"decompose(*)"});
+        REQUIRE(cMsgShape == record.at("msg").at("shape").get<std::string>());
+        REQUIRE(std::vector<int64_t>{42} == record.at("msg").at("int").get<std::vector<int64_t>>());
+        REQUIRE(cInnerShape == record.at("nested").at("inner").at("shape").get<std::string>());
+        REQUIRE(cArrShape == record.at("arr").at("shape").get<std::string>());
+        REQUIRE(false == record.contains("nospaces"));
+    }
+
+    SECTION("decompose(*) combines with an explicitly projected column") {
+        auto const record = project_single_record({"decompose(*)", "msg"});
+        REQUIRE(cMsgValue == record.at("msg").get<std::string>());
+        REQUIRE(cMsgShape == record.at("msg.decompose").at("shape").get<std::string>());
+    }
+
     SECTION("An unprojected query is unaffected") {
         auto const record = project_single_record({});
         REQUIRE(cMsgValue == record.at("msg").get<std::string>());
