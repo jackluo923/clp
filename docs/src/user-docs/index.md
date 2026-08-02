@@ -209,7 +209,7 @@ Reference for the shell scripts in the package's `sbin/` directory.
 :::
 
 :::{grid-item-card}
-:link: reference-unstructured-schema-file
+:link: reference-unstructured-parsing-specification
 Schema file syntax
 ^^^
 Syntax reference for clp's schema file for parsing unstructured text logs.
@@ -289,6 +289,6 @@ resources-datasets
 reference-json-search-syntax
 reference-text-search-syntax
 reference-sbin-scripts/index
-reference-unstructured-schema-file
+reference-unstructured-parsing-specification
 reference-telemetry
 :::
