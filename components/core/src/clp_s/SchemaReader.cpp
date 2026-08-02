@@ -4,6 +4,7 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stack>
@@ -32,6 +33,33 @@
 
 namespace clp_s {
 namespace {
+/**
+ * The projections that apply to a single CLP-encoded string leaf.
+ * @var has_shape `shape(...)`: emit the logtype template instead of the reconstructed value.
+ */
+struct ClpStringProjection {
+    bool has_shape{false};
+};
+
+/**
+ * Resolves the `shape(...)` projection applying to a CLP-encoded string leaf.
+ * @param projection Null means the leaf is emitted normally.
+ * @param node_id
+ * @return The projections that apply.
+ */
+auto get_clp_string_projection(
+        std::shared_ptr<search::Projection> const& projection,
+        SchemaNode::id_t node_id
+) -> ClpStringProjection {
+    if (nullptr == projection) {
+        return ClpStringProjection{};
+    }
+    return ClpStringProjection{
+            .has_shape
+            = projection->is_projected_as(node_id, search::Projection::NodeMask::Mode::Shape)
+    };
+}
+
 /**
  * Collapses `%%` to `%` in a shape text segment, JSON-escapes the result, and
  * appends it as a string segment to the compiled shape.
@@ -341,6 +369,16 @@ auto SchemaReader::generate_json_string(uint64_t message_index) -> std::string {
                 auto name = m_global_schema_tree->get_node(column->get_id()).get_key_name();
                 m_json_serializer.append_key(name);
                 m_json_serializer.append_value_from_column_with_quotes(column, message_index);
+                break;
+            }
+            case JsonSerializer::Op::AddClpStringLogtypeField: {
+                column = m_reordered_columns[column_id_index++];
+                auto name = m_global_schema_tree->get_node(column->get_id()).get_key_name();
+                m_json_serializer.append_key(name);
+                m_json_serializer.append_logtype_value_from_column_with_quotes(
+                        column,
+                        message_index
+                );
                 break;
             }
             case JsonSerializer::Op::AddStringValue: {
@@ -820,7 +858,16 @@ size_t SchemaReader::generate_structured_object_template(
                     m_reordered_columns.push_back(m_columns[column_idx++]);
                     break;
                 }
-                case NodeType::ClpString:
+                case NodeType::ClpString: {
+                    // Mirrors the top-level leaf handling.
+                    auto const proj{get_clp_string_projection(m_projection, global_column_id)};
+                    m_json_serializer.add_op(
+                            proj.has_shape ? JsonSerializer::Op::AddClpStringLogtypeField
+                                           : JsonSerializer::Op::AddStringField
+                    );
+                    m_reordered_columns.push_back(m_columns[column_idx++]);
+                    break;
+                }
                 case NodeType::VarString: {
                     m_json_serializer.add_op(JsonSerializer::Op::AddStringField);
                     m_reordered_columns.push_back(m_columns[column_idx++]);
@@ -982,7 +1029,17 @@ void SchemaReader::generate_json_template(int32_t id) {
                 m_reordered_columns.push_back(m_column_map[child_global_id]);
                 break;
             }
-            case NodeType::ClpString:
+            case NodeType::ClpString: {
+                // `shape(...)` renders the logtype template in place of the value. LogMessage
+                // scopes go through `generate_log_message_template` instead.
+                auto const proj{get_clp_string_projection(m_projection, child_global_id)};
+                m_json_serializer.add_op(
+                        proj.has_shape ? JsonSerializer::Op::AddClpStringLogtypeField
+                                       : JsonSerializer::Op::AddStringField
+                );
+                m_reordered_columns.push_back(m_column_map[child_global_id]);
+                break;
+            }
             case NodeType::VarString:
             case NodeType::DeprecatedDateString: {
                 m_json_serializer.add_op(JsonSerializer::Op::AddStringField);

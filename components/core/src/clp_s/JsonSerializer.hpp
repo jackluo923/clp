@@ -34,6 +34,7 @@ public:
         AddLiteralField,
         AddConstantStringField,
         AddReconstructedLogShapeField,
+        AddClpStringLogtypeField,
     };
 
     static int64_t const cReservedLength = 4096;
@@ -149,6 +150,19 @@ public:
     append_value_from_column_with_quotes(clp_s::BaseColumnReader* column, uint64_t cur_message) {
         m_json_string += "\"";
         column->extract_escaped_string_value_into_buffer(
+                cur_message,
+                m_json_string,
+                m_string_value_escaper
+        );
+        m_json_string += "\",";
+    }
+
+    void append_logtype_value_from_column_with_quotes(
+            clp_s::BaseColumnReader* column,
+            uint64_t cur_message
+    ) {
+        m_json_string += "\"";
+        column->extract_escaped_logtype_value_into_buffer(
                 cur_message,
                 m_json_string,
                 m_string_value_escaper
