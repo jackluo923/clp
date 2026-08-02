@@ -146,6 +146,34 @@ compressed data:**
 ./clp-s s --ignore-case /mnt/data/archives1 'level: FATAL OR level: ERROR'
 ```
 
+### Projecting columns
+
+`--projection` restricts the output to a set of columns. It must appear after the positional
+arguments:
+
+```shell
+./clp-s s /mnt/data/archives1 'level: ERROR' --projection level message
+```
+
+Columns are separated by spaces, and each may be a plain name or a function. The same column may appear more than once with different functions, but repeating a column with the same function is an error.
+
+For a column that CLP encoded as a log message (a string containing a space), `shape(<column>)`
+outputs the column's shape—its static text with each variable replaced by a typed placeholder—in
+place of the value:
+
+```shell
+./clp-s s /mnt/data/archives1 'level: ERROR' --projection "shape(message)"
+```
+
+```json
+{"message":"user %int% logged in from %str% after %float% seconds"}
+```
+
+A column that CLP did not encode as a log message, such as a string with no spaces, has no shape,
+and projecting one is an error.
+
+`shape()` replaces the column's value rather than accompanying it, so a column projected both plainly and as a shape outputs only the shape.
+
 ## Current limitations
 
 * `clp-s` currently only supports *valid* JSON logs; it does not handle JSON logs with trailing

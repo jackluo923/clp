@@ -95,6 +95,31 @@ public:
         extract_escaped_string_value_into_buffer(cur_message, buffer);
     }
 
+    /**
+     * Extracts a column value's logtype template into a buffer. For columns which are not
+     * CLP-encoded this extracts the value itself.
+     * @param cur_message
+     * @param buffer
+     */
+    virtual auto extract_logtype_value_into_buffer(uint64_t cur_message, std::string& buffer)
+            -> void {
+        extract_string_value_into_buffer(cur_message, buffer);
+    }
+
+    /**
+     * Extracts a column value's logtype template, escapes it, and serializes it into a buffer.
+     * @param cur_message
+     * @param buffer
+     * @param escaper
+     */
+    virtual auto extract_escaped_logtype_value_into_buffer(
+            uint64_t cur_message,
+            std::string& buffer,
+            SimdJsonStringEscaper& escaper
+    ) -> void {
+        extract_escaped_string_value_into_buffer(cur_message, buffer, escaper);
+    }
+
 private:
     int32_t m_id;
 };
@@ -274,6 +299,15 @@ public:
             -> void override;
 
     auto extract_escaped_string_value_into_buffer(
+            uint64_t cur_message,
+            std::string& buffer,
+            SimdJsonStringEscaper& escaper
+    ) -> void override;
+
+    auto extract_logtype_value_into_buffer(uint64_t cur_message, std::string& buffer)
+            -> void override;
+
+    auto extract_escaped_logtype_value_into_buffer(
             uint64_t cur_message,
             std::string& buffer,
             SimdJsonStringEscaper& escaper

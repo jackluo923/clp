@@ -115,7 +115,10 @@ auto Projection::collect_structural_projections(
         NodeMask::Mode mode
 ) -> bool {
     auto is_projectable_structure = [](NodeType type) -> bool {
-        return NodeType::LogMessage == type || NodeType::ParentRule == type;
+        // `shape(...)` also applies to plain CLP-encoded string leaves, which is how it is served
+        // for archives with no LogShapeDictionary.
+        return NodeType::LogMessage == type || NodeType::ParentRule == type
+               || NodeType::ClpString == type;
     };
 
     bool found_structural_match{false};
@@ -138,8 +141,8 @@ auto Projection::resolve_columns(SchemaTree const& tree) -> void {
             {
                 throw std::runtime_error(
                         fmt::format(
-                                "{}(<col>) can only be applied to LogMessage or ParentRule "
-                                "columns; no LogMessage or ParentRule nodes match column \"{}\".",
+                                "{}(<col>) can only be applied to LogMessage, ParentRule, or "
+                                "CLP-encoded string columns; no such nodes match column \"{}\".",
                                 NodeMask::Mode::Decompose == entry.m_mode ? clpp::cDecomposeFunction
                                                                           : clpp::cShapeFunction,
                                 column_descriptor_to_string(*entry.m_column)

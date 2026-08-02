@@ -17,6 +17,7 @@
 #include <clp_s/ColumnWriter.hpp>
 #include <clp_s/Defs.hpp>
 #include <clp_s/FloatFormatEncoding.hpp>
+#include <clp_s/LogtypeTemplate.hpp>
 #include <clp_s/SchemaTree.hpp>
 #include <clp_s/Utils.hpp>
 
@@ -193,6 +194,34 @@ auto ClpStringColumnReader::extract_escaped_string_value_into_buffer(
         escaper.escape(buffer, tmp);
     } else {
         extract_string_value_into_buffer(cur_message, buffer);
+    }
+}
+
+auto
+ClpStringColumnReader::extract_logtype_value_into_buffer(uint64_t cur_message, std::string& buffer)
+        -> void {
+    auto const value{m_logtypes[cur_message]};
+    auto const logtype_id{ClpStringColumnWriter::get_encoded_log_dict_id(value)};
+    auto& entry{m_log_dict->get_entry(logtype_id)};
+
+    if (false == entry.initialized()) {
+        entry.decode_log_type();
+    }
+
+    append_logtype_template(entry.get_value(), buffer);
+}
+
+auto ClpStringColumnReader::extract_escaped_logtype_value_into_buffer(
+        uint64_t cur_message,
+        std::string& buffer,
+        SimdJsonStringEscaper& escaper
+) -> void {
+    if (false == m_is_array) {
+        std::string tmp;
+        extract_logtype_value_into_buffer(cur_message, tmp);
+        escaper.escape(buffer, tmp);
+    } else {
+        extract_logtype_value_into_buffer(cur_message, buffer);
     }
 }
 
