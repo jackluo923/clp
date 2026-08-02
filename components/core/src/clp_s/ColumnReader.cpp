@@ -219,13 +219,11 @@ auto ClpStringColumnReader::extract_escaped_logtype_value_into_buffer(
         std::string& buffer,
         SimdJsonStringEscaper& escaper
 ) -> void {
-    if (false == m_is_array) {
-        std::string tmp;
-        extract_logtype_value_into_buffer(cur_message, tmp);
-        escaper.escape(buffer, tmp);
-    } else {
-        extract_logtype_value_into_buffer(cur_message, buffer);
-    }
+    // Unlike a value, a logtype template is always emitted as a JSON string, so it is escaped even
+    // for an array, whose template contains the quotes of its elements.
+    std::string tmp;
+    extract_logtype_value_into_buffer(cur_message, tmp);
+    escaper.escape(buffer, tmp);
 }
 
 auto ClpStringColumnReader::extract_decomposed_value_into_buffer(

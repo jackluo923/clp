@@ -787,6 +787,8 @@ size_t SchemaReader::generate_structured_array_template(
                     m_reordered_columns.push_back(m_columns[column_idx++]);
                     break;
                 }
+                // `shape(...)`/`decompose(...)` do not apply inside a structured array: its
+                // elements are positional and unnamed, so no descriptor can address them.
                 case NodeType::ClpString:
                 case NodeType::VarString: {
                     m_json_serializer.add_op(JsonSerializer::Op::AddStringValue);
@@ -1016,8 +1018,25 @@ void SchemaReader::generate_json_template(int32_t id) {
                 break;
             }
             case NodeType::UnstructuredArray: {
-                m_json_serializer.add_op(JsonSerializer::Op::AddArrayField);
-                m_reordered_columns.push_back(m_column_map[child_global_id]);
+                // An unstructured array is a CLP-encoded string, so it projects like a leaf.
+                auto const proj{get_clp_string_projection(m_projection, child_global_id)};
+                auto const bare_emitted{proj.emits_bare_value()};
+                if (bare_emitted) {
+                    m_json_serializer.add_op(
+                            proj.has_shape ? JsonSerializer::Op::AddClpStringLogtypeField
+                                           : JsonSerializer::Op::AddArrayField
+                    );
+                    m_reordered_columns.push_back(m_column_map[child_global_id]);
+                }
+                if (proj.has_decomposed) {
+                    m_json_serializer.add_special_key(
+                            bare_emitted
+                                    ? std::string{key} + "." + std::string{clpp::cDecomposeFunction}
+                                    : std::string{key}
+                    );
+                    m_json_serializer.add_op(JsonSerializer::Op::AddClpStringDecomposedField);
+                    m_reordered_columns.push_back(m_column_map[child_global_id]);
+                }
                 break;
             }
             case NodeType::StructuredArray: {

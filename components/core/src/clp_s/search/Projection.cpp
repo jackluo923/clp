@@ -118,9 +118,10 @@ auto Projection::collect_structural_projections(
         // `shape(...)`/`decompose(...)` also apply to plain CLP-encoded string leaves, serving
         // archives with no LogShapeDictionary. Every mode is registered for them, not just
         // Shape/Decompose: `should_emit_value` reads the `Value` bit, so omitting it would drop a
-        // column projected alongside `decompose(...)`.
+        // column projected alongside `decompose(...)`. An unstructured array is stored as a
+        // CLP-encoded string too, so it decomposes the same way.
         return NodeType::LogMessage == type || NodeType::ParentRule == type
-               || NodeType::ClpString == type;
+               || NodeType::ClpString == type || NodeType::UnstructuredArray == type;
     };
 
     bool found_structural_match{false};

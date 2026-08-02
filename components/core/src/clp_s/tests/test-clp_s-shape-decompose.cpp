@@ -34,6 +34,7 @@ constexpr std::string_view cTestIdxKey{"idx"};
 constexpr std::string_view cMsgValue{"user 42 logged in from 10.0.0.1 after 3.5 seconds"};
 constexpr std::string_view cMsgShape{"user %int% logged in from %str% after %float% seconds"};
 constexpr std::string_view cInnerShape{"task %int% finished in %float% sec"};
+constexpr std::string_view cArrShape{R"(["job %int% done in %float% s","plain"])"};
 
 namespace {
 auto get_test_input_local_path(std::string_view test_input_path) -> std::string {
@@ -211,6 +212,29 @@ TEST_CASE("clp-s-shape-decompose-projections", "[clp-s][shape-decompose]") {
         REQUIRE(std::vector<int64_t>{7} == decomposed.at("int").get<std::vector<int64_t>>());
         REQUIRE(std::vector<double>{1.25} == decomposed.at("float").get<std::vector<double>>());
         REQUIRE(false == decomposed.contains("str"));
+    }
+
+    SECTION("decompose(...) applies to an unstructured array") {
+        auto const record = project_single_record({"decompose(arr)"});
+        auto const& decomposed = record.at("arr");
+        REQUIRE(cArrShape == decomposed.at("shape").get<std::string>());
+        REQUIRE(std::vector<int64_t>{9} == decomposed.at("int").get<std::vector<int64_t>>());
+        REQUIRE(std::vector<double>{2.5} == decomposed.at("float").get<std::vector<double>>());
+    }
+
+    SECTION("shape(...) on an unstructured array emits an escaped JSON string") {
+        // The array's template contains the quotes of its elements, so it must be escaped when
+        // emitted as a string; otherwise the record is malformed JSON.
+        auto const record = project_single_record({"shape(arr)"});
+        REQUIRE(cArrShape == record.at("arr").get<std::string>());
+    }
+
+    SECTION("An unstructured array projected bare stays raw JSON") {
+        // The bare fallback must remain `AddArrayField`; using the string op would emit the array
+        // encoded as a JSON string instead of an array.
+        auto const record = project_single_record({"decompose(arr)", "arr"});
+        REQUIRE(record.at("arr").is_array());
+        REQUIRE(cArrShape == record.at("arr.decompose").at("shape").get<std::string>());
     }
 
     SECTION("A field with no variables decomposes to a shape and no value arrays") {
