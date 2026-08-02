@@ -36,13 +36,25 @@ namespace {
 /**
  * The projections that apply to a single CLP-encoded string leaf.
  * @var has_shape `shape(...)`: emit the logtype template instead of the reconstructed value.
+ * @var has_decomposed `decompose(...)`: emit the `{shape,int,float,str}` object.
+ * @var has_default Emit the reconstructed value as usual.
  */
 struct ClpStringProjection {
     bool has_shape{false};
+    bool has_decomposed{false};
+    bool has_default{false};
+
+    /**
+     * @return Whether the bare value is emitted. Suppressed only when `decompose(...)` is the
+     * sole projection on the leaf.
+     */
+    [[nodiscard]] auto emits_bare_value() const -> bool {
+        return has_default || has_shape || false == has_decomposed;
+    }
 };
 
 /**
- * Resolves the `shape(...)` projection applying to a CLP-encoded string leaf.
+ * Resolves the `shape(...)`/`decompose(...)` projections applying to a CLP-encoded string leaf.
  * @param projection Null means the leaf is emitted normally.
  * @param node_id
  * @return The projections that apply.
@@ -52,11 +64,18 @@ auto get_clp_string_projection(
         SchemaNode::id_t node_id
 ) -> ClpStringProjection {
     if (nullptr == projection) {
-        return ClpStringProjection{};
+        return ClpStringProjection{.has_default = true};
     }
+    using Mode = search::Projection::NodeMask::Mode;
+    auto const mask{projection->get_node_mask(node_id)};
+    auto const has_decomposed{mask.has(Mode::Decompose)};
     return ClpStringProjection{
-            .has_shape
-            = projection->is_projected_as(node_id, search::Projection::NodeMask::Mode::Shape)
+            // `Decompose` implies `Shape` in the mask, so render the bare value as a template
+            // only when `shape(...)` was requested without `decompose(...)`; the decomposed object
+            // already carries the shape.
+            .has_shape = mask.has(Mode::Shape) && false == has_decomposed,
+            .has_decomposed = has_decomposed,
+            .has_default = projection->should_emit_value(node_id)
     };
 }
 
@@ -379,6 +398,12 @@ auto SchemaReader::generate_json_string(uint64_t message_index) -> std::string {
                         column,
                         message_index
                 );
+                break;
+            }
+            case JsonSerializer::Op::AddClpStringDecomposedField: {
+                column = m_reordered_columns[column_id_index++];
+                m_json_serializer.append_key();
+                m_json_serializer.append_decomposed_value_from_column(column, message_index);
                 break;
             }
             case JsonSerializer::Op::AddStringValue: {
@@ -859,13 +884,27 @@ size_t SchemaReader::generate_structured_object_template(
                     break;
                 }
                 case NodeType::ClpString: {
-                    // Mirrors the top-level leaf handling.
+                    // Mirrors the top-level leaf handling: keys are available inside a structured
+                    // object, so a decomposed value can be nested under `<key>.decompose`.
                     auto const proj{get_clp_string_projection(m_projection, global_column_id)};
-                    m_json_serializer.add_op(
-                            proj.has_shape ? JsonSerializer::Op::AddClpStringLogtypeField
-                                           : JsonSerializer::Op::AddStringField
-                    );
-                    m_reordered_columns.push_back(m_columns[column_idx++]);
+                    auto const bare_emitted{proj.emits_bare_value()};
+                    auto* const clp_string_column{m_columns[column_idx++]};
+                    if (bare_emitted) {
+                        m_json_serializer.add_op(
+                                proj.has_shape ? JsonSerializer::Op::AddClpStringLogtypeField
+                                               : JsonSerializer::Op::AddStringField
+                        );
+                        m_reordered_columns.push_back(clp_string_column);
+                    }
+                    if (proj.has_decomposed) {
+                        m_json_serializer.add_special_key(
+                                bare_emitted ? std::string{node.get_key_name()} + "."
+                                                       + std::string{clpp::cDecomposeFunction}
+                                             : std::string{node.get_key_name()}
+                        );
+                        m_json_serializer.add_op(JsonSerializer::Op::AddClpStringDecomposedField);
+                        m_reordered_columns.push_back(clp_string_column);
+                    }
                     break;
                 }
                 case NodeType::VarString: {
@@ -1030,14 +1069,27 @@ void SchemaReader::generate_json_template(int32_t id) {
                 break;
             }
             case NodeType::ClpString: {
-                // `shape(...)` renders the logtype template in place of the value. LogMessage
-                // scopes go through `generate_log_message_template` instead.
+                // `shape(...)` renders the logtype template and `decompose(...)` the decomposed
+                // form. LogMessage scopes go through `generate_log_message_template` instead.
                 auto const proj{get_clp_string_projection(m_projection, child_global_id)};
-                m_json_serializer.add_op(
-                        proj.has_shape ? JsonSerializer::Op::AddClpStringLogtypeField
-                                       : JsonSerializer::Op::AddStringField
-                );
-                m_reordered_columns.push_back(m_column_map[child_global_id]);
+                auto const bare_emitted{proj.emits_bare_value()};
+                if (bare_emitted) {
+                    m_json_serializer.add_op(
+                            proj.has_shape ? JsonSerializer::Op::AddClpStringLogtypeField
+                                           : JsonSerializer::Op::AddStringField
+                    );
+                    m_reordered_columns.push_back(m_column_map[child_global_id]);
+                }
+                if (proj.has_decomposed) {
+                    // Nest under `<key>.decompose` so it does not collide with the bare value.
+                    m_json_serializer.add_special_key(
+                            bare_emitted
+                                    ? std::string{key} + "." + std::string{clpp::cDecomposeFunction}
+                                    : std::string{key}
+                    );
+                    m_json_serializer.add_op(JsonSerializer::Op::AddClpStringDecomposedField);
+                    m_reordered_columns.push_back(m_column_map[child_global_id]);
+                }
                 break;
             }
             case NodeType::VarString:

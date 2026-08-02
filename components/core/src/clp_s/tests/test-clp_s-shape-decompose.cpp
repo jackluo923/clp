@@ -133,7 +133,7 @@ auto project_single_record(std::vector<std::string> const& projection_columns) -
 }
 }  // namespace
 
-TEST_CASE("clp-s-shape-projection", "[clp-s][shape-decompose]") {
+TEST_CASE("clp-s-shape-decompose-projections", "[clp-s][shape-decompose]") {
     TestOutputCleaner const test_cleanup{{std::string{cTestShapeArchiveDirectory}}};
     REQUIRE_NOTHROW(
             std::ignore = compress_archive(
@@ -162,8 +162,6 @@ TEST_CASE("clp-s-shape-projection", "[clp-s][shape-decompose]") {
     }
 
     SECTION("shape(...) rejects a column that is not CLP-encoded") {
-        // A string without a space is stored as a VarString, which has no logtype to render.
-        // The projection must fail loudly at resolution time rather than silently emit nothing.
         REQUIRE_THROWS_AS(project_single_record({"shape(nospaces)"}), std::runtime_error);
     }
 
@@ -185,9 +183,56 @@ TEST_CASE("clp-s-shape-projection", "[clp-s][shape-decompose]") {
         REQUIRE(cMsgShape == record.at("msg").get<std::string>());
     }
 
+    SECTION("decompose(...) alone replaces the value with the decomposed object") {
+        auto const record = project_single_record({"decompose(msg)"});
+        // The bare value is suppressed, so the decomposed object takes the original key.
+        REQUIRE(false == record.contains("msg.decompose"));
+        auto const& decomposed = record.at("msg");
+        REQUIRE(cMsgShape == decomposed.at("shape").get<std::string>());
+        REQUIRE(std::vector<int64_t>{42} == decomposed.at("int").get<std::vector<int64_t>>());
+        REQUIRE(std::vector<double>{3.5} == decomposed.at("float").get<std::vector<double>>());
+        REQUIRE(std::vector<std::string>{"10.0.0.1"}
+                == decomposed.at("str").get<std::vector<std::string>>());
+    }
+
+    SECTION("decompose(...) with the bare column emits both, without colliding") {
+        // Regression test: `NodeMask::set` makes `Decompose` imply `Shape`, and a plain projection
+        // registers `Mode::Value`. If either is mishandled the explicitly requested value is
+        // silently replaced by a template or dropped entirely.
+        auto const record = project_single_record({"decompose(msg)", "msg"});
+        REQUIRE(cMsgValue == record.at("msg").get<std::string>());
+        REQUIRE(cMsgShape == record.at("msg.decompose").at("shape").get<std::string>());
+    }
+
+    SECTION("decompose(...) applies to a field nested in an object") {
+        auto const record = project_single_record({"decompose(nested.inner)"});
+        auto const& decomposed = record.at("nested").at("inner");
+        REQUIRE(cInnerShape == decomposed.at("shape").get<std::string>());
+        REQUIRE(std::vector<int64_t>{7} == decomposed.at("int").get<std::vector<int64_t>>());
+        REQUIRE(std::vector<double>{1.25} == decomposed.at("float").get<std::vector<double>>());
+        REQUIRE(false == decomposed.contains("str"));
+    }
+
+    SECTION("A field with no variables decomposes to a shape and no value arrays") {
+        auto const record = project_single_record({"decompose(novars)"});
+        auto const& decomposed = record.at("novars");
+        REQUIRE("only static text here" == decomposed.at("shape").get<std::string>());
+        // Empty category arrays are omitted entirely rather than emitted as `[]`.
+        REQUIRE(false == decomposed.contains("int"));
+        REQUIRE(false == decomposed.contains("float"));
+        REQUIRE(false == decomposed.contains("str"));
+    }
+
+    SECTION("decompose(...) rejects a column that is not CLP-encoded") {
+        // A string without a space is stored as a VarString, which has no logtype to decompose.
+        // The projection must fail loudly at resolution time rather than silently emit nothing.
+        REQUIRE_THROWS_AS(project_single_record({"decompose(nospaces)"}), std::runtime_error);
+    }
+
     SECTION("An unprojected query is unaffected") {
         auto const record = project_single_record({});
         REQUIRE(cMsgValue == record.at("msg").get<std::string>());
         REQUIRE(record.at("arr").is_array());
+        REQUIRE(false == record.contains("msg.decompose"));
     }
 }

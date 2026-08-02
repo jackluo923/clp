@@ -120,6 +120,20 @@ public:
         extract_escaped_string_value_into_buffer(cur_message, buffer, escaper);
     }
 
+    /**
+     * Extracts a CLP-encoded string's decomposed form into a buffer as a JSON object body:
+     * `{"shape":..., "int":[...], "float":[...], "str":[...]}`, with empty arrays omitted. Only
+     * `ClpStringColumnReader` produces a meaningful result.
+     * @param cur_message
+     * @param buffer
+     */
+    virtual auto extract_decomposed_value_into_buffer(
+            [[maybe_unused]] uint64_t cur_message,
+            [[maybe_unused]] std::string& buffer
+    ) -> void {
+        throw OperationFailed(ErrorCodeBadParam, __FILENAME__, __LINE__);
+    }
+
 private:
     int32_t m_id;
 };
@@ -312,6 +326,9 @@ public:
             std::string& buffer,
             SimdJsonStringEscaper& escaper
     ) -> void override;
+
+    auto extract_decomposed_value_into_buffer(uint64_t cur_message, std::string& buffer)
+            -> void override;
 
     /**
      * Gets the encoded id of the variable

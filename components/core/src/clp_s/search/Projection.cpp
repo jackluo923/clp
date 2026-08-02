@@ -115,8 +115,10 @@ auto Projection::collect_structural_projections(
         NodeMask::Mode mode
 ) -> bool {
     auto is_projectable_structure = [](NodeType type) -> bool {
-        // `shape(...)` also applies to plain CLP-encoded string leaves, which is how it is served
-        // for archives with no LogShapeDictionary.
+        // `shape(...)`/`decompose(...)` also apply to plain CLP-encoded string leaves, serving
+        // archives with no LogShapeDictionary. Every mode is registered for them, not just
+        // Shape/Decompose: `should_emit_value` reads the `Value` bit, so omitting it would drop a
+        // column projected alongside `decompose(...)`.
         return NodeType::LogMessage == type || NodeType::ParentRule == type
                || NodeType::ClpString == type;
     };

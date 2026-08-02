@@ -174,6 +174,21 @@ and projecting one is an error.
 
 `shape()` replaces the column's value rather than accompanying it, so a column projected both plainly and as a shape outputs only the shape.
 
+`decompose(<column>)` outputs the shape together with the variables it elides, grouped by type.
+Empty groups are omitted:
+
+```shell
+./clp-s s /mnt/data/archives1 'level: ERROR' --projection "decompose(message)"
+```
+
+```json
+{"message":{"shape":"user %int% logged in from %str% after %float% seconds","int":[42],
+            "float":[3.5],"str":["10.0.0.1"]}}
+```
+
+Projecting the column itself alongside `decompose(<column>)` outputs both, with the decomposed form
+under `<column>.decompose`.
+
 ## Current limitations
 
 * `clp-s` currently only supports *valid* JSON logs; it does not handle JSON logs with trailing

@@ -35,6 +35,7 @@ public:
         AddConstantStringField,
         AddReconstructedLogShapeField,
         AddClpStringLogtypeField,
+        AddClpStringDecomposedField,
     };
 
     static int64_t const cReservedLength = 4096;
@@ -168,6 +169,12 @@ public:
                 m_string_value_escaper
         );
         m_json_string += "\",";
+    }
+
+    void
+    append_decomposed_value_from_column(clp_s::BaseColumnReader* column, uint64_t cur_message) {
+        column->extract_decomposed_value_into_buffer(cur_message, m_json_string);
+        m_json_string += ",";
     }
 
     void add_constant_string_field(std::string_view key, std::string_view value) {
