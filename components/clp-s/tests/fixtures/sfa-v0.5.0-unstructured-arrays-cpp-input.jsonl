@@ -1,0 +1,6 @@
+{"array":[],"kind":0}
+{"array":[1,true,null,"x",{"k":"v"},[2,3]],"kind":1}
+{"array":[2,false,null,"y",{"k":"w"},[4,5]],"kind":2}
+{"array":[ -7, 12.50 , "user=face", {"n": 9} ],"kind":3}
+{"array":["slash\\\\marker","\u0011\u0012\u0013"],"kind":4}
+{"array":[[],{},[{"x":[]}]],"kind":5}

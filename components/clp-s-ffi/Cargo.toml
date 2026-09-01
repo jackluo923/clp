@@ -1,0 +1,13 @@
+[package]
+name = "clp-s-ffi"
+version = "0.13.1-dev"
+edition = "2024"
+description = "Versioned C ABI for the library-first CLP structured archive engine"
+
+[lib]
+name = "clp_s_ffi"
+path = "src/lib.rs"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+clp-s = { path = "../clp-s", default-features = false }

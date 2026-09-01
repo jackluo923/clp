@@ -1,0 +1,9 @@
+{"id":0,"items":[1,2,null,{"x":1},{"y":2},[]]}
+{"id":1,"items":[{"x":1,"y":0},{"x":0,"y":2}]}
+{"id":2,"items":[[{"x":3}],[{"y":4}]]}
+{"id":7,"items":[{"nested":{"z":"yes"}},{"nested":{"z":"no"}}]}
+{"id":6,"obj":{"items":[{"x":5}]}}
+{"id":8,"items":[{"nested":[{"z":"deep"}]}]}
+{"id":3,"items":[]}
+{"id":4,"items":[null]}
+{"id":5,"items":[{},{"x":null}]}

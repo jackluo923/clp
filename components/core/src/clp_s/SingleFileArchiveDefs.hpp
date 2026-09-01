@@ -2,10 +2,12 @@
 #define CLP_S_ARCHIVEDEFS_HPP
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 #include "msgpack.hpp"
@@ -94,6 +96,16 @@ struct ArchiveHeader {
     uint16_t compression_type{};
     uint16_t padding{};
 };
+
+static_assert(std::is_standard_layout_v<ArchiveHeader>);
+static_assert(64 == sizeof(ArchiveHeader));
+static_assert(4 == offsetof(ArchiveHeader, version));
+static_assert(8 == offsetof(ArchiveHeader, uncompressed_size));
+static_assert(16 == offsetof(ArchiveHeader, compressed_size));
+static_assert(24 == offsetof(ArchiveHeader, reserved_padding));
+static_assert(56 == offsetof(ArchiveHeader, metadata_section_size));
+static_assert(60 == offsetof(ArchiveHeader, compression_type));
+static_assert(62 == offsetof(ArchiveHeader, padding));
 
 enum class ArchiveCompressionType : uint16_t {
     Zstd = 0,

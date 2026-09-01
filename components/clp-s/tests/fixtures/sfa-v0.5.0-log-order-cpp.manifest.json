@@ -1,0 +1,73 @@
+{
+  "format_version": "0.5.0",
+  "purpose": "Milestone-5 C++ oracle for default archive-global log order across interleaved schemas",
+  "generated_at_utc": "2026-08-30",
+  "repository_revision": "7636e26a98a9f78f18964af4d8d951b95602f712",
+  "environment": {
+    "image": "clp-core-dependencies-x86-manylinux_2_28:dev",
+    "image_digest": "sha256:404dc2526ba72b548e69b4b66da5c9f2cabd5cd47d856b7f6d51c0bedfd2fee5",
+    "compiler": "GCC 14.2.1 20250110 (Red Hat 14.2.1-11)",
+    "architecture": "x86_64",
+    "byte_order": "little-endian"
+  },
+  "generator": {
+    "binary": "build/clp-s-reference/core/clp-s",
+    "binary_sha256": "e5042953dedaaec7c95ac6746be6b3d4de6e5629ca9d86ecf45d7e59f0a21284",
+    "arguments": [
+      "c",
+      "--single-file-archive",
+      "<output-directory>/archive",
+      "components/clp-s/tests/fixtures/sfa-v0.5.0-log-order-cpp-input.jsonl"
+    ],
+    "relevant_source_sha256": {
+      "components/core/src/clp_s/JsonParser.cpp": "20623cfda9ffcc25504720186048f61bd5ace7ed016e7fa74db4feba34a88368",
+      "components/core/src/clp_s/ArchiveWriter.cpp": "4e51e13ea22797401bf30005ae03af18cbfce77ed28187ea07b3a3d33922836c",
+      "components/core/src/clp_s/ColumnWriter.cpp": "d0fc22bf25e30aa30fd3cee02c71793dab2af2e4d299aef2712e34cfdb38853d",
+      "components/core/src/clp_s/SchemaTree.cpp": "50d9470d29665fb4de5d9cadfd5fbd3ae9c301d65d4fe2e2f8938734a2bf7387",
+      "components/core/src/clp_s/Schema.cpp": "4cfd5747adb48bfd834f4244bb46464ef367d007f9c56c277a3699418683e174",
+      "components/core/src/clp_s/RangeIndexWriter.cpp": "bebe90ad2457eb576be481de3141f1579946b283781f19c1f9d06d1b7086e1ed",
+      "components/core/src/clp_s/archive_constants.hpp": "a0f270328ed511b229c839ee8219ee0bfe906668787cc50dabe3cac45d72379b"
+    }
+  },
+  "input": {
+    "path": "components/clp-s/tests/fixtures/sfa-v0.5.0-log-order-cpp-input.jsonl",
+    "size": 60,
+    "sha256": "078fd9a91cf95c9258905b432e9483fabaa5ff75f09d87a7d45847e94844a707"
+  },
+  "cpp_archive": {
+    "path": "components/clp-s/tests/fixtures/sfa-v0.5.0-log-order-cpp.bin",
+    "size": 593,
+    "sha256": "60dc5e3dfdbec73575184017e9cb06dfeefce55b7a1ed38f52e4178347e266f2",
+    "deterministic": false,
+    "nondeterminism": "C++ emits source-range metadata containing a random _archive_creator_id UUID",
+    "repeat_size": 597,
+    "repeat_sha256": "1538dd284bcf9fb324b6f10c5f758398a19d0fa32c0d0b930dd5b93d7bf233f5"
+  },
+  "rust_archive": {
+    "generated_by_test": "writer::archive_set::tests::source_context_makes_the_complete_log_order_archive_byte_identical_to_cpp",
+    "size": 593,
+    "sha256": "60dc5e3dfdbec73575184017e9cb06dfeefce55b7a1ed38f52e4178347e266f2"
+  },
+  "verified": {
+    "all_seven_canonical_sections_byte_identical": true,
+    "whole_archive_byte_identical": true,
+    "whole_archive_difference": null,
+    "cpp_extracts_rust_archive": true,
+    "cpp_extracts_cpp_archive": true,
+    "cpp_unordered_output_path": "components/clp-s/tests/fixtures/sfa-v0.5.0-log-order-cpp-unordered.jsonl",
+    "cpp_unordered_output_size": 60,
+    "cpp_unordered_output_sha256": "dcaa61bb09a97f417985b7cfeb69257af23c81a33462216c2dcf9da9390ed162",
+    "rust_ordered_output_size": 60,
+    "rust_ordered_output_sha256": "078fd9a91cf95c9258905b432e9483fabaa5ff75f09d87a7d45847e94844a707"
+  },
+  "empty_characterization": {
+    "cpp_default_order_selected_size": 403,
+    "cpp_default_order_selected_sha256": "978bffaa46bd976414e0a2cccf70ebd4e06ca1532ed19f13a45c1bfbf3b5b7f5",
+    "cpp_default_order_is_nondeterministic": true,
+    "cpp_disabled_order_size": 280,
+    "cpp_disabled_order_sha256": "772eadf924b47e7e4f37f682db65ab60b6b9766bc54ca897ad5b81392473ce22",
+    "rust_default_order_size": 280,
+    "rust_default_order_sha256": "772eadf924b47e7e4f37f682db65ab60b6b9766bc54ca897ad5b81392473ce22",
+    "explanation": "C++ initializes source-range metadata even for an empty input. ArchiveSetWriter now reproduces the empty [0,0) source range when given the captured source context; the lower-level OpenArchive remains source-agnostic."
+  }
+}

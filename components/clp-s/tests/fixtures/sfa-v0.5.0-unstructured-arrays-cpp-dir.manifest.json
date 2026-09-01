@@ -1,0 +1,101 @@
+{
+  "format_version": "0.5.0",
+  "purpose": "Milestone-8 canonical C++ directory-archive member oracle",
+  "generated_at_utc": "2026-08-30",
+  "repository_revision": "7636e26a98a9f78f18964af4d8d951b95602f712",
+  "environment": {
+    "image": "clp-core-dependencies-x86-manylinux_2_28:dev",
+    "image_digest": "sha256:404dc2526ba72b548e69b4b66da5c9f2cabd5cd47d856b7f6d51c0bedfd2fee5",
+    "compiler": "GCC 14.2.1 20250110 (Red Hat 14.2.1-11)",
+    "cmake": "3.31.10",
+    "zstd": "1.5.7",
+    "architecture": "x86_64",
+    "byte_order": "little-endian"
+  },
+  "generator": {
+    "binary": "build/clp-s-reference/core/clp-s",
+    "binary_sha256": "e5042953dedaaec7c95ac6746be6b3d4de6e5629ca9d86ecf45d7e59f0a21284",
+    "arguments": [
+      "c",
+      "--disable-log-order",
+      "<output-directory>/archive",
+      "components/clp-s/tests/fixtures/sfa-v0.5.0-unstructured-arrays-cpp-input.jsonl"
+    ],
+    "relevant_source_sha256": {
+      "components/core/src/clp_s/archive_constants.hpp": "a0f270328ed511b229c839ee8219ee0bfe906668787cc50dabe3cac45d72379b",
+      "components/core/src/clp_s/ArchiveWriter.cpp": "4e51e13ea22797401bf30005ae03af18cbfce77ed28187ea07b3a3d33922836c",
+      "components/core/src/clp_s/ArchiveWriter.hpp": "9848268a25ce31127052832f5839590a067b065064dfc51ffb06efd173966957",
+      "components/core/src/clp_s/JsonParser.cpp": "20623cfda9ffcc25504720186048f61bd5ace7ed016e7fa74db4feba34a88368",
+      "components/core/src/clp_s/ColumnWriter.cpp": "d0fc22bf25e30aa30fd3cee02c71793dab2af2e4d299aef2712e34cfdb38853d",
+      "components/core/src/clp_s/DictionaryWriter.cpp": "4dd76ecf36005e6dc029222ed9924fbf7817a16c17395de4376418ef0eb483b8"
+    }
+  },
+  "input": {
+    "path": "components/clp-s/tests/fixtures/sfa-v0.5.0-unstructured-arrays-cpp-input.jsonl",
+    "size": 284,
+    "sha256": "68fbc4e1b8d1c838a6ddff7381229533c9d1600e2e564a8d8f2510058f16e827"
+  },
+  "archive": {
+    "path": "components/clp-s/tests/fixtures/sfa-v0.5.0-unstructured-arrays-cpp-dir",
+    "member_count": 8,
+    "aggregate_size": 618,
+    "canonical_concatenation_sha256": "0e8608c850f5faf8c068afb92c75b2b01aef39ba4f112a1079f3912e9dd1b058",
+    "canonical_concatenation_matches_sfa_oracle": true,
+    "deterministic_without_log_order_metadata": true,
+    "selected_work_path": "build/cpp-m8-dir-oracle-final/archive/09059d4c-36d1-42e9-b46f-b36a8714788b",
+    "repeat_work_path": "build/cpp-m8-dir-repeat-final/archive/284f5d6f-689d-4155-afc9-d7587f071ffb",
+    "members": [
+      {
+        "name": "header",
+        "size": 207,
+        "sha256": "2f811fb74ef3d65e7e71d36f46517868c5b158a2a5054c69d212c4a75747fdc3"
+      },
+      {
+        "name": "schema_tree",
+        "size": 51,
+        "sha256": "3b2cdd7009253b5ec5bde9538efc45b340a646d4ecad06daf78f614b6f9b8a66"
+      },
+      {
+        "name": "schema_ids",
+        "size": 28,
+        "sha256": "c7d859d32c4441ee250a936df28250e79ce95a8fbc602eec74becc7d692d7c23"
+      },
+      {
+        "name": "table_metadata",
+        "size": 31,
+        "sha256": "d39d6f9685fa0715095320667c00c84505c354b28771c6a5e6eaa02ea0b79044"
+      },
+      {
+        "name": "var.dict",
+        "size": 48,
+        "sha256": "6b7cff6571aafc40cc0e5250c441956431e22649285714438db052a46165ee3f"
+      },
+      {
+        "name": "log.dict",
+        "size": 8,
+        "sha256": "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc"
+      },
+      {
+        "name": "array.dict",
+        "size": 138,
+        "sha256": "a18d6e00d3e29db04d1eb780065fef1223dcdf84f98640ce71f52e7b0de96bd1"
+      },
+      {
+        "name": "0",
+        "size": 107,
+        "sha256": "2a5f9360a0fd92cf272dbea21d6ac83e91956bd5ca3502b2b7e62391897a62b1"
+      }
+    ]
+  },
+  "verified": {
+    "rust_generated_path": "build/rust-m8-dir-final",
+    "all_rust_members_match_cpp": true,
+    "rust_directory_reader_extracts_exact_input": true,
+    "cpp_extracts_rust_directory": true,
+    "cpp_extracts_cpp_directory": true,
+    "cpp_extracted_size": 284,
+    "cpp_extracted_sha256": "68fbc4e1b8d1c838a6ddff7381229533c9d1600e2e564a8d8f2510058f16e827",
+    "cpp_rust_archive_extraction_path": "build/cpp-m8-rust-x-final/out/original",
+    "cpp_oracle_extraction_path": "build/cpp-m8-cpp-x-final/out/original"
+  }
+}

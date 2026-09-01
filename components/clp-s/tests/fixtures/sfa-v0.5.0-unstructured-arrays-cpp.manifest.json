@@ -1,0 +1,77 @@
+{
+  "format_version": "0.5.0",
+  "purpose": "Milestone-7 C++ oracle for default-mode UnstructuredArray columns",
+  "generated_at_utc": "2026-08-30",
+  "repository_revision": "7636e26a98a9f78f18964af4d8d951b95602f712",
+  "environment": {
+    "image": "clp-core-dependencies-x86-manylinux_2_28:dev",
+    "image_digest": "sha256:404dc2526ba72b548e69b4b66da5c9f2cabd5cd47d856b7f6d51c0bedfd2fee5",
+    "compiler": "GCC 14.2.1 20250110 (Red Hat 14.2.1-11)",
+    "cmake": "3.31.10",
+    "zstd": "1.5.7",
+    "architecture": "x86_64",
+    "byte_order": "little-endian"
+  },
+  "generator": {
+    "binary": "build/clp-s-reference/core/clp-s",
+    "binary_sha256": "e5042953dedaaec7c95ac6746be6b3d4de6e5629ca9d86ecf45d7e59f0a21284",
+    "arguments": [
+      "c",
+      "--single-file-archive",
+      "--disable-log-order",
+      "<output-directory>/archive",
+      "components/clp-s/tests/fixtures/sfa-v0.5.0-unstructured-arrays-cpp-input.jsonl"
+    ],
+    "relevant_source_sha256": {
+      "components/core/src/clp_s/JsonParser.cpp": "20623cfda9ffcc25504720186048f61bd5ace7ed016e7fa74db4feba34a88368",
+      "components/core/src/clp_s/JsonParser.hpp": "97d34184bef2ea1b0615e3a68368e7c151d32fadd2a4edf746932659d396e1ab",
+      "components/core/src/clp_s/ArchiveWriter.cpp": "4e51e13ea22797401bf30005ae03af18cbfce77ed28187ea07b3a3d33922836c",
+      "components/core/src/clp_s/ArchiveWriter.hpp": "9848268a25ce31127052832f5839590a067b065064dfc51ffb06efd173966957",
+      "components/core/src/clp_s/ColumnWriter.cpp": "d0fc22bf25e30aa30fd3cee02c71793dab2af2e4d299aef2712e34cfdb38853d",
+      "components/core/src/clp_s/ColumnWriter.hpp": "c5e9094f976f41dc9247cd7e2dc3b38d3c416daac3fbbe60c38768d4e7803baa",
+      "components/core/src/clp_s/DictionaryWriter.cpp": "4dd76ecf36005e6dc029222ed9924fbf7817a16c17395de4376418ef0eb483b8",
+      "components/core/src/clp_s/DictionaryWriter.hpp": "11094ccf15bd6bc20cfc1e69dbf8fae7618bf6230bfbb32e847acbde1c2ca2e2",
+      "components/core/src/clp_s/SchemaTree.cpp": "50d9470d29665fb4de5d9cadfd5fbd3ae9c301d65d4fe2e2f8938734a2bf7387",
+      "components/core/src/clp_s/SchemaTree.hpp": "ee308f31f7b8d445b512ae8fd0685c504d45ae216ba8c821c1f80fe5daaa2cc4"
+    }
+  },
+  "input": {
+    "path": "components/clp-s/tests/fixtures/sfa-v0.5.0-unstructured-arrays-cpp-input.jsonl",
+    "size": 284,
+    "sha256": "68fbc4e1b8d1c838a6ddff7381229533c9d1600e2e564a8d8f2510058f16e827"
+  },
+  "archive": {
+    "path": "components/clp-s/tests/fixtures/sfa-v0.5.0-unstructured-arrays-cpp.bin",
+    "size": 618,
+    "sha256": "0e8608c850f5faf8c068afb92c75b2b01aef39ba4f112a1079f3912e9dd1b058",
+    "deterministic_without_log_order_metadata": true,
+    "repeat_size": 618,
+    "repeat_sha256": "0e8608c850f5faf8c068afb92c75b2b01aef39ba4f112a1079f3912e9dd1b058",
+    "selected_work_path": "build/cpp-m7-array-oracle-final/archive/4d52ab98-5246-47f0-8c93-0dd43374f7f8",
+    "repeat_work_path": "build/cpp-m7-array-repeat-final/archive/6c2fe59b-b871-4702-b4bd-e1a19cafeea8"
+  },
+  "wire_characterization": {
+    "schema_count": 1,
+    "record_count": 6,
+    "array_dictionary_entries": 6,
+    "variable_dictionary_entries": 2,
+    "variable_dictionary_values": ["face", "\\u0011\\u0012\\u0013"],
+    "descriptors": [0, 1, 50331650, 100663299, 167772164, 184549381],
+    "encoded_variables": [1, 2, 3, 2, 4, 5, -7, 320049, 0, 9, 1],
+    "raw_lexeme_whitespace_preserved": true,
+    "structured_arrays_enabled": false
+  },
+  "verified": {
+    "rust_generated_path": "build/rust-m7-unstructured-arrays.sfa",
+    "rust_generated_size": 618,
+    "rust_generated_sha256": "0e8608c850f5faf8c068afb92c75b2b01aef39ba4f112a1079f3912e9dd1b058",
+    "whole_archive_byte_identical": true,
+    "rust_reader_extracts_exact_input": true,
+    "cpp_extracts_rust_archive": true,
+    "cpp_extracts_cpp_archive": true,
+    "cpp_extracted_size": 284,
+    "cpp_extracted_sha256": "68fbc4e1b8d1c838a6ddff7381229533c9d1600e2e564a8d8f2510058f16e827",
+    "cpp_rust_archive_extraction_path": "build/cpp-m7-rust-x-final/out/original",
+    "cpp_oracle_extraction_path": "build/cpp-m7-array-x-final/out/original"
+  }
+}

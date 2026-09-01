@@ -545,6 +545,20 @@ if(CLP_BUILD_EXECUTABLES)
 endif()
 
 if(CLP_BUILD_TESTING)
+    add_executable(
+            clp-s-sfa-header-fixture-emitter
+            EXCLUDE_FROM_ALL
+            tests/sfa-header-fixture-emitter.cpp
+    )
+    target_compile_features(clp-s-sfa-header-fixture-emitter PRIVATE cxx_std_20)
+    target_include_directories(clp-s-sfa-header-fixture-emitter PRIVATE ../)
+    target_link_libraries(clp-s-sfa-header-fixture-emitter PRIVATE msgpack-cxx)
+    set_target_properties(
+            clp-s-sfa-header-fixture-emitter
+            PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
+    )
+
         add_library(clp_s_unit_test_sources INTERFACE)
         add_library(clp_s::unit_test_sources ALIAS clp_s_unit_test_sources)
         target_sources(

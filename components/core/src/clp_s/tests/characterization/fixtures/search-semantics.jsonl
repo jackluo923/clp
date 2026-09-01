@@ -1,0 +1,8 @@
+{"id":0,"ts":1000,"feature":true,"logic_a":true,"logic_b":false,"logic_c":false,"typed_number":7,"typed_bool":true,"typed_null":null,"search_text":"needle","wild":"a*b","dot.key":"flat","$_filename":"event-file","optional":"yes","case_ascii":"MiXeD","case_unicode":"École","project_z":"z","project_a":"a","path":{"*":{"leaf":"literal-star"}},"items":[{"x":1},{"y":2}],"arr":[{"n":3}]}
+{"id":1,"ts":2000,"feature":true,"logic_a":false,"logic_b":true,"logic_c":true,"typed_number":"7","typed_bool":"true","typed_null":"null","search_text":"other","wild":"axxb","dot":{"key":"nested"},"optional":"no","case_ascii":"other","case_unicode":"other","project_z":"z1","project_a":"a1","items":[{"x":1,"y":2}],"arr":[{"n":5}]}
+{"id":2,"ts":3000,"feature":true,"logic_a":false,"logic_b":true,"logic_c":false,"search_text":"other","wild":"other","case_ascii":"other","case_unicode":"other","project_z":"z2","project_a":"a2","path":{"one":{"leaf":"branch"}},"items":[{"x":1}],"arr":[{"n":7}]}
+{"id":3,"ts":4000,"feature":true,"logic_a":true,"logic_b":false,"logic_c":true,"search_text":"other","wild":"other","optional":"other","case_ascii":"other","case_unicode":"other","project_z":"z3","project_a":"a3","path":{"leaf":"shallow"},"items":[{"y":2}],"arr":[{"n":5}]}
+{"id":10,"ts":5000,"order_group":"A","shared":0}
+{"id":11,"ts":6000,"order_group":"B","shared":0,"only_b":true}
+{"id":12,"ts":7000,"order_group":"A","shared":0}
+{"id":13,"ts":8000,"order_group":"B","shared":0,"only_b":true}

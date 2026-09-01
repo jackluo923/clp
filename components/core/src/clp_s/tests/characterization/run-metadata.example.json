@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "container": {
+    "image": "clp-core-dependencies-x86-manylinux_2_28:dev",
+    "digest": "sha256:REPLACE_WITH_DOCKER_IMAGE_ID"
+  },
+  "target": {
+    "architecture": "x86_64",
+    "os": "linux",
+    "libc": "glibc-REPLACE_WITH_VERSION"
+  },
+  "builds": {
+    "cpp": {
+      "compiler": "REPLACE_WITH_COMPILER_ID",
+      "compiler_version": "REPLACE_WITH_FULL_VERSION",
+      "configuration": "Release with IPO/LTO",
+      "flags": [
+        "REPLACE_WITH_EFFECTIVE_CXX_FLAGS"
+      ]
+    },
+    "rust": {
+      "rustc": "REPLACE_WITH_RUSTC_VERBOSE_VERSION",
+      "cargo_profile": "release",
+      "flags": [
+        "REPLACE_WITH_EFFECTIVE_RUSTFLAGS"
+      ]
+    }
+  },
+  "native_dependencies": {
+    "zstd": "REPLACE_WITH_VERSION",
+    "msgpack-cxx": "REPLACE_WITH_VERSION",
+    "simdjson": "REPLACE_WITH_VERSION",
+    "libarchive": "REPLACE_WITH_VERSION"
+  }
+}

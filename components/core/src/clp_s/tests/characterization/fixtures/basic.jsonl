@@ -1,0 +1,4 @@
+{"ts":3000,"level":"ERROR","message":"request 17 failed","latency":12.50,"tags":["api","retry"],"active":false}
+{"ts":1000,"level":"INFO","message":"service started","latency":0.0,"tags":["lifecycle"],"active":true}
+{"ts":2000,"level":"WARN","message":"request 16 is slow","latency":8.2500,"tags":[],"active":true}
+{"ts":4000,"level":"ERROR","message":"request 18 failed","latency":13,"tags":["api"],"active":false,"detail":null}

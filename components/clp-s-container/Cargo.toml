@@ -1,0 +1,10 @@
+[package]
+name = "clp-s-container"
+version = "0.13.1-dev"
+edition = "2024"
+description = "Bounded streaming access to libarchive containers for CLP structured ingestion"
+links = "archive"
+
+[build-dependencies]
+cc = "1.2.62"
+pkg-config = "0.3.33"

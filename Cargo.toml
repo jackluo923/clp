@@ -2,8 +2,18 @@
 members = [
     "components/api-server",
     "components/clp-rust-utils",
+    "components/clp-s",
+    "components/clp-s-container",
+    "components/clp-s-ffi",
     "components/clp-tdl-package",
     "components/compression-coordinator",
     "components/log-ingestor"
 ]
 resolver = "3"
+
+# Shipping profile for the performance-sensitive clp-s binary. Naming the profile keeps these
+# code-generation settings opt-in for the rest of the workspace.
+[profile.clp-s-release]
+inherits = "release"
+codegen-units = 1
+lto = "fat"

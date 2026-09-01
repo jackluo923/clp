@@ -1,0 +1,54 @@
+{
+  "format_version": "0.5.0",
+  "purpose": "Milestone-4 C++ oracle for retained FormattedFloat and DictionaryFloat columns",
+  "generated_at_utc": "2026-08-30",
+  "repository_revision": "7636e26a98a9f78f18964af4d8d951b95602f712",
+  "environment": {
+    "image": "clp-core-dependencies-x86-manylinux_2_28:dev",
+    "image_digest": "sha256:404dc2526ba72b548e69b4b66da5c9f2cabd5cd47d856b7f6d51c0bedfd2fee5",
+    "compiler": "GCC 14.2.1 20250110 (Red Hat 14.2.1-11)",
+    "cmake": "3.31.10",
+    "zstd": "1.5.7",
+    "architecture": "x86_64",
+    "byte_order": "little-endian"
+  },
+  "generator": {
+    "binary": "build/clp-s-reference/core/clp-s",
+    "binary_sha256": "e5042953dedaaec7c95ac6746be6b3d4de6e5629ca9d86ecf45d7e59f0a21284",
+    "arguments": [
+      "c",
+      "--single-file-archive",
+      "--disable-log-order",
+      "<output-directory>/archive",
+      "components/clp-s/tests/fixtures/sfa-v0.5.0-retained-floats-cpp-input.jsonl"
+    ],
+    "relevant_source_sha256": {
+      "components/core/src/clp_s/FloatFormatEncoding.cpp": "be5a68cc4c9b19732da0ec0497fe030e590b79da491f767b32bc476bf57527ea",
+      "components/core/src/clp_s/FloatFormatEncoding.hpp": "f9a3890e7c314bf285d68e5ab0ecc095a4b1bc036c8e434669a37eaaa68b7397",
+      "components/core/src/clp_s/JsonParser.cpp": "20623cfda9ffcc25504720186048f61bd5ace7ed016e7fa74db4feba34a88368",
+      "components/core/src/clp_s/JsonParser.hpp": "97d34184bef2ea1b0615e3a68368e7c151d32fadd2a4edf746932659d396e1ab",
+      "components/core/src/clp_s/ColumnWriter.cpp": "d0fc22bf25e30aa30fd3cee02c71793dab2af2e4d299aef2712e34cfdb38853d",
+      "components/core/src/clp_s/ColumnWriter.hpp": "c5e9094f976f41dc9247cd7e2dc3b38d3c416daac3fbbe60c38768d4e7803baa",
+      "components/core/src/clp_s/DictionaryWriter.cpp": "4dd76ecf36005e6dc029222ed9924fbf7817a16c17395de4376418ef0eb483b8",
+      "components/core/src/clp_s/SchemaTree.hpp": "ee308f31f7b8d445b512ae8fd0685c504d45ae216ba8c821c1f80fe5daaa2cc4"
+    }
+  },
+  "input": {
+    "path": "components/clp-s/tests/fixtures/sfa-v0.5.0-retained-floats-cpp-input.jsonl",
+    "size": 381,
+    "sha256": "a2cd123a7ce22dc7d19ba680d8ce1aa90aa1f9ce0f83ac1cf785eb1e2e047953"
+  },
+  "archive": {
+    "path": "components/clp-s/tests/fixtures/sfa-v0.5.0-retained-floats-cpp.bin",
+    "size": 504,
+    "sha256": "b47781ecc24fcd06198602da0e491a9c2b2419f07880209706604a66e3c2aaf1",
+    "deterministic_without_log_order_metadata": true
+  },
+  "verified": {
+    "rust_write_retained_float_sfa_byte_identical": true,
+    "cpp_extracts_rust_archive": true,
+    "cpp_extracts_cpp_archive": true,
+    "cpp_extracted_size": 381,
+    "cpp_extracted_sha256": "a2cd123a7ce22dc7d19ba680d8ce1aa90aa1f9ce0f83ac1cf785eb1e2e047953"
+  }
+}

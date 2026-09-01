@@ -1,0 +1,402 @@
+{
+  "schema_version": 1,
+  "fixture_id": "clp-s-sfa-v0.5.0-minimal-cpp",
+  "purpose": "Exercise Rust envelope, metadata, packed-stream, zero-copy column, timestamp, and CLP-message reconstruction against a complete single-file archive produced by the C++ clp-s command-line oracle.",
+  "feature_tags": [
+    "archive-info",
+    "archive-file-info",
+    "column-decode",
+    "cpp-oracle",
+    "integer-timestamp",
+    "logtype-reconstruction",
+    "log-order",
+    "record-reconstruction",
+    "range-index",
+    "sfa",
+    "timestamp-dictionary",
+    "timestamp-marshalling"
+  ],
+  "expected_phase": "record-reconstruction",
+  "expected_success": true,
+  "artifact": {
+    "path": "sfa-v0.5.0-minimal-cpp.bin",
+    "size": 654,
+    "sha256": "9942fc47de9834a2dea06d2d5ea46e8df7dfb653aa34fb7e698c3dee546768e6",
+    "comparison": "byte-exact",
+    "complete_archive": true,
+    "layout": "single-file",
+    "version": "0.5.0"
+  },
+  "source_input": {
+    "path": "sfa-v0.5.0-minimal-cpp-input.jsonl",
+    "size": 88,
+    "sha256": "654ad54e12ddfaa0b6a33ae6cbed544a9aaea348d68fda1ee8250c24aa1d8817",
+    "format": "JSON Lines",
+    "redistribution_license": "Apache-2.0"
+  },
+  "expected_header": {
+    "magic_hex": "fd2fc530",
+    "version": "0.5.0",
+    "uncompressed_size": 88,
+    "compressed_size": 654,
+    "reserved_padding": [0, 0, 0, 0],
+    "metadata_section_offset": 64,
+    "metadata_section_size": 299,
+    "files_section_offset": 363,
+    "files_section_size": 291,
+    "compression": "Zstd",
+    "compression_wire_value": 0,
+    "final_padding": 0,
+    "header_sha256": "f405742d0fa3faee1911d012c65228c65d1d31383be7f89e58859dc5aa953ef5"
+  },
+  "expected_metadata": {
+    "compressed_sha256": "b1664cadf82a61f5aabbf6332f93b9376a4f6e54da5a58d33eb85fee7ff45cb9",
+    "decompressed_size": 383,
+    "decompressed_sha256": "9af092f04368f47356348701ed92111ef1ef298b90a9c44dbe8768dd26512d6e",
+    "packet_count": 4,
+    "packets": [
+      {
+        "type": 0,
+        "name": "ArchiveInfo",
+        "payload_size": 15,
+        "payload_sha256": "03abf4b7ae6b05655e21ef241ad2dfc910111f839366c5e0be2accd95e6a3437"
+      },
+      {
+        "type": 1,
+        "name": "ArchiveFileInfo",
+        "payload_size": 131,
+        "payload_sha256": "84091801efee833bc8b48d6644f6591e57d8570d93bcd85f565c12669db240a9"
+      },
+      {
+        "type": 2,
+        "name": "TimestampDictionary",
+        "payload_size": 80,
+        "payload_sha256": "5ee973ece48407cfafa4708ab3e92c0bc661a3202221980c8bd68d7df60be104",
+        "authoritative_key": "ts",
+        "column_ids": [3],
+        "bounds": {
+          "encoding": "Epoch",
+          "start": 1700000000123,
+          "end": 1700000000123
+        },
+        "patterns": [
+          {
+            "id": 0,
+            "raw": "\\L"
+          }
+        ]
+      },
+      {
+        "type": 3,
+        "name": "ArchiveRangeIndex",
+        "payload_size": 136,
+        "payload_sha256": "d605bc907de6b0dbcbbcf3b1f5d8ce85cd043507c3493b9e71ad29c9fd628d49"
+      }
+    ],
+    "unknown_packet_count": 0
+  },
+  "archive_members": [
+    {
+      "name": "/schema_tree",
+      "offset": 363,
+      "size": 108,
+      "sha256": "fcc05491ba3f334f7e8076947f289d884e4a2df6d03dac52dca0cfa3f85e68f4"
+    },
+    {
+      "name": "/schema_ids",
+      "offset": 471,
+      "size": 39,
+      "sha256": "fd6180b89c71328a2d6209a4e15c9766fa59c516953633ae0805cc00797b43d1"
+    },
+    {
+      "name": "/table_metadata",
+      "offset": 510,
+      "size": 31,
+      "sha256": "424ea9849a2981e9815a52c7b481b368628d5feb3d553cf989a7d6b47e9b26d0"
+    },
+    {
+      "name": "/var.dict",
+      "offset": 541,
+      "size": 29,
+      "sha256": "f8543ebdce240edbd50a3362ea9e34b07c44b889fc073b1b91f20561f93393e8"
+    },
+    {
+      "name": "/log.dict",
+      "offset": 570,
+      "size": 39,
+      "sha256": "2ce6d9392bc19c4b95018def2af592067fde9ae20fb82aaaf62fff3f9799e69e"
+    },
+    {
+      "name": "/array.dict",
+      "offset": 609,
+      "size": 8,
+      "sha256": "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc"
+    },
+    {
+      "name": "/0",
+      "offset": 617,
+      "size": 37,
+      "sha256": "bfa3377fc933bf7c86642db6afb581a542471a8d0861b92243568ee52f26bf7c"
+    }
+  ],
+  "expected_schema_tree": {
+    "decompressed_size": 150,
+    "decompressed_sha256": "e7a7ec60c91132115f30e06ec82a5655fd2f84e30cea114df2366414f3046f2d",
+    "nodes": [
+      {
+        "id": 0,
+        "parent": null,
+        "key": "",
+        "type": "Metadata",
+        "wire_type": 10
+      },
+      {
+        "id": 1,
+        "parent": 0,
+        "key": "log_event_idx",
+        "type": "DeltaInteger",
+        "wire_type": 11
+      },
+      {
+        "id": 2,
+        "parent": null,
+        "key": "",
+        "type": "Object",
+        "wire_type": 5
+      },
+      {
+        "id": 3,
+        "parent": 2,
+        "key": "ts",
+        "type": "Timestamp",
+        "wire_type": 14
+      },
+      {
+        "id": 4,
+        "parent": 2,
+        "key": "level",
+        "type": "VarString",
+        "wire_type": 3
+      },
+      {
+        "id": 5,
+        "parent": 2,
+        "key": "message",
+        "type": "ClpString",
+        "wire_type": 2
+      },
+      {
+        "id": 6,
+        "parent": 2,
+        "key": "value",
+        "type": "Integer",
+        "wire_type": 0
+      },
+      {
+        "id": 7,
+        "parent": 2,
+        "key": "active",
+        "type": "Boolean",
+        "wire_type": 4
+      }
+    ]
+  },
+  "expected_schema_map": {
+    "decompressed_size": 44,
+    "decompressed_sha256": "e0b7e4267e2847c74b78cf97ff7ab0b3da28f6cf2d5dd941d614831ccb21d2c6",
+    "schemas": [
+      {
+        "id": 0,
+        "entry_count": 6,
+        "ordered_entry_count": 6,
+        "entries": [1, 3, 4, 5, 6, 7]
+      }
+    ]
+  },
+  "expected_table_metadata": {
+    "compressed_size": 31,
+    "compressed_sha256": "424ea9849a2981e9815a52c7b481b368628d5feb3d553cf989a7d6b47e9b26d0",
+    "decompressed_size": 68,
+    "decompressed_sha256": "4748a6d7f18427dc196503cb374c3aaa6e4e410abb3e0af0b870ee00c6ac4bef",
+    "separate_column_schema_count": 0,
+    "total_uncompressed_stream_size": 57,
+    "record_count": 1,
+    "packed_streams": [
+      {
+        "id": 0,
+        "file_offset": 0,
+        "compressed_size": 37,
+        "uncompressed_size": 57,
+        "decompressed_sha256": "532ac9a2ca332936a243c4d0a74b1d875a5eb3e545de23a96dfbd5aa9c544273"
+      }
+    ],
+    "schema_tables": [
+      {
+        "stream_id": 0,
+        "stream_offset": 0,
+        "uncompressed_size": 57,
+        "schema_id": 0,
+        "num_messages": 1
+      }
+    ]
+  },
+  "configuration": {
+    "compression_level": 3,
+    "minimum_table_size": 1048576,
+    "timestamp_key": "ts",
+    "structurize_arrays": false,
+    "retain_float_format": true,
+    "record_log_order": true,
+    "range_index": "present",
+    "archive_splitting": false,
+    "single_file_archive": true,
+    "canonical_input_path": "/sfa-v0.5.0-minimal-cpp-input.jsonl"
+  },
+  "expected_archive_stats": {
+    "id": "c45423d7-84df-4797-8889-6a0718aa6b81",
+    "begin_timestamp": 1700000000123,
+    "end_timestamp": 1700000000123,
+    "uncompressed_size": 88,
+    "size": 654,
+    "is_split": false,
+    "range_index": [
+      {
+        "s": 0,
+        "e": 1,
+        "f": {
+          "_archive_creator_id": "764d6dd1-aab6-49ca-86e1-b41e19cffb16",
+          "_file_split_number": 0,
+          "_filename": "/sfa-v0.5.0-minimal-cpp-input.jsonl"
+        }
+      }
+    ]
+  },
+  "expected_interoperability": {
+    "cpp_extract": {
+      "comparison": "byte-exact",
+      "size": 88,
+      "sha256": "654ad54e12ddfaa0b6a33ae6cbed544a9aaea348d68fda1ee8250c24aa1d8817"
+    },
+    "cpp_search": {
+      "query": "level: INFO",
+      "comparison": "structural-json-lines",
+      "record_count": 1
+    }
+  },
+  "source_baseline": {
+    "repository_commit": "7636e26a98a9f78f18964af4d8d951b95602f712",
+    "reference_implementation": "C++ clp-s",
+    "working_tree_note": "ArchiveWriter.cpp, JsonParser.cpp, CommandLineArguments files, and clp-s.cpp match repository_commit. SingleFileArchiveDefs.hpp only adds compile-time layout assertions; its emitted ArchiveHeader definition is unchanged.",
+    "source_files": {
+      "components/core/src/clp_s/ArchiveWriter.cpp": {
+        "size": 19989,
+        "sha256": "4e51e13ea22797401bf30005ae03af18cbfce77ed28187ea07b3a3d33922836c"
+      },
+      "components/core/src/clp_s/JsonParser.cpp": {
+        "size": 59062,
+        "sha256": "20623cfda9ffcc25504720186048f61bd5ace7ed016e7fa74db4feba34a88368"
+      },
+      "components/core/src/clp_s/SingleFileArchiveDefs.hpp": {
+        "size": 4432,
+        "sha256": "26ac4a9464a040e3079613d6ab3f682e98f9d0cb40a8b03cc0695a2c01b6cfca",
+        "repository_commit_sha256": "faf207cf4c17f6c9c93dc7d7b899d8dbaa99c91a803f97bf916436badc555676"
+      },
+      "components/core/src/clp_s/CommandLineArguments.cpp": {
+        "size": 57821,
+        "sha256": "8545e085df17651afac5761fa3fa85f5981657c296884402227b506bb2604d78"
+      },
+      "components/core/src/clp_s/CommandLineArguments.hpp": {
+        "size": 9773,
+        "sha256": "ead9667aa4e897dd8266979b3bd8d799a940717fb73990dcbb42dae00e22b063"
+      },
+      "components/core/src/clp_s/clp-s.cpp": {
+        "size": 24605,
+        "sha256": "2bb38d31fcd0826b3837e10d5168e031d158f4bfcd2e37995da7f78c9382b8d2"
+      }
+    },
+    "submodules": {
+      "tools/yscope-dev-utils": "0c214c44acddff330a204201428ea145e641891d"
+    }
+  },
+  "generation_environment": {
+    "container": {
+      "image": "clp-core-dependencies-x86-manylinux_2_28:dev",
+      "digest": "sha256:404dc2526ba72b548e69b4b66da5c9f2cabd5cd47d856b7f6d51c0bedfd2fee5"
+    },
+    "target": {
+      "architecture": "x86_64",
+      "os": "linux",
+      "libc": "glibc-2.28",
+      "endianness": "little"
+    },
+    "toolchain": {
+      "compiler": "GCC",
+      "compiler_version": "14.2.1 20250110 (Red Hat 14.2.1-11)",
+      "cmake_version": "3.31.10",
+      "configuration": "Release with IPO/LTO",
+      "cxx_standard": 20,
+      "compile_flags": ["-O3", "-DNDEBUG", "-std=gnu++20", "-flto=auto", "-fno-fat-lto-objects"]
+    },
+    "dependencies": {
+      "zstd": "1.5.7",
+      "msgpack-cxx": "7.0.0",
+      "simdjson": "4.6.4",
+      "libarchive": "3.8.0"
+    },
+    "binary": {
+      "path": "build/clp-s-reference/core/clp-s",
+      "size": 13967712,
+      "sha256": "e5042953dedaaec7c95ac6746be6b3d4de6e5629ca9d86ecf45d7e59f0a21284"
+    }
+  },
+  "generation": {
+    "argument_vector": [
+      "build/clp-s-reference/core/clp-s",
+      "c",
+      "--compression-level",
+      "3",
+      "--timestamp-key",
+      "ts",
+      "--print-archive-stats",
+      "--remove-path-prefix",
+      "components/clp-s/tests/fixtures",
+      "--single-file-archive",
+      "build/clp-s-full-fixture-investigation/run-1",
+      "components/clp-s/tests/fixtures/sfa-v0.5.0-minimal-cpp-input.jsonl"
+    ],
+    "relevant_environment_variable_names": ["LANG", "LC_ALL", "TZ"],
+    "redistribution_license": "Apache-2.0"
+  },
+  "nondeterminism_investigation": {
+    "byte_reproducible_across_fresh_runs": false,
+    "cause": "JsonParser draws an archive UUID used as the output filename and archive-stat id, then independently draws an archive-creator UUID stored in the range-index metadata packet. The creator UUID changes metadata-frame zstd compressibility, so total sizes can differ by a few bytes.",
+    "stable_files_section": {
+      "size": 291,
+      "sha256_across_all_runs": "2a9700169334dc899470d46ccf2f125371e3e00978c03f2f0d3140ff13070c3c"
+    },
+    "admission_policy": "Preserve the selected run's generated UUIDs and exact bytes as fixture facts; regeneration requires review and manifest hash updates.",
+    "runs": [
+      {
+        "archive_id": "c45423d7-84df-4797-8889-6a0718aa6b81",
+        "archive_creator_id": "764d6dd1-aab6-49ca-86e1-b41e19cffb16",
+        "size": 654,
+        "sha256": "9942fc47de9834a2dea06d2d5ea46e8df7dfb653aa34fb7e698c3dee546768e6",
+        "admitted": true
+      },
+      {
+        "archive_id": "33b0966d-c560-4b70-b0bf-bd46d7589f04",
+        "archive_creator_id": "2a3477a4-56cf-434c-bc79-f61be92ae66b",
+        "size": 655,
+        "sha256": "4f5b9acd99b3be6e3f1dd2e38cbe431828c52a0f5865088a85da43d989e09823",
+        "admitted": false
+      },
+      {
+        "archive_id": "e5c84efe-91f8-4100-9dd5-31df9bd9f1de",
+        "archive_creator_id": "5d89ffdf-3444-4e08-8e8c-3d407d7c7f56",
+        "size": 656,
+        "sha256": "b0145e9f0108427d83e0e5129fac0e9cc8ea0df62a3027382f6e634ea25d14bc",
+        "admitted": false
+      }
+    ]
+  }
+}

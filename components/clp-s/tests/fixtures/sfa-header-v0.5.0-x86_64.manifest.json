@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "fixture_id": "clp-s-sfa-header-v0.5.0-x86_64-cpp",
+  "purpose": "Pin the byte layout emitted by the C++ ArchiveHeader constructor for Rust cross-language decoding tests.",
+  "feature_tags": [
+    "archive-header",
+    "byte-order",
+    "cpp-oracle",
+    "padding",
+    "sfa"
+  ],
+  "expected_phase": "header-decode",
+  "expected_success": true,
+  "artifact": {
+    "path": "sfa-header-v0.5.0-x86_64.bin",
+    "size": 64,
+    "sha256": "1aa45f532211277208b35f3d743e1a10b1f88fea9e825c0e6b3f19ff4dd0d522",
+    "comparison": "byte-exact",
+    "complete_archive": false
+  },
+  "expected_header": {
+    "magic_hex": "fd2fc530",
+    "version": {
+      "major": 0,
+      "minor": 5,
+      "patch": 0,
+      "wire_hex": "0x00050000"
+    },
+    "uncompressed_size": "0x0102030405060708",
+    "compressed_size": "0x1112131415161718",
+    "reserved_padding": [
+      "0x0000000000000000",
+      "0x0000000000000000",
+      "0x0000000000000000",
+      "0x0000000000000000"
+    ],
+    "metadata_section_size": "0x21222324",
+    "files_section_offset": "0x21222364",
+    "compression_type": {
+      "name": "Zstd",
+      "wire_value": 0
+    },
+    "final_padding": 0
+  },
+  "source_baseline": {
+    "repository_commit": "7636e26a98a9f78f18964af4d8d951b95602f712",
+    "reference_implementation": "C++ clp-s",
+    "working_tree_note": "Generated as part of the pending Rust rewrite change. Relative to repository_commit, SingleFileArchiveDefs.hpp only adds includes and compile-time layout assertions; its ArchiveHeader definition and constructor are unchanged.",
+    "files": {
+      "components/core/src/clp_s/SingleFileArchiveDefs.hpp": {
+        "size": 4432,
+        "sha256": "26ac4a9464a040e3079613d6ab3f682e98f9d0cb40a8b03cc0695a2c01b6cfca",
+        "repository_commit_sha256": "faf207cf4c17f6c9c93dc7d7b899d8dbaa99c91a803f97bf916436badc555676"
+      },
+      "components/core/src/clp_s/tests/sfa-header-fixture-emitter.cpp": {
+        "size": 1959,
+        "sha256": "f7e846d851094717819ecbf45f7ad9afdefeadc559003949a18e53357944aaee"
+      },
+      "components/core/src/clp_s/CMakeLists.txt": {
+        "size": 19363,
+        "sha256": "42860de83b141d9f42951364215172577a56c7934ea3ac2e9fed91bda9172dbb"
+      },
+      "components/core/tools/docker-images/clp-env-base-manylinux_2_28/Dockerfile": {
+        "size": 2675,
+        "sha256": "86ffd8a424c1427275fe6833ea337c7719b19b36bb84a6bd716d706a376c485c"
+      },
+      "components/core/tools/docker-images/clp-env-base-manylinux_2_28/build.sh": {
+        "size": 2150,
+        "sha256": "9cec9e7d994e0cc7dd92c4bbe631ca6fd4251346884f96726f8faa1f46542bf9"
+      }
+    },
+    "submodules": {
+      "tools/yscope-dev-utils": "0c214c44acddff330a204201428ea145e641891d"
+    }
+  },
+  "generation_environment": {
+    "container": {
+      "image": "clp-core-dependencies-x86-manylinux_2_28:dev",
+      "digest": "sha256:404dc2526ba72b548e69b4b66da5c9f2cabd5cd47d856b7f6d51c0bedfd2fee5"
+    },
+    "target": {
+      "architecture": "x86_64",
+      "os": "linux",
+      "libc": "glibc-2.28",
+      "endianness": "little"
+    },
+    "toolchain": {
+      "compiler": "GCC",
+      "compiler_version": "14.2.1 20250110 (Red Hat 14.2.1-11)",
+      "cmake_version": "3.31.10",
+      "configuration": "Release with IPO/LTO",
+      "cxx_standard": 20
+    }
+  },
+  "generation": {
+    "cmake_target": "clp-s-sfa-header-fixture-emitter",
+    "argument_vector": [
+      "build/clp-s-reference/core/clp-s-sfa-header-fixture-emitter",
+      "components/clp-s/tests/fixtures/sfa-header-v0.5.0-x86_64.bin"
+    ],
+    "relevant_environment_variable_names": [],
+    "source_inputs": [
+      "components/core/src/clp_s/SingleFileArchiveDefs.hpp",
+      "components/core/src/clp_s/tests/sfa-header-fixture-emitter.cpp"
+    ],
+    "redistribution_license": "Apache-2.0"
+  }
+}

@@ -1,0 +1,41 @@
+[package]
+name = "clp-s"
+version = "0.13.1-dev"
+edition = "2024"
+description = "Library-first Rust implementation of CLP's structured archive engine"
+
+[lib]
+name = "clp_s"
+path = "src/lib.rs"
+
+[features]
+default = ["cli"]
+cli = ["container", "dep:clap", "dep:mongodb", "dep:serde_json", "dep:uuid", "network"]
+container = ["dep:clp-s-container"]
+network = ["dep:hmac", "dep:reqwest", "dep:sha2", "dep:time"]
+
+[[bin]]
+name = "clp-s"
+path = "src/bin/clp-s.rs"
+required-features = ["cli"]
+
+[dependencies]
+ahash = "0.8.12"
+bumpalo = { version = "3.20.2", features = ["collections"] }
+clap = { version = "4.6.4", features = ["derive"], optional = true }
+clp-s-container = { path = "../clp-s-container", optional = true }
+flate2 = { version = "1.1.2", default-features = false, features = ["rust_backend"] }
+hashbrown = { version = "0.15.5", default-features = false, features = ["inline-more"] }
+hmac = { version = "0.12.1", optional = true }
+itoa = "1.0.18"
+mongodb = { version = "3.5.0", features = ["sync"], optional = true }
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls", "system-proxy"], optional = true }
+rmp-serde = "1.3.1"
+ryu = "1.0.23"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.149", optional = true }
+sha2 = { version = "0.10.9", optional = true }
+smallvec = "1.15.1"
+time = { version = "0.3.47", optional = true }
+uuid = { version = "1.20.0", features = ["v4"], optional = true }
+zstd = "0.13.3"

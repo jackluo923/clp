@@ -1,0 +1,11 @@
+{"ts":-1700000001501,"mixed":9007199254740993,"unique":2,"outer":{"a.b":{"value":7}},"target":10}
+{"ts":-1700000001000,"mixed":9007199254740992.0,"unique":-1,"outer":{"a.b":{"value":3}},"target":2.5}
+{"ts":-1700000000999,"unique":1.5,"target":null}
+{"ts":-1700000000001,"unique":-0.0,"target":{"nested":1}}
+{"ts":-1700000000000,"unique":"z","target":[1]}
+{"ts":-1699999999999,"unique":"a"}
+{"ts":-1699999999000,"unique":true}
+{"ts":-1699999998999,"unique":false}
+{"ts":-1699999998001,"unique":null}
+{"ts":-1699999998000,"unique":{"nested":1}}
+{"ts":-1699999997999,"unique":[1]}

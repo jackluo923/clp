@@ -1,0 +1,86 @@
+{
+  "format_version": "0.5.0",
+  "purpose": "Milestone-6 C++ oracle for exact string and numeric Timestamp columns",
+  "generated_at_utc": "2026-08-30",
+  "repository_revision": "7636e26a98a9f78f18964af4d8d951b95602f712",
+  "environment": {
+    "image": "clp-core-dependencies-x86-manylinux_2_28:dev",
+    "image_digest": "sha256:404dc2526ba72b548e69b4b66da5c9f2cabd5cd47d856b7f6d51c0bedfd2fee5",
+    "compiler": "GCC 14.2.1 20250110 (Red Hat 14.2.1-11)",
+    "cmake": "3.31.10",
+    "zstd": "1.5.7",
+    "architecture": "x86_64",
+    "byte_order": "little-endian"
+  },
+  "generator": {
+    "binary": "build/clp-s-reference/core/clp-s",
+    "binary_sha256": "e5042953dedaaec7c95ac6746be6b3d4de6e5629ca9d86ecf45d7e59f0a21284",
+    "arguments": [
+      "c",
+      "--single-file-archive",
+      "--disable-log-order",
+      "--timestamp-key",
+      "ts",
+      "<output-directory>/archive",
+      "components/clp-s/tests/fixtures/sfa-v0.5.0-timestamps-cpp-input.jsonl"
+    ],
+    "relevant_source_sha256": {
+      "components/core/src/clp_s/TimestampDictionaryWriter.cpp": "2b8aacb8c56649c30f914e0ddbef6b65cceaca30d58b4761d7da807099487fdf",
+      "components/core/src/clp_s/TimestampDictionaryWriter.hpp": "a976ccbf4441ef80174e29fade00f912667d0a7e3470133cfd4c9d0495f6cf65",
+      "components/core/src/clp_s/TimestampEntry.cpp": "7653de831616104442739b3db34c65ee6501b8c6334d6c001b29d4d21b9a37b0",
+      "components/core/src/clp_s/TimestampEntry.hpp": "f66d8dc967f24ffa1f062d0951fff24c31067130ff1ca81ef895c879983fe94a",
+      "components/core/src/clp_s/timestamp_parser/TimestampParser.cpp": "f75743eb03dc46de716e79e2f60317ca1e839c89a7fe59114f61bae4dbc9a51e",
+      "components/core/src/clp_s/timestamp_parser/TimestampParser.hpp": "db9490ede4e184a335e6c2fd41b4d275aebb9a963d1a8fcbdc3ef25f88ab899d",
+      "components/core/src/clp_s/JsonParser.cpp": "20623cfda9ffcc25504720186048f61bd5ace7ed016e7fa74db4feba34a88368",
+      "components/core/src/clp_s/JsonParser.hpp": "97d34184bef2ea1b0615e3a68368e7c151d32fadd2a4edf746932659d396e1ab",
+      "components/core/src/clp_s/ColumnWriter.cpp": "d0fc22bf25e30aa30fd3cee02c71793dab2af2e4d299aef2712e34cfdb38853d",
+      "components/core/src/clp_s/ColumnWriter.hpp": "c5e9094f976f41dc9247cd7e2dc3b38d3c416daac3fbbe60c38768d4e7803baa",
+      "components/core/src/clp_s/ArchiveWriter.cpp": "4e51e13ea22797401bf30005ae03af18cbfce77ed28187ea07b3a3d33922836c"
+    }
+  },
+  "input": {
+    "path": "components/clp-s/tests/fixtures/sfa-v0.5.0-timestamps-cpp-input.jsonl",
+    "size": 144,
+    "sha256": "6dc00287c52da04bbc307d52522b6371ce9426f7c0718f7579dcfcf523c82446"
+  },
+  "archive": {
+    "path": "components/clp-s/tests/fixtures/sfa-v0.5.0-timestamps-cpp.bin",
+    "size": 474,
+    "sha256": "9e41c1c854fc84a77ab587007e06ff6157a2d75fc6ca0c8fa29c23a16d0a3ffa",
+    "deterministic_without_log_order_metadata": true,
+    "repeat_size": 474,
+    "repeat_sha256": "9e41c1c854fc84a77ab587007e06ff6157a2d75fc6ca0c8fa29c23a16d0a3ffa",
+    "repeat_work_path": "build/cpp-m6-timestamp-repeat.86tqXJ/archive/34348043-fe3b-4ace-9789-9f41fc619a21"
+  },
+  "wire_characterization": {
+    "timestamp_node_id": 1,
+    "range_key": "ts",
+    "range_start_milliseconds": 1422752523004,
+    "range_end_milliseconds": 1700000001123,
+    "pattern_ids": [0, 1, 0, 1],
+    "patterns": [
+      "\"\\Y-\\m-\\dT\\H:\\M:\\S.\\3\"",
+      "\\L"
+    ],
+    "epoch_nanoseconds": [
+      1422752523004000000,
+      1700000000123000000,
+      1422752524004000000,
+      1700000001123000000
+    ]
+  },
+  "verified": {
+    "rust_generated_path": "build/rust-m6-timestamp.sfa",
+    "rust_generated_size": 474,
+    "rust_generated_sha256": "9e41c1c854fc84a77ab587007e06ff6157a2d75fc6ca0c8fa29c23a16d0a3ffa",
+    "whole_archive_byte_identical": true,
+    "rust_reader_extracts_exact_input": true,
+    "cpp_extracts_rust_archive": true,
+    "cpp_extracts_cpp_archive": true,
+    "cpp_extracted_size": 144,
+    "cpp_extracted_sha256": "6dc00287c52da04bbc307d52522b6371ce9426f7c0718f7579dcfcf523c82446",
+    "cpp_rust_archive_extraction_path": "build/cpp-m6-rust-x-final/out/original",
+    "cpp_oracle_work_path": "build/cpp-m6-timestamp-oracle.9mEkQ8/archive/24c8ea6b-b7e2-4a09-8a79-35735eac1efe",
+    "cpp_oracle_extraction_path": "build/cpp-m6-timestamp-x.uRnoZJ/out/original"
+  }
+}

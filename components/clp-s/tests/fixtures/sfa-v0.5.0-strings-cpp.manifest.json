@@ -1,0 +1,49 @@
+{
+  "format_version": "0.5.0",
+  "purpose": "Milestone-3 C++ oracle for VarString, ClpString, dictionaries, logtype escaping, and encoded variables",
+  "generated_at_utc": "2026-08-30",
+  "repository_revision": "7636e26a98a9f78f18964af4d8d951b95602f712",
+  "environment": {
+    "image": "clp-core-dependencies-x86-manylinux_2_28:dev",
+    "image_digest": "sha256:404dc2526ba72b548e69b4b66da5c9f2cabd5cd47d856b7f6d51c0bedfd2fee5",
+    "compiler": "GCC 14.2.1 20250110 (Red Hat 14.2.1-11)",
+    "architecture": "x86_64",
+    "byte_order": "little-endian"
+  },
+  "generator": {
+    "binary": "build/clp-s-reference/core/clp-s",
+    "binary_sha256": "e5042953dedaaec7c95ac6746be6b3d4de6e5629ca9d86ecf45d7e59f0a21284",
+    "arguments": [
+      "c",
+      "--single-file-archive",
+      "--disable-log-order",
+      "--no-retain-float-format",
+      "<output-directory>/archive",
+      "components/clp-s/tests/fixtures/sfa-v0.5.0-strings-cpp-input.jsonl"
+    ],
+    "relevant_source_sha256": {
+      "components/core/src/clp_s/JsonParser.cpp": "20623cfda9ffcc25504720186048f61bd5ace7ed016e7fa74db4feba34a88368",
+      "components/core/src/clp_s/ColumnWriter.cpp": "d0fc22bf25e30aa30fd3cee02c71793dab2af2e4d299aef2712e34cfdb38853d",
+      "components/core/src/clp_s/DictionaryWriter.cpp": "4dd76ecf36005e6dc029222ed9924fbf7817a16c17395de4376418ef0eb483b8",
+      "components/core/src/clp/EncodedVariableInterpreter.cpp": "46c2616d45fc733731c6e913760829a291164fbb762494a3d1d2bc87a5851140",
+      "components/core/src/clp/ir/parsing.cpp": "e21fe1ec2036a70d7f6787f070f1b08e21d3e93a821828655bafc8ae2c7c5629"
+    }
+  },
+  "input": {
+    "path": "components/clp-s/tests/fixtures/sfa-v0.5.0-strings-cpp-input.jsonl",
+    "size": 205,
+    "sha256": "9fbb1ef6327dcb09d77d16828d48045011f6cb7a50ea976639fa78e4a43f39ff"
+  },
+  "archive": {
+    "path": "components/clp-s/tests/fixtures/sfa-v0.5.0-strings-cpp.bin",
+    "size": 504,
+    "sha256": "5496a358b3ecb526e4cb2b4ccd13e510179d25b86d2946057ed9722f5d6a18fe",
+    "deterministic_without_log_order_metadata": true
+  },
+  "verified": {
+    "rust_write_string_sfa_byte_identical": true,
+    "cpp_extracts_rust_archive": true,
+    "cpp_extracted_size": 205,
+    "cpp_extracted_sha256": "9fbb1ef6327dcb09d77d16828d48045011f6cb7a50ea976639fa78e4a43f39ff"
+  }
+}
