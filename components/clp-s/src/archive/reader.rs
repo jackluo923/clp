@@ -96,7 +96,7 @@ impl<R: Read + Seek> SingleFileArchiveReader<R> {
             .read_exact(&mut header_bytes)
             .map_err(OpenError::Io)?;
         let header = ArchiveHeader::decode(&header_bytes).map_err(OpenError::Header)?;
-        if ArchiveVersion::CURRENT != header.version() {
+        if !header.version().is_readable() {
             return Err(OpenError::UnsupportedVersion {
                 actual: header.version(),
             });
@@ -405,8 +405,9 @@ impl Display for OpenError {
             Self::Header(error) => write!(formatter, "invalid structured archive header: {error}"),
             Self::UnsupportedVersion { actual } => write!(
                 formatter,
-                "unsupported structured archive version {actual}; expected {}",
-                ArchiveVersion::CURRENT
+                "unsupported structured archive version {actual}; expected {}.{}.x",
+                ArchiveVersion::CURRENT.major(),
+                ArchiveVersion::CURRENT.minor()
             ),
             Self::Layout(error) => write!(formatter, "invalid structured archive layout: {error}"),
         }

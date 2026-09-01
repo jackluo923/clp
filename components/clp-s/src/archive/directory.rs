@@ -288,7 +288,7 @@ impl<S: DirectoryArchiveSource> DirectoryArchiveReader<S> {
             })?;
         let header =
             ArchiveHeader::decode(&header_bytes).map_err(DirectoryArchiveOpenError::Header)?;
-        if ArchiveVersion::CURRENT != header.version() {
+        if !header.version().is_readable() {
             return Err(DirectoryArchiveOpenError::UnsupportedVersion {
                 actual: header.version(),
             });
@@ -768,8 +768,9 @@ impl Display for DirectoryArchiveOpenError {
             Self::Header(error) => write!(formatter, "invalid directory archive header: {error}"),
             Self::UnsupportedVersion { actual } => write!(
                 formatter,
-                "unsupported structured archive version {actual}; expected {}",
-                ArchiveVersion::CURRENT
+                "unsupported structured archive version {actual}; expected {}.{}.x",
+                ArchiveVersion::CURRENT.major(),
+                ArchiveVersion::CURRENT.minor()
             ),
             Self::SizeOverflow => formatter.write_str("directory archive size overflow"),
             Self::HeaderMemberSizeMismatch { expected, actual } => write!(

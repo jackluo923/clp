@@ -59,6 +59,18 @@ impl ArchiveVersion {
         ])
     }
 
+    /// Whether this crate's readers can decode an archive stamped with this version.
+    ///
+    /// Any patch release of the supported major.minor line is accepted. A patch bump records a
+    /// writer change rather than a layout change: 0.5.1 added RFC 2822 timestamp parsing and left
+    /// every section byte-identical, so rejecting it would refuse archives this crate decodes
+    /// correctly. A differing major or minor is still refused, because that is where layout
+    /// changes land, and reading one as if it were 0.5 would misparse rather than fail.
+    #[must_use]
+    pub const fn is_readable(self) -> bool {
+        self.major == Self::CURRENT.major && self.minor == Self::CURRENT.minor
+    }
+
     /// Returns the major version component.
     #[must_use]
     pub const fn major(self) -> u8 {
@@ -363,6 +375,18 @@ mod tests {
         assert_eq!("0.5.0", ArchiveVersion::CURRENT.to_string());
         assert!(ArchiveVersion::new(0, 4, u16::MAX).can_contain_deprecated_date_string());
         assert!(!ArchiveVersion::CURRENT.can_contain_deprecated_date_string());
+    }
+
+    #[test]
+    fn accepts_every_patch_of_the_supported_line() {
+        assert!(ArchiveVersion::CURRENT.is_readable());
+        // 0.5.1 is what the reference C++ writer emits after the RFC 2822 timestamp change.
+        assert!(ArchiveVersion::new(0, 5, 1).is_readable());
+        assert!(ArchiveVersion::new(0, 5, u16::MAX).is_readable());
+        // A different minor or major changes the layout, so it stays refused.
+        assert!(!ArchiveVersion::new(0, 4, 0).is_readable());
+        assert!(!ArchiveVersion::new(0, 6, 0).is_readable());
+        assert!(!ArchiveVersion::new(1, 5, 0).is_readable());
     }
 
     #[test]
