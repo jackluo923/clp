@@ -249,6 +249,36 @@ impl<'stream, 'archive> SchemaTableStream<'stream, 'archive> {
     }
 }
 
+impl SchemaTableStream<'_, '_> {
+    /// Positions the stream so the next item is the table at `table_index`.
+    ///
+    /// Decoding is lazy but sequential, so a consumer resuming a partially read stream would
+    /// otherwise decode every table it skips past. Seeking is sound because
+    /// [`SchemaTableStream::new`] has already validated that this stream's tables form contiguous,
+    /// in-bounds spans covering the whole buffer, so no table's position depends on having decoded
+    /// the one before it.
+    ///
+    /// `table_index` is archive-wide and physical, matching [`DecodedSchemaTable::table_index`].
+    /// One past the last table is accepted and leaves the stream exhausted. Returns whether the
+    /// index named a valid position; anything else leaves the stream where it was.
+    pub fn seek_to_table(&mut self, table_index: usize) -> bool {
+        let Some(relative) = table_index.checked_sub(self.first_table_index) else {
+            return false;
+        };
+        if relative > self.tables.len() {
+            return false;
+        }
+        self.next_table_index = relative;
+        true
+    }
+
+    /// Returns the archive-wide index of the table this stream would decode next.
+    #[must_use]
+    pub const fn next_table_index(&self) -> usize {
+        self.first_table_index + self.next_table_index
+    }
+}
+
 impl<'stream, 'archive> Iterator for SchemaTableStream<'stream, 'archive> {
     type Item = Result<DecodedSchemaTable<'stream, 'archive>, TableStreamError>;
 
@@ -954,5 +984,50 @@ mod tests {
         assert_eq!(4, second.table().message_count());
         assert!(second.table().is_empty());
         assert!(tables.next().is_none());
+    }
+
+    #[test]
+    fn seeking_repositions_the_stream_and_refuses_indices_outside_it() {
+        let (catalog, stream) = cpp_catalog_and_stream();
+        let construct = || {
+            SchemaTableStream::new(
+                0,
+                stream.as_bytes(),
+                catalog.table_metadata(),
+                catalog.schema_map(),
+                catalog.schema_tree(),
+                catalog.variable_dictionary(),
+                catalog.log_type_dictionary(),
+                catalog.array_dictionary(),
+                catalog.metadata().timestamp_dictionary(),
+                ColumnLimits::default(),
+            )
+            .expect("select C++ fixture stream tables")
+        };
+
+        let mut tables = construct();
+        let first = tables.next_table_index();
+        assert!(tables.seek_to_table(first));
+        assert_eq!(
+            first,
+            tables
+                .next()
+                .expect("a table remains")
+                .expect("the table decodes")
+                .table_index()
+        );
+
+        // One past the last table is a valid resume position and yields nothing.
+        let mut tables = construct();
+        let end = first + tables.len();
+        assert!(tables.seek_to_table(end));
+        assert_eq!(end, tables.next_table_index());
+        assert!(tables.next().is_none());
+
+        // An index outside this stream is refused and leaves the position untouched.
+        let mut tables = construct();
+        let before = tables.next_table_index();
+        assert!(!tables.seek_to_table(end + 1));
+        assert_eq!(before, tables.next_table_index());
     }
 }

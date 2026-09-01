@@ -25,13 +25,14 @@ use clp_s::search::{ArchiveSearchOptions, ParsedQuery};
 ///
 /// Large enough that recompiling the query once per batch is lost in the noise, small enough that
 /// a query matching an entire stream does not hold the whole stream's values at once.
-/// Rows buffered before a batch is handed back.
+/// Rows buffered before a batch is handed back, as a ceiling checked between tables.
 ///
-/// This is a ceiling, not a target. A batch normally ends when a packed stream does, so a stream
-/// is decoded in one forward pass and no table is decoded twice. Only a query matching far more
-/// rows than this stops mid-stream, and resuming then re-walks the stream's earlier tables, which
-/// is why the ceiling is high enough that ordinary windowed queries never reach it.
-const BATCH_ROWS: usize = 262_144;
+/// A batch ends on a table boundary rather than on an exact row count. Stopping mid-table would
+/// force the next call to decode and re-match that table from the start, which is quadratic in a
+/// table's matches; stopping between tables costs nothing, because `seek_to_table` resumes at the
+/// next one without walking the tables before it. Memory is therefore bounded by one table's
+/// matched rows, not by the whole query's.
+const BATCH_ROWS: usize = 8192;
 
 /// Bytes allowed for one reconstructed CLP string.
 const CLP_SCRATCH_LIMIT: usize = 1024 * 1024;
@@ -177,8 +178,6 @@ pub(crate) struct ProjectedScanner {
     stream: Option<DecodedPackedStream>,
     /// Physical table index to resume from, archive-wide.
     table_cursor: usize,
-    /// Row within the resumed table.
-    row_cursor: usize,
     cells: Vec<Cell>,
     text: Vec<u8>,
     emit_cursor: usize,
@@ -219,7 +218,6 @@ impl ProjectedScanner {
             stream_count,
             stream: None,
             table_cursor: 0,
-            row_cursor: 0,
             cells: Vec::new(),
             text: Vec::new(),
             emit_cursor: 0,
@@ -266,7 +264,6 @@ impl ProjectedScanner {
             if !self.drain_current_stream()? {
                 self.stream = None;
                 self.stream_index += 1;
-                self.row_cursor = 0;
             } else {
                 // The stream still has rows but the buffer is full.
                 return Ok(());
@@ -322,7 +319,6 @@ impl ProjectedScanner {
             .filter(|table| table.stream_id() == stream_id)
             .count();
         self.table_cursor += skipped;
-        self.row_cursor = 0;
     }
 
     /// Projects the current stream's matched rows in one forward pass.
@@ -338,65 +334,49 @@ impl ProjectedScanner {
             .parsed
             .compile_for_archive(&self.catalog, self.options.search())
             .map_err(|source| ScanError::Archive(format!("failed to compile query: {source}")))?;
-        let tables = self
+        let mut tables = self
             .catalog
             .schema_tables(stream_id, stream, self.options.columns())
             .map_err(|source| {
                 ScanError::Archive(format!("failed to open stream {stream_id}: {source}"))
             })?;
+        // Resume where the last batch stopped without decoding the tables in between.
+        if !tables.seek_to_table(self.table_cursor) {
+            return Ok(false);
+        }
 
         let mut cells = std::mem::take(&mut self.cells);
         let mut text = std::mem::take(&mut self.text);
         let mut buffered = self.buffered_rows;
         let mut table_cursor = self.table_cursor;
-        let mut row_cursor = self.row_cursor;
         let mut stream_has_more = false;
 
         for decoded in tables {
             let decoded = decoded
                 .map_err(|source| ScanError::Archive(format!("failed to decode table: {source}")))?;
-            if decoded.table_index() < table_cursor {
-                continue;
-            }
             let bitmap = compiled
                 .match_table(&decoded)
                 .map_err(|source| ScanError::Archive(format!("failed to match table: {source}")))?;
             if 0 == bitmap.match_count() {
                 table_cursor = decoded.table_index() + 1;
-                row_cursor = 0;
                 continue;
             }
             let columns = self.column_slots(&decoded);
-            let mut seen = 0_usize;
-            let mut stopped_early = false;
             for row in bitmap.matching_rows() {
-                if seen < row_cursor {
-                    seen += 1;
-                    continue;
-                }
-                if buffered >= BATCH_ROWS {
-                    row_cursor = seen;
-                    stopped_early = true;
-                    break;
-                }
-                seen += 1;
                 project_row(&decoded, &columns, row, &mut cells, &mut text)?;
                 buffered += 1;
             }
-            if stopped_early {
-                table_cursor = decoded.table_index();
+            table_cursor = decoded.table_index() + 1;
+            if buffered >= BATCH_ROWS {
                 stream_has_more = true;
                 break;
             }
-            table_cursor = decoded.table_index() + 1;
-            row_cursor = 0;
         }
 
         self.cells = cells;
         self.text = text;
         self.buffered_rows = buffered;
         self.table_cursor = table_cursor;
-        self.row_cursor = row_cursor;
         Ok(stream_has_more)
     }
 
