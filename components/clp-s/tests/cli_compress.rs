@@ -43,8 +43,7 @@ const EIGHT_BYTE_KV_TIMESTAMP_HEX: &str =
 const FOUR_BYTE_KV_TIMESTAMP_SPLIT_HEX: &str =
     include_str!("fixtures/kv-ir-v0.1.0-timestamp-split-four-cpp.hex");
 const EXPECTED_KV_IR_JSONL: &[u8] = concat!(
-    "{\"level\":\"info\",\"seq\":7,\"empty\":{},",
-    "\"message\":\"task 42 done\",\"none\":null,",
+    "{\"empty\":{},\"message\":\"task 42 done\",\"none\":null,",
     "\"ok\":true,\"ratio\":1.250000}\n"
 )
 .as_bytes();

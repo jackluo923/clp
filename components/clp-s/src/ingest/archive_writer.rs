@@ -828,6 +828,22 @@ impl<'record> RecordEventConsumer<'record> for CapturedRecordEvent<'record> {
         Ok(())
     }
 
+    fn kv_ir_namespace(
+        &mut self,
+        _namespace: super::KvIrNamespace,
+    ) -> Result<(), crate::writer::AppendError> {
+        unreachable!("the JSON record source cannot emit KV-IR namespace boundaries")
+    }
+
+    fn kv_ir_encoded_text(
+        &mut self,
+        _key: &'record [u8],
+        _event: &'record super::KvIrLogEvent<'record>,
+        _pair_index: usize,
+    ) -> Result<(), crate::writer::AppendError> {
+        unreachable!("the JSON record source cannot emit KV-IR encoded text")
+    }
+
     fn object_start(&mut self, key: &'record [u8]) -> Result<(), crate::writer::AppendError> {
         self.event = Some(RecordEventRef::ObjectStart(key));
         Ok(())

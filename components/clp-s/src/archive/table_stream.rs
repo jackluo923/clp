@@ -261,7 +261,7 @@ impl SchemaTableStream<'_, '_> {
     /// `table_index` is archive-wide and physical, matching [`DecodedSchemaTable::table_index`].
     /// One past the last table is accepted and leaves the stream exhausted. Returns whether the
     /// index named a valid position; anything else leaves the stream where it was.
-    pub fn seek_to_table(&mut self, table_index: usize) -> bool {
+    pub const fn seek_to_table(&mut self, table_index: usize) -> bool {
         let Some(relative) = table_index.checked_sub(self.first_table_index) else {
             return false;
         };

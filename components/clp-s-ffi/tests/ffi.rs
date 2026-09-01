@@ -3,6 +3,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::ptr;
 use std::slice;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use clp_s_ffi::*;
 
@@ -28,6 +30,31 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+static NEXT_TEMPORARY_KV_IR_FILE: AtomicU64 = AtomicU64::new(0);
+
+struct TemporaryKvIrFile {
+    path: PathBuf,
+}
+
+impl TemporaryKvIrFile {
+    fn from_raw_stream(raw: &[u8]) -> Self {
+        let sequence = NEXT_TEMPORARY_KV_IR_FILE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "clp-s-ffi-kv-ir-{}-{sequence}.clp.zst",
+            std::process::id()
+        ));
+        let compressed = zstd::stream::encode_all(raw, 1).expect("compress KV-IR fixture");
+        std::fs::write(&path, compressed).expect("write temporary KV-IR fixture");
+        Self { path }
+    }
+}
+
+impl Drop for TemporaryKvIrFile {
+    fn drop(&mut self) {
+        drop(std::fs::remove_file(&self.path));
+    }
+}
+
 struct ArchiveHandle(*mut ClpSArchive);
 
 impl Drop for ArchiveHandle {
@@ -46,6 +73,17 @@ impl Drop for QueryHandle {
         // SAFETY: The wrapper owns exactly one live handle.
         unsafe {
             clp_s_v1_query_free(self.0);
+        }
+    }
+}
+
+struct KvIrScannerHandle(*mut ClpSV2KvIrScanner);
+
+impl Drop for KvIrScannerHandle {
+    fn drop(&mut self) {
+        // SAFETY: The wrapper owns exactly one live handle.
+        unsafe {
+            clp_s_v2_kv_ir_scanner_free(self.0);
         }
     }
 }
@@ -602,6 +640,13 @@ fn reports_frozen_abi_and_library_versions() {
     assert_eq!(2, CLP_S_CALLBACK_ERROR);
     assert_eq!(1, CLP_S_EXTRACT_LOG_ORDER);
     assert_eq!(1, CLP_S_QUERY_IGNORE_CASE);
+    assert_eq!(0, CLP_S_V2_VALUE_ABSENT);
+    assert_eq!(1, CLP_S_V2_VALUE_BOOLEAN);
+    assert_eq!(2, CLP_S_V2_VALUE_INTEGER);
+    assert_eq!(3, CLP_S_V2_VALUE_FLOAT);
+    assert_eq!(4, CLP_S_V2_VALUE_STRING);
+    assert_eq!(5, CLP_S_V2_VALUE_TIMESTAMP);
+    assert_eq!(6, CLP_S_V2_VALUE_UNSUPPORTED);
     assert_eq!(0, CLP_S_KV_IR_ENCODING_DEFAULT);
     assert_eq!(4, CLP_S_KV_IR_ENCODING_FOUR_BYTE);
     assert_eq!(8, CLP_S_KV_IR_ENCODING_EIGHT_BYTE);
@@ -622,6 +667,8 @@ fn reports_frozen_abi_and_library_versions() {
     assert_eq!(8, std::mem::size_of::<ClpSKvIrEventSpan>());
     assert_eq!(32, std::mem::size_of::<ClpSKvIrEventNode>());
     assert_eq!(120, std::mem::size_of::<ClpSKvIrEventView>());
+    assert_eq!(16, std::mem::size_of::<ClpSV2ProjectedField>());
+    assert_eq!(40, std::mem::size_of::<ClpSV2Value>());
 
     let mut required = 0;
     // SAFETY: Null with zero capacity is a documented size probe; `required` is writable.
@@ -655,6 +702,150 @@ fn reports_frozen_abi_and_library_versions() {
     assert_eq!(
         env!("CARGO_PKG_VERSION").as_bytes(),
         &complete[..required - 1]
+    );
+}
+
+const fn v2_value_sentinel() -> ClpSV2Value {
+    ClpSV2Value {
+        kind: u32::MAX,
+        reserved: u32::MAX,
+        integer: i64::MIN,
+        real: f64::from_bits(u64::MAX - 1),
+        text: ptr::dangling(),
+        text_length: usize::MAX,
+    }
+}
+
+fn assert_v2_value_sentinel(value: &ClpSV2Value) {
+    assert_eq!(u32::MAX, value.kind);
+    assert_eq!(u32::MAX, value.reserved);
+    assert_eq!(i64::MIN, value.integer);
+    assert_eq!(u64::MAX - 1, value.real.to_bits());
+    assert_eq!(ptr::dangling::<u8>(), value.text);
+    assert_eq!(usize::MAX, value.text_length);
+}
+
+#[test]
+fn kv_ir_v2_scanner_projects_exact_typed_width_and_owns_its_query() {
+    let stream = TemporaryKvIrFile::from_raw_stream(&decode_hex(FOUR_BYTE_KV_IR_ORACLE_HEX));
+    let query = compile_query("message:TASK*", CLP_S_QUERY_IGNORE_CASE);
+    let names: [&[u8]; 6] = [b"message", b"seq", b"ok", b"ratio", b"none", b"missing"];
+    let fields: Vec<ClpSV2ProjectedField> = names
+        .iter()
+        .map(|name| ClpSV2ProjectedField {
+            path: name.as_ptr(),
+            path_length: name.len(),
+        })
+        .collect();
+    let path = stream.path.to_str().expect("temporary path is UTF-8");
+    let mut scanner = ptr::dangling_mut::<ClpSV2KvIrScanner>();
+    let mut text = [0_u8; 512];
+    let mut error = error_buffer(&mut text);
+    // SAFETY: All inputs and outputs are live and disjoint for this synchronous call.
+    let status = unsafe {
+        clp_s_v2_kv_ir_scanner_open(
+            path.as_ptr(),
+            path.len(),
+            query.0,
+            fields.as_ptr(),
+            fields.len(),
+            &raw mut scanner,
+            &raw mut error,
+        )
+    };
+    assert_eq!(CLP_S_STATUS_OK, status, "{}", error_text(&text));
+    assert!(!scanner.is_null());
+    let scanner = KvIrScannerHandle(scanner);
+    drop(query);
+
+    let sentinel = v2_value_sentinel();
+    let mut values = [sentinel; 7];
+    let mut has_row = u32::MAX;
+    // SAFETY: The scanner is live, six output elements are required, and seven are writable.
+    let status = unsafe {
+        clp_s_v2_kv_ir_scanner_next_row(
+            scanner.0,
+            values.as_mut_ptr(),
+            &raw mut has_row,
+            &raw mut error,
+        )
+    };
+    assert_eq!(CLP_S_STATUS_OK, status, "{}", error_text(&text));
+    assert_eq!(1, has_row);
+    assert!(values[..6].iter().all(|value| 0 == value.reserved));
+    assert_eq!(CLP_S_V2_VALUE_STRING, values[0].kind);
+    assert_eq!(12, values[0].text_length);
+    assert!(!values[0].text.is_null());
+    // SAFETY: The scanner lends exactly `text_length` bytes until its next next-row call.
+    let message = unsafe { slice::from_raw_parts(values[0].text, values[0].text_length) }.to_vec();
+    assert_eq!(b"task 42 done", message.as_slice());
+    assert_eq!(CLP_S_V2_VALUE_INTEGER, values[1].kind);
+    assert_eq!(7, values[1].integer);
+    assert_eq!(CLP_S_V2_VALUE_BOOLEAN, values[2].kind);
+    assert_eq!(1, values[2].integer);
+    assert_eq!(CLP_S_V2_VALUE_FLOAT, values[3].kind);
+    assert_eq!(1.25_f64.to_bits(), values[3].real.to_bits());
+    assert_eq!(CLP_S_V2_VALUE_ABSENT, values[4].kind);
+    assert_eq!(CLP_S_V2_VALUE_ABSENT, values[5].kind);
+    for value in &values[1..6] {
+        assert!(value.text.is_null());
+        assert_eq!(0, value.text_length);
+    }
+    assert_v2_value_sentinel(&values[6]);
+
+    values[..6].fill(sentinel);
+    has_row = u32::MAX;
+    // SAFETY: The scanner and all outputs remain live and disjoint.
+    let status = unsafe {
+        clp_s_v2_kv_ir_scanner_next_row(
+            scanner.0,
+            values.as_mut_ptr(),
+            &raw mut has_row,
+            &raw mut error,
+        )
+    };
+    assert_eq!(CLP_S_STATUS_OK, status, "{}", error_text(&text));
+    assert_eq!(0, has_row);
+    for value in &values {
+        assert_v2_value_sentinel(value);
+    }
+}
+
+#[test]
+fn kv_ir_v2_scanner_rejects_fatal_post_event_truncation() {
+    let mut raw = decode_hex(FOUR_BYTE_KV_IR_ORACLE_HEX);
+    assert_eq!(
+        Some(0),
+        raw.pop(),
+        "canonical fixture ends with explicit stream end"
+    );
+    let stream = TemporaryKvIrFile::from_raw_stream(&raw);
+    let query = compile_query("*: *", 0);
+    let path = stream.path.to_str().expect("temporary path is UTF-8");
+    let mut scanner = ptr::dangling_mut::<ClpSV2KvIrScanner>();
+    let mut text = [0_u8; 512];
+    let mut error = error_buffer(&mut text);
+    // SAFETY: Null fields are valid for a zero field count; every other region is live.
+    let status = unsafe {
+        clp_s_v2_kv_ir_scanner_open(
+            path.as_ptr(),
+            path.len(),
+            query.0,
+            ptr::null(),
+            0,
+            &raw mut scanner,
+            &raw mut error,
+        )
+    };
+    assert_eq!(CLP_S_STATUS_ARCHIVE, status);
+    assert!(
+        scanner.is_null(),
+        "open initializes its handle before failing"
+    );
+    assert!(
+        error_text(&text).contains("truncated"),
+        "{}",
+        error_text(&text)
     );
 }
 

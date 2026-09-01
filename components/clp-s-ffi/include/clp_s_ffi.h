@@ -418,6 +418,7 @@ clp_s_status clp_s_v1_search(
 #define CLP_S_V2_VALUE_UNSUPPORTED 6u
 
 typedef struct clp_s_v2_scanner clp_s_v2_scanner;
+typedef struct clp_s_v2_kv_ir_scanner clp_s_v2_kv_ir_scanner;
 
 /** One requested projection path, as an escaped dot descriptor. */
 typedef struct clp_s_v2_projected_field {
@@ -430,8 +431,8 @@ typedef struct clp_s_v2_projected_field {
  *
  * ABSENT covers both a path this archive does not carry and an explicit null, matching how a
  * missing value reaches SQL. Booleans use 0/1 in `integer`, timestamps epoch nanoseconds. `text`
- * borrows the scanner's batch arena and is valid only until the next
- * `clp_s_v2_scanner_next_row` call on the same scanner.
+ * borrows the scanner's batch arena and is valid only until the next next-row call on, or
+ * destruction of, the owning scanner.
  */
 typedef struct clp_s_v2_value {
     uint32_t kind;
@@ -443,9 +444,9 @@ typedef struct clp_s_v2_value {
 } clp_s_v2_value;
 
 /**
- * Opens a projected scan. `query` must outlive the scanner. A path the archive does not carry is
- * reported ABSENT on every row rather than refused, because a dataset's schemas need not all
- * carry every field.
+ * Opens a projected scan. `query` and every field descriptor are borrowed only for this call. A
+ * path the archive does not carry is reported ABSENT on every row rather than refused, because a
+ * dataset's schemas need not all carry every field.
  */
 clp_s_status clp_s_v2_scanner_open(
         const uint8_t *archive_path,
@@ -471,6 +472,39 @@ clp_s_status clp_s_v2_scanner_next_row(
 /** Frees a scanner handle. A null handle is a no-op. */
 void clp_s_v2_scanner_free(clp_s_v2_scanner *scanner);
 
+/**
+ * Opens a projected scan over the first stream in a local zstd-framed KV-IR file. `query` and every
+ * field descriptor are borrowed only for this call. `fields` may be NULL only when `field_count`
+ * is zero; `out_scanner` is initialized to NULL before validation. Missing, explicit-null, and
+ * empty-object values are ABSENT; unstructured arrays and unrepresentable value kinds are
+ * UNSUPPORTED. The narrow live-ingest truncation accepted by C++ retains complete preceding
+ * events; every other decode, input, query, or resource failure fails this call.
+ */
+clp_s_status clp_s_v2_kv_ir_scanner_open(
+        const uint8_t *stream_path,
+        size_t stream_path_length,
+        const clp_s_query *query,
+        const clp_s_v2_projected_field *fields,
+        size_t field_count,
+        clp_s_v2_kv_ir_scanner **out_scanner,
+        clp_s_error_buffer *error
+);
+
+/**
+ * Delivers the next matching KV-IR event in requested-field order. `out_values` must hold the
+ * scanner's `field_count` elements (and may be NULL only when that count is zero). `out_has_row`
+ * receives one on success or zero at exhaustion; at exhaustion `out_values` is untouched.
+ */
+clp_s_status clp_s_v2_kv_ir_scanner_next_row(
+        clp_s_v2_kv_ir_scanner *scanner,
+        clp_s_v2_value *out_values,
+        uint32_t *out_has_row,
+        clp_s_error_buffer *error
+);
+
+/** Frees a KV-IR scanner handle. A null handle is a no-op. */
+void clp_s_v2_kv_ir_scanner_free(clp_s_v2_kv_ir_scanner *scanner);
+
 #if defined(__cplusplus)
 #define CLP_S_ABI_STATIC_ASSERT(condition, message) static_assert((condition), message)
 #elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
@@ -490,6 +524,48 @@ CLP_S_ABI_STATIC_ASSERT(
 CLP_S_ABI_STATIC_ASSERT(
         sizeof(clp_s_error_buffer) == sizeof(void *) + 2 * sizeof(size_t),
         "clp_s_error_buffer layout differs from ABI v1"
+);
+
+CLP_S_ABI_STATIC_ASSERT(
+        offsetof(clp_s_v2_projected_field, path) == 0,
+        "v2 field path offset"
+);
+CLP_S_ABI_STATIC_ASSERT(
+        offsetof(clp_s_v2_projected_field, path_length) == sizeof(void *),
+        "v2 field length offset"
+);
+CLP_S_ABI_STATIC_ASSERT(
+        sizeof(clp_s_v2_projected_field) == sizeof(void *) + sizeof(size_t),
+        "v2 field size"
+);
+CLP_S_ABI_STATIC_ASSERT(offsetof(clp_s_v2_value, kind) == 0, "v2 value kind offset");
+CLP_S_ABI_STATIC_ASSERT(
+        offsetof(clp_s_v2_value, reserved) == sizeof(uint32_t),
+        "v2 value reserved offset"
+);
+CLP_S_ABI_STATIC_ASSERT(
+        offsetof(clp_s_v2_value, integer) == 2 * sizeof(uint32_t),
+        "v2 value integer offset"
+);
+CLP_S_ABI_STATIC_ASSERT(
+        offsetof(clp_s_v2_value, real) == 2 * sizeof(uint32_t) + sizeof(int64_t),
+        "v2 value real offset"
+);
+CLP_S_ABI_STATIC_ASSERT(
+        offsetof(clp_s_v2_value, text)
+                == 2 * sizeof(uint32_t) + sizeof(int64_t) + sizeof(double),
+        "v2 value text offset"
+);
+CLP_S_ABI_STATIC_ASSERT(
+        offsetof(clp_s_v2_value, text_length)
+                == 2 * sizeof(uint32_t) + sizeof(int64_t) + sizeof(double) + sizeof(void *),
+        "v2 value text length offset"
+);
+CLP_S_ABI_STATIC_ASSERT(
+        sizeof(clp_s_v2_value)
+                == 2 * sizeof(uint32_t) + sizeof(int64_t) + sizeof(double) + sizeof(void *)
+                           + sizeof(size_t),
+        "v2 value size"
 );
 
 CLP_S_ABI_STATIC_ASSERT(offsetof(clp_s_record, json) == 0, "record JSON offset");

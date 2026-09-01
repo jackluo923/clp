@@ -156,6 +156,21 @@ pub const CLP_S_EXTRACT_LOG_ORDER: u32 = 1;
 /// Fold ASCII case during query matching.
 pub const CLP_S_QUERY_IGNORE_CASE: u32 = 1;
 
+/// A projected path is missing, explicitly null, or an empty object.
+pub const CLP_S_V2_VALUE_ABSENT: u32 = columnar::kind::ABSENT;
+/// A projected Boolean whose value is zero or one in `integer`.
+pub const CLP_S_V2_VALUE_BOOLEAN: u32 = columnar::kind::BOOLEAN;
+/// A projected signed 64-bit integer.
+pub const CLP_S_V2_VALUE_INTEGER: u32 = columnar::kind::INTEGER;
+/// A projected IEEE-754 double.
+pub const CLP_S_V2_VALUE_FLOAT: u32 = columnar::kind::FLOAT;
+/// A projected byte string borrowed from the scanner.
+pub const CLP_S_V2_VALUE_STRING: u32 = columnar::kind::STRING;
+/// A projected timestamp represented as epoch nanoseconds in `integer`.
+pub const CLP_S_V2_VALUE_TIMESTAMP: u32 = columnar::kind::TIMESTAMP;
+/// A present value kind that this ABI cannot represent directly.
+pub const CLP_S_V2_VALUE_UNSUPPORTED: u32 = columnar::kind::UNSUPPORTED;
+
 /// Use the ABI's default KV-IR encoding (four-byte in ABI v1).
 pub const CLP_S_KV_IR_ENCODING_DEFAULT: u32 = 0;
 /// Use four-byte encoded variables in the KV-IR stream.
@@ -1623,6 +1638,46 @@ pub struct ClpSV2ProjectedField {
     pub path_length: usize,
 }
 
+const _: () = {
+    assert!(std::mem::offset_of!(ClpSV2ProjectedField, path) == 0);
+    assert!(
+        std::mem::offset_of!(ClpSV2ProjectedField, path_length) == std::mem::size_of::<*const u8>()
+    );
+    assert!(
+        std::mem::size_of::<ClpSV2ProjectedField>()
+            == std::mem::size_of::<*const u8>() + std::mem::size_of::<usize>()
+    );
+
+    assert!(std::mem::offset_of!(ClpSV2Value, kind) == 0);
+    assert!(std::mem::offset_of!(ClpSV2Value, reserved) == std::mem::size_of::<u32>());
+    assert!(std::mem::offset_of!(ClpSV2Value, integer) == 2 * std::mem::size_of::<u32>());
+    assert!(
+        std::mem::offset_of!(ClpSV2Value, real)
+            == 2 * std::mem::size_of::<u32>() + std::mem::size_of::<i64>()
+    );
+    assert!(
+        std::mem::offset_of!(ClpSV2Value, text)
+            == 2 * std::mem::size_of::<u32>()
+                + std::mem::size_of::<i64>()
+                + std::mem::size_of::<f64>()
+    );
+    assert!(
+        std::mem::offset_of!(ClpSV2Value, text_length)
+            == 2 * std::mem::size_of::<u32>()
+                + std::mem::size_of::<i64>()
+                + std::mem::size_of::<f64>()
+                + std::mem::size_of::<*const u8>()
+    );
+    assert!(
+        std::mem::size_of::<ClpSV2Value>()
+            == 2 * std::mem::size_of::<u32>()
+                + std::mem::size_of::<i64>()
+                + std::mem::size_of::<f64>()
+                + std::mem::size_of::<*const u8>()
+                + std::mem::size_of::<usize>()
+    );
+};
+
 /// Opaque projected-scan handle.
 pub struct ClpSV2Scanner {
     inner: columnar::ProjectedScanner,
@@ -1691,10 +1746,9 @@ pub unsafe extern "C" fn clp_s_v2_scanner_open(
             let archive = ClpSArchive::validate(PathBuf::from(path_text))?;
             let reader = archive.open_reader()?;
             let inner = columnar::ProjectedScanner::open(
-                PathBuf::from(path_text),
                 reader,
                 query.parsed.clone(),
-                query.options,
+                &query.options,
                 &paths,
             )
             .map_err(|source| ApiError::Archive(source.to_string()))?;
@@ -1775,8 +1829,8 @@ pub unsafe extern "C" fn clp_s_v2_scanner_next_row(
                     text_length: cell.text_length,
                 };
             }
-            for index in 0..field_count {
-                out_values.add(index).write(scanner.values[index]);
+            for (index, value) in scanner.values.iter().copied().enumerate() {
+                out_values.add(index).write(value);
             }
             out_has_row.write(1);
             Ok(())
@@ -1927,8 +1981,8 @@ pub unsafe extern "C" fn clp_s_v2_kv_ir_scanner_next_row(
                     text_length: cell.text_length,
                 };
             }
-            for index in 0..field_count {
-                out_values.add(index).write(scanner.values[index]);
+            for (index, value) in scanner.values.iter().copied().enumerate() {
+                out_values.add(index).write(value);
             }
             out_has_row.write(1);
             Ok(())

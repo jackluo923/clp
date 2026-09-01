@@ -41,11 +41,11 @@ use crate::archive::DecodedSchemaTable;
 use crate::archive::EncodedVariableError;
 use crate::archive::NodeType;
 use crate::archive::RangeIndexValue;
-use crate::log_order::locate_log_order_column;
 use crate::archive::SchemaEntry;
 use crate::archive::SchemaTree;
 use crate::archive::TimestampBounds;
 use crate::archive::append_clp_message_bounded;
+use crate::log_order::locate_log_order_column;
 
 /// Resource limits for archive semantic compilation and one table match.
 ///
@@ -616,7 +616,6 @@ pub struct CompiledQuery<'query, 'archive> {
     nodes: Vec<CompiledNode>,
     predicates: Vec<CompiledPredicate>,
     lists: Vec<CompiledList>,
-    table_record_starts: Vec<u64>,
     authoritative_timestamp_range: Option<CompiledAuthoritativeTimestampRange>,
 }
 
@@ -650,7 +649,7 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
             limits.max_resolved_nodes(),
         )?;
         let schema_index = SchemaIndex::new(catalog.schema_tree(), limits)?;
-        let table_record_starts = build_table_starts(catalog, limits)?;
+        validate_archive_tables(catalog, limits)?;
         let authoritative_timestamp_range =
             compile_authoritative_timestamp_range(catalog, options)?;
         let mut builder = Compiler::new(query, catalog, options, schema_index)?;
@@ -662,7 +661,6 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
             nodes: builder.nodes,
             predicates: builder.predicates,
             lists: builder.lists,
-            table_record_starts,
             authoritative_timestamp_range,
         })
     }
@@ -825,10 +823,10 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
             return Ok(Tri::False);
         };
         for entry in range_index.entries() {
-            if let Some((start, end)) = span {
-                if entry.end_index() <= start || entry.start_index() >= end {
-                    continue;
-                }
+            if let Some((start, end)) = span
+                && (entry.end_index() <= start || entry.start_index() >= end)
+            {
+                continue;
             }
             if Tri::True
                 == evaluate_range_fields(
@@ -2411,28 +2409,23 @@ fn push_resolved(resolved: &mut Vec<u32>, node_id: usize, limit: usize) -> Resul
     Ok(())
 }
 
-fn build_table_starts(
+fn validate_archive_tables(
     catalog: &ArchiveCatalog,
     limits: SearchLimits,
-) -> Result<Vec<u64>, SearchError> {
+) -> Result<(), SearchError> {
     let tables = catalog.table_metadata().schema_tables();
     check_limit(
         SearchResource::ArchiveTables,
         tables.len(),
         limits.max_archive_tables(),
     )?;
-    let mut starts = Vec::new();
-    starts
-        .try_reserve_exact(tables.len())
-        .map_err(|_| allocation(SearchResource::ArchiveTables, tables.len()))?;
     let mut next = 0_u64;
     for table in tables {
-        starts.push(next);
         next = next
             .checked_add(table.message_count())
             .ok_or(SearchError::SizeOverflow)?;
     }
-    Ok(starts)
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -3269,7 +3262,7 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
             if log_event_idx < 0 {
                 continue;
             }
-            let idx = log_event_idx as u64;
+            let idx = log_event_idx.cast_unsigned();
             for (start, end, result) in &evaluated {
                 if idx >= *start && idx < *end {
                     bitmap[row] = *result as u8;

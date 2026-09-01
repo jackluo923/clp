@@ -153,6 +153,7 @@ int main(int argc, char **argv) {
     clp_s_archive *archive = NULL;
     clp_s_query *query = NULL;
     clp_s_kv_ir_serializer *serializer = NULL;
+    clp_s_v2_kv_ir_scanner *kv_scanner = NULL;
     struct callback_state state = {0, 0};
     uint64_t delivered = 0;
     clp_s_status status;
@@ -513,5 +514,6 @@ int main(int argc, char **argv) {
     clp_s_v1_kv_ir_serializer_free(NULL);
     clp_s_v1_query_free(NULL);
     clp_s_v1_archive_free(NULL);
+    clp_s_v2_kv_ir_scanner_free(kv_scanner);
     return EXIT_SUCCESS;
 }

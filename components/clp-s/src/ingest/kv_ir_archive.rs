@@ -14,12 +14,14 @@
 //! reparsing JSON or allocating a record tree. Matching booleans, nulls, objects, and arrays retain
 //! their ordinary values instead of reproducing the pinned C++ writer's wrong-variant failure.
 //!
-//! CLP encoded-text ASTs are decoded to their exact byte strings before being passed to the
-//! generic archive writer. The current writer does not accept a pre-encoded AST, so a dictionary
-//! variable that itself looks numeric may be reclassified physically on output; extraction still
-//! reproduces the exact decoded value.
+//! Ordinary CLP encoded-text ASTs are validated and passed directly to the archive writer without
+//! reconstructing or rescanning their decoded text. Timestamp candidates and unstructured arrays
+//! still reconstruct an exact lexeme because timestamp parsing and JSON-array validation require
+//! it. Four-byte dictionary variables retain the C++ reclassification rules, while eight-byte
+//! dictionary variables retain their dictionary representation.
 
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::fmt::Display;
@@ -43,20 +45,24 @@ use super::KvIrSink;
 use super::KvIrTimestampResolver;
 use super::timestamp::KvIrResolvedTimestamp;
 use crate::archive::RangeIndexValue;
+use crate::writer::ArchiveSetAppendError;
 use crate::writer::ArchiveSetError;
 use crate::writer::ArchiveSetStatsCallback;
 use crate::writer::ArchiveSetWriter;
 use crate::writer::ArchiveSourceContext;
 use crate::writer::ArchiveSourceContextError;
+use crate::writer::FieldRef;
 use crate::writer::FinalizedArchiveSink;
-use crate::writer::RecordEventRef;
+use crate::writer::RecordEventAppendError;
+use crate::writer::RecordEventConsumer;
+use crate::writer::ReplayableRecordEventSource;
 use crate::writer::TimestampRef;
 use crate::writer::UnstructuredArrayRef;
 use crate::writer::ValueRef;
 
 const MEBIBYTE: u64 = 1024 * 1024;
-const NO_PAIR: usize = usize::MAX;
 const FIXED_FLOAT_BUFFER_BYTES: usize = 384;
+const NO_SPARSE_INDEX: u32 = u32::MAX;
 
 struct FixedFloatBuffer {
     bytes: [u8; FIXED_FLOAT_BUFFER_BYTES],
@@ -238,6 +244,8 @@ pub enum KvIrArchiveResource {
     SchemaKey,
     /// Per-event node-to-pair selection maps.
     SelectionMap,
+    /// Per-event links between selected schema paths.
+    SparseTraversal,
     /// Iterative schema traversal frames.
     TraversalStack,
     /// Writer-native event plan.
@@ -252,6 +260,7 @@ impl Display for KvIrArchiveResource {
             Self::SchemaNodes => "schema nodes",
             Self::SchemaKey => "schema key",
             Self::SelectionMap => "event selection map",
+            Self::SparseTraversal => "sparse event traversal",
             Self::TraversalStack => "schema traversal stack",
             Self::RecordPlan => "record event plan",
             Self::ReconstructedText => "reconstructed encoded text",
@@ -699,26 +708,29 @@ impl KvIrArchiveStats {
 
 #[derive(Debug)]
 struct SchemaNode {
-    parent: usize,
-    first_child: Option<usize>,
-    last_child: Option<usize>,
-    next_sibling: Option<usize>,
     key: Vec<u8>,
+    parent: u32,
+    timestamp_prefix_length: Option<u32>,
     node_type: KvIrNodeType,
-    timestamp_prefix_length: Option<usize>,
 }
 
 impl SchemaNode {
     const fn root() -> Self {
         Self {
             parent: 0,
-            first_child: None,
-            last_child: None,
-            next_sibling: None,
             key: Vec::new(),
             node_type: KvIrNodeType::Object,
             timestamp_prefix_length: None,
         }
+    }
+
+    fn parent(&self) -> usize {
+        usize::try_from(self.parent).expect("validated schema parent ID fits usize")
+    }
+
+    fn timestamp_prefix_length(&self) -> Option<usize> {
+        self.timestamp_prefix_length
+            .and_then(|length| usize::try_from(length).ok())
     }
 }
 
@@ -784,21 +796,12 @@ impl SchemaTree {
                 requested_additional: 1,
             })?;
         self.nodes.push(SchemaNode {
-            parent,
-            first_child: None,
-            last_child: None,
-            next_sibling: None,
             key,
+            parent: node.parent_id(),
             node_type: node.node_type(),
             timestamp_prefix_length: None,
         });
         self.update_timestamp_prefix(actual, node.namespace(), resolver);
-        if let Some(previous) = self.nodes[parent].last_child {
-            self.nodes[previous].next_sibling = Some(actual);
-        } else {
-            self.nodes[parent].first_child = Some(actual);
-        }
-        self.nodes[parent].last_child = Some(actual);
         Ok(())
     }
 
@@ -827,17 +830,17 @@ impl SchemaTree {
             self.nodes[node_id].timestamp_prefix_length = None;
             return;
         };
-        let parent = self.nodes[node_id].parent;
+        let parent = self.nodes[node_id].parent();
         let Some(prefix_length) = self.nodes[parent].timestamp_prefix_length else {
             self.nodes[node_id].timestamp_prefix_length = None;
             return;
         };
-        self.nodes[node_id].timestamp_prefix_length = resolver
-            .path()
-            .components()
-            .get(prefix_length)
+        let prefix_index = usize::try_from(prefix_length).ok();
+        self.nodes[node_id].timestamp_prefix_length = prefix_index
+            .and_then(|prefix_index| resolver.path().components().get(prefix_index))
             .is_some_and(|component| component.as_bytes() == self.nodes[node_id].key)
-            .then(|| prefix_length + 1);
+            .then(|| prefix_length.checked_add(1))
+            .flatten();
     }
 }
 
@@ -871,6 +874,7 @@ enum PlannedEvent {
         node_id: usize,
         pair_index: usize,
         reconstructed: Option<ScratchSpan>,
+        direct_encoded_text: bool,
         unstructured_array: bool,
         timestamp: Option<PlannedTimestamp>,
     },
@@ -882,6 +886,90 @@ struct WalkFrame {
     close_object: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SparseLinks {
+    first_child: u32,
+    next_sibling: u32,
+}
+
+impl SparseLinks {
+    const EMPTY: Self = Self {
+        first_child: NO_SPARSE_INDEX,
+        next_sibling: NO_SPARSE_INDEX,
+    };
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<SparseLinks>() == std::mem::size_of::<u64>());
+};
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SelectionSlot {
+    epoch: u32,
+    pair_index_plus_one: u32,
+    active_index_plus_one: u32,
+}
+
+impl SelectionSlot {
+    const fn is_included(self, epoch: u32) -> bool {
+        self.epoch == epoch
+    }
+
+    const fn selected_pair_index(self, epoch: u32) -> Option<u32> {
+        if self.is_included(epoch) {
+            self.pair_index_plus_one.checked_sub(1)
+        } else {
+            None
+        }
+    }
+
+    const fn active_index(self, epoch: u32) -> Option<u32> {
+        if self.is_included(epoch) {
+            self.active_index_plus_one.checked_sub(1)
+        } else {
+            None
+        }
+    }
+
+    fn select(&mut self, epoch: u32, pair_index: usize) -> Result<(), KvIrArchiveFailure> {
+        let pair_index = u32::try_from(pair_index)
+            .map_err(|_| KvIrArchiveFailure::SizeOverflow)?
+            .checked_add(1)
+            .ok_or(KvIrArchiveFailure::SizeOverflow)?;
+        self.epoch = epoch;
+        self.pair_index_plus_one = pair_index;
+        Ok(())
+    }
+
+    fn set_active_index(
+        &mut self,
+        epoch: u32,
+        active_index: usize,
+    ) -> Result<(), KvIrArchiveFailure> {
+        debug_assert!(self.is_included(epoch));
+        self.active_index_plus_one = u32::try_from(active_index)
+            .map_err(|_| KvIrArchiveFailure::SizeOverflow)?
+            .checked_add(1)
+            .ok_or(KvIrArchiveFailure::SizeOverflow)?;
+        Ok(())
+    }
+
+    const fn include(&mut self, epoch: u32) -> bool {
+        if self.epoch == epoch {
+            false
+        } else {
+            self.epoch = epoch;
+            self.pair_index_plus_one = 0;
+            self.active_index_plus_one = 0;
+            true
+        }
+    }
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<SelectionSlot>() == 3 * std::mem::size_of::<u32>());
+};
+
 /// Reusable KV-IR sink that appends complete events to a caller-owned archive-set session.
 pub struct KvIrArchiveSetSink<'archive, S, C> {
     archive_set: &'archive mut ArchiveSetWriter<S, C>,
@@ -890,13 +978,16 @@ pub struct KvIrArchiveSetSink<'archive, S, C> {
     auto_schema: SchemaTree,
     user_schema: SchemaTree,
     schema_key_bytes: u64,
-    selected_auto: Vec<usize>,
-    selected_user: Vec<usize>,
-    included_auto: Vec<bool>,
-    included_user: Vec<bool>,
+    selection_auto: Vec<SelectionSlot>,
+    selection_user: Vec<SelectionSlot>,
+    selection_epoch: u32,
+    active_auto: Vec<u32>,
+    active_user: Vec<u32>,
+    sparse_links: Vec<SparseLinks>,
     traversal: Vec<WalkFrame>,
     plan: Vec<PlannedEvent>,
     reconstructed: Vec<u8>,
+    direct_reconstructed_bytes: usize,
     active_stream: bool,
     accounted_input_bytes: u64,
     stats: KvIrArchiveStats,
@@ -962,13 +1053,16 @@ where
             auto_schema: SchemaTree::default(),
             user_schema: SchemaTree::default(),
             schema_key_bytes: 0,
-            selected_auto: Vec::new(),
-            selected_user: Vec::new(),
-            included_auto: Vec::new(),
-            included_user: Vec::new(),
+            selection_auto: Vec::new(),
+            selection_user: Vec::new(),
+            selection_epoch: 0,
+            active_auto: Vec::new(),
+            active_user: Vec::new(),
+            sparse_links: Vec::new(),
             traversal: Vec::new(),
             plan: Vec::new(),
             reconstructed: Vec::new(),
+            direct_reconstructed_bytes: 0,
             active_stream: false,
             accounted_input_bytes: 0,
             stats: KvIrArchiveStats::default(),
@@ -1245,19 +1339,24 @@ where
     }
 
     fn prepare_selection(&mut self, event: KvIrLogEvent<'_>) -> Result<(), KvIrArchiveFailure> {
-        resize_selection(
-            &mut self.selected_auto,
-            &mut self.included_auto,
-            self.auto_schema.nodes.len(),
-        )?;
-        resize_selection(
-            &mut self.selected_user,
-            &mut self.included_user,
-            self.user_schema.nodes.len(),
-        )?;
+        self.active_auto.clear();
+        self.active_user.clear();
+        self.next_selection_epoch();
+        resize_selection(&mut self.selection_auto, self.auto_schema.nodes.len())?;
+        resize_selection(&mut self.selection_user, self.user_schema.nodes.len())?;
         for (pair_index, pair) in event.pairs().enumerate() {
             self.select_pair(pair, pair_index)?;
         }
+        order_active(
+            &mut self.selection_auto,
+            &mut self.active_auto,
+            self.selection_epoch,
+        )?;
+        order_active(
+            &mut self.selection_user,
+            &mut self.active_user,
+            self.selection_epoch,
+        )?;
         Ok(())
     }
 
@@ -1268,16 +1367,17 @@ where
     ) -> Result<(), KvIrArchiveFailure> {
         let node_id =
             usize::try_from(pair.node_id()).map_err(|_| KvIrArchiveFailure::SizeOverflow)?;
-        let (tree, selected, included) = match pair.namespace() {
+        let selection_epoch = self.selection_epoch;
+        let (tree, selection, active) = match pair.namespace() {
             KvIrNamespace::AutoGenerated => (
                 &self.auto_schema,
-                &mut self.selected_auto,
-                &mut self.included_auto,
+                &mut self.selection_auto,
+                &mut self.active_auto,
             ),
             KvIrNamespace::UserGenerated => (
                 &self.user_schema,
-                &mut self.selected_user,
-                &mut self.included_user,
+                &mut self.selection_user,
+                &mut self.active_user,
             ),
         };
         if node_id == 0 || node_id >= tree.nodes.len() {
@@ -1288,7 +1388,10 @@ where
                 },
             ));
         }
-        if selected[node_id] != NO_PAIR {
+        if selection[node_id]
+            .selected_pair_index(selection_epoch)
+            .is_some()
+        {
             return Err(KvIrArchiveFailure::Invalid(
                 KvIrArchiveInvalidData::DuplicateEventNode {
                     namespace: pair.namespace(),
@@ -1296,15 +1399,24 @@ where
                 },
             ));
         }
-        selected[node_id] = pair_index;
         let mut ancestor = node_id;
         loop {
-            included[ancestor] = true;
+            if !selection[ancestor].include(selection_epoch) {
+                break;
+            }
+            active
+                .try_reserve(1)
+                .map_err(|_| KvIrArchiveFailure::AllocationFailed {
+                    resource: KvIrArchiveResource::SparseTraversal,
+                    requested_additional: 1,
+                })?;
+            active.push(u32::try_from(ancestor).map_err(|_| KvIrArchiveFailure::SizeOverflow)?);
             if ancestor == 0 {
                 break;
             }
-            ancestor = tree.nodes[ancestor].parent;
+            ancestor = tree.nodes[ancestor].parent();
         }
+        selection[node_id].select(selection_epoch, pair_index)?;
         Ok(())
     }
 
@@ -1338,27 +1450,34 @@ where
         event: KvIrLogEvent<'_>,
         resolver: Option<&KvIrTimestampResolver>,
     ) -> Result<(), KvIrArchiveFailure> {
+        self.build_sparse_links(namespace)?;
         self.traversal.clear();
-        let first_child = self.tree(namespace).nodes[0].first_child;
+        let first_child = self
+            .sparse_links
+            .first()
+            .map_or(Ok(None), |links| sparse_index(links.first_child))?;
         self.push_frame(WalkFrame {
             next_child: first_child,
             close_object: false,
         })?;
         while let Some(frame_index) = self.traversal.len().checked_sub(1) {
-            let Some(node_id) = self.traversal[frame_index].next_child else {
+            let Some(active_index) = self.traversal[frame_index].next_child else {
                 let close_object = self.traversal.pop().expect("frame exists").close_object;
                 if close_object {
                     self.push_plan(PlannedEvent::ObjectEnd)?;
                 }
                 continue;
             };
-            let next_sibling = self.tree(namespace).nodes[node_id].next_sibling;
+            let node_id = usize::try_from(self.active(namespace)[active_index])
+                .map_err(|_| KvIrArchiveFailure::SizeOverflow)?;
+            let links = self.sparse_links[active_index];
+            let next_sibling = sparse_index(links.next_sibling)?;
             self.traversal[frame_index].next_child = next_sibling;
-            if !self.included(namespace)[node_id] {
-                continue;
-            }
-            let pair_index = self.selected(namespace)[node_id];
-            if pair_index != NO_PAIR {
+            let selection = self.selection(namespace)[node_id];
+            debug_assert!(selection.is_included(self.selection_epoch));
+            if let Some(pair_index) = selection.selected_pair_index(self.selection_epoch) {
+                let pair_index =
+                    usize::try_from(pair_index).map_err(|_| KvIrArchiveFailure::SizeOverflow)?;
                 self.plan_selected(namespace, node_id, pair_index, event, resolver)?;
                 continue;
             }
@@ -1371,12 +1490,54 @@ where
                     },
                 ));
             }
-            let child = self.tree(namespace).nodes[node_id].first_child;
+            let child = sparse_index(links.first_child)?;
             self.push_plan(PlannedEvent::ObjectStart { namespace, node_id })?;
             self.push_frame(WalkFrame {
                 next_child: child,
                 close_object: true,
             })?;
+        }
+        Ok(())
+    }
+
+    fn build_sparse_links(&mut self, namespace: KvIrNamespace) -> Result<(), KvIrArchiveFailure> {
+        let (tree, active, selection) = match namespace {
+            KvIrNamespace::AutoGenerated => {
+                (&self.auto_schema, &self.active_auto, &self.selection_auto)
+            }
+            KvIrNamespace::UserGenerated => {
+                (&self.user_schema, &self.active_user, &self.selection_user)
+            }
+        };
+        if active.first().is_some_and(|node_id| *node_id != 0) {
+            return Err(KvIrArchiveFailure::SizeOverflow);
+        }
+        self.sparse_links.clear();
+        self.sparse_links.try_reserve(active.len()).map_err(|_| {
+            KvIrArchiveFailure::AllocationFailed {
+                resource: KvIrArchiveResource::SparseTraversal,
+                requested_additional: active.len(),
+            }
+        })?;
+        self.sparse_links.resize(active.len(), SparseLinks::EMPTY);
+        for child_index in (1..active.len()).rev() {
+            let node_id = usize::try_from(active[child_index])
+                .map_err(|_| KvIrArchiveFailure::SizeOverflow)?;
+            let parent_id = tree.nodes[node_id].parent();
+            let parent_index = selection
+                .get(parent_id)
+                .and_then(|slot| slot.active_index(self.selection_epoch))
+                .ok_or(KvIrArchiveFailure::SizeOverflow)?;
+            let parent_index =
+                usize::try_from(parent_index).map_err(|_| KvIrArchiveFailure::SizeOverflow)?;
+            let child_index_u32 =
+                u32::try_from(child_index).map_err(|_| KvIrArchiveFailure::SizeOverflow)?;
+            if child_index_u32 == NO_SPARSE_INDEX {
+                return Err(KvIrArchiveFailure::SizeOverflow);
+            }
+            self.sparse_links[child_index].next_sibling =
+                self.sparse_links[parent_index].first_child;
+            self.sparse_links[parent_index].first_child = child_index_u32;
         }
         Ok(())
     }
@@ -1404,11 +1565,12 @@ where
             KvIrArchiveInvalidData::MissingPlannedPair { pair_index },
         ))?;
         let mut reconstructed = None;
+        let mut direct_encoded_text = false;
         let mut timestamp = None;
         let unstructured_array =
             self.tree(namespace).nodes[node_id].node_type == KvIrNodeType::UnstructuredArray;
         let timestamp_resolver = resolver.filter(|resolver| {
-            self.tree(namespace).nodes[node_id].timestamp_prefix_length
+            self.tree(namespace).nodes[node_id].timestamp_prefix_length()
                 == Some(resolver.path().components().len())
         });
         match pair.value().kind() {
@@ -1453,11 +1615,15 @@ where
                 )?);
                 reconstructed = Some(text.lexeme);
             }
-            super::KvIrValueKind::EncodedText(text) => {
+            super::KvIrValueKind::EncodedText(text) if unstructured_array => {
                 reconstructed = Some(
                     self.reconstruct_text(namespace, pair.node_id(), text, false)?
                         .lexeme,
                 );
+            }
+            super::KvIrValueKind::EncodedText(text) => {
+                self.validate_direct_encoded_text(namespace, pair.node_id(), text)?;
+                direct_encoded_text = true;
             }
             super::KvIrValueKind::EmptyObject => {
                 self.push_plan(PlannedEvent::ObjectStart { namespace, node_id })?;
@@ -1470,6 +1636,7 @@ where
             node_id,
             pair_index,
             reconstructed,
+            direct_encoded_text,
             unstructured_array,
             timestamp,
         })
@@ -1558,6 +1725,113 @@ where
         KvIrTimestampResolver::resolve_string(value)
             .map(planned_timestamp)
             .map_err(|source| timestamp_failure(namespace, node_id, source))
+    }
+
+    fn validate_direct_encoded_text(
+        &mut self,
+        namespace: KvIrNamespace,
+        node_id: u32,
+        text: KvIrEncodedText<'_>,
+    ) -> Result<(), KvIrArchiveFailure> {
+        let unsupported = |source| KvIrArchiveFailure::Unsupported {
+            namespace,
+            node_id,
+            source,
+        };
+        let mut value_len = 0_usize;
+        let mut encoded = text.encoded_variables();
+        let mut dictionaries = text.dictionary_variables();
+        let logtype = text.logtype();
+        let mut position = 0_usize;
+        while position < logtype.len() {
+            let byte = logtype[position];
+            if !matches!(byte, b'\\' | 0x11..=0x13) {
+                let literal_start = position;
+                position = position
+                    .checked_add(1)
+                    .ok_or(KvIrArchiveFailure::SizeOverflow)?;
+                while position < logtype.len() && !matches!(logtype[position], b'\\' | 0x11..=0x13)
+                {
+                    position += 1;
+                }
+                let additional = position
+                    .checked_sub(literal_start)
+                    .ok_or(KvIrArchiveFailure::SizeOverflow)?;
+                value_len = self.check_direct_reconstructed_growth(value_len, additional)?;
+                continue;
+            }
+            if byte == b'\\' {
+                position = position
+                    .checked_add(1)
+                    .ok_or(KvIrArchiveFailure::SizeOverflow)?;
+                if logtype.get(position).is_none() {
+                    return Err(unsupported(KvIrArchiveUnsupported::TrailingEscape));
+                }
+                value_len = self.check_direct_reconstructed_growth(value_len, 1)?;
+            } else if byte == 0x12 {
+                let additional = dictionaries
+                    .next()
+                    .ok_or_else(|| unsupported(KvIrArchiveUnsupported::MissingDictionaryVariable))?
+                    .len();
+                value_len = self.check_direct_reconstructed_growth(value_len, additional)?;
+            } else {
+                let value = encoded
+                    .next()
+                    .ok_or_else(|| unsupported(KvIrArchiveUnsupported::MissingEncodedVariable))?;
+                if byte == 0x11 {
+                    let (negative, digit_count) =
+                        encoded_integer_parts(text.encoding(), value).map_err(unsupported)?;
+                    if negative {
+                        value_len = self.check_direct_reconstructed_growth(value_len, 1)?;
+                    }
+                    value_len = self.check_direct_reconstructed_growth(value_len, digit_count)?;
+                } else {
+                    let properties =
+                        decode_float_properties(text.encoding(), value).map_err(unsupported)?;
+                    let additional = usize::from(properties.digit_count)
+                        .checked_add(1)
+                        .and_then(|value| value.checked_add(usize::from(properties.negative)))
+                        .ok_or(KvIrArchiveFailure::SizeOverflow)?;
+                    value_len = self.check_direct_reconstructed_growth(value_len, additional)?;
+                    validate_encoded_float_digit_count(properties).map_err(unsupported)?;
+                }
+            }
+            position = position
+                .checked_add(1)
+                .ok_or(KvIrArchiveFailure::SizeOverflow)?;
+        }
+        self.direct_reconstructed_bytes = self
+            .direct_reconstructed_bytes
+            .checked_add(value_len)
+            .ok_or(KvIrArchiveFailure::SizeOverflow)?;
+        Ok(())
+    }
+
+    fn check_direct_reconstructed_growth(
+        &self,
+        current_value_len: usize,
+        additional: usize,
+    ) -> Result<usize, KvIrArchiveFailure> {
+        let value_len = current_value_len
+            .checked_add(additional)
+            .ok_or(KvIrArchiveFailure::SizeOverflow)?;
+        check_limit(
+            KvIrArchiveLimitResource::ReconstructedValueBytes,
+            value_len,
+            self.options.limits.reconstructed_value_bytes,
+        )?;
+        let record_len = self
+            .reconstructed
+            .len()
+            .checked_add(self.direct_reconstructed_bytes)
+            .and_then(|value| value.checked_add(value_len))
+            .ok_or(KvIrArchiveFailure::SizeOverflow)?;
+        check_limit(
+            KvIrArchiveLimitResource::ReconstructedRecordBytes,
+            record_len,
+            self.options.limits.reconstructed_record_bytes,
+        )?;
+        Ok(value_len)
     }
 
     fn reconstruct_text(
@@ -1799,11 +2073,14 @@ where
         )?;
         check_limit(
             KvIrArchiveLimitResource::ReconstructedRecordBytes,
-            new_len,
+            new_len
+                .checked_add(self.direct_reconstructed_bytes)
+                .ok_or(KvIrArchiveFailure::SizeOverflow)?,
             self.options.limits.reconstructed_record_bytes,
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn append_event(
         &mut self,
         event: KvIrLogEvent<'_>,
@@ -1857,6 +2134,7 @@ where
 
         self.plan.clear();
         self.reconstructed.clear();
+        self.direct_reconstructed_bytes = 0;
         self.prepare_selection(event).map_err(|source| {
             Self::failure(
                 event.stream_index(),
@@ -1879,16 +2157,16 @@ where
             })?;
 
         let events = PlannedRecordEvents {
-            event,
+            event: &event,
             auto_schema: &self.auto_schema.nodes,
             user_schema: &self.user_schema.nodes,
-            plan: self.plan.iter(),
+            plan: &self.plan,
             reconstructed: &self.reconstructed,
             timestamp_resolver: resolver,
         };
         let result = self
             .archive_set
-            .append_record_events_with_source_bytes(events, source_bytes);
+            .try_append_replayable_record_events_with_source_bytes(events, source_bytes);
         let committed = match &result {
             Ok(()) => true,
             Err(source) => source.record_committed(),
@@ -1898,12 +2176,18 @@ where
             self.stats.source_bytes = input_end;
             self.stats.records = records;
         }
-        result.map_err(|source| KvIrArchiveError {
-            stream_index: event.stream_index(),
-            unit_index: Some(event.unit_index()),
-            event_index: Some(event.event_index()),
-            input_offset: event.input_offset(),
-            kind: KvIrArchiveErrorKind::ArchiveSet(source),
+        result.map_err(|source| {
+            let source = match source {
+                ArchiveSetAppendError::Source { source, .. } => match source {},
+                ArchiveSetAppendError::ArchiveSet(source) => source,
+            };
+            KvIrArchiveError {
+                stream_index: event.stream_index(),
+                unit_index: Some(event.unit_index()),
+                event_index: Some(event.event_index()),
+                input_offset: event.input_offset(),
+                kind: KvIrArchiveErrorKind::ArchiveSet(source),
+            }
         })
     }
 
@@ -1991,17 +2275,26 @@ where
         }
     }
 
-    fn selected(&self, namespace: KvIrNamespace) -> &[usize] {
+    fn selection(&self, namespace: KvIrNamespace) -> &[SelectionSlot] {
         match namespace {
-            KvIrNamespace::AutoGenerated => &self.selected_auto,
-            KvIrNamespace::UserGenerated => &self.selected_user,
+            KvIrNamespace::AutoGenerated => &self.selection_auto,
+            KvIrNamespace::UserGenerated => &self.selection_user,
         }
     }
 
-    fn included(&self, namespace: KvIrNamespace) -> &[bool] {
+    fn active(&self, namespace: KvIrNamespace) -> &[u32] {
         match namespace {
-            KvIrNamespace::AutoGenerated => &self.included_auto,
-            KvIrNamespace::UserGenerated => &self.included_user,
+            KvIrNamespace::AutoGenerated => &self.active_auto,
+            KvIrNamespace::UserGenerated => &self.active_user,
+        }
+    }
+
+    fn next_selection_epoch(&mut self) {
+        self.selection_epoch = self.selection_epoch.wrapping_add(1);
+        if self.selection_epoch == 0 {
+            self.selection_auto.fill(SelectionSlot::default());
+            self.selection_user.fill(SelectionSlot::default());
+            self.selection_epoch = 1;
         }
     }
 }
@@ -2088,72 +2381,69 @@ where
     }
 }
 
+#[derive(Clone, Copy)]
 struct PlannedRecordEvents<'record> {
-    event: KvIrLogEvent<'record>,
+    event: &'record KvIrLogEvent<'record>,
     auto_schema: &'record [SchemaNode],
     user_schema: &'record [SchemaNode],
-    plan: std::slice::Iter<'record, PlannedEvent>,
+    plan: &'record [PlannedEvent],
     reconstructed: &'record [u8],
     timestamp_resolver: Option<&'record KvIrTimestampResolver>,
 }
 
-impl<'record> Iterator for PlannedRecordEvents<'record> {
-    type Item = RecordEventRef<'record>;
+impl<'record> ReplayableRecordEventSource<'record> for PlannedRecordEvents<'record> {
+    type Error = Infallible;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        let planned = *self.plan.next()?;
-        Some(match planned {
-            PlannedEvent::ObjectStart { namespace, node_id } => {
-                RecordEventRef::object_start(self.node(namespace, node_id).key.as_slice())
+    fn consume<C>(self, consumer: &mut C) -> Result<(), RecordEventAppendError<Self::Error>>
+    where
+        C: RecordEventConsumer<'record>, {
+        let mut current_namespace = None;
+        for planned in self.plan.iter().copied() {
+            let namespace = match planned {
+                PlannedEvent::ObjectStart { namespace, .. }
+                | PlannedEvent::Value { namespace, .. } => namespace,
+                PlannedEvent::ObjectEnd => current_namespace
+                    .expect("an object-end plan follows a namespaced object-start plan"),
+            };
+            if current_namespace != Some(namespace) {
+                consumer.kv_ir_namespace(namespace)?;
+                current_namespace = Some(namespace);
             }
-            PlannedEvent::ObjectEnd => RecordEventRef::ObjectEnd,
-            PlannedEvent::Value {
-                namespace,
-                node_id,
-                pair_index,
-                reconstructed,
-                unstructured_array,
-                timestamp,
-            } => {
-                let pair = self
-                    .event
-                    .pair(pair_index)
-                    .expect("event plan only retains validated pair indices");
-                let value = if let Some(timestamp) = timestamp {
-                    let span = reconstructed.expect("timestamp plans retain their exact lexeme");
-                    let lexeme = str::from_utf8(&self.reconstructed[span.start..span.end])
-                        .expect("resolved timestamp lexemes are UTF-8");
-                    let resolver = self
-                        .timestamp_resolver
-                        .expect("timestamp plans retain their resolver");
-                    ValueRef::Timestamp(TimestampRef::new(
-                        timestamp.epoch_nanoseconds,
-                        lexeme,
-                        timestamp.pattern,
-                        resolver.path().descriptor(),
-                    ))
-                } else if let Some(span) = reconstructed {
-                    let bytes = &self.reconstructed[span.start..span.end];
-                    if unstructured_array {
-                        ValueRef::UnstructuredArray(UnstructuredArrayRef::new(bytes))
-                    } else {
-                        ValueRef::String(bytes)
+            match planned {
+                PlannedEvent::ObjectStart { namespace, node_id } => {
+                    consumer.object_start(self.node(namespace, node_id).key.as_slice())?;
+                }
+                PlannedEvent::ObjectEnd => consumer.object_end()?,
+                PlannedEvent::Value {
+                    namespace,
+                    node_id,
+                    pair_index,
+                    reconstructed,
+                    direct_encoded_text,
+                    unstructured_array,
+                    timestamp,
+                } => {
+                    let key = self.node(namespace, node_id).key.as_slice();
+                    if direct_encoded_text {
+                        debug_assert!(reconstructed.is_none());
+                        debug_assert!(!unstructured_array);
+                        debug_assert!(timestamp.is_none());
+                        consumer.kv_ir_encoded_text(key, self.event, pair_index)?;
+                        continue;
                     }
-                } else {
-                    value_ref(pair)
-                };
-                RecordEventRef::value(self.node(namespace, node_id).key.as_slice(), value)
+                    let value =
+                        self.value(pair_index, reconstructed, unstructured_array, timestamp);
+                    consumer.value(FieldRef::new(key, value))?;
+                }
             }
-        })
+        }
+        Ok(())
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.plan.size_hint()
+    fn supports_cached_layout_proof(&self) -> bool {
+        true
     }
 }
-
-impl std::iter::ExactSizeIterator for PlannedRecordEvents<'_> {}
-impl std::iter::FusedIterator for PlannedRecordEvents<'_> {}
 
 impl<'record> PlannedRecordEvents<'record> {
     const fn node(&self, namespace: KvIrNamespace, node_id: usize) -> &'record SchemaNode {
@@ -2161,6 +2451,48 @@ impl<'record> PlannedRecordEvents<'record> {
             KvIrNamespace::AutoGenerated => &self.auto_schema[node_id],
             KvIrNamespace::UserGenerated => &self.user_schema[node_id],
         }
+    }
+
+    fn value(
+        self,
+        pair_index: usize,
+        reconstructed: Option<ScratchSpan>,
+        unstructured_array: bool,
+        timestamp: Option<PlannedTimestamp>,
+    ) -> ValueRef<'record> {
+        let pair = self
+            .event
+            .pair(pair_index)
+            .expect("event plan only retains validated pair indices");
+        timestamp.map_or_else(
+            || {
+                reconstructed.map_or_else(
+                    || value_ref(pair),
+                    |span| {
+                        let bytes = &self.reconstructed[span.start..span.end];
+                        if unstructured_array {
+                            ValueRef::UnstructuredArray(UnstructuredArrayRef::new(bytes))
+                        } else {
+                            ValueRef::String(bytes)
+                        }
+                    },
+                )
+            },
+            |timestamp| {
+                let span = reconstructed.expect("timestamp plans retain their exact lexeme");
+                let lexeme = str::from_utf8(&self.reconstructed[span.start..span.end])
+                    .expect("resolved timestamp lexemes are UTF-8");
+                let resolver = self
+                    .timestamp_resolver
+                    .expect("timestamp plans retain their resolver");
+                ValueRef::Timestamp(TimestampRef::new(
+                    timestamp.epoch_nanoseconds,
+                    lexeme,
+                    timestamp.pattern,
+                    resolver.path().descriptor(),
+                ))
+            },
+        )
     }
 }
 
@@ -2197,36 +2529,102 @@ const fn timestamp_failure(
 }
 
 fn resize_selection(
-    selected: &mut Vec<usize>,
-    included: &mut Vec<bool>,
+    selection: &mut Vec<SelectionSlot>,
     len: usize,
 ) -> Result<(), KvIrArchiveFailure> {
-    if selected.len() < len {
-        let additional = len - selected.len();
-        selected
+    if selection.len() < len {
+        let additional = len - selection.len();
+        selection
             .try_reserve(additional)
             .map_err(|_| KvIrArchiveFailure::AllocationFailed {
                 resource: KvIrArchiveResource::SelectionMap,
                 requested_additional: additional,
             })?;
-        selected.resize(len, NO_PAIR);
+        selection.resize(len, SelectionSlot::default());
     } else {
-        selected.truncate(len);
+        selection.truncate(len);
     }
-    selected.fill(NO_PAIR);
-    if included.len() < len {
-        let additional = len - included.len();
-        included
-            .try_reserve(additional)
-            .map_err(|_| KvIrArchiveFailure::AllocationFailed {
-                resource: KvIrArchiveResource::SelectionMap,
-                requested_additional: additional,
-            })?;
-        included.resize(len, false);
+    Ok(())
+}
+
+/// Orders active nodes by schema ID and records their sparse positions for constant-time linking.
+///
+/// Sparse events sort only the nodes they touch. Once at least one eighth of a schema is active,
+/// scanning the epoch-stamped selection map is cheaper and restores linear behavior for dense
+/// events. Clearing `active` retains capacity for exactly the same number of included nodes, so
+/// the dense path cannot allocate while rebuilding it.
+fn order_active(
+    selection: &mut [SelectionSlot],
+    active: &mut Vec<u32>,
+    epoch: u32,
+) -> Result<(), KvIrArchiveFailure> {
+    const DENSE_SCAN_RATIO: usize = 8;
+
+    if active.len().saturating_mul(DENSE_SCAN_RATIO) >= selection.len() {
+        let included_count = active.len();
+        active.clear();
+        for (node_id, slot) in selection.iter().enumerate() {
+            if slot.is_included(epoch) {
+                active.push(u32::try_from(node_id).map_err(|_| KvIrArchiveFailure::SizeOverflow)?);
+            }
+        }
+        debug_assert_eq!(included_count, active.len());
     } else {
-        included.truncate(len);
+        active.sort_unstable();
     }
-    included.fill(false);
+
+    for (active_index, node_id) in active.iter().copied().enumerate() {
+        let node_id = usize::try_from(node_id).map_err(|_| KvIrArchiveFailure::SizeOverflow)?;
+        selection
+            .get_mut(node_id)
+            .ok_or(KvIrArchiveFailure::SizeOverflow)?
+            .set_active_index(epoch, active_index)?;
+    }
+    Ok(())
+}
+
+fn sparse_index(index: u32) -> Result<Option<usize>, KvIrArchiveFailure> {
+    if index == NO_SPARSE_INDEX {
+        Ok(None)
+    } else {
+        usize::try_from(index)
+            .map(Some)
+            .map_err(|_| KvIrArchiveFailure::SizeOverflow)
+    }
+}
+
+fn encoded_integer_parts(
+    encoding: KvIrEncoding,
+    value: KvIrEncodedVariable,
+) -> Result<(bool, usize), KvIrArchiveUnsupported> {
+    let value = match (encoding, value) {
+        (KvIrEncoding::FourByte, KvIrEncodedVariable::FourByte(value)) => i64::from(value),
+        (KvIrEncoding::EightByte, KvIrEncodedVariable::EightByte(value)) => value,
+        _ => return Err(KvIrArchiveUnsupported::EncodedVariableWidthMismatch),
+    };
+    let mut magnitude = value.unsigned_abs();
+    let mut digits = 1_usize;
+    while magnitude >= 10 {
+        magnitude /= 10;
+        digits += 1;
+    }
+    Ok((value.is_negative(), digits))
+}
+
+fn validate_encoded_float_digit_count(
+    properties: FloatProperties,
+) -> Result<(), KvIrArchiveUnsupported> {
+    let mut remaining = properties.digits;
+    let mut populated_digits = 0_u8;
+    while remaining != 0 {
+        populated_digits = populated_digits
+            .checked_add(1)
+            .ok_or(KvIrArchiveUnsupported::EncodedFloatDigitCount)?;
+        remaining /= 10;
+    }
+    if populated_digits > properties.digit_count {
+        return Err(KvIrArchiveUnsupported::EncodedFloatDigitCount);
+    }
     Ok(())
 }
 
@@ -2448,7 +2846,9 @@ mod tests {
     use super::*;
     use crate::ExtractionMode;
     use crate::ExtractionOptions;
+    use crate::archive::ArchiveCatalogLimits;
     use crate::archive::MetadataLimits;
+    use crate::archive::NodeType;
     use crate::archive::SingleFileArchiveReader;
     use crate::extract_jsonl;
     use crate::ingest::KvIrOptions;
@@ -2473,8 +2873,7 @@ mod tests {
     const EIGHT_BYTE_TIMESTAMP_SFA_HEX: &str =
         include_str!("../../tests/fixtures/sfa-v0.5.0-kv-ir-timestamps-eight-cpp.hex");
     const EXPECTED_JSON: &[u8] = concat!(
-        "{\"level\":\"info\",\"seq\":7,\"empty\":{},",
-        "\"message\":\"task 42 done\",\"none\":null,",
+        "{\"empty\":{},\"message\":\"task 42 done\",\"none\":null,",
         "\"ok\":true,\"ratio\":1.250000}\n"
     )
     .as_bytes();
@@ -2657,6 +3056,42 @@ mod tests {
         output
     }
 
+    fn assert_cpp_kv_namespaces(sfa: &[u8]) {
+        let mut reader =
+            SingleFileArchiveReader::open(Cursor::new(sfa)).expect("open namespaced KV archive");
+        let catalog = reader
+            .read_catalog(ArchiveCatalogLimits::default())
+            .expect("read namespaced KV catalog");
+        let tree = catalog.schema_tree();
+        let namespace_root = |key: &[u8]| {
+            tree.nodes()
+                .iter()
+                .position(|node| {
+                    node.parent_id().is_none()
+                        && node.node_type() == NodeType::Object
+                        && node.key_bytes() == key
+                })
+                .expect("KV namespace root exists")
+        };
+        let auto_root = namespace_root(b"@");
+        let user_root = namespace_root(b"");
+        let child_keys = |root| {
+            tree.nodes()
+                .iter()
+                .filter(|node| node.parent_id() == Some(root))
+                .map(crate::archive::SchemaNode::key_bytes)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            [b"level".as_slice(), b"seq"],
+            child_keys(auto_root).as_slice()
+        );
+        assert_eq!(
+            [b"empty".as_slice(), b"message", b"none", b"ok", b"ratio",],
+            child_keys(user_root).as_slice()
+        );
+    }
+
     fn assert_timestamp_metadata(sfa: &[u8]) {
         let mut reader =
             SingleFileArchiveReader::open(Cursor::new(sfa)).expect("open timestamp archive");
@@ -2693,6 +3128,138 @@ mod tests {
     }
 
     #[test]
+    fn selection_slot_preserves_a_selection_only_within_its_epoch() {
+        let mut slot = SelectionSlot::default();
+        assert!(!slot.is_included(1));
+        assert_eq!(None, slot.selected_pair_index(1));
+        assert_eq!(None, slot.active_index(1));
+
+        assert!(slot.include(1));
+        assert!(slot.is_included(1));
+        assert_eq!(None, slot.selected_pair_index(1));
+        slot.set_active_index(1, 3)
+            .expect("small active index fits");
+        assert_eq!(Some(3), slot.active_index(1));
+
+        slot.select(1, 7).expect("small pair index fits");
+        assert!(!slot.include(1));
+        assert_eq!(Some(7), slot.selected_pair_index(1));
+        assert_eq!(Some(3), slot.active_index(1));
+
+        assert!(!slot.is_included(2));
+        assert_eq!(None, slot.selected_pair_index(2));
+        assert_eq!(None, slot.active_index(2));
+        assert!(slot.include(2));
+        assert!(slot.is_included(2));
+        assert_eq!(None, slot.selected_pair_index(2));
+        assert_eq!(None, slot.active_index(2));
+    }
+
+    #[test]
+    fn selection_epoch_wrap_clears_every_stale_slot_once() {
+        let options = ArchiveSetOptions::new(WriterOptions::default(), u64::MAX);
+        let mut writer =
+            ArchiveSetWriter::new(MemorySink::default(), StatsSink::default(), options);
+        let mut adapter = KvIrArchiveSetSink::new(&mut writer, KvIrArchiveOptions::default());
+        adapter.selection_epoch = u32::MAX;
+
+        let mut selected = SelectionSlot::default();
+        assert!(selected.include(u32::MAX));
+        selected.select(u32::MAX, 7).expect("small pair index fits");
+        selected
+            .set_active_index(u32::MAX, 3)
+            .expect("small active index fits");
+        adapter.selection_auto.push(selected);
+        adapter.selection_user.push(selected);
+
+        adapter.next_selection_epoch();
+        assert_eq!(1, adapter.selection_epoch);
+        assert_eq!(
+            [SelectionSlot::default()],
+            adapter.selection_auto.as_slice()
+        );
+        assert_eq!(
+            [SelectionSlot::default()],
+            adapter.selection_user.as_slice()
+        );
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn schema_nodes_do_not_retain_dense_sibling_links() {
+        assert_eq!(16, std::mem::size_of::<Option<usize>>());
+        assert_eq!(12, std::mem::size_of::<SelectionSlot>());
+        assert_eq!(40, std::mem::size_of::<SchemaNode>());
+    }
+
+    #[test]
+    fn wide_sparse_events_leave_prior_epoch_slots_untouched() {
+        const SCHEMA_NODE_COUNT: i16 = 4_096;
+
+        let mut input = stream_preamble();
+        for key in 1..=SCHEMA_NODE_COUNT {
+            input.extend_from_slice(&[
+                0x71, // integer schema node
+                0x60, 0, // user root parent
+                0x41, 2, // two-byte key
+            ]);
+            input.extend_from_slice(&key.to_be_bytes());
+        }
+        for (node_id, value) in [(1_i16, 7_u8), (SCHEMA_NODE_COUNT, 8_u8)] {
+            input.push(0x66);
+            input.extend_from_slice(&node_id.to_be_bytes());
+            input.extend_from_slice(&[0x51, value]);
+        }
+        input.push(0);
+
+        let options =
+            ArchiveSetOptions::new(WriterOptions::default().with_log_order(false), u64::MAX);
+        let mut writer =
+            ArchiveSetWriter::new(MemorySink::default(), StatsSink::default(), options);
+        {
+            let mut adapter = KvIrArchiveSetSink::new(&mut writer, KvIrArchiveOptions::default());
+            let mut reader = KvIrReader::new(Cursor::new(&input), KvIrOptions::default());
+            reader
+                .read_to_end(&mut adapter)
+                .expect("wide sparse stream bridges into the archive set");
+
+            assert_eq!(2, adapter.selection_epoch);
+            assert_eq!(
+                usize::try_from(SCHEMA_NODE_COUNT).unwrap() + 1,
+                adapter.selection_user.len()
+            );
+
+            let prior = adapter.selection_user[1];
+            assert_eq!(1, prior.epoch);
+            assert_eq!(Some(0), prior.selected_pair_index(1));
+            assert!(!prior.is_included(adapter.selection_epoch));
+            assert_eq!(SelectionSlot::default(), adapter.selection_user[2]);
+
+            let current = adapter.selection_user[usize::try_from(SCHEMA_NODE_COUNT).unwrap()];
+            assert_eq!(adapter.selection_epoch, current.epoch);
+            assert_eq!(
+                Some(0),
+                current.selected_pair_index(adapter.selection_epoch)
+            );
+            assert_eq!(adapter.active_auto.as_slice(), &[]);
+            assert_eq!(
+                [0, u32::try_from(SCHEMA_NODE_COUNT).unwrap()],
+                adapter.active_user.as_slice()
+            );
+            assert_eq!(
+                [
+                    SparseLinks {
+                        first_child: 1,
+                        next_sibling: NO_SPARSE_INDEX,
+                    },
+                    SparseLinks::EMPTY,
+                ],
+                adapter.sparse_links.as_slice()
+            );
+        }
+    }
+
+    #[test]
     fn both_cpp_encodings_round_trip_to_the_same_archive_semantics() {
         let four = decode_hex(FOUR_BYTE_ORACLE_HEX);
         let eight = decode_hex(EIGHT_BYTE_ORACLE_HEX);
@@ -2701,6 +3268,8 @@ mod tests {
 
         assert_eq!(EXPECTED_JSON, extract(&four_sink.archives[0]));
         assert_eq!(EXPECTED_JSON, extract(&eight_sink.archives[0]));
+        assert_cpp_kv_namespaces(&four_sink.archives[0]);
+        assert_cpp_kv_namespaces(&eight_sink.archives[0]);
         assert_eq!(1, four_adapter.records());
         assert_eq!(1, eight_adapter.records());
         assert_eq!(345, four_adapter.source_bytes());
@@ -3072,6 +3641,98 @@ mod tests {
     }
 
     #[test]
+    fn sparse_planning_preserves_nested_schema_order_for_interleaved_pairs() {
+        let mut bytes = stream_preamble();
+        append_test_user_schema_node(&mut bytes, KvIrNodeType::Object, 0, b"a");
+        append_test_user_schema_node(&mut bytes, KvIrNodeType::Integer, 0, b"z");
+        append_test_user_schema_node(&mut bytes, KvIrNodeType::Integer, 1, b"c");
+        append_test_user_schema_node(&mut bytes, KvIrNodeType::Object, 1, b"b");
+        append_test_user_schema_node(&mut bytes, KvIrNodeType::Integer, 4, b"y");
+        append_test_user_schema_node(&mut bytes, KvIrNodeType::Integer, 1, b"d");
+        append_test_user_schema_node(&mut bytes, KvIrNodeType::Integer, 0, b"m");
+        append_test_user_schema_node(&mut bytes, KvIrNodeType::Integer, 4, b"x");
+        bytes.extend_from_slice(&[
+            0x65, 5, // a.b.y
+            0x65, 7, // m
+            0x65, 6, // a.d
+            0x65, 8, // a.b.x
+            0x65, 2, // z
+            0x65, 3, // a.c
+            0x51, 50, // a.b.y value
+            0x51, 70, // m value
+            0x51, 60, // a.d value
+            0x51, 80, // a.b.x value
+            0x51, 20, // z value
+            0x51, 30, // a.c value
+            0,
+        ]);
+
+        let (sink, _, adapter) = archive_fixture(&bytes, u64::MAX);
+        assert_eq!(
+            b"{\"a\":{\"c\":30,\"b\":{\"y\":50,\"x\":80},\"d\":60},\"z\":20,\"m\":70}\n",
+            extract(&sink.archives[0]).as_slice()
+        );
+        assert_eq!(1, adapter.records());
+    }
+
+    #[test]
+    fn sparse_planning_materializes_shared_deep_ancestors_once() {
+        const DEPTH: u8 = 32;
+
+        let mut bytes = stream_preamble();
+        let mut parent_id = 0;
+        for node_id in 1..=DEPTH {
+            append_test_user_schema_node(&mut bytes, KvIrNodeType::Object, parent_id, b"o");
+            parent_id = node_id;
+        }
+        let x_id = DEPTH + 1;
+        let y_id = DEPTH + 2;
+        append_test_user_schema_node(&mut bytes, KvIrNodeType::Integer, DEPTH, b"x");
+        append_test_user_schema_node(&mut bytes, KvIrNodeType::Integer, DEPTH, b"y");
+        bytes.extend_from_slice(&[
+            0x65, y_id, // reverse wire order must not change sibling order
+            0x65, x_id, 0x51, 2, // y value
+            0x51, 1, // x value
+            0,
+        ]);
+
+        let options =
+            ArchiveSetOptions::new(WriterOptions::default().with_log_order(false), u64::MAX);
+        let mut writer =
+            ArchiveSetWriter::new(MemorySink::default(), StatsSink::default(), options);
+        {
+            let mut adapter = KvIrArchiveSetSink::new(&mut writer, KvIrArchiveOptions::default());
+            let mut reader = KvIrReader::new(Cursor::new(&bytes), KvIrOptions::default());
+            reader
+                .read_to_end(&mut adapter)
+                .expect("deep shared paths bridge into the archive set");
+
+            let active_count = usize::from(DEPTH) + 3;
+            assert_eq!(adapter.active_auto.as_slice(), &[]);
+            assert_eq!(active_count, adapter.active_user.len());
+            assert_eq!(active_count, adapter.sparse_links.len());
+            assert_eq!(2 * usize::from(DEPTH) + 2, adapter.plan.len());
+            assert_eq!(
+                (0..u32::try_from(active_count).unwrap()).collect::<Vec<_>>(),
+                adapter.active_user
+            );
+        }
+
+        let (sink, _) = writer
+            .finish()
+            .expect("finish deep sparse archive")
+            .into_parts();
+        let mut expected = Vec::new();
+        for _ in 0..DEPTH {
+            expected.extend_from_slice(b"{\"o\":");
+        }
+        expected.extend_from_slice(b"{\"x\":1,\"y\":2}");
+        expected.extend(std::iter::repeat_n(b'}', usize::from(DEPTH)));
+        expected.push(b'\n');
+        assert_eq!(expected, extract(&sink.archives[0]));
+    }
+
+    #[test]
     fn encoded_float_text_and_unstructured_arrays_match_in_both_widths() {
         for encoding in [KvIrEncoding::FourByte, KvIrEncoding::EightByte] {
             let bytes = stream_with_encoded_float_and_array(encoding);
@@ -3084,6 +3745,64 @@ mod tests {
             assert_eq!(u64::try_from(bytes.len()).unwrap(), adapter.source_bytes());
             assert_eq!(adapter.source_bytes(), stats.values[0].uncompressed_size());
         }
+    }
+
+    #[test]
+    fn direct_encoded_text_preserves_cpp_dictionary_width_semantics() {
+        for (encoding, expected_logtype, expected_variable) in [
+            (KvIrEncoding::FourByte, b"d=\x11".as_slice(), None),
+            (
+                KvIrEncoding::EightByte,
+                b"d=\x12".as_slice(),
+                Some(b"123".as_slice()),
+            ),
+        ] {
+            let bytes = stream_with_numeric_dictionary(encoding);
+            let (sink, ..) = archive_fixture(&bytes, u64::MAX);
+            assert_eq!(
+                b"{\"x\":\"d=123\"}\n".as_slice(),
+                extract(&sink.archives[0])
+            );
+
+            let mut reader = SingleFileArchiveReader::open(Cursor::new(&sink.archives[0]))
+                .expect("open direct encoded-text archive");
+            let catalog = reader
+                .read_catalog(ArchiveCatalogLimits::default())
+                .expect("read direct encoded-text catalog");
+            let logtypes = catalog.log_type_dictionary().entries().collect::<Vec<_>>();
+            let [logtype] = logtypes.as_slice() else {
+                panic!("expected one direct encoded-text logtype")
+            };
+            assert_eq!(expected_logtype, logtype.escaped_value());
+            assert_eq!(
+                expected_variable,
+                catalog
+                    .variable_dictionary()
+                    .entry(0)
+                    .map(crate::archive::VariableDictionaryEntry::value)
+            );
+            assert_eq!(
+                usize::from(expected_variable.is_some()),
+                catalog.variable_dictionary().len()
+            );
+        }
+    }
+
+    #[test]
+    fn direct_encoded_text_replays_the_cached_layout_across_three_records() {
+        let bytes = stream_with_repeated_direct_encoded_text();
+        let (sink, stats, adapter) = archive_fixture(&bytes, u64::MAX);
+        assert_eq!(3, adapter.records());
+        assert_eq!(3, stats.values[0].record_count());
+        assert_eq!(
+            concat!(
+                "{\"x\":\"value=1\"}\n",
+                "{\"x\":\"value=2\"}\n",
+                "{\"x\":\"value=3\"}\n",
+            )
+            .as_bytes(),
+            extract(&sink.archives[0]),
+        );
     }
 
     #[test]
@@ -3114,6 +3833,41 @@ mod tests {
         assert_eq!(11, limit.limit());
         assert_eq!(0, adapter.stats().records());
         assert_eq!(0, adapter.accounted_input_bytes());
+    }
+
+    #[test]
+    fn direct_encoded_text_preserves_incremental_reconstruction_limit_precedence() {
+        for (placeholder, encoded, limit, expected_actual) in [
+            (0x11, -42_i32, 0_u64, 1_u64),
+            // Two populated digits in a one-digit field are malformed, but reconstruction first
+            // checks the declared two-byte `0.` output just like the former materialized path.
+            (0x13, 12_i32 << 6, 1_u64, 2_u64),
+        ] {
+            let bytes = stream_with_four_byte_encoded_variable(placeholder, encoded);
+            let limits = KvIrArchiveLimits::new().with_max_reconstructed_value_bytes(limit);
+            let options = ArchiveSetOptions::new(WriterOptions::default(), u64::MAX);
+            let mut writer =
+                ArchiveSetWriter::new(MemorySink::default(), StatsSink::default(), options);
+            let mut adapter =
+                KvIrArchiveSetSink::new(&mut writer, KvIrArchiveOptions::new().with_limits(limits));
+            let mut reader = KvIrReader::new(Cursor::new(&bytes), KvIrOptions::default());
+            let error = reader
+                .read_to_end(&mut adapter)
+                .expect_err("the incremental reconstructed-value limit must fail first");
+            let KvIrReadError::Sink { source, .. } = error else {
+                panic!("expected adapter error")
+            };
+            assert!(matches!(
+                source.kind(),
+                KvIrArchiveErrorKind::Conversion(KvIrArchiveFailure::Limit(violation))
+                    if violation.resource()
+                        == KvIrArchiveLimitResource::ReconstructedValueBytes
+                        && violation.actual() == expected_actual
+                        && violation.limit() == limit
+            ));
+            assert_eq!(0, adapter.stats().records());
+            assert_eq!(0, adapter.accounted_input_bytes());
+        }
     }
 
     #[test]
@@ -3153,6 +3907,74 @@ mod tests {
             0,
         ]);
         bytes
+    }
+
+    fn stream_with_four_byte_encoded_variable(placeholder: u8, encoded: i32) -> Vec<u8> {
+        let mut bytes = stream_preamble();
+        bytes.extend_from_slice(&[
+            0x74, 0x60, 0, 0x41, 1, b'x', // user string schema node 1
+            0x65, 1, 0x59, 0x18, // event, four-byte encoded text, one i32 variable
+        ]);
+        bytes.extend_from_slice(&encoded.to_be_bytes());
+        bytes.extend_from_slice(&[0x21, 1, placeholder, 0]);
+        bytes
+    }
+
+    fn stream_with_repeated_direct_encoded_text() -> Vec<u8> {
+        let mut bytes = stream_preamble();
+        bytes.extend_from_slice(&[
+            0x74, 0x60, 0, 0x41, 1, b'x', // user string schema node 1
+        ]);
+        for encoded in [1_i32, 2, 3] {
+            bytes.extend_from_slice(&[
+                0x65, 1, 0x59, 0x18, // event, four-byte encoded text, one i32 variable
+            ]);
+            bytes.extend_from_slice(&encoded.to_be_bytes());
+            bytes.extend_from_slice(&[
+                0x21, 7, b'v', b'a', b'l', b'u', b'e', b'=', 0x11, // logtype
+            ]);
+        }
+        bytes.push(0);
+        bytes
+    }
+
+    fn stream_with_numeric_dictionary(encoding: KvIrEncoding) -> Vec<u8> {
+        let mut bytes = stream_preamble_with_encoding(encoding);
+        bytes.extend_from_slice(&[
+            0x74, 0x60, 0, 0x41, 1, b'x', // user string schema node 1
+            0x65, 1, // event selecting node 1
+        ]);
+        bytes.push(match encoding {
+            KvIrEncoding::FourByte => 0x59,
+            KvIrEncoding::EightByte => 0x5a,
+        });
+        bytes.extend_from_slice(&[
+            0x11, 3, b'1', b'2', b'3', // numeric-looking dictionary variable
+            0x21, 3, b'd', b'=', 0x12, // logtype
+            0,
+        ]);
+        bytes
+    }
+
+    fn append_test_user_schema_node(
+        bytes: &mut Vec<u8>,
+        node_type: KvIrNodeType,
+        parent_id: u8,
+        key: &[u8],
+    ) {
+        let node_type = match node_type {
+            KvIrNodeType::Integer => 0x71,
+            KvIrNodeType::Object => 0x76,
+            _ => panic!("test helper only needs integer and object schema nodes"),
+        };
+        bytes.extend_from_slice(&[
+            node_type,
+            0x60,
+            parent_id,
+            0x41,
+            u8::try_from(key.len()).expect("test schema key length fits u8"),
+        ]);
+        bytes.extend_from_slice(key);
     }
 
     fn stream_with_nested_integer() -> Vec<u8> {

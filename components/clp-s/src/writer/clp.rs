@@ -27,6 +27,39 @@ pub(super) struct EncodedClpString {
     pub(super) variables: SmallVec<[i64; 4]>,
 }
 
+#[derive(Debug)]
+pub(super) struct PreencodedClpString<'a> {
+    pub(super) logtype: PreencodedLogtype<'a>,
+    pub(super) variables: SmallVec<[i64; 4]>,
+}
+
+#[derive(Debug)]
+pub(super) enum PreencodedLogtype<'a> {
+    Borrowed(&'a [u8]),
+    Owned(SmallVec<[u8; 128]>),
+}
+
+impl PreencodedLogtype<'_> {
+    pub(super) fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(value) => value,
+            Self::Owned(value) => value,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PreencodedWidth {
+    FourByte,
+    EightByte,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PreencodedVariable {
+    FourByte(i32),
+    EightByte(i64),
+}
+
 /// Matches `JsonParser`'s deliberately byte-oriented string classification.
 ///
 /// Only a literal ASCII space selects CLP encoding. Tabs, newlines, and Unicode whitespace do not.
@@ -105,6 +138,212 @@ where
         max_logtype_bytes,
     )?;
     Ok(EncodedClpString { logtype, variables })
+}
+
+/// Converts a validated KV-IR encoded-text AST directly into the archive's eight-byte CLP form.
+///
+/// This mirrors the C++ `EncodedVariableInterpreter` path: four-byte integer and float variables
+/// are widened, eight-byte dictionary variables remain dictionary variables, and four-byte
+/// dictionary variables are reclassified as integers or floats when possible. The caller must
+/// validate placeholder counts, escape syntax, and encoded-float domains before calling this
+/// function.
+#[allow(clippy::too_many_lines)]
+pub(super) fn encode_preencoded_clp_string<'a, E, D, F>(
+    source_logtype: &'a [u8],
+    width: PreencodedWidth,
+    encoded_variables: E,
+    dictionary_variables: D,
+    max_logtype_bytes: u64,
+    max_variables: u64,
+    mut resolve_dictionary: F,
+) -> Result<PreencodedClpString<'a>, AppendError>
+where
+    E: IntoIterator<Item = PreencodedVariable>,
+    D: IntoIterator<Item = &'a [u8]>,
+    F: FnMut(&[u8]) -> Result<u64, AppendError>, {
+    let mut owned_logtype = None;
+    let mut logtype_len = 0_usize;
+    let mut variables = SmallVec::new();
+    let mut encoded = encoded_variables.into_iter();
+    let mut dictionaries = dictionary_variables.into_iter();
+    let mut position = 0_usize;
+    while position < source_logtype.len() {
+        let byte = source_logtype[position];
+        if ESCAPE_MARKER == byte {
+            let escaped = source_logtype
+                .get(position + 1)
+                .copied()
+                .ok_or(AppendError::SizeOverflow)?;
+            append_preencoded_logtype_byte(
+                ESCAPE_MARKER,
+                &mut owned_logtype,
+                &mut logtype_len,
+                max_logtype_bytes,
+            )?;
+            append_preencoded_logtype_byte(
+                escaped,
+                &mut owned_logtype,
+                &mut logtype_len,
+                max_logtype_bytes,
+            )?;
+            position = position.checked_add(2).ok_or(AppendError::SizeOverflow)?;
+            continue;
+        }
+        if !matches!(
+            byte,
+            INTEGER_PLACEHOLDER | DICTIONARY_PLACEHOLDER | FLOAT_PLACEHOLDER
+        ) {
+            append_preencoded_logtype_byte(
+                byte,
+                &mut owned_logtype,
+                &mut logtype_len,
+                max_logtype_bytes,
+            )?;
+            position += 1;
+            continue;
+        }
+
+        let (placeholder, variable) = match byte {
+            INTEGER_PLACEHOLDER => {
+                let value = encoded.next().ok_or(AppendError::SizeOverflow)?;
+                let widened = match (width, value) {
+                    (PreencodedWidth::FourByte, PreencodedVariable::FourByte(value)) => {
+                        i64::from(value)
+                    }
+                    (PreencodedWidth::EightByte, PreencodedVariable::EightByte(value)) => value,
+                    _ => return Err(AppendError::SizeOverflow),
+                };
+                (INTEGER_PLACEHOLDER, widened)
+            }
+            FLOAT_PLACEHOLDER => {
+                let value = encoded.next().ok_or(AppendError::SizeOverflow)?;
+                let widened = match (width, value) {
+                    (PreencodedWidth::FourByte, PreencodedVariable::FourByte(value)) => {
+                        widen_four_byte_float(value)
+                    }
+                    (PreencodedWidth::EightByte, PreencodedVariable::EightByte(value)) => value,
+                    _ => return Err(AppendError::SizeOverflow),
+                };
+                (FLOAT_PLACEHOLDER, widened)
+            }
+            DICTIONARY_PLACEHOLDER => {
+                let value = dictionaries.next().ok_or(AppendError::SizeOverflow)?;
+                if matches!(width, PreencodedWidth::FourByte)
+                    && let Some(integer) = encode_integer(value)
+                {
+                    (INTEGER_PLACEHOLDER, integer)
+                } else if matches!(width, PreencodedWidth::FourByte)
+                    && let Some(float) = encode_float(value)
+                {
+                    (FLOAT_PLACEHOLDER, float)
+                } else {
+                    let id = resolve_dictionary(value)?;
+                    (DICTIONARY_PLACEHOLDER, i64::from_le_bytes(id.to_le_bytes()))
+                }
+            }
+            _ => unreachable!("all CLP placeholders are matched above"),
+        };
+        if placeholder != byte && owned_logtype.is_none() {
+            owned_logtype = Some(copy_preencoded_logtype_prefix(
+                source_logtype,
+                position,
+                max_logtype_bytes,
+            )?);
+        }
+        append_preencoded_variable(
+            placeholder,
+            variable,
+            &mut owned_logtype,
+            &mut logtype_len,
+            &mut variables,
+            max_logtype_bytes,
+            max_variables,
+        )?;
+        position += 1;
+    }
+    debug_assert_eq!(source_logtype.len(), logtype_len);
+    let logtype = owned_logtype.map_or(
+        PreencodedLogtype::Borrowed(source_logtype),
+        PreencodedLogtype::Owned,
+    );
+    Ok(PreencodedClpString { logtype, variables })
+}
+
+fn copy_preencoded_logtype_prefix(
+    source: &[u8],
+    prefix_len: usize,
+    limit: u64,
+) -> Result<SmallVec<[u8; 128]>, AppendError> {
+    let reserve = source
+        .len()
+        .min(usize::try_from(limit).unwrap_or(usize::MAX));
+    let mut logtype = SmallVec::new();
+    logtype
+        .try_reserve(reserve)
+        .map_err(|_| allocation_failed(AppendResource::DictionaryValueBytes, reserve))?;
+    logtype.extend_from_slice(source.get(..prefix_len).ok_or(AppendError::SizeOverflow)?);
+    Ok(logtype)
+}
+
+fn append_preencoded_variable(
+    placeholder: u8,
+    value: i64,
+    logtype: &mut Option<SmallVec<[u8; 128]>>,
+    logtype_len: &mut usize,
+    variables: &mut SmallVec<[i64; 4]>,
+    max_logtype_bytes: u64,
+    max_variables: u64,
+) -> Result<(), AppendError> {
+    append_preencoded_logtype_byte(placeholder, logtype, logtype_len, max_logtype_bytes)?;
+    let proposed = u64::try_from(variables.len())
+        .map_err(|_| AppendError::SizeOverflow)?
+        .checked_add(1)
+        .ok_or(AppendError::SizeOverflow)?;
+    if proposed > max_variables {
+        return Err(AppendError::LimitExceeded {
+            resource: AppendResource::EncodedVariablesPerColumn,
+            actual: proposed,
+            limit: max_variables,
+        });
+    }
+    variables
+        .try_reserve(1)
+        .map_err(|_| allocation_failed(AppendResource::EncodedVariablesPerColumn, 1))?;
+    variables.push(value);
+    Ok(())
+}
+
+fn append_preencoded_logtype_byte(
+    byte: u8,
+    owned: &mut Option<SmallVec<[u8; 128]>>,
+    current_len: &mut usize,
+    limit: u64,
+) -> Result<(), AppendError> {
+    let resulting = current_len
+        .checked_add(1)
+        .ok_or(AppendError::SizeOverflow)?;
+    check_logtype_size(resulting, limit)?;
+    if let Some(logtype) = owned {
+        logtype
+            .try_reserve(1)
+            .map_err(|_| allocation_failed(AppendResource::DictionaryValueBytes, 1))?;
+        logtype.push(byte);
+    }
+    *current_len = resulting;
+    Ok(())
+}
+
+fn widen_four_byte_float(value: i32) -> i64 {
+    let encoded = u32::from_ne_bytes(value.to_ne_bytes());
+    let negative = u64::from(encoded >> 31);
+    let digits = u64::from((encoded >> 6) & ((1_u32 << 25) - 1));
+    let digit_count_minus_one = u64::from((encoded >> 3) & 0x07);
+    let decimal_position_minus_one = u64::from(encoded & 0x07);
+    let widened = (negative << 63)
+        | (digits << 8)
+        | (digit_count_minus_one << 4)
+        | decimal_position_minus_one;
+    i64::from_ne_bytes(widened.to_ne_bytes())
 }
 
 fn append_escaped_constant(
@@ -517,6 +756,184 @@ mod tests {
         assert_eq!(7, encoded.variables[2]);
         assert_eq!(7, encoded.variables[3]);
         assert_eq!(Some(encoded.variables[1]), encode_float(b"001.2300"));
+    }
+
+    #[test]
+    fn preencoded_four_byte_values_are_widened_and_dictionary_values_are_reclassified() {
+        let four_byte_float = {
+            let negative = 1_u32;
+            let digits = 1234_u32;
+            let digit_count_minus_one = 3_u32;
+            let decimal_position_minus_one = 1_u32;
+            let encoded = (((negative << 25) | digits) << 3 | digit_count_minus_one) << 3
+                | decimal_position_minus_one;
+            i32::from_ne_bytes(encoded.to_ne_bytes())
+        };
+        let encoded = encode_preencoded_clp_string(
+            b"integer=\x11 float=\x13 numeric-dictionary=\x12 escaped=\\\x11",
+            PreencodedWidth::FourByte,
+            [
+                PreencodedVariable::FourByte(-42),
+                PreencodedVariable::FourByte(four_byte_float),
+            ],
+            [b"123".as_slice()],
+            u64::MAX,
+            u64::MAX,
+            |_| panic!("numeric four-byte dictionary variables must not enter the dictionary"),
+        )
+        .expect("convert four-byte encoded text");
+        assert_eq!(
+            b"integer=\x11 float=\x13 numeric-dictionary=\x11 escaped=\\\x11",
+            encoded.logtype.as_slice()
+        );
+        assert!(matches!(&encoded.logtype, PreencodedLogtype::Owned(_)));
+        assert_eq!(
+            [-42, encode_float(b"-12.34").expect("encoded float"), 123],
+            encoded.variables.as_slice()
+        );
+    }
+
+    #[test]
+    fn preencoded_eight_byte_dictionary_values_remain_dictionary_values() {
+        let encoded = encode_preencoded_clp_string(
+            b"integer=\x11 numeric-dictionary=\x12",
+            PreencodedWidth::EightByte,
+            [PreencodedVariable::EightByte(-42)],
+            [b"123".as_slice()],
+            u64::MAX,
+            u64::MAX,
+            |value| {
+                assert_eq!(b"123", value);
+                Ok(17)
+            },
+        )
+        .expect("convert eight-byte encoded text");
+        assert_eq!(
+            b"integer=\x11 numeric-dictionary=\x12",
+            encoded.logtype.as_slice()
+        );
+        assert!(matches!(&encoded.logtype, PreencodedLogtype::Borrowed(_)));
+        assert_eq!([-42, 17], encoded.variables.as_slice());
+    }
+
+    #[test]
+    fn preencoded_four_byte_nonnumeric_dictionary_values_stay_dictionary_values() {
+        let encoded = encode_preencoded_clp_string(
+            b"name=\x12",
+            PreencodedWidth::FourByte,
+            std::iter::empty(),
+            [b"alice".as_slice()],
+            u64::MAX,
+            u64::MAX,
+            |value| {
+                assert_eq!(b"alice", value);
+                Ok(23)
+            },
+        )
+        .expect("convert nonnumeric four-byte dictionary value");
+        assert_eq!(b"name=\x12", encoded.logtype.as_slice());
+        assert!(matches!(&encoded.logtype, PreencodedLogtype::Borrowed(_)));
+        assert_eq!([23], encoded.variables.as_slice());
+    }
+
+    #[test]
+    fn preencoded_eight_byte_float_bits_are_preserved_exactly() {
+        let raw = (1_u64 << 62) | (125_u64 << 8) | (2_u64 << 4) | 1;
+        let raw = i64::from_ne_bytes(raw.to_ne_bytes());
+        let encoded = encode_preencoded_clp_string(
+            b"float=\x13",
+            PreencodedWidth::EightByte,
+            [PreencodedVariable::EightByte(raw)],
+            std::iter::empty(),
+            u64::MAX,
+            u64::MAX,
+            |_| unreachable!("float values do not use the variable dictionary"),
+        )
+        .expect("convert eight-byte encoded float");
+        assert_eq!(b"float=\x13", encoded.logtype.as_slice());
+        assert_eq!([raw], encoded.variables.as_slice());
+    }
+
+    #[test]
+    fn preencoded_limits_are_checked_at_exact_boundaries() {
+        encode_preencoded_clp_string(
+            b"a\x11",
+            PreencodedWidth::FourByte,
+            [PreencodedVariable::FourByte(1)],
+            std::iter::empty(),
+            2,
+            1,
+            |_| unreachable!("integer values do not use the variable dictionary"),
+        )
+        .expect("exact logtype and variable limits are accepted");
+
+        assert!(matches!(
+            encode_preencoded_clp_string(
+                b"a\x11",
+                PreencodedWidth::FourByte,
+                [PreencodedVariable::FourByte(1)],
+                std::iter::empty(),
+                1,
+                1,
+                |_| unreachable!("integer values do not use the variable dictionary"),
+            ),
+            Err(AppendError::LimitExceeded {
+                resource: AppendResource::DictionaryEntryBytes,
+                actual: 2,
+                limit: 1,
+            })
+        ));
+        assert!(matches!(
+            encode_preencoded_clp_string(
+                b"\x11\x11",
+                PreencodedWidth::FourByte,
+                [
+                    PreencodedVariable::FourByte(1),
+                    PreencodedVariable::FourByte(2),
+                ],
+                std::iter::empty(),
+                2,
+                1,
+                |_| unreachable!("integer values do not use the variable dictionary"),
+            ),
+            Err(AppendError::LimitExceeded {
+                resource: AppendResource::EncodedVariablesPerColumn,
+                actual: 2,
+                limit: 1,
+            })
+        ));
+        assert!(matches!(
+            encode_preencoded_clp_string(
+                b"a\x11z",
+                PreencodedWidth::FourByte,
+                [PreencodedVariable::FourByte(1)],
+                std::iter::empty(),
+                2,
+                0,
+                |_| unreachable!("integer values do not use the variable dictionary"),
+            ),
+            Err(AppendError::LimitExceeded {
+                resource: AppendResource::EncodedVariablesPerColumn,
+                actual: 1,
+                limit: 0,
+            })
+        ));
+        assert!(matches!(
+            encode_preencoded_clp_string(
+                b"\\a",
+                PreencodedWidth::EightByte,
+                std::iter::empty(),
+                std::iter::empty(),
+                1,
+                0,
+                |_| unreachable!("constant logtypes do not use the variable dictionary"),
+            ),
+            Err(AppendError::LimitExceeded {
+                resource: AppendResource::DictionaryEntryBytes,
+                actual: 2,
+                limit: 1,
+            })
+        ));
     }
 
     #[test]

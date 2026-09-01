@@ -45,6 +45,11 @@ use super::timestamp::prepare_reservations as prepare_timestamp_reservations;
 use crate::LOG_EVENT_IDX_KEY;
 use crate::archive::NodeType;
 use crate::archive::SchemaEntry;
+use crate::ingest::KvIrEncodedVariable;
+use crate::ingest::KvIrEncoding;
+use crate::ingest::KvIrLogEvent;
+use crate::ingest::KvIrNamespace;
+use crate::ingest::KvIrValueKind;
 
 const MAX_SCHEMA_NODE_ID: u64 = 0x00ff_ffff;
 const MAX_SCHEMA_ID: u64 = 2_147_483_647;
@@ -347,6 +352,11 @@ pub enum RecordEventError {
         /// Number of still-open nested objects, excluding the implicit root.
         count: usize,
     },
+    /// A KV-IR namespace boundary appeared inside a nested object.
+    KvIrNamespaceInsideObject {
+        /// Number of open nested objects below the namespace root.
+        depth: usize,
+    },
 }
 
 impl Display for RecordEventError {
@@ -361,6 +371,10 @@ impl Display for RecordEventError {
                     "event stream ended with {count} unclosed nested objects"
                 )
             }
+            Self::KvIrNamespaceInsideObject { depth } => write!(
+                formatter,
+                "KV-IR namespace boundary appeared inside {depth} nested objects"
+            ),
         }
     }
 }
@@ -418,6 +432,16 @@ impl<E> From<AppendError> for RecordEventAppendError<E> {
 /// without constructing an intermediate event that the planner immediately matches again.
 pub trait RecordEventConsumer<'record> {
     fn value(&mut self, field: FieldRef<'record>) -> Result<(), AppendError>;
+
+    #[doc(hidden)]
+    fn kv_ir_namespace(&mut self, namespace: KvIrNamespace) -> Result<(), AppendError>;
+
+    fn kv_ir_encoded_text(
+        &mut self,
+        key: &'record [u8],
+        event: &'record KvIrLogEvent<'record>,
+        pair_index: usize,
+    ) -> Result<(), AppendError>;
 
     fn object_start(&mut self, key: &'record [u8]) -> Result<(), AppendError>;
 
@@ -1441,6 +1465,10 @@ enum BorrowedScalarValue<'a> {
         value: &'a [u8],
         node_type: NodeType,
     },
+    KvIrEncodedText {
+        event: &'a KvIrLogEvent<'a>,
+        pair_index: usize,
+    },
     UnstructuredArray(UnstructuredArrayRef<'a>),
     Timestamp(TimestampRef<'a>),
     PrevalidatedTimestamp(TimestampRef<'a>),
@@ -1456,6 +1484,7 @@ impl BorrowedScalarValue<'_> {
             Self::DictionaryFloat(_) => NodeType::DictionaryFloat,
             Self::Bool(_) => NodeType::Boolean,
             Self::String { node_type, .. } => node_type,
+            Self::KvIrEncodedText { .. } => NodeType::ClpString,
             Self::UnstructuredArray(_) => NodeType::UnstructuredArray,
             Self::Timestamp(_) | Self::PrevalidatedTimestamp(_) => NodeType::Timestamp,
         }
@@ -1798,6 +1827,7 @@ struct EventTraversal<'builder, 'archive, 'record, 'scratch> {
     builder: &'builder mut RecordPlanBuilder<'archive, 'record, 'scratch>,
     limits: WriterLimits,
     root: u32,
+    kv_ir_namespace_selected: bool,
     frames: EventFrames,
     seen_fields: SeenEventFields<'record>,
     field_indexes: HashMap<(usize, &'record [u8]), usize>,
@@ -1848,6 +1878,7 @@ impl<'builder, 'archive, 'record, 'scratch> EventTraversal<'builder, 'archive, '
             builder,
             limits,
             root,
+            kv_ir_namespace_selected: false,
             frames,
             seen_fields,
             field_indexes: HashMap::new(),
@@ -1925,6 +1956,78 @@ impl<'builder, 'archive, 'record, 'scratch> EventTraversal<'builder, 'archive, '
             parent_depth: frame.depth,
         })?;
         self.builder.walk()
+    }
+
+    fn kv_ir_encoded_text(
+        &mut self,
+        key: &'record [u8],
+        event: &'record KvIrLogEvent<'record>,
+        pair_index: usize,
+    ) -> Result<(), AppendError> {
+        let frame = *self
+            .frames
+            .last()
+            .expect("the implicit root frame remains open");
+        self.register_field(key)?;
+        let node_id = self
+            .builder
+            .resolve_node(Some(frame.node_id), NodeType::ClpString, key)?;
+        self.builder.push_entry(node_id)?;
+        self.builder.push_planned_scalar(
+            node_id,
+            BorrowedScalarValue::KvIrEncodedText { event, pair_index },
+        )
+    }
+
+    fn kv_ir_namespace(&mut self, namespace: KvIrNamespace) -> Result<(), AppendError> {
+        if 1 != self.frames.len() {
+            return Err(AppendError::InvalidRecordEvents {
+                event_index: self.event_index,
+                reason: RecordEventError::KvIrNamespaceInsideObject {
+                    depth: self.frames.len() - 1,
+                },
+            });
+        }
+
+        let previous = self
+            .frames
+            .pop()
+            .expect("the prior namespace root frame exists");
+        if matches!(self.field_validation, EventFieldValidation::Full) {
+            if previous.fields_are_indexed {
+                for field in &self.seen_fields[previous.seen_start..] {
+                    let removed = self.field_indexes.remove(&(previous.scope_id, field.key));
+                    debug_assert!(removed.is_some());
+                }
+            }
+            self.seen_fields.truncate(previous.seen_start);
+        }
+        if self.kv_ir_namespace_selected && !previous.has_fields {
+            self.builder.push_entry(previous.node_id)?;
+        }
+
+        let key = match namespace {
+            KvIrNamespace::AutoGenerated => b"@".as_slice(),
+            KvIrNamespace::UserGenerated => b"".as_slice(),
+        };
+        let root = self.builder.resolve_node(None, NodeType::Object, key)?;
+        let scope_id = self.next_scope_id;
+        self.next_scope_id = self
+            .next_scope_id
+            .checked_add(1)
+            .ok_or(AppendError::SizeOverflow)?;
+        self.root = root;
+        self.frames.push(EventObjectFrame {
+            node_id: root,
+            depth: 1,
+            scope_id,
+            seen_start: self.seen_fields.len(),
+            field_count: 0,
+            has_fields: false,
+            fields_are_indexed: false,
+        });
+        self.kv_ir_namespace_selected = true;
+        Ok(())
     }
 
     fn object_start(&mut self, key: &'record [u8]) -> Result<(), AppendError> {
@@ -2008,6 +2111,21 @@ impl<'builder, 'archive, 'record, 'scratch> EventTraversal<'builder, 'archive, '
 impl<'record> RecordEventConsumer<'record> for EventTraversal<'_, '_, 'record, '_> {
     fn value(&mut self, field: FieldRef<'record>) -> Result<(), AppendError> {
         EventTraversal::value(self, field)?;
+        self.advance_event_index()
+    }
+
+    fn kv_ir_namespace(&mut self, namespace: KvIrNamespace) -> Result<(), AppendError> {
+        EventTraversal::kv_ir_namespace(self, namespace)?;
+        self.advance_event_index()
+    }
+
+    fn kv_ir_encoded_text(
+        &mut self,
+        key: &'record [u8],
+        event: &'record KvIrLogEvent<'record>,
+        pair_index: usize,
+    ) -> Result<(), AppendError> {
+        EventTraversal::kv_ir_encoded_text(self, key, event, pair_index)?;
         self.advance_event_index()
     }
 
@@ -2973,7 +3091,7 @@ fn resulting_node_path_cache(
     Ok(Some(replacement))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn encode_values(
     values: &[BorrowedPlannedValue<'_>],
     sorted_to_traversal: &[usize],
@@ -3028,8 +3146,51 @@ fn encode_values(
                     limits.max_encoded_variables_per_column(),
                     |variable| dictionaries.resolve_variable(variable, None, limits),
                 )?;
-                let log_type_id =
-                    dictionaries.resolve_log_type(&clp.logtype, dictionary_hint, limits)?;
+                let log_type_id = dictionaries.resolve_log_type(
+                    clp.logtype.as_slice(),
+                    dictionary_hint,
+                    limits,
+                )?;
+                EncodedValue::ClpString {
+                    node_type: NodeType::ClpString,
+                    log_type_id,
+                    encoded_variable_offset: 0,
+                    variables: clp.variables,
+                }
+            }
+            BorrowedScalarValue::KvIrEncodedText { event, pair_index } => {
+                let pair = event
+                    .pair(pair_index)
+                    .expect("the KV-IR event plan retains a validated pair index");
+                let KvIrValueKind::EncodedText(text) = pair.value().kind() else {
+                    unreachable!("the direct KV-IR plan retains only encoded-text values")
+                };
+                let width = match text.encoding() {
+                    KvIrEncoding::FourByte => clp::PreencodedWidth::FourByte,
+                    KvIrEncoding::EightByte => clp::PreencodedWidth::EightByte,
+                };
+                let encoded_variables = text.encoded_variables().map(|value| match value {
+                    KvIrEncodedVariable::FourByte(value) => {
+                        clp::PreencodedVariable::FourByte(value)
+                    }
+                    KvIrEncodedVariable::EightByte(value) => {
+                        clp::PreencodedVariable::EightByte(value)
+                    }
+                });
+                let clp = clp::encode_preencoded_clp_string(
+                    text.logtype(),
+                    width,
+                    encoded_variables,
+                    text.dictionary_variables(),
+                    limits.max_dictionary_entry_size(),
+                    limits.max_encoded_variables_per_column(),
+                    |variable| dictionaries.resolve_variable(variable, None, limits),
+                )?;
+                let log_type_id = dictionaries.resolve_log_type(
+                    clp.logtype.as_slice(),
+                    dictionary_hint,
+                    limits,
+                )?;
                 EncodedValue::ClpString {
                     node_type: NodeType::ClpString,
                     log_type_id,
@@ -4457,6 +4618,13 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn borrowed_record_planning_values_remain_compact() {
+        assert_eq!(64, size_of::<BorrowedScalarValue<'_>>());
+        assert_eq!(72, size_of::<BorrowedPlannedValue<'_>>());
+    }
 
     #[derive(Clone)]
     struct ReplayableEvents<'record> {

@@ -12,14 +12,16 @@
 //! borrowed from the catalog or the stream is retained across a call, which keeps the state
 //! machine expressible without a self-referential struct, and no work happens on another thread.
 
-use std::path::PathBuf;
-
 use clp_s::ArchiveReader;
-use clp_s::archive::{
-    ArchiveCatalog, ColumnData, DecodedPackedStream, DecodedSchemaTable, NodeType, SchemaTree,
-    append_clp_message_bounded,
-};
-use clp_s::search::{ArchiveSearchOptions, ParsedQuery};
+use clp_s::archive::ArchiveCatalog;
+use clp_s::archive::ColumnData;
+use clp_s::archive::DecodedPackedStream;
+use clp_s::archive::DecodedSchemaTable;
+use clp_s::archive::NodeType;
+use clp_s::archive::SchemaTree;
+use clp_s::archive::append_clp_message_bounded;
+use clp_s::search::ArchiveSearchOptions;
+use clp_s::search::ParsedQuery;
 
 /// Rows materialized before a batch is handed back.
 ///
@@ -38,7 +40,7 @@ const BATCH_ROWS: usize = 8192;
 const CLP_SCRATCH_LIMIT: usize = 1024 * 1024;
 
 /// Value kinds shared with the C header.
-pub(crate) mod kind {
+pub mod kind {
     pub const ABSENT: u32 = 0;
     pub const BOOLEAN: u32 = 1;
     pub const INTEGER: u32 = 2;
@@ -50,7 +52,7 @@ pub(crate) mod kind {
 
 /// One projected value, with text held as a span into the batch's arena.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Cell {
+pub struct Cell {
     pub kind: u32,
     pub integer: i64,
     pub real: f64,
@@ -82,7 +84,7 @@ impl Cell {
 
 /// Failure while scanning one archive.
 #[derive(Debug)]
-pub(crate) enum ScanError {
+pub enum ScanError {
     Archive(String),
     Projection(String),
 }
@@ -105,7 +107,9 @@ fn resolve_path(tree: &SchemaTree, components: &[&str]) -> Vec<u32> {
     let mut resolved = Vec::new();
     let nodes = tree.nodes();
     let Some(mut current) = nodes.iter().position(|node| {
-        node.parent_id().is_none() && NodeType::Metadata != node.node_type() && node.key_bytes().is_empty()
+        node.parent_id().is_none()
+            && NodeType::Metadata != node.node_type()
+            && node.key_bytes().is_empty()
     }) else {
         return resolved;
     };
@@ -120,10 +124,9 @@ fn resolve_path(tree: &SchemaTree, components: &[&str]) -> Vec<u32> {
                 if !matches!(
                     child.node_type(),
                     NodeType::Object | NodeType::StructuredArray
-                ) {
-                    if let Ok(id) = u32::try_from(child_id) {
-                        resolved.push(id);
-                    }
+                ) && let Ok(id) = u32::try_from(child_id)
+                {
+                    resolved.push(id);
                 }
             } else if NodeType::Object == child.node_type() {
                 next_object = Some(child_id);
@@ -165,7 +168,7 @@ fn split_descriptor(source: &str) -> Vec<String> {
 }
 
 /// A pull-based projected scan over one archive.
-pub(crate) struct ProjectedScanner {
+pub struct ProjectedScanner {
     reader: Box<dyn ArchiveReader>,
     catalog: ArchiveCatalog,
     parsed: ParsedQuery,
@@ -186,14 +189,12 @@ pub(crate) struct ProjectedScanner {
 }
 
 impl ProjectedScanner {
-    pub(crate) fn open(
-        path: PathBuf,
+    pub fn open(
         reader: Box<dyn ArchiveReader>,
         parsed: ParsedQuery,
-        options: ArchiveSearchOptions,
+        options: &ArchiveSearchOptions,
         fields: &[String],
     ) -> Result<Self, ScanError> {
-        let _ = path;
         let mut reader = reader;
         let catalog = reader
             .read_catalog(options.catalog())
@@ -211,7 +212,7 @@ impl ProjectedScanner {
             reader,
             catalog,
             parsed,
-            options,
+            options: *options,
             field_count: fields.len(),
             field_nodes,
             stream_index: 0,
@@ -227,7 +228,7 @@ impl ProjectedScanner {
     }
 
     /// Returns the next row's cells, or `None` once the archive is exhausted.
-    pub(crate) fn next_row(&mut self) -> Result<Option<(&[Cell], &[u8])>, ScanError> {
+    pub fn next_row(&mut self) -> Result<Option<ProjectedRow<'_>>, ScanError> {
         while self.emit_cursor >= self.buffered_rows {
             if self.finished {
                 return Ok(None);
@@ -261,13 +262,12 @@ impl ProjectedScanner {
                     continue;
                 }
             }
-            if !self.drain_current_stream()? {
-                self.stream = None;
-                self.stream_index += 1;
-            } else {
+            if self.drain_current_stream()? {
                 // The stream still has rows but the buffer is full.
                 return Ok(());
             }
+            self.stream = None;
+            self.stream_index += 1;
         }
         Ok(())
     }
@@ -289,7 +289,9 @@ impl ProjectedScanner {
                 self.options.packed_stream(),
             )
             .map_err(|source| {
-                ScanError::Archive(format!("failed to read packed stream {stream_id}: {source}"))
+                ScanError::Archive(format!(
+                    "failed to read packed stream {stream_id}: {source}"
+                ))
             })?;
         self.stream = Some(stream);
         Ok(true)
@@ -326,8 +328,9 @@ impl ProjectedScanner {
         let mut stream_has_more = false;
 
         for decoded in tables {
-            let decoded = decoded
-                .map_err(|source| ScanError::Archive(format!("failed to decode table: {source}")))?;
+            let decoded = decoded.map_err(|source| {
+                ScanError::Archive(format!("failed to decode table: {source}"))
+            })?;
             let bitmap = compiled
                 .match_table(&decoded)
                 .map_err(|source| ScanError::Archive(format!("failed to match table: {source}")))?;
@@ -360,9 +363,10 @@ impl ProjectedScanner {
         self.field_nodes
             .iter()
             .map(|candidates| {
-                table.columns().iter().position(|column| {
-                    candidates.iter().any(|node| *node == column.node_id())
-                })
+                table
+                    .columns()
+                    .iter()
+                    .position(|column| candidates.iter().any(|node| *node == column.node_id()))
             })
             .collect()
     }
@@ -387,34 +391,31 @@ fn project_row(
             continue;
         };
         let cell = match column.data() {
-            ColumnData::Integer(values) => values
-                .get(row)
-                .map_or_else(Cell::absent, |value| {
+            ColumnData::Integer(values) => values.get(row).map_or_else(Cell::absent, |value| {
+                Cell::scalar(kind::INTEGER, value, 0.0)
+            }),
+            ColumnData::DeltaInteger(values) => {
+                values.get(row).map_or_else(Cell::absent, |value| {
                     Cell::scalar(kind::INTEGER, value, 0.0)
-                }),
-            ColumnData::DeltaInteger(values) => values
-                .get(row)
-                .map_or_else(Cell::absent, |value| {
-                    Cell::scalar(kind::INTEGER, value, 0.0)
-                }),
+                })
+            }
             ColumnData::Float(values) => values
                 .get(row)
                 .map_or_else(Cell::absent, |value| Cell::scalar(kind::FLOAT, 0, value)),
-            ColumnData::FormattedFloat(values) => values.get(row).map_or_else(Cell::absent, |value| {
-                Cell::scalar(kind::FLOAT, 0, value.value())
-            }),
+            ColumnData::FormattedFloat(values) => {
+                values.get(row).map_or_else(Cell::absent, |value| {
+                    Cell::scalar(kind::FLOAT, 0, value.value())
+                })
+            }
             ColumnData::Boolean(values) => values.get(row).map_or_else(Cell::absent, |value| {
                 Cell::scalar(kind::BOOLEAN, i64::from(value), 0.0)
             }),
             ColumnData::Timestamp(values) => values.get(row).map_or_else(Cell::absent, |value| {
                 Cell::scalar(kind::TIMESTAMP, value.epoch_nanoseconds(), 0.0)
             }),
-            ColumnData::VarString(values) | ColumnData::DictionaryFloat(values) => {
-                match values.value(row) {
-                    Some(bytes) => push_text(kind::STRING, bytes, text),
-                    None => Cell::absent(),
-                }
-            }
+            ColumnData::VarString(values) | ColumnData::DictionaryFloat(values) => values
+                .value(row)
+                .map_or_else(Cell::absent, |bytes| push_text(kind::STRING, bytes, text)),
             ColumnData::ClpString(values) | ColumnData::UnstructuredArray(values) => {
                 match values.record(row) {
                     Some(record) => {
@@ -440,17 +441,17 @@ fn project_row(
                     None => Cell::absent(),
                 }
             }
-            // Legacy date strings carry no value this ABI can represent faithfully. Reporting
-            // them as unsupported keeps "absent" meaning "the path is not here".
-            ColumnData::DeprecatedDateString(_) => Cell::scalar(kind::UNSUPPORTED, 0, 0.0),
-            // ColumnData is non-exhaustive. A variant added upstream is reported as unsupported
-            // rather than absent, so a new column type cannot be mistaken for a missing path.
+            // Legacy date strings and variants added upstream carry no value this ABI can
+            // represent faithfully. Reporting them as unsupported keeps "absent" meaning "the
+            // path is not here" and prevents new column types from looking like missing paths.
             _ => Cell::scalar(kind::UNSUPPORTED, 0, 0.0),
         };
         cells.push(cell);
     }
     Ok(())
 }
+
+pub type ProjectedRow<'a> = (&'a [Cell], &'a [u8]);
 
 /// Appends borrowed bytes to the batch arena and returns a cell spanning them.
 fn push_text(kind: u32, bytes: &[u8], text: &mut Vec<u8>) -> Cell {
