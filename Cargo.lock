@@ -1029,6 +1029,7 @@ name = "clp-s-ffi"
 version = "0.13.1-dev"
 dependencies = [
  "clp-s",
+ "zstd",
 ]
 
 [[package]]

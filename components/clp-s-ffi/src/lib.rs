@@ -45,6 +45,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod columnar;
+mod kv_ir_columnar;
 
 use std::ffi::c_void;
 use std::fs;
@@ -1780,6 +1781,175 @@ pub unsafe extern "C" fn clp_s_v2_scanner_next_row(
             out_has_row.write(1);
             Ok(())
         })
+    }
+}
+
+/// Opaque projected KV-IR scan handle.
+pub struct ClpSV2KvIrScanner {
+    inner: kv_ir_columnar::KvIrProjectedScanner,
+    values: Vec<ClpSV2Value>,
+}
+
+/// Opens a projected scan over one KV-IR stream.
+///
+/// ABI v1 could decode a KV-IR stream but not filter one. This applies the compiled query and
+/// returns typed values for the requested paths, the same contract
+/// [`clp_s_v2_scanner_open`] provides for archives. A stream still being appended to has no end
+/// marker; the complete events before the truncation are returned, which is what a reader of a
+/// live segment needs.
+///
+/// # Safety
+///
+/// `stream_path` and each field path must be readable for their lengths. `query` must be a live
+/// handle from [`clp_s_v1_query_compile`]. `out_scanner` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clp_s_v2_kv_ir_scanner_open(
+    stream_path: *const u8,
+    stream_path_length: usize,
+    query: *const ClpSQuery,
+    fields: *const ClpSV2ProjectedField,
+    field_count: usize,
+    out_scanner: *mut *mut ClpSV2KvIrScanner,
+    error: *mut ClpSErrorBuffer,
+) -> ClpSStatus {
+    if out_scanner.is_null() {
+        // SAFETY: Forwarded from the function contract.
+        return unsafe {
+            ffi_entry(error, || {
+                Err(ApiError::InvalidArgument(
+                    "out_scanner must not be null".to_owned(),
+                ))
+            })
+        };
+    }
+    // SAFETY: The caller provides writable output storage. This happens before fallible work.
+    unsafe {
+        out_scanner.write(ptr::null_mut());
+    }
+    // SAFETY: All raw arguments are governed by this function's contract.
+    unsafe {
+        ffi_entry(error, || {
+            let query = query.as_ref().ok_or_else(|| {
+                ApiError::InvalidArgument("query handle must not be null".to_owned())
+            })?;
+            let path_bytes = borrowed_bytes(stream_path, stream_path_length, "stream_path")?;
+            let path_text = str::from_utf8(path_bytes).map_err(|source| {
+                ApiError::InvalidArgument(format!("stream path is not valid UTF-8: {source}"))
+            })?;
+            if field_count != 0 && fields.is_null() {
+                return Err(ApiError::InvalidArgument(
+                    "fields must not be null when field_count is non-zero".to_owned(),
+                ));
+            }
+            let mut paths = Vec::with_capacity(field_count);
+            for index in 0..field_count {
+                let field = *fields.add(index);
+                let bytes = borrowed_bytes(field.path, field.path_length, "field path")?;
+                let text = str::from_utf8(bytes).map_err(|source| {
+                    ApiError::InvalidArgument(format!("field path is not valid UTF-8: {source}"))
+                })?;
+                paths.push(text.to_owned());
+            }
+            let inner = kv_ir_columnar::KvIrProjectedScanner::open(
+                std::path::Path::new(path_text),
+                &query.parsed,
+                query.options.search().ignore_case(),
+                &paths,
+            )
+            .map_err(|source| ApiError::Archive(source.to_string()))?;
+            let handle = Box::new(ClpSV2KvIrScanner {
+                inner,
+                values: vec![
+                    ClpSV2Value {
+                        kind: 0,
+                        reserved: 0,
+                        integer: 0,
+                        real: 0.0,
+                        text: ptr::null(),
+                        text_length: 0,
+                    };
+                    field_count
+                ],
+            });
+            // SAFETY: `out_scanner` is valid writable storage and still contains null.
+            out_scanner.write(Box::into_raw(handle));
+            Ok(())
+        })
+    }
+}
+
+/// Delivers the next matching event's projected values.
+///
+/// # Safety
+///
+/// `scanner` must be a live handle, `out_values` writable for its field count, and `out_has_row`
+/// writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clp_s_v2_kv_ir_scanner_next_row(
+    scanner: *mut ClpSV2KvIrScanner,
+    out_values: *mut ClpSV2Value,
+    out_has_row: *mut u32,
+    error: *mut ClpSErrorBuffer,
+) -> ClpSStatus {
+    // SAFETY: All raw arguments are governed by this function's contract.
+    unsafe {
+        ffi_entry(error, || {
+            let scanner = scanner.as_mut().ok_or_else(|| {
+                ApiError::InvalidArgument("scanner handle must not be null".to_owned())
+            })?;
+            if out_has_row.is_null() {
+                return Err(ApiError::InvalidArgument(
+                    "out_has_row must not be null".to_owned(),
+                ));
+            }
+            out_has_row.write(0);
+            let field_count = scanner.values.len();
+            if field_count != 0 && out_values.is_null() {
+                return Err(ApiError::InvalidArgument(
+                    "out_values must not be null".to_owned(),
+                ));
+            }
+            let Some((cells, arena)) = scanner.inner.next_row() else {
+                return Ok(());
+            };
+            for (index, cell) in cells.iter().enumerate() {
+                let text = if 0 == cell.text_length {
+                    ptr::null()
+                } else {
+                    arena.as_ptr().add(cell.text_offset)
+                };
+                scanner.values[index] = ClpSV2Value {
+                    kind: cell.kind,
+                    reserved: 0,
+                    integer: cell.integer,
+                    real: cell.real,
+                    text,
+                    text_length: cell.text_length,
+                };
+            }
+            for index in 0..field_count {
+                out_values.add(index).write(scanner.values[index]);
+            }
+            out_has_row.write(1);
+            Ok(())
+        })
+    }
+}
+
+/// Frees a KV-IR scanner handle. A null handle is a no-op.
+///
+/// # Safety
+///
+/// A non-null pointer must have been returned by [`clp_s_v2_kv_ir_scanner_open`] and must not have
+/// been freed already.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clp_s_v2_kv_ir_scanner_free(scanner: *mut ClpSV2KvIrScanner) {
+    if scanner.is_null() {
+        return;
+    }
+    // SAFETY: Forwarded from the function contract.
+    unsafe {
+        drop(Box::from_raw(scanner));
     }
 }
 

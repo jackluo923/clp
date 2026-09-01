@@ -11,3 +11,5 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 clp-s = { path = "../clp-s", default-features = false }
+# KV-IR streams are zstd framed; the scanner opens them the way the CLI does.
+zstd = "0.13.3"
