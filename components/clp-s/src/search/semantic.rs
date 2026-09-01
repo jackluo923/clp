@@ -710,6 +710,83 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
         self.evaluate_schema_preflight()
     }
 
+    /// Whether any record in `[start, end)` can satisfy the query's range-index predicates.
+    ///
+    /// Only `$` predicates decide this. Every other predicate stays unknown, because its value is
+    /// row data that has not been read yet, so a `false` answer means the range index alone proves
+    /// the span cannot match. A caller may then skip the span without decompressing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a range predicate cannot be evaluated against the index.
+    pub fn may_match_record_span(&self, start: u64, end: u64) -> Result<bool, SearchError> {
+        if start >= end {
+            return Ok(false);
+        }
+        if self.catalog.metadata().range_index().is_none() {
+            return Ok(true);
+        }
+        let mut states = preflight_states(self.nodes.len())?;
+        let mut range_work = Vec::new();
+        for (index, node) in self.nodes.iter().copied().enumerate() {
+            let value = match node {
+                CompiledNode::Predicate(predicate_index) => {
+                    let compiled = self
+                        .predicates
+                        .get(predicate_index)
+                        .ok_or(SearchError::SizeOverflow)?;
+                    let predicate = self.predicate_ref(compiled)?;
+                    self.evaluate_range_leaf_in_span(
+                        compiled.expression,
+                        compiled.negated,
+                        predicate,
+                        &mut range_work,
+                        Some((start, end)),
+                    )?
+                }
+                CompiledNode::List(list_index) => {
+                    self.evaluate_range_list(list_index, &mut range_work)?
+                }
+                CompiledNode::Not(operand) => {
+                    invert_tri(preflight_operand(&states, NodeId::new(index), operand)?)
+                }
+                CompiledNode::Boolean {
+                    operator,
+                    left,
+                    right,
+                } => combine_tri(
+                    preflight_operand(&states, NodeId::new(index), left)?,
+                    preflight_operand(&states, NodeId::new(index), right)?,
+                    operator,
+                ),
+            };
+            states.push(value);
+        }
+        Ok(Tri::False != preflight_root(self.query, &states)?)
+    }
+
+    /// Returns the record span `[start, end)` covered by one packed stream.
+    ///
+    /// Derived from table metadata alone, so a caller can ask about a stream before deciding to
+    /// decompress it. Returns `None` when the stream holds no tables.
+    #[must_use]
+    pub fn stream_record_span(&self, stream_id: u64) -> Option<(u64, u64)> {
+        let tables = self.catalog.table_metadata().schema_tables();
+        let mut span: Option<(u64, u64)> = None;
+        for (index, table) in tables.iter().enumerate() {
+            if table.stream_id() != stream_id {
+                continue;
+            }
+            let start = *self.table_record_starts.get(index)?;
+            let end = start.checked_add(table.message_count())?;
+            span = Some(match span {
+                None => (start, end),
+                Some((lo, hi)) => (lo.min(start), hi.max(end)),
+            });
+        }
+        span
+    }
+
     fn evaluate_range_preflight(&self) -> Result<Tri, SearchError> {
         let mut states = preflight_states(self.nodes.len())?;
         let mut range_work = Vec::new();
@@ -801,6 +878,22 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
         predicate: PredicateRef<'_>,
         range_work: &mut Vec<RangeState<'archive>>,
     ) -> Result<Tri, SearchError> {
+        self.evaluate_range_leaf_in_span(expression, negated, predicate, range_work, None)
+    }
+
+    /// Evaluates one range-index leaf, optionally restricted to a record span.
+    ///
+    /// `span` limits the entries considered to those overlapping `[start, end)`. Entries outside
+    /// it cannot decide rows inside it, so ignoring them is what lets a caller ask whether a span
+    /// is worth reading at all.
+    fn evaluate_range_leaf_in_span(
+        &self,
+        expression: NodeId,
+        negated: bool,
+        predicate: PredicateRef<'_>,
+        range_work: &mut Vec<RangeState<'archive>>,
+        span: Option<(u64, u64)>,
+    ) -> Result<Tri, SearchError> {
         if ColumnNamespace::RangeIndex != predicate.path().namespace() {
             return Ok(Tri::Unknown);
         }
@@ -808,6 +901,11 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
             return Ok(Tri::False);
         };
         for entry in range_index.entries() {
+            if let Some((start, end)) = span {
+                if entry.end_index() <= start || entry.start_index() >= end {
+                    continue;
+                }
+            }
             if Tri::True
                 == evaluate_range_fields(
                     entry.fields(),

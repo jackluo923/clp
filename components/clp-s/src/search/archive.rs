@@ -96,6 +96,8 @@ pub struct ArchiveSearchStats {
     tables_scanned: u64,
     rows_scanned: u64,
     matching_rows: u64,
+    streams_skipped: u64,
+    rows_skipped: u64,
 }
 
 impl ArchiveSearchStats {
@@ -123,10 +125,37 @@ impl ArchiveSearchStats {
         self.rows_scanned
     }
 
+    /// Returns the number of packed streams the range index proved could not match.
+    ///
+    /// A skipped stream is never decompressed, so its rows appear in
+    /// [`Self::rows_skipped`] rather than [`Self::rows_scanned`].
+    #[must_use]
+    pub const fn streams_skipped(self) -> u64 {
+        self.streams_skipped
+    }
+
+    /// Returns the number of rows in skipped packed streams.
+    #[must_use]
+    pub const fn rows_skipped(self) -> u64 {
+        self.rows_skipped
+    }
+
     /// Returns the number of rows accepted by the query.
     #[must_use]
     pub const fn matching_rows(self) -> u64 {
         self.matching_rows
+    }
+
+    fn add_skipped_stream(&mut self, rows: u64) -> Result<(), ArchiveSearchError> {
+        self.streams_skipped = self
+            .streams_skipped
+            .checked_add(1)
+            .ok_or(ArchiveSearchError::SizeOverflow)?;
+        self.rows_skipped = self
+            .rows_skipped
+            .checked_add(rows)
+            .ok_or(ArchiveSearchError::SizeOverflow)?;
+        Ok(())
     }
 
     fn add_stream(&mut self, decoded_bytes: usize) -> Result<(), ArchiveSearchError> {
@@ -380,6 +409,27 @@ pub fn search_archive<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
     for stream_index in 0..catalog.table_metadata().packed_streams().len() {
         let stream_id =
             u64::try_from(stream_index).map_err(|_| ArchiveSearchError::SizeOverflow)?;
+        // Decompressing a packed stream dominates the cost of searching it. When the query
+        // selects a subset of the archive's logical files, the range index can prove a whole
+        // stream out of contention from metadata alone, and then the stream is never read.
+        if let Some((span_start, span_end)) = compiled.stream_record_span(stream_id) {
+            if !compiled
+                .may_match_record_span(span_start, span_end)
+                .map_err(ArchiveSearchError::Compile)?
+            {
+                let mut skipped_tables = 0_usize;
+                for table in catalog.table_metadata().schema_tables() {
+                    if table.stream_id() == stream_id {
+                        skipped_tables += 1;
+                    }
+                }
+                expected_table_index = expected_table_index
+                    .checked_add(skipped_tables)
+                    .ok_or(ArchiveSearchError::SizeOverflow)?;
+                stats.add_skipped_stream(span_end - span_start)?;
+                continue;
+            }
+        }
         let stream = reader
             .read_packed_stream(
                 catalog.metadata(),
@@ -441,10 +491,14 @@ pub fn search_archive<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
         });
     }
     let expected_rows = catalog.table_metadata().record_count();
-    if stats.rows_scanned != expected_rows {
+    let covered_rows = stats
+        .rows_scanned
+        .checked_add(stats.rows_skipped)
+        .ok_or(ArchiveSearchError::SizeOverflow)?;
+    if covered_rows != expected_rows {
         return Err(ArchiveSearchError::RecordCountMismatch {
             expected: expected_rows,
-            actual: stats.rows_scanned,
+            actual: covered_rows,
         });
     }
     Ok(stats)
