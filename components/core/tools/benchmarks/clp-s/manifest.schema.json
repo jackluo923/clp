@@ -1,0 +1,299 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/y-scope/clp/components/core/tools/benchmarks/clp-s/manifest.schema.json",
+  "title": "CLP-S benchmark manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "name",
+    "datasets",
+    "workloads"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "version": {
+      "const": 1
+    },
+    "name": {
+      "$ref": "#/$defs/name"
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": {
+        "type": [
+          "string",
+          "number",
+          "integer",
+          "boolean",
+          "null"
+        ]
+      }
+    },
+    "environment": {
+      "$ref": "#/$defs/environment"
+    },
+    "defaults": {
+      "$ref": "#/$defs/runOptions"
+    },
+    "datasets": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "$ref": "#/$defs/name"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/dataset"
+      }
+    },
+    "preparations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/preparation"
+      }
+    },
+    "workloads": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/workload"
+      }
+    }
+  },
+  "$defs": {
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+    },
+    "environment": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+      },
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "dataset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "logical_size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "description": {
+          "type": "string"
+        }
+      }
+    },
+    "inputReference": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "dataset"
+          ],
+          "properties": {
+            "dataset": {
+              "$ref": "#/$defs/name"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "preparation"
+          ],
+          "properties": {
+            "preparation": {
+              "$ref": "#/$defs/name"
+            }
+          }
+        }
+      ]
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "metric",
+        "statistic",
+        "comparison",
+        "threshold"
+      ],
+      "properties": {
+        "metric": {
+          "enum": [
+            "wall_time_seconds",
+            "cpu_time_seconds",
+            "user_cpu_seconds",
+            "system_cpu_seconds",
+            "peak_rss_bytes",
+            "output_size_bytes",
+            "stdout_size_bytes",
+            "throughput_per_second"
+          ]
+        },
+        "statistic": {
+          "enum": [
+            "median",
+            "p05",
+            "p95"
+          ]
+        },
+        "comparison": {
+          "enum": [
+            "min_ratio",
+            "max_ratio"
+          ]
+        },
+        "threshold": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "runOptions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "warmups": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "trials": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "timeout_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "gates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/gate"
+          }
+        }
+      }
+    },
+    "preparation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "implementation",
+        "input",
+        "args"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/name"
+        },
+        "implementation": {
+          "enum": [
+            "cpp",
+            "rust"
+          ]
+        },
+        "input": {
+          "$ref": "#/$defs/inputReference"
+        },
+        "args": {
+          "$ref": "#/$defs/args"
+        },
+        "environment": {
+          "$ref": "#/$defs/environment"
+        },
+        "timeout_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "args": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string"
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "operation",
+        "input",
+        "args"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/name"
+        },
+        "operation": {
+          "enum": [
+            "compression",
+            "extraction",
+            "search"
+          ]
+        },
+        "input": {
+          "$ref": "#/$defs/inputReference"
+        },
+        "args": {
+          "$ref": "#/$defs/args"
+        },
+        "environment": {
+          "$ref": "#/$defs/environment"
+        },
+        "warmups": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "trials": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "timeout_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "throughput_source": {
+          "enum": [
+            "none",
+            "input_bytes",
+            "logical_input_bytes",
+            "output_bytes",
+            "stdout_bytes",
+            "stdout_lines",
+            "output_lines"
+          ]
+        },
+        "gates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/gate"
+          }
+        }
+      }
+    }
+  }
+}

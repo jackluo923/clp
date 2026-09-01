@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/y-scope/clp/components/core/tools/benchmarks/clp-s/build-metadata.schema.json",
+  "title": "CLP-S benchmark build metadata",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "source_commit",
+    "cpp",
+    "rust"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "source_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40,64}$"
+    },
+    "notes": {
+      "type": "string"
+    },
+    "cpp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "binary_sha256",
+        "build_type",
+        "cmake_arguments",
+        "compiler",
+        "compiler_version",
+        "compiler_flags",
+        "linker_flags",
+        "lto",
+        "target_cpu",
+        "allocator"
+      ],
+      "properties": {
+        "binary_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "build_type": {
+          "$ref": "#/$defs/nonemptyString"
+        },
+        "cmake_arguments": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "compiler": {
+          "$ref": "#/$defs/nonemptyString"
+        },
+        "compiler_version": {
+          "$ref": "#/$defs/nonemptyString"
+        },
+        "compiler_flags": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "linker_flags": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "lto": {
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "target_cpu": {
+          "$ref": "#/$defs/nonemptyString"
+        },
+        "allocator": {
+          "$ref": "#/$defs/nonemptyString"
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "rust": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "binary_sha256",
+        "profile",
+        "cargo_arguments",
+        "rustc_version",
+        "rustflags",
+        "profile_settings",
+        "target_triple",
+        "target_cpu",
+        "allocator"
+      ],
+      "properties": {
+        "binary_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "profile": {
+          "$ref": "#/$defs/nonemptyString"
+        },
+        "cargo_arguments": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "rustc_version": {
+          "$ref": "#/$defs/nonemptyString"
+        },
+        "rustflags": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "profile_settings": {
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "number",
+              "integer",
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "target_triple": {
+          "$ref": "#/$defs/nonemptyString"
+        },
+        "target_cpu": {
+          "$ref": "#/$defs/nonemptyString"
+        },
+        "allocator": {
+          "$ref": "#/$defs/nonemptyString"
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "nonemptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "stringArray": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

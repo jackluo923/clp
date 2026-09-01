@@ -1,0 +1,109 @@
+{
+  "$schema": "./manifest.schema.json",
+  "version": 1,
+  "name": "clp-s-smoke",
+  "metadata": {
+    "purpose": "Harness smoke test only; this dataset is too small for performance conclusions"
+  },
+  "environment": {
+    "LC_ALL": "C",
+    "TZ": "UTC"
+  },
+  "defaults": {
+    "warmups": 1,
+    "trials": 3,
+    "timeout_seconds": 60,
+    "gates": [
+      {
+        "metric": "wall_time_seconds",
+        "statistic": "median",
+        "comparison": "max_ratio",
+        "threshold": 2.0
+      },
+      {
+        "metric": "peak_rss_bytes",
+        "statistic": "median",
+        "comparison": "max_ratio",
+        "threshold": 2.0
+      }
+    ]
+  },
+  "datasets": {
+    "smoke-ndjson": {
+      "path": "fixtures/smoke.ndjson",
+      "sha256": "b80ee9df3f376d36c1fb2da95aabbeb417aadc00fdf2e7a2df505bf1b090ed31"
+    }
+  },
+  "preparations": [
+    {
+      "name": "smoke-reference-archive",
+      "implementation": "cpp",
+      "input": {
+        "dataset": "smoke-ndjson"
+      },
+      "args": [
+        "c",
+        "--single-file-archive",
+        "{output}",
+        "{input}"
+      ]
+    }
+  ],
+  "workloads": [
+    {
+      "name": "compress-smoke-sfa",
+      "operation": "compression",
+      "input": {
+        "dataset": "smoke-ndjson"
+      },
+      "args": [
+        "c",
+        "--single-file-archive",
+        "{output}",
+        "{input}"
+      ],
+      "throughput_source": "logical_input_bytes",
+      "gates": [
+        {
+          "metric": "throughput_per_second",
+          "statistic": "median",
+          "comparison": "min_ratio",
+          "threshold": 0.5
+        },
+        {
+          "metric": "output_size_bytes",
+          "statistic": "median",
+          "comparison": "max_ratio",
+          "threshold": 1.25
+        }
+      ]
+    },
+    {
+      "name": "extract-smoke-unordered",
+      "operation": "extraction",
+      "input": {
+        "preparation": "smoke-reference-archive"
+      },
+      "args": [
+        "x",
+        "{input}",
+        "{output}"
+      ],
+      "throughput_source": "output_bytes"
+    },
+    {
+      "name": "search-smoke-info-count",
+      "operation": "search",
+      "input": {
+        "preparation": "smoke-reference-archive"
+      },
+      "args": [
+        "s",
+        "{input}",
+        "level: INFO",
+        "--count"
+      ],
+      "throughput_source": "input_bytes"
+    }
+  ]
+}

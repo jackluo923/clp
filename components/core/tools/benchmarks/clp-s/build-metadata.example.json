@@ -1,0 +1,47 @@
+{
+  "$schema": "./build-metadata.schema.json",
+  "schema_version": 1,
+  "source_commit": "0000000000000000000000000000000000000000",
+  "notes": "Template only: replace every placeholder with the exact build invocation and output",
+  "cpp": {
+    "binary_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "build_type": "Release",
+    "cmake_arguments": [
+      "-DCMAKE_BUILD_TYPE=Release"
+    ],
+    "compiler": "REPLACE_WITH_CXX_PATH",
+    "compiler_version": "REPLACE_WITH_CXX_VERSION",
+    "compiler_flags": [
+      "REPLACE_WITH_EFFECTIVE_CXX_FLAGS"
+    ],
+    "linker_flags": [
+      "REPLACE_WITH_EFFECTIVE_LINKER_FLAGS"
+    ],
+    "lto": true,
+    "target_cpu": "REPLACE_WITH_EFFECTIVE_TARGET_CPU",
+    "allocator": "REPLACE_WITH_ALLOCATOR"
+  },
+  "rust": {
+    "binary_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "profile": "release",
+    "cargo_arguments": [
+      "build",
+      "--release",
+      "--bin",
+      "clp-s"
+    ],
+    "rustc_version": "REPLACE_WITH_RUSTC_VERBOSE_VERSION",
+    "rustflags": [
+      "REPLACE_WITH_EFFECTIVE_RUSTFLAGS"
+    ],
+    "profile_settings": {
+      "lto": "REPLACE_WITH_CARGO_PROFILE_LTO",
+      "codegen-units": "REPLACE_WITH_CARGO_PROFILE_CODEGEN_UNITS",
+      "opt-level": "REPLACE_WITH_CARGO_PROFILE_OPT_LEVEL",
+      "panic": "REPLACE_WITH_CARGO_PROFILE_PANIC"
+    },
+    "target_triple": "REPLACE_WITH_TARGET_TRIPLE",
+    "target_cpu": "REPLACE_WITH_EFFECTIVE_TARGET_CPU",
+    "allocator": "REPLACE_WITH_ALLOCATOR"
+  }
+}
