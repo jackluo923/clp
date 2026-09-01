@@ -51,7 +51,6 @@ tasks:
         . "{{.G_RUST_TOOLCHAIN_ENV_FILE}}"
         cargo nextest run \
           --locked \
-          --offline \
           --package clp-s \
           --package clp-s-container \
           --package clp-s-ffi \
