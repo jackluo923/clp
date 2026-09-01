@@ -41,6 +41,7 @@ use crate::archive::DecodedSchemaTable;
 use crate::archive::EncodedVariableError;
 use crate::archive::NodeType;
 use crate::archive::RangeIndexValue;
+use crate::log_order::locate_log_order_column;
 use crate::archive::SchemaEntry;
 use crate::archive::SchemaTree;
 use crate::archive::TimestampBounds;
@@ -708,83 +709,6 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
             return Ok(false);
         }
         self.evaluate_schema_preflight()
-    }
-
-    /// Whether any record in `[start, end)` can satisfy the query's range-index predicates.
-    ///
-    /// Only `$` predicates decide this. Every other predicate stays unknown, because its value is
-    /// row data that has not been read yet, so a `false` answer means the range index alone proves
-    /// the span cannot match. A caller may then skip the span without decompressing it.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a range predicate cannot be evaluated against the index.
-    pub fn may_match_record_span(&self, start: u64, end: u64) -> Result<bool, SearchError> {
-        if start >= end {
-            return Ok(false);
-        }
-        if self.catalog.metadata().range_index().is_none() {
-            return Ok(true);
-        }
-        let mut states = preflight_states(self.nodes.len())?;
-        let mut range_work = Vec::new();
-        for (index, node) in self.nodes.iter().copied().enumerate() {
-            let value = match node {
-                CompiledNode::Predicate(predicate_index) => {
-                    let compiled = self
-                        .predicates
-                        .get(predicate_index)
-                        .ok_or(SearchError::SizeOverflow)?;
-                    let predicate = self.predicate_ref(compiled)?;
-                    self.evaluate_range_leaf_in_span(
-                        compiled.expression,
-                        compiled.negated,
-                        predicate,
-                        &mut range_work,
-                        Some((start, end)),
-                    )?
-                }
-                CompiledNode::List(list_index) => {
-                    self.evaluate_range_list(list_index, &mut range_work)?
-                }
-                CompiledNode::Not(operand) => {
-                    invert_tri(preflight_operand(&states, NodeId::new(index), operand)?)
-                }
-                CompiledNode::Boolean {
-                    operator,
-                    left,
-                    right,
-                } => combine_tri(
-                    preflight_operand(&states, NodeId::new(index), left)?,
-                    preflight_operand(&states, NodeId::new(index), right)?,
-                    operator,
-                ),
-            };
-            states.push(value);
-        }
-        Ok(Tri::False != preflight_root(self.query, &states)?)
-    }
-
-    /// Returns the record span `[start, end)` covered by one packed stream.
-    ///
-    /// Derived from table metadata alone, so a caller can ask about a stream before deciding to
-    /// decompress it. Returns `None` when the stream holds no tables.
-    #[must_use]
-    pub fn stream_record_span(&self, stream_id: u64) -> Option<(u64, u64)> {
-        let tables = self.catalog.table_metadata().schema_tables();
-        let mut span: Option<(u64, u64)> = None;
-        for (index, table) in tables.iter().enumerate() {
-            if table.stream_id() != stream_id {
-                continue;
-            }
-            let start = *self.table_record_starts.get(index)?;
-            let end = start.checked_add(table.message_count())?;
-            span = Some(match span {
-                None => (start, end),
-                Some((lo, hi)) => (lo.min(start), hi.max(end)),
-            });
-        }
-        span
     }
 
     fn evaluate_range_preflight(&self) -> Result<Tri, SearchError> {
@@ -3304,20 +3228,18 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
         let Some(range_index) = self.compiled.catalog.metadata().range_index() else {
             return Ok(bitmap);
         };
-        let table_start = *self
-            .compiled
-            .table_record_starts
-            .get(self.decoded.table_index())
-            .ok_or(SearchError::SizeOverflow)?;
-        let table_end = table_start
-            .checked_add(u64::try_from(row_count).map_err(|_| SearchError::SizeOverflow)?)
-            .ok_or(SearchError::SizeOverflow)?;
+
+        // A range-index entry addresses a span of LOG event indices, the order events were
+        // written in. A table addresses rows in PHYSICAL order, which groups them by schema. The
+        // two coincide only in an archive holding a single schema, so a row's position in its
+        // table says nothing about which entry covers it. C++ resolves this by rewriting a
+        // matching entry into bounds on the `log_event_idx` metadata column and testing each row's
+        // own value against them; this does the same.
+        let mut evaluated = Vec::new();
+        evaluated
+            .try_reserve_exact(range_index.entries().len())
+            .map_err(|_| allocation(SearchResource::BitmapBytes, range_index.entries().len()))?;
         for entry in range_index.entries() {
-            let start = entry.start_index().max(table_start);
-            let end = entry.end_index().min(table_end);
-            if start >= end {
-                continue;
-            }
             let result = evaluate_range_fields(
                 entry.fields(),
                 expression,
@@ -3326,11 +3248,34 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
                 self.compiled.options,
                 &mut self.range_work,
             )?;
-            let local_start =
-                usize::try_from(start - table_start).map_err(|_| SearchError::SizeOverflow)?;
-            let local_end =
-                usize::try_from(end - table_start).map_err(|_| SearchError::SizeOverflow)?;
-            bitmap[local_start..local_end].fill(result as u8);
+            evaluated.push((entry.start_index(), entry.end_index(), result));
+        }
+
+        let located = locate_log_order_column(
+            self.compiled.catalog.schema_tree(),
+            self.decoded.schema(),
+            self.decoded.table(),
+        )
+        .map_err(|_| SearchError::SizeOverflow)?;
+        let Some(column) = located else {
+            // Without the metadata column a row cannot be placed in log order, so no entry can be
+            // shown to cover or exclude it. Leaving the default keeps the predicate unproven
+            // rather than answering it from positions that do not mean what it needs.
+            return Ok(bitmap);
+        };
+
+        // The column is delta encoded, so it is walked once rather than indexed per row.
+        for (row, log_event_idx) in column.cursor().enumerate().take(row_count) {
+            if log_event_idx < 0 {
+                continue;
+            }
+            let idx = log_event_idx as u64;
+            for (start, end, result) in &evaluated {
+                if idx >= *start && idx < *end {
+                    bitmap[row] = *result as u8;
+                    break;
+                }
+            }
         }
         Ok(bitmap)
     }

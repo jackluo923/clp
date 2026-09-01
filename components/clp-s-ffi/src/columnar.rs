@@ -272,30 +272,14 @@ impl ProjectedScanner {
         Ok(())
     }
 
-    /// Reads the next packed stream, skipping any the range index rules out.
+    /// Reads the next packed stream.
     ///
-    /// Returns whether a stream was loaded; a skipped stream advances the cursor instead.
+    /// Every stream is read. A range-index predicate cannot rule one out from metadata alone: an
+    /// entry's bounds are log event indices, while a stream covers a physical span, and the two
+    /// orders differ as soon as an archive holds more than one schema. Deciding without reading
+    /// would need each row's `log_event_idx`, which is inside the stream being skipped.
     fn load_next_stream(&mut self) -> Result<bool, ScanError> {
         let stream_id = self.stream_index as u64;
-        let skip = {
-            let compiled = self
-                .parsed
-                .compile_for_archive(&self.catalog, self.options.search())
-                .map_err(|source| {
-                    ScanError::Archive(format!("failed to compile query: {source}"))
-                })?;
-            match compiled.stream_record_span(stream_id) {
-                Some((start, end)) => !compiled.may_match_record_span(start, end).map_err(
-                    |source| ScanError::Archive(format!("failed to test record span: {source}")),
-                )?,
-                None => false,
-            }
-        };
-        if skip {
-            self.advance_past_stream(stream_id);
-            self.stream_index += 1;
-            return Ok(false);
-        }
         let stream = self
             .reader
             .read_packed_stream(
@@ -309,16 +293,6 @@ impl ProjectedScanner {
             })?;
         self.stream = Some(stream);
         Ok(true)
-    }
-
-    /// Moves the table cursor past every table belonging to `stream_id`.
-    fn advance_past_stream(&mut self, stream_id: u64) {
-        let tables = self.catalog.table_metadata().schema_tables();
-        let skipped = tables
-            .iter()
-            .filter(|table| table.stream_id() == stream_id)
-            .count();
-        self.table_cursor += skipped;
     }
 
     /// Projects the current stream's matched rows in one forward pass.
