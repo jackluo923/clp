@@ -96,6 +96,8 @@ tooling-gh-workflows
 
 design-project-structure
 design-deployment-orchestration
+design-clp-s-rust-compatibility
+design-clp-s-archive-format
 logging
 
 design-kv-ir-streams/index
