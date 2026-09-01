@@ -401,6 +401,76 @@ clp_s_status clp_s_v1_search(
         clp_s_error_buffer *error
 );
 
+/**
+ * ABI v2: projected columnar scanning.
+ *
+ * `clp_s_v1_search` delivers one complete JSON document per match, so a caller wanting a few
+ * scalar fields pays to reconstruct, serialize, and reparse every other field. These entry points
+ * read only the requested paths out of the decoded columns instead.
+ */
+
+#define CLP_S_V2_VALUE_ABSENT 0u
+#define CLP_S_V2_VALUE_BOOLEAN 1u
+#define CLP_S_V2_VALUE_INTEGER 2u
+#define CLP_S_V2_VALUE_FLOAT 3u
+#define CLP_S_V2_VALUE_STRING 4u
+#define CLP_S_V2_VALUE_TIMESTAMP 5u
+#define CLP_S_V2_VALUE_UNSUPPORTED 6u
+
+typedef struct clp_s_v2_scanner clp_s_v2_scanner;
+
+/** One requested projection path, as an escaped dot descriptor. */
+typedef struct clp_s_v2_projected_field {
+    const uint8_t *path;
+    size_t path_length;
+} clp_s_v2_projected_field;
+
+/**
+ * One projected value.
+ *
+ * ABSENT covers both a path this archive does not carry and an explicit null, matching how a
+ * missing value reaches SQL. Booleans use 0/1 in `integer`, timestamps epoch nanoseconds. `text`
+ * borrows the scanner's batch arena and is valid only until the next
+ * `clp_s_v2_scanner_next_row` call on the same scanner.
+ */
+typedef struct clp_s_v2_value {
+    uint32_t kind;
+    uint32_t reserved;
+    int64_t integer;
+    double real;
+    const uint8_t *text;
+    size_t text_length;
+} clp_s_v2_value;
+
+/**
+ * Opens a projected scan. `query` must outlive the scanner. A path the archive does not carry is
+ * reported ABSENT on every row rather than refused, because a dataset's schemas need not all
+ * carry every field.
+ */
+clp_s_status clp_s_v2_scanner_open(
+        const uint8_t *archive_path,
+        size_t archive_path_length,
+        const clp_s_query *query,
+        const clp_s_v2_projected_field *fields,
+        size_t field_count,
+        clp_s_v2_scanner **out_scanner,
+        clp_s_error_buffer *error
+);
+
+/**
+ * Delivers the next matching row. `out_values` must hold `field_count` elements. `out_has_row`
+ * receives zero once the archive is exhausted, and `out_values` is then untouched.
+ */
+clp_s_status clp_s_v2_scanner_next_row(
+        clp_s_v2_scanner *scanner,
+        clp_s_v2_value *out_values,
+        uint32_t *out_has_row,
+        clp_s_error_buffer *error
+);
+
+/** Frees a scanner handle. A null handle is a no-op. */
+void clp_s_v2_scanner_free(clp_s_v2_scanner *scanner);
+
 #if defined(__cplusplus)
 #define CLP_S_ABI_STATIC_ASSERT(condition, message) static_assert((condition), message)
 #elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
