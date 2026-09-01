@@ -1,0 +1,45 @@
+name: "clp-s-rust-checks"
+
+on:
+  pull_request:
+    paths: &monitored_paths
+      - ".cargo/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".github/actions/run-on-image/**"
+      - ".github/workflows/clp-s-rust-checks.yaml"
+      - "components/clp-s/**"
+      - "components/clp-s-container/**"
+      - "components/clp-s-ffi/**"
+      - "taskfile.yaml"
+      - "taskfiles/lint.yaml"
+      - "taskfiles/tests/**"
+      - "taskfiles/toolchains.yaml"
+      - "tools/yscope-dev-utils"
+  push:
+    paths: *monitored_paths
+  schedule:
+    - cron: "15 0 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: "${{github.workflow}}-${{github.ref}}"
+  cancel-in-progress: true
+
+jobs:
+  clp-s-rust-checks:
+    runs-on: "ubuntu-22.04"
+    steps:
+      - uses: "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"  # v6.0.2
+        with:
+          submodules: "recursive"
+
+      - name: "Lint and test clp-s in manylinux_2_28"
+        uses: "./.github/actions/run-on-image"
+        with:
+          arch: "amd64"
+          image_name: "clp-core-dependencies-manylinux_2_28"
+          run_command: >-
+            HOME=/tmp task lint:check-rust-clp-s
+            && HOME=/tmp task tests:rust-clp-s
+          use_published_image: "true"

@@ -46,10 +46,13 @@ jobs:
         shell: "bash"
         run: "task deps:lock:check-rust"
 
-      - name: "Lint"
+      - name: "Lint non-clp-s Rust workspace members"
         shell: "bash"
-        run: "task lint:check-rust"
+        run: "task lint:check-rust-non-clp-s"
 
-      - name: "Test"
+      - name: "Test non-clp-s Rust workspace members"
+        env:
+          CARGO_NEXTEST_EXCLUDE_FLAGS: >-
+            --exclude clp-s --exclude clp-s-container --exclude clp-s-ffi
         shell: "bash"
         run: "task tests:rust-all"

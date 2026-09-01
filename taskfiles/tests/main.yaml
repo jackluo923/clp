@@ -7,6 +7,8 @@ includes:
 tasks:
   rust-all:
     vars:
+      CARGO_NEXTEST_EXCLUDE_FLAGS: >-
+        {{default "" .CARGO_NEXTEST_EXCLUDE_FLAGS}}
       LOG_INGESTOR_BUCKET: "clp-log-ingestor-test-bucket"
       LOG_INGESTOR_QUEUE: "clp-log-ingestor-test-queue"
       LOCALSTACK_CONTAINER_NAME:
@@ -34,4 +36,25 @@ tasks:
         AWS_ENDPOINT_URL="http://localhost:{{.LOCALSTACK_PORT}}" \
         CLP_LOG_INGESTOR_S3_BUCKET="{{.LOG_INGESTOR_BUCKET}}" \
         CLP_LOG_INGESTOR_SQS_QUEUE="{{.LOG_INGESTOR_QUEUE}}" \
-        cargo nextest run --all --all-features --run-ignored all --release
+        cargo nextest run \
+          --all \
+          {{.CARGO_NEXTEST_EXCLUDE_FLAGS}} \
+          --all-features \
+          --run-ignored all \
+          --release
+
+  rust-clp-s:
+    dir: "{{.ROOT_DIR}}"
+    deps: ["toolchains:rust"]
+    cmds:
+      - |-
+        . "{{.G_RUST_TOOLCHAIN_ENV_FILE}}"
+        cargo nextest run \
+          --locked \
+          --offline \
+          --package clp-s \
+          --package clp-s-container \
+          --package clp-s-ffi \
+          --all-features \
+          --run-ignored all \
+          --release

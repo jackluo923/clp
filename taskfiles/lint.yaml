@@ -800,6 +800,29 @@ tasks:
       - task: "check-rust-format"
       - task: "check-rust-static"
 
+  check-rust-clp-s:
+    cmds:
+      - task: "check-rust-format"
+      - task: "cargo-workspace-clippy"
+        vars:
+          CARGO_CLIPPY_FLAGS: >-
+            --package clp-s
+            --package clp-s-container
+            --package clp-s-ffi
+            -- -D warnings
+
+  check-rust-non-clp-s:
+    cmds:
+      - task: "check-rust-format"
+      - task: "cargo-workspace-clippy"
+        vars:
+          CARGO_CLIPPY_FLAGS: >-
+            --workspace
+            --exclude clp-s
+            --exclude clp-s-container
+            --exclude clp-s-ffi
+            -- -D warnings
+
   fix-rust:
     cmds:
       # `fix-rust-static` must come before `fix-rust-format` to ensure that any fixes made by the
