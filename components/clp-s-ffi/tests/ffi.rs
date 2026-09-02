@@ -812,6 +812,96 @@ fn kv_ir_v2_scanner_projects_exact_typed_width_and_owns_its_query() {
 }
 
 #[test]
+fn kv_ir_v2_scanner_reports_the_whole_streams_field_types() {
+    let stream = TemporaryKvIrFile::from_raw_stream(&decode_hex(FOUR_BYTE_KV_IR_ORACLE_HEX));
+    // A filter that matches nothing still yields the schema of the whole stream.
+    let query = compile_query("message:no-such-message", 0);
+    let path = stream.path.to_str().expect("temporary path is UTF-8");
+    let mut scanner = ptr::dangling_mut::<ClpSV2KvIrScanner>();
+    let mut text = [0_u8; 512];
+    let mut error = error_buffer(&mut text);
+    // SAFETY: All inputs and outputs are live and disjoint for this synchronous call.
+    let status = unsafe {
+        clp_s_v2_kv_ir_scanner_open(
+            path.as_ptr(),
+            path.len(),
+            query.0,
+            ptr::null(),
+            0,
+            &raw mut scanner,
+            &raw mut error,
+        )
+    };
+    assert_eq!(CLP_S_STATUS_OK, status, "{}", error_text(&text));
+    let scanner = KvIrScannerHandle(scanner);
+
+    let mut entries = ptr::dangling::<ClpSV2KvIrFieldType>();
+    let mut count = usize::MAX;
+    // SAFETY: The scanner is live and both outputs are writable.
+    let status = unsafe {
+        clp_s_v2_kv_ir_scanner_field_types(
+            scanner.0,
+            &raw mut entries,
+            &raw mut count,
+            &raw mut error,
+        )
+    };
+    assert_eq!(CLP_S_STATUS_OK, status, "{}", error_text(&text));
+    assert!(!entries.is_null());
+    assert!(count > 0);
+    // SAFETY: The scanner owns `count` entries and their paths until it is freed.
+    let entries = unsafe { slice::from_raw_parts(entries, count) };
+    let types: Vec<(Vec<u8>, u8)> = entries
+        .iter()
+        .map(|entry| {
+            // SAFETY: Each path is `path_length` bytes owned by the scanner.
+            let path = unsafe { slice::from_raw_parts(entry.path, entry.path_length) };
+            (path.to_vec(), entry.node_type)
+        })
+        .collect();
+    let type_of = |name: &[u8]| -> Vec<u8> {
+        types
+            .iter()
+            .filter(|(path, _)| path.as_slice() == name)
+            .map(|(_, node_type)| *node_type)
+            .collect()
+    };
+    assert_eq!(vec![kv_ir_node::STRING], type_of(b"message"), "{types:?}");
+    assert_eq!(vec![kv_ir_node::BOOLEAN], type_of(b"ok"), "{types:?}");
+    assert_eq!(vec![kv_ir_node::FLOAT], type_of(b"ratio"), "{types:?}");
+    assert_eq!(vec![kv_ir_node::OBJECT], type_of(b"empty"), "{types:?}");
+    // A null-valued key is an object node in the schema tree.
+    assert_eq!(vec![kv_ir_node::OBJECT], type_of(b"none"), "{types:?}");
+    // `seq` and `missing` live in the auto-generated namespace, which is not
+    // reported: certification only ever looks at user keys.
+    assert!(type_of(b"seq").is_empty(), "{types:?}");
+    assert!(type_of(b"missing").is_empty(), "{types:?}");
+    assert!(type_of(b"no-such-key").is_empty(), "{types:?}");
+    assert!(types.iter().all(|(path, _)| !path.is_empty()));
+
+    // Null handles and null outputs are rejected, and the outputs are reset first.
+    let mut entries = ptr::dangling::<ClpSV2KvIrFieldType>();
+    let mut count = usize::MAX;
+    // SAFETY: The outputs are writable; the handle is deliberately null.
+    let status = unsafe {
+        clp_s_v2_kv_ir_scanner_field_types(
+            ptr::null(),
+            &raw mut entries,
+            &raw mut count,
+            &raw mut error,
+        )
+    };
+    assert_ne!(CLP_S_STATUS_OK, status);
+    assert!(entries.is_null());
+    assert_eq!(0, count);
+    // SAFETY: The scanner is live; the entry output is deliberately null.
+    let status = unsafe {
+        clp_s_v2_kv_ir_scanner_field_types(scanner.0, ptr::null_mut(), &raw mut count, &raw mut error)
+    };
+    assert_ne!(CLP_S_STATUS_OK, status);
+}
+
+#[test]
 fn kv_ir_v2_scanner_rejects_fatal_post_event_truncation() {
     let mut raw = decode_hex(FOUR_BYTE_KV_IR_ORACLE_HEX);
     assert_eq!(

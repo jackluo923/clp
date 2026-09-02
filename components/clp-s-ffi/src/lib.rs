@@ -1842,6 +1842,42 @@ pub unsafe extern "C" fn clp_s_v2_scanner_next_row(
 pub struct ClpSV2KvIrScanner {
     inner: kv_ir_columnar::KvIrProjectedScanner,
     values: Vec<ClpSV2Value>,
+    /// Points into `inner`'s field-type paths, which are never mutated after open.
+    field_types: Vec<ClpSV2KvIrFieldType>,
+}
+
+/// One user-namespace schema node of a searched KV-IR stream. Layout-identical to
+/// `clp_s_v2_kv_ir_field_type`: an escaped dot path and a `CLP_S_V2_KV_IR_NODE_*` code.
+#[repr(C)]
+pub struct ClpSV2KvIrFieldType {
+    pub path: *const u8,
+    pub path_length: usize,
+    pub node_type: u8,
+}
+
+/// `CLP_S_V2_KV_IR_NODE_*` codes of the C header.
+pub mod kv_ir_node {
+    pub const INTEGER: u8 = 0;
+    pub const FLOAT: u8 = 1;
+    pub const BOOLEAN: u8 = 2;
+    pub const STRING: u8 = 3;
+    pub const UNSTRUCTURED_ARRAY: u8 = 4;
+    pub const OBJECT: u8 = 5;
+    /// A node type this ABI does not name; a caller must treat it as incompatible.
+    pub const UNKNOWN: u8 = 255;
+}
+
+const fn kv_ir_node_code(node_type: clp_s::ingest::KvIrNodeType) -> u8 {
+    use clp_s::ingest::KvIrNodeType;
+    match node_type {
+        KvIrNodeType::Integer => kv_ir_node::INTEGER,
+        KvIrNodeType::Float => kv_ir_node::FLOAT,
+        KvIrNodeType::Boolean => kv_ir_node::BOOLEAN,
+        KvIrNodeType::String => kv_ir_node::STRING,
+        KvIrNodeType::UnstructuredArray => kv_ir_node::UNSTRUCTURED_ARRAY,
+        KvIrNodeType::Object => kv_ir_node::OBJECT,
+        _ => kv_ir_node::UNKNOWN,
+    }
 }
 
 /// Opens a projected scan over one KV-IR stream.
@@ -1911,8 +1947,18 @@ pub unsafe extern "C" fn clp_s_v2_kv_ir_scanner_open(
                 &paths,
             )
             .map_err(|source| ApiError::Archive(source.to_string()))?;
+            let field_types = inner
+                .field_types()
+                .iter()
+                .map(|field| ClpSV2KvIrFieldType {
+                    path: field.path.as_ptr(),
+                    path_length: field.path.len(),
+                    node_type: kv_ir_node_code(field.node_type),
+                })
+                .collect::<Vec<_>>();
             let handle = Box::new(ClpSV2KvIrScanner {
                 inner,
+                field_types,
                 values: vec![
                     ClpSV2Value {
                         kind: 0,
@@ -1985,6 +2031,50 @@ pub unsafe extern "C" fn clp_s_v2_kv_ir_scanner_next_row(
                 out_values.add(index).write(value);
             }
             out_has_row.write(1);
+            Ok(())
+        })
+    }
+}
+
+/// Lists the user-namespace schema nodes the scan saw, with escaped dot paths and types.
+///
+/// The stream is searched to its end when the scanner opens, so this is the schema of the whole
+/// stream and can certify a pushed filter after the fact instead of decoding the stream a second
+/// time. The entries and the paths they point at are owned by the scanner and stay valid until
+/// it is freed. Both outputs are set to empty before validation.
+///
+/// # Safety
+///
+/// `scanner` must be a live handle; `out_entries` and `out_count` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clp_s_v2_kv_ir_scanner_field_types(
+    scanner: *const ClpSV2KvIrScanner,
+    out_entries: *mut *const ClpSV2KvIrFieldType,
+    out_count: *mut usize,
+    error: *mut ClpSErrorBuffer,
+) -> ClpSStatus {
+    // SAFETY: The caller provides writable output storage. This happens before fallible work.
+    unsafe {
+        if !out_entries.is_null() {
+            out_entries.write(ptr::null());
+        }
+        if !out_count.is_null() {
+            out_count.write(0);
+        }
+    }
+    // SAFETY: All raw arguments are governed by this function's contract.
+    unsafe {
+        ffi_entry(error, || {
+            let scanner = scanner.as_ref().ok_or_else(|| {
+                ApiError::InvalidArgument("scanner handle must not be null".to_owned())
+            })?;
+            if out_entries.is_null() || out_count.is_null() {
+                return Err(ApiError::InvalidArgument(
+                    "out_entries and out_count must not be null".to_owned(),
+                ));
+            }
+            out_entries.write(scanner.field_types.as_ptr());
+            out_count.write(scanner.field_types.len());
             Ok(())
         })
     }

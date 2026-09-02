@@ -532,6 +532,37 @@ clp_s_status clp_s_v2_kv_ir_scanner_next_row(
 /** Frees a KV-IR scanner handle. A null handle is a no-op. */
 void clp_s_v2_kv_ir_scanner_free(clp_s_v2_kv_ir_scanner *scanner);
 
+#define CLP_S_V2_KV_IR_NODE_INTEGER 0u
+#define CLP_S_V2_KV_IR_NODE_FLOAT 1u
+#define CLP_S_V2_KV_IR_NODE_BOOLEAN 2u
+#define CLP_S_V2_KV_IR_NODE_STRING 3u
+#define CLP_S_V2_KV_IR_NODE_UNSTRUCTURED_ARRAY 4u
+#define CLP_S_V2_KV_IR_NODE_OBJECT 5u
+#define CLP_S_V2_KV_IR_NODE_UNKNOWN 255u
+
+/**
+ * One user-namespace schema node of a searched KV-IR stream: its dot path, escaped the way a
+ * projection descriptor is (a backslash before `.` and `\`), and its `CLP_S_V2_KV_IR_NODE_*` type.
+ */
+typedef struct clp_s_v2_kv_ir_field_type {
+    const uint8_t *path;
+    size_t path_length;
+    uint8_t node_type;
+} clp_s_v2_kv_ir_field_type;
+
+/**
+ * Lists the user-namespace schema nodes the scan saw. The stream is searched to its end when the
+ * scanner opens, so this is the schema of the whole stream and can certify a pushed filter after
+ * the fact instead of decoding the stream a second time. The entries and the paths they point at
+ * are owned by the scanner and stay valid until it is freed.
+ */
+clp_s_status clp_s_v2_kv_ir_scanner_field_types(
+        const clp_s_v2_kv_ir_scanner *scanner,
+        const clp_s_v2_kv_ir_field_type **out_entries,
+        size_t *out_count,
+        clp_s_error_buffer *error
+);
+
 #if defined(__cplusplus)
 #define CLP_S_ABI_STATIC_ASSERT(condition, message) static_assert((condition), message)
 #elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L

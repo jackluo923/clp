@@ -20,6 +20,7 @@ use clp_s::ingest::KvIrReader;
 use clp_s::ingest::KvIrValueKind;
 use clp_s::search::KvIrMatchedEvent;
 use clp_s::search::KvIrSearchLimits;
+use clp_s::search::KvIrSearchSchemaNode;
 use clp_s::search::KvIrSearchOptions;
 use clp_s::search::KvIrSearchSink;
 use clp_s::search::ParsedQuery;
@@ -202,6 +203,53 @@ pub struct KvIrProjectedScanner {
     text: Vec<u8>,
     emit_cursor: usize,
     rows: usize,
+    field_types: Vec<FieldType>,
+}
+
+/// One user-namespace schema node of a searched stream: its escaped dot path and its type.
+///
+/// The path uses the same escaping a projection descriptor does (a backslash before `.` and
+/// `\`), so the C++ side can compare it with the paths its own inspection would produce.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FieldType {
+    pub path: Vec<u8>,
+    pub node_type: KvIrNodeType,
+}
+
+/// Appends `key` to `path` with `.` and `\` escaped.
+fn push_escaped_component(path: &mut Vec<u8>, key: &[u8]) {
+    for &byte in key {
+        if byte == b'\\' || byte == b'.' {
+            path.push(b'\\');
+        }
+        path.push(byte);
+    }
+}
+
+/// Lists every non-root node of a schema tree with its escaped dot path.
+///
+/// Nodes arrive in insertion order and a parent always precedes its children, so each path is
+/// its parent's path plus one component.
+fn collect_field_types(nodes: &[KvIrSearchSchemaNode]) -> Vec<FieldType> {
+    let mut paths: Vec<Vec<u8>> = Vec::with_capacity(nodes.len());
+    let mut types = Vec::with_capacity(nodes.len().saturating_sub(1));
+    for (node_id, node) in nodes.iter().enumerate() {
+        if node_id == 0 {
+            paths.push(Vec::new());
+            continue;
+        }
+        let mut path = paths.get(node.parent_id()).cloned().unwrap_or_default();
+        if !path.is_empty() {
+            path.push(b'.');
+        }
+        push_escaped_component(&mut path, node.key());
+        types.push(FieldType {
+            path: path.clone(),
+            node_type: node.node_type(),
+        });
+        paths.push(path);
+    }
+    types
 }
 
 impl KvIrProjectedScanner {
@@ -227,7 +275,7 @@ impl KvIrProjectedScanner {
             ScanError::Archive(format!("failed to open {}: {source}", path.display()))
         })?;
 
-        {
+        let field_types = {
             let sink = |event: KvIrMatchedEvent<'_>| -> Result<(), ScanError> {
                 for path_components in &components {
                     let cell = project_field(event, path_components, &mut text, max_text_bytes)?;
@@ -253,7 +301,10 @@ impl KvIrProjectedScanner {
                     )));
                 }
             }
-        }
+            // The search has now seen every schema node of the stream, which is what a caller
+            // needs to certify a pushed filter without decoding the stream a second time.
+            collect_field_types(searcher.schema(KvIrNamespace::UserGenerated))
+        };
 
         Ok(Self {
             field_count,
@@ -261,7 +312,14 @@ impl KvIrProjectedScanner {
             text,
             emit_cursor: 0,
             rows,
+            field_types,
         })
+    }
+
+    /// Returns every user-namespace schema node the search saw, with escaped dot paths.
+    #[must_use]
+    pub fn field_types(&self) -> &[FieldType] {
+        &self.field_types
     }
 
     /// Returns the next matched row's cells, or `None` once the stream is exhausted.
