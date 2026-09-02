@@ -2007,6 +2007,75 @@ pub unsafe extern "C" fn clp_s_v2_kv_ir_scanner_free(scanner: *mut ClpSV2KvIrSca
     }
 }
 
+/// One projected value in a batch. Layout-identical to `columnar::Cell`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ClpSV2Cell {
+    pub kind: u32,
+    pub integer: i64,
+    pub real: f64,
+    pub text_offset: usize,
+    pub text_length: usize,
+}
+
+const _: () = assert!(
+    std::mem::size_of::<ClpSV2Cell>() == std::mem::size_of::<columnar::Cell>(),
+    "ClpSV2Cell must mirror columnar::Cell"
+);
+
+/// Delivers every matching row buffered so far, at once.
+///
+/// `out_cells` receives `*out_row_count * field_count` cells in row-major order and `out_text`
+/// the arena their `text_offset`s index into. Both borrow the scanner and stay valid until the
+/// next call on it. `*out_row_count` is zero once the archive is exhausted. A scanner must be
+/// driven by this or by `clp_s_v2_scanner_next_row`, not both.
+///
+/// # Safety
+///
+/// `scanner` must be a live handle from `clp_s_v2_scanner_open`, and every out-pointer valid
+/// writable storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clp_s_v2_scanner_next_batch(
+    scanner: *mut ClpSV2Scanner,
+    out_cells: *mut *const ClpSV2Cell,
+    out_text: *mut *const u8,
+    out_text_length: *mut usize,
+    out_row_count: *mut usize,
+    error: *mut ClpSErrorBuffer,
+) -> ClpSStatus {
+    // SAFETY: All raw arguments are governed by this function's contract.
+    unsafe {
+        ffi_entry(error, || {
+            let scanner = scanner.as_mut().ok_or_else(|| {
+                ApiError::InvalidArgument("scanner handle must not be null".to_owned())
+            })?;
+            if out_cells.is_null() || out_text.is_null() || out_text_length.is_null() || out_row_count.is_null() {
+                return Err(ApiError::InvalidArgument(
+                    "batch out-pointers must not be null".to_owned(),
+                ));
+            }
+            out_row_count.write(0);
+            out_cells.write(ptr::null());
+            out_text.write(ptr::null());
+            out_text_length.write(0);
+            let field_count = scanner.values.len();
+            let Some((cells, arena)) = scanner
+                .inner
+                .next_batch()
+                .map_err(|source| ApiError::Archive(source.to_string()))?
+            else {
+                return Ok(());
+            };
+            let row_count = if field_count == 0 { 0 } else { cells.len() / field_count };
+            out_cells.write(cells.as_ptr().cast::<ClpSV2Cell>());
+            out_text.write(arena.as_ptr());
+            out_text_length.write(arena.len());
+            out_row_count.write(row_count);
+            Ok(())
+        })
+    }
+}
+
 /// Frees a scanner handle. A null handle is a no-op.
 ///
 /// # Safety

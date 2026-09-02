@@ -35,16 +35,21 @@ use crate::archive::ArchiveCatalog;
 use crate::archive::ArchiveCatalogError;
 use crate::archive::ArchiveCatalogLimits;
 use crate::archive::ArchiveMetadata;
+use crate::archive::ArrayDictionary;
 use crate::archive::ColumnLimits;
 use crate::archive::DecodedPackedStream;
 use crate::archive::DecodedSchemaTable;
+use crate::archive::DictionaryError;
+use crate::archive::DictionaryLimits;
 use crate::archive::DirectoryArchiveReader;
 use crate::archive::DirectoryArchiveSource;
+use crate::archive::LogTypeDictionary;
 use crate::archive::PackedStreamError;
 use crate::archive::PackedStreamLimits;
 use crate::archive::SingleFileArchiveReader;
 use crate::archive::TableMetadata;
 use crate::archive::TableStreamError;
+use crate::archive::VariableDictionary;
 use crate::json::JsonBytePolicy;
 
 const MEBIBYTE: u64 = 1024 * 1024;
@@ -478,6 +483,39 @@ pub trait ArchiveReader {
         limits: ArchiveCatalogLimits,
     ) -> Result<ArchiveCatalog, ArchiveCatalogError>;
 
+    /// Decodes `/var.dict` on its own, for a catalog read with its dictionaries skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns a section decode error.
+    fn read_variable_dictionary(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        limits: DictionaryLimits,
+    ) -> Result<VariableDictionary, DictionaryError>;
+
+    /// Decodes `/log.dict` on its own; see [`Self::read_variable_dictionary`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a section decode error.
+    fn read_log_type_dictionary(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        limits: DictionaryLimits,
+    ) -> Result<LogTypeDictionary, DictionaryError>;
+
+    /// Decodes `/array.dict` on its own; see [`Self::read_variable_dictionary`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a section decode error.
+    fn read_array_dictionary(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        limits: DictionaryLimits,
+    ) -> Result<ArrayDictionary, DictionaryError>;
+
     /// Reads and validates one packed stream described by `catalog` state.
     ///
     /// # Errors
@@ -510,6 +548,27 @@ impl<R: Read + Seek> ArchiveReader for SingleFileArchiveReader<R> {
     ) -> Result<DecodedPackedStream, PackedStreamError> {
         Self::read_packed_stream(self, metadata, table_metadata, stream_id, limits)
     }
+    fn read_variable_dictionary(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        limits: DictionaryLimits,
+    ) -> Result<VariableDictionary, DictionaryError> {
+        Self::read_variable_dictionary(self, metadata, limits)
+    }
+    fn read_log_type_dictionary(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        limits: DictionaryLimits,
+    ) -> Result<LogTypeDictionary, DictionaryError> {
+        Self::read_log_type_dictionary(self, metadata, limits)
+    }
+    fn read_array_dictionary(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        limits: DictionaryLimits,
+    ) -> Result<ArrayDictionary, DictionaryError> {
+        Self::read_array_dictionary(self, metadata, limits)
+    }
 }
 
 impl<S: DirectoryArchiveSource> ArchiveReader for DirectoryArchiveReader<S> {
@@ -528,6 +587,27 @@ impl<S: DirectoryArchiveSource> ArchiveReader for DirectoryArchiveReader<S> {
         limits: PackedStreamLimits,
     ) -> Result<DecodedPackedStream, PackedStreamError> {
         Self::read_packed_stream(self, metadata, table_metadata, stream_id, limits)
+    }
+    fn read_variable_dictionary(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        limits: DictionaryLimits,
+    ) -> Result<VariableDictionary, DictionaryError> {
+        Self::read_variable_dictionary(self, metadata, limits)
+    }
+    fn read_log_type_dictionary(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        limits: DictionaryLimits,
+    ) -> Result<LogTypeDictionary, DictionaryError> {
+        Self::read_log_type_dictionary(self, metadata, limits)
+    }
+    fn read_array_dictionary(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        limits: DictionaryLimits,
+    ) -> Result<ArrayDictionary, DictionaryError> {
+        Self::read_array_dictionary(self, metadata, limits)
     }
 }
 

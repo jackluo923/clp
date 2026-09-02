@@ -47,9 +47,27 @@ pub struct ArchiveCatalogLimits {
     log_type_dictionary: DictionaryLimits,
     array_dictionary: DictionaryLimits,
     timestamp_patterns: TimestampPatternCatalogLimits,
+    skip_dictionaries: bool,
 }
 
 impl ArchiveCatalogLimits {
+    /// Leaves the three dictionaries unloaded, so the catalog holds empty ones.
+    ///
+    /// A projected scan that reads and filters only non-dictionary columns never consults them,
+    /// and on a string-heavy archive decoding them costs more than the tables. The caller can load
+    /// them afterwards with [`ArchiveCatalog::set_dictionaries`] once it knows they are needed.
+    #[must_use]
+    pub const fn with_skip_dictionaries(mut self, skip: bool) -> Self {
+        self.skip_dictionaries = skip;
+        self
+    }
+
+    /// Returns whether the dictionaries are left unloaded.
+    #[must_use]
+    pub const fn skip_dictionaries(self) -> bool {
+        self.skip_dictionaries
+    }
+
     /// Replaces the archive-metadata limits.
     #[must_use]
     pub const fn with_metadata(mut self, limits: MetadataLimits) -> Self {
@@ -170,9 +188,29 @@ pub struct ArchiveCatalog {
     log_type_dictionary: LogTypeDictionary,
     array_dictionary: ArrayDictionary,
     timestamp_patterns: TimestampPatternCatalog,
+    dictionaries_loaded: bool,
 }
 
 impl ArchiveCatalog {
+    /// Returns whether the three dictionaries were decoded, rather than left empty.
+    #[must_use]
+    pub const fn dictionaries_loaded(&self) -> bool {
+        self.dictionaries_loaded
+    }
+
+    /// Installs dictionaries into a catalog that was read with them skipped.
+    pub fn set_dictionaries(
+        &mut self,
+        variable_dictionary: VariableDictionary,
+        log_type_dictionary: LogTypeDictionary,
+        array_dictionary: ArrayDictionary,
+    ) {
+        self.variable_dictionary = variable_dictionary;
+        self.log_type_dictionary = log_type_dictionary;
+        self.array_dictionary = array_dictionary;
+        self.dictionaries_loaded = true;
+    }
+
     /// Returns the archive metadata and validated physical section directory.
     #[must_use]
     pub const fn metadata(&self) -> &ArchiveMetadata {
@@ -323,15 +361,26 @@ pub(super) fn load_catalog<S: CatalogSectionSource>(
             .validate_record_domain(table_metadata.record_count())
             .map_err(ArchiveCatalogError::RangeIndex)?;
     }
-    let variable_dictionary = source
-        .catalog_variable_dictionary(&metadata, limits.variable_dictionary)
-        .map_err(ArchiveCatalogError::VariableDictionary)?;
-    let log_type_dictionary = source
-        .catalog_log_type_dictionary(&metadata, limits.log_type_dictionary)
-        .map_err(ArchiveCatalogError::LogTypeDictionary)?;
-    let array_dictionary = source
-        .catalog_array_dictionary(&metadata, limits.array_dictionary)
-        .map_err(ArchiveCatalogError::ArrayDictionary)?;
+    let (variable_dictionary, log_type_dictionary, array_dictionary) = if limits.skip_dictionaries
+    {
+        (
+            VariableDictionary::empty(),
+            LogTypeDictionary::empty(),
+            ArrayDictionary::empty(),
+        )
+    } else {
+        (
+            source
+                .catalog_variable_dictionary(&metadata, limits.variable_dictionary)
+                .map_err(ArchiveCatalogError::VariableDictionary)?,
+            source
+                .catalog_log_type_dictionary(&metadata, limits.log_type_dictionary)
+                .map_err(ArchiveCatalogError::LogTypeDictionary)?,
+            source
+                .catalog_array_dictionary(&metadata, limits.array_dictionary)
+                .map_err(ArchiveCatalogError::ArrayDictionary)?,
+        )
+    };
     let timestamp_patterns = TimestampPatternCatalog::compile(
         metadata.timestamp_dictionary(),
         limits.timestamp_patterns,
@@ -347,6 +396,7 @@ pub(super) fn load_catalog<S: CatalogSectionSource>(
         log_type_dictionary,
         array_dictionary,
         timestamp_patterns,
+        dictionaries_loaded: !limits.skip_dictionaries,
     })
 }
 

@@ -34,6 +34,7 @@ pub struct ColumnLimits {
     columns: u64,
     encoded_variables_per_column: u64,
     total_encoded_variables: u64,
+    validate_dictionary_references: bool,
 }
 
 impl ColumnLimits {
@@ -52,7 +53,27 @@ impl ColumnLimits {
             columns: max_columns,
             encoded_variables_per_column: max_encoded_variables_per_column,
             total_encoded_variables: max_total_encoded_variables,
+            validate_dictionary_references: true,
         }
+    }
+
+    /// Controls whether decoding checks every dictionary ID and logtype a table references.
+    ///
+    /// The check reads each ID of every dictionary-backed column against the dictionary, whether
+    /// or not the column is ever read. A caller that loaded no dictionaries, having established
+    /// that it reads and filters only other columns, turns it off; the column views it never
+    /// touches then hold unchecked IDs, and a view it does touch resolves each ID on access and
+    /// reports a miss as absent.
+    #[must_use]
+    pub const fn with_dictionary_validation(mut self, validate: bool) -> Self {
+        self.validate_dictionary_references = validate;
+        self
+    }
+
+    /// Returns whether decoding validates dictionary references.
+    #[must_use]
+    pub const fn validates_dictionary_references(self) -> bool {
+        self.validate_dictionary_references
     }
 
     /// Maximum bytes accepted in the complete decompressed table.
@@ -1159,6 +1180,7 @@ fn decode_column<'table, 'archive>(
             message_count,
             variable_dictionary,
             true,
+            limits.validate_dictionary_references,
         )?)),
         NodeType::Boolean => Ok(ColumnData::Boolean(take_boolean_column(
             cursor,
@@ -1171,6 +1193,7 @@ fn decode_column<'table, 'archive>(
             message_count,
             variable_dictionary,
             false,
+            limits.validate_dictionary_references,
         )?)),
         NodeType::ClpString => Ok(ColumnData::ClpString(take_clp_string_column(
             cursor,
@@ -1322,8 +1345,12 @@ fn take_dictionary_id_column<'table, 'archive>(
     count: usize,
     dictionary: &'archive VariableDictionary,
     validate_float: bool,
+    validate_references: bool,
 ) -> Result<DictionaryIdColumn<'table, 'archive>, ColumnError> {
     let ids = take_u64_column(cursor, context, count)?;
+    if !validate_references {
+        return Ok(DictionaryIdColumn { ids, dictionary });
+    }
     for (message_index, id) in ids.iter().enumerate() {
         let entry = dictionary.entry(id).ok_or_else(|| {
             corrupt(
@@ -1390,6 +1417,14 @@ fn take_clp_string_column<'table, 'archive>(
     let encoded_variable_count =
         usize::try_from(encoded_variable_count).map_err(|_| ColumnError::SizeOverflow)?;
     let encoded_variables = take_i64_column(cursor, context, encoded_variable_count)?;
+    if !limits.validate_dictionary_references {
+        return Ok(ClpStringColumn {
+            descriptors,
+            encoded_variables,
+            variable_dictionary,
+            logtype_dictionary,
+        });
+    }
     validate_clp_descriptors(
         descriptors,
         encoded_variables,

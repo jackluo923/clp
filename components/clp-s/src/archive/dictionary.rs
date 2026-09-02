@@ -165,6 +165,20 @@ pub struct VariableDictionary {
 }
 
 impl VariableDictionary {
+    /// A dictionary with no entries, for a catalog whose dictionaries were not loaded.
+    ///
+    /// Every lookup misses. A caller that chose not to load the dictionaries has established that
+    /// nothing it reads or filters resolves to a dictionary-backed column, so no lookup happens.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            storage: DictionaryStorage {
+                bytes: Vec::new(),
+                ranges: Vec::new(),
+            },
+        }
+    }
+
     /// Returns the number of variable dictionary entries.
     #[must_use]
     pub const fn len(&self) -> usize {
@@ -277,6 +291,20 @@ pub struct LogTypeDictionary {
 }
 
 impl LogTypeDictionary {
+    /// A dictionary with no entries; see [`VariableDictionary::empty`].
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            storage: DictionaryStorage {
+                bytes: Vec::new(),
+                ranges: Vec::new(),
+            },
+            placeholder_counts: Vec::new(),
+            variable_kinds: Vec::new(),
+            variable_kind_ranges: Vec::new(),
+        }
+    }
+
     /// Returns the number of logtype dictionary entries.
     #[must_use]
     pub const fn len(&self) -> usize {
@@ -322,6 +350,20 @@ pub struct ArrayDictionary {
 }
 
 impl ArrayDictionary {
+    /// A dictionary with no entries; see [`VariableDictionary::empty`].
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            storage: DictionaryStorage {
+                bytes: Vec::new(),
+                ranges: Vec::new(),
+            },
+            placeholder_counts: Vec::new(),
+            variable_kinds: Vec::new(),
+            variable_kind_ranges: Vec::new(),
+        }
+    }
+
     /// Returns the number of unstructured-array logtype entries.
     #[must_use]
     pub const fn len(&self) -> usize {

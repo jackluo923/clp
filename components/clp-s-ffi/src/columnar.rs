@@ -21,7 +21,10 @@ use clp_s::archive::NodeType;
 use clp_s::archive::SchemaTree;
 use clp_s::archive::append_clp_message_bounded;
 use clp_s::search::ArchiveSearchOptions;
+use clp_s::search::ColumnNamespace;
+use clp_s::search::ExpressionKind;
 use clp_s::search::ParsedQuery;
+use clp_s::search::PathComponent;
 
 /// Rows materialized before a batch is handed back.
 ///
@@ -51,7 +54,11 @@ pub mod kind {
 }
 
 /// One projected value, with text held as a span into the batch's arena.
+///
+/// `#[repr(C)]` because a batch of these is handed to C by pointer as `clp_s_v2_cell`; the two
+/// declarations must agree field for field, which the size assertion below pins on this side.
 #[derive(Clone, Copy, Debug)]
+#[repr(C)]
 pub struct Cell {
     pub kind: u32,
     pub integer: i64,
@@ -188,6 +195,58 @@ pub struct ProjectedScanner {
     finished: bool,
 }
 
+/// Whether any node in `nodes` is read through a dictionary.
+fn any_dictionary_backed(tree: &SchemaTree, nodes: &[u32]) -> bool {
+    nodes.iter().any(|node_id| {
+        tree.get(*node_id as usize).is_some_and(|node| {
+            matches!(
+                node.node_type(),
+                NodeType::VarString
+                    | NodeType::DictionaryFloat
+                    | NodeType::ClpString
+                    | NodeType::UnstructuredArray
+            )
+        })
+    })
+}
+
+/// Whether evaluating `parsed` or projecting `field_nodes` can consult a dictionary.
+///
+/// The three dictionaries are decoded eagerly by default, and on a string-heavy archive that
+/// costs more than reading the tables. A scan that only reads and filters integers, floats,
+/// booleans and timestamps never looks anything up, so it can leave them unloaded. The check is
+/// conservative: a wildcard, a non-default namespace, or a path that resolves to any
+/// dictionary-backed node under any type keeps the dictionaries.
+fn query_needs_dictionaries(parsed: &ParsedQuery, tree: &SchemaTree, field_nodes: &[Vec<u32>]) -> bool {
+    if field_nodes.iter().any(|nodes| any_dictionary_backed(tree, nodes)) {
+        return true;
+    }
+    for node in parsed.nodes() {
+        let path = match node.kind() {
+            ExpressionKind::Predicate(predicate) => predicate.path(),
+            ExpressionKind::List(list) => list.path(),
+            ExpressionKind::Not { .. } | ExpressionKind::Boolean { .. } => continue,
+            // ExpressionKind is non-exhaustive. A kind this code does not know
+            // may read anything, so it keeps the dictionaries.
+            _ => return true,
+        };
+        match path.namespace() {
+            ColumnNamespace::Default => {}
+            // A range-index selector reads metadata, never a table column.
+            ColumnNamespace::RangeIndex => continue,
+            _ => return true,
+        }
+        if path.components().iter().any(PathComponent::is_wildcard) {
+            return true;
+        }
+        let components: Vec<&str> = path.components().iter().map(PathComponent::value).collect();
+        if any_dictionary_backed(tree, &resolve_path(tree, &components)) {
+            return true;
+        }
+    }
+    false
+}
+
 impl ProjectedScanner {
     pub fn open(
         reader: Box<dyn ArchiveReader>,
@@ -196,8 +255,11 @@ impl ProjectedScanner {
         fields: &[String],
     ) -> Result<Self, ScanError> {
         let mut reader = reader;
-        let catalog = reader
-            .read_catalog(options.catalog())
+        // Read everything but the dictionaries first: whether they are needed depends on the
+        // schema tree, which is only known once the catalog is open.
+        let catalog_limits = options.catalog().with_skip_dictionaries(true);
+        let mut catalog = reader
+            .read_catalog(catalog_limits)
             .map_err(|source| ScanError::Archive(format!("failed to read catalog: {source}")))?;
         let field_nodes = fields
             .iter()
@@ -207,12 +269,29 @@ impl ProjectedScanner {
                 resolve_path(catalog.schema_tree(), &borrowed)
             })
             .collect::<Vec<_>>();
+        let mut options = *options;
+        if query_needs_dictionaries(&parsed, catalog.schema_tree(), &field_nodes) {
+            let limits = options.catalog();
+            let variable = reader
+                .read_variable_dictionary(catalog.metadata(), limits.variable_dictionary())
+                .map_err(|source| ScanError::Archive(format!("failed to read var.dict: {source}")))?;
+            let log_type = reader
+                .read_log_type_dictionary(catalog.metadata(), limits.log_type_dictionary())
+                .map_err(|source| ScanError::Archive(format!("failed to read log.dict: {source}")))?;
+            let array = reader
+                .read_array_dictionary(catalog.metadata(), limits.array_dictionary())
+                .map_err(|source| ScanError::Archive(format!("failed to read array.dict: {source}")))?;
+            catalog.set_dictionaries(variable, log_type, array);
+        } else {
+            // Nothing will look an ID up, so decoding need not check them either.
+            options = options.with_columns(options.columns().with_dictionary_validation(false));
+        }
         let stream_count = catalog.table_metadata().packed_streams().len();
         Ok(Self {
             reader,
             catalog,
             parsed,
-            options: *options,
+            options,
             field_count: fields.len(),
             field_nodes,
             stream_index: 0,
@@ -225,6 +304,23 @@ impl ProjectedScanner {
             buffered_rows: 0,
             finished: false,
         })
+    }
+
+    /// Returns every buffered row not yet emitted, refilling first if none remain.
+    ///
+    /// The same rows `next_row` would return one at a time. A caller that consumes the batch
+    /// must not mix the two, since both advance the same cursor.
+    pub fn next_batch(&mut self) -> Result<Option<ProjectedBatch<'_>>, ScanError> {
+        while self.emit_cursor >= self.buffered_rows {
+            if self.finished {
+                return Ok(None);
+            }
+            self.fill_batch()?;
+        }
+        let start = self.emit_cursor * self.field_count;
+        let end = self.buffered_rows * self.field_count;
+        self.emit_cursor = self.buffered_rows;
+        Ok(Some((&self.cells[start..end], &self.text)))
     }
 
     /// Returns the next row's cells, or `None` once the archive is exhausted.
@@ -452,6 +548,11 @@ fn project_row(
 }
 
 pub type ProjectedRow<'a> = (&'a [Cell], &'a [u8]);
+
+/// A run of projected rows: `cells` holds `row_count * field_count` cells in row-major order.
+pub type ProjectedBatch<'a> = (&'a [Cell], &'a [u8]);
+
+const _: () = assert!(std::mem::size_of::<Cell>() == 40, "Cell layout is part of the C ABI");
 
 /// Appends borrowed bytes to the batch arena and returns a cell spanning them.
 fn push_text(kind: u32, bytes: &[u8], text: &mut Vec<u8>) -> Cell {

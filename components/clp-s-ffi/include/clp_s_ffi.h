@@ -470,6 +470,33 @@ clp_s_status clp_s_v2_scanner_next_row(
 );
 
 /** Frees a scanner handle. A null handle is a no-op. */
+/**
+ * One projected value in a batch. `text_offset` indexes the batch's text arena. The compiler
+ * inserts four bytes of padding after `kind`, matching the Rust layout.
+ */
+typedef struct clp_s_v2_cell {
+    uint32_t kind;
+    int64_t integer;
+    double real;
+    size_t text_offset;
+    size_t text_length;
+} clp_s_v2_cell;
+
+/**
+ * Delivers every matching row buffered so far. `*out_cells` receives `*out_row_count * field_count`
+ * cells in row-major order and `*out_text` the arena their offsets index into; both stay valid
+ * until the next call on the scanner. `*out_row_count` is zero once the archive is exhausted.
+ * Drive a scanner with this or with `clp_s_v2_scanner_next_row`, not both.
+ */
+clp_s_status clp_s_v2_scanner_next_batch(
+        clp_s_v2_scanner *scanner,
+        const clp_s_v2_cell **out_cells,
+        const uint8_t **out_text,
+        size_t *out_text_length,
+        size_t *out_row_count,
+        clp_s_error_buffer *error
+);
+
 void clp_s_v2_scanner_free(clp_s_v2_scanner *scanner);
 
 /**
