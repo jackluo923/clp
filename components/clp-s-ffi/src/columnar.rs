@@ -270,7 +270,10 @@ impl ProjectedScanner {
             })
             .collect::<Vec<_>>();
         let mut options = *options;
-        if query_needs_dictionaries(&parsed, catalog.schema_tree(), &field_nodes) {
+        // A measurement hook: force the eager load so the two paths can be timed
+        // in one binary. Not a supported setting.
+        let force_eager = std::env::var_os("CLP_RUST_EAGER_DICTIONARIES").is_some();
+        if force_eager || query_needs_dictionaries(&parsed, catalog.schema_tree(), &field_nodes) {
             let limits = options.catalog();
             let variable = reader
                 .read_variable_dictionary(catalog.metadata(), limits.variable_dictionary())
