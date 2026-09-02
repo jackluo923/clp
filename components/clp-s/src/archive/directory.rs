@@ -40,6 +40,7 @@ use super::metadata::MetadataError;
 use super::metadata::MetadataLimits;
 use super::metadata::decode_metadata;
 use super::packed_stream::DecodedPackedStream;
+use super::table_metadata::PackedStreamMetadata;
 use super::packed_stream::PackedStreamError;
 use super::packed_stream::PackedStreamLimits;
 use super::packed_stream::decode_packed_stream;
@@ -464,6 +465,10 @@ impl<S: DirectoryArchiveSource> DirectoryArchiveReader<S> {
         stream_id: usize,
         limits: PackedStreamLimits,
     ) -> Result<DecodedPackedStream, PackedStreamError> {
+        // A separate-column stream is several frames; inflate them in order.
+        if table_metadata.separate_columns_for(stream_id as u64).is_some() {
+            return self.read_packed_stream_frames(metadata, table_metadata, stream_id, None, limits);
+        }
         if metadata.directory().get("/0").is_none() {
             return Err(PackedStreamError::MissingTablesSection);
         }
@@ -476,6 +481,56 @@ impl<S: DirectoryArchiveSource> DirectoryArchiveReader<S> {
             .reader_for_member_range(DirectoryArchiveMember::PackedStreams, range)
             .map_err(PackedStreamError::Io)?;
         decode_packed_stream(compressed, stream, limits)
+    }
+
+    /// Reads one packed stream, inflating every column frame of a separate-column stream in
+    /// order so the bytes match a shared-frame stream exactly.
+    pub(crate) fn read_packed_stream_frames(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        table_metadata: &TableMetadata,
+        stream_id: usize,
+        wanted: Option<&[bool]>,
+        limits: PackedStreamLimits,
+    ) -> Result<DecodedPackedStream, PackedStreamError> {
+        let Some(separate) = table_metadata.separate_columns_for(stream_id as u64) else {
+            return self.read_packed_stream(metadata, table_metadata, stream_id, limits);
+        };
+        if metadata.directory().get("/0").is_none() {
+            return Err(PackedStreamError::MissingTablesSection);
+        }
+        if !self.section_matches_member(metadata, DirectoryArchiveMember::PackedStreams) {
+            return Err(PackedStreamError::TablesSectionOutsideArchive);
+        }
+        let tables_size = self.member_size(DirectoryArchiveMember::PackedStreams);
+        let (_, relative_range) = packed_stream_range(table_metadata, stream_id, tables_size)?;
+        let mut columns = Vec::with_capacity(separate.columns().len());
+        let mut sizes = Vec::with_capacity(separate.columns().len());
+        let mut offset = relative_range.start;
+        for (index, frame) in separate.columns().iter().enumerate() {
+            let size = usize::try_from(frame.uncompressed_size())
+                .map_err(|_| PackedStreamError::SizeOverflow)?;
+            sizes.push(size);
+            let load = wanted.is_none_or(|mask| mask.get(index).copied().unwrap_or(true));
+            let end = offset
+                .checked_add(frame.compressed_size())
+                .ok_or(PackedStreamError::SizeOverflow)?;
+            if load && 0 != size {
+                let frame_meta =
+                    PackedStreamMetadata::for_frame(frame.compressed_size(), frame.uncompressed_size());
+                let compressed = self
+                    .reader_for_member_range(DirectoryArchiveMember::PackedStreams, offset..end)
+                    .map_err(PackedStreamError::Io)?;
+                let decoded = decode_packed_stream(compressed, &frame_meta, limits)?;
+                columns.push(Some(decoded.into_bytes()));
+            } else if load {
+                columns.push(Some(Vec::new()));
+            } else {
+                columns.push(None);
+            }
+            offset = end;
+        }
+        Ok(DecodedPackedStream::from_columns(columns, &sizes))
     }
 
     /// Decompresses `/var.dict` and preserves entries as arbitrary bytes.

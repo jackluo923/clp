@@ -3655,6 +3655,28 @@ impl TableColumn {
         }
     }
 
+    /// The number of bytes `write_to` emits.
+    fn encoded_len(&self) -> usize {
+        match &self.data {
+            TableColumnData::Fixed(bytes) => bytes.len(),
+            TableColumnData::DeltaI64 { deltas, .. } => deltas.len(),
+            TableColumnData::Timestamp {
+                deltas,
+                pattern_ids,
+                ..
+            } => deltas.len() + pattern_ids.len(),
+            TableColumnData::FormattedFloat {
+                values,
+                descriptors,
+            } => values.len() + descriptors.len(),
+            TableColumnData::ClpString {
+                descriptors,
+                encoded_variables,
+                ..
+            } => descriptors.len() + 8 + encoded_variables.len(),
+        }
+    }
+
     fn write_to<W: Write>(&self, output: &mut W) -> Result<(), WriterError> {
         match &self.data {
             TableColumnData::Fixed(bytes) => output.write_all(bytes).map_err(WriterError::Io),
@@ -4336,6 +4358,13 @@ struct PackedTables {
     compressed: Vec<u8>,
     streams: Vec<PackedStreamWire>,
     tables: Vec<SchemaTableWire>,
+    separate: Vec<SeparateColumnWire>,
+}
+/// One packed stream that holds a single table as one zstd frame per column.
+struct SeparateColumnWire {
+    stream_id: u64,
+    /// `(uncompressed_size, compressed_size)` per value column, in schema order.
+    columns: Vec<(u64, u64)>,
 }
 
 #[derive(Clone, Copy)]
@@ -4361,6 +4390,7 @@ fn pack_tables(
         compressed: Vec::new(),
         streams: Vec::new(),
         tables: Vec::new(),
+        separate: Vec::new(),
     };
     packed
         .streams
@@ -4374,6 +4404,25 @@ fn pack_tables(
         .map_err(|_| WriterError::AllocationFailed {
             requested: order.len(),
         })?;
+    let min_separate = options.separate_columns_min_size();
+    let mut grouped = Vec::new();
+    grouped
+        .try_reserve_exact(order.len())
+        .map_err(|_| WriterError::AllocationFailed {
+            requested: order.len(),
+        })?;
+    for table_index in order.iter().copied() {
+        let table = &tables[table_index];
+        let separate = 0 != min_separate
+            && usize_u64(table.uncompressed_size)? >= min_separate
+            && table.columns.len() > 1;
+        if separate {
+            encode_separate_table(table, options, &mut packed)?;
+        } else {
+            grouped.push(table_index);
+        }
+    }
+    let order = grouped.as_slice();
     let mut stream_start = 0_usize;
     let mut stream_size = 0_u64;
     for (position, table_index) in order.iter().copied().enumerate() {
@@ -4398,6 +4447,57 @@ fn pack_tables(
         }
     }
     Ok(packed)
+}
+
+/// Writes one table as its own packed stream, one zstd frame per column.
+///
+/// The stream's uncompressed bytes are identical to what `encode_table_stream` would write for
+/// this table alone, so a reader that inflates every frame in order needs no other change. A
+/// reader that knows the frame boundaries can inflate only the columns it needs.
+fn encode_separate_table(
+    table: &TableBuilder,
+    options: WriterOptions,
+    packed: &mut PackedTables,
+) -> Result<(), WriterError> {
+    let file_offset = len_u64(&packed.compressed)?;
+    let stream_id = usize_u64(packed.streams.len())?;
+    let mut columns = Vec::new();
+    columns
+        .try_reserve_exact(table.columns.len())
+        .map_err(|_| WriterError::AllocationFailed {
+            requested: table.columns.len(),
+        })?;
+    let mut uncompressed_size = 0_u64;
+    for column in &table.columns {
+        let uncompressed = usize_u64(column.encoded_len())?;
+        let start = packed.compressed.len();
+        if 0 != uncompressed {
+            let mut encoder = zstd::stream::write::Encoder::new(
+                &mut packed.compressed,
+                options.compression_level(),
+            )
+            .map_err(WriterError::Io)?;
+            column.write_to(&mut encoder)?;
+            encoder.finish().map_err(WriterError::Io)?;
+        }
+        let compressed = usize_u64(packed.compressed.len() - start)?;
+        columns.push((uncompressed, compressed));
+        uncompressed_size = uncompressed_size
+            .checked_add(uncompressed)
+            .ok_or(WriterError::SizeOverflow)?;
+    }
+    packed.tables.push(SchemaTableWire {
+        stream_id,
+        stream_offset: 0,
+        schema_id: table.schema_id,
+        message_count: table.message_count,
+    });
+    packed.streams.push(PackedStreamWire {
+        file_offset,
+        uncompressed_size,
+    });
+    packed.separate.push(SeparateColumnWire { stream_id, columns });
+    Ok(())
 }
 
 fn encode_table_stream(
@@ -4468,6 +4568,21 @@ fn encode_table_metadata(
                 .and_then(|tables| size.checked_add(tables))
         })
         .ok_or(WriterError::SizeOverflow)?;
+    let separate_size = packed
+        .separate
+        .iter()
+        .try_fold(0_usize, |size, entry| {
+            entry
+                .columns
+                .len()
+                .checked_mul(16)
+                .and_then(|columns| columns.checked_add(16))
+                .and_then(|entry| size.checked_add(entry))
+        })
+        .ok_or(WriterError::SizeOverflow)?;
+    let capacity = capacity
+        .checked_add(separate_size)
+        .ok_or(WriterError::SizeOverflow)?;
     let mut raw = Vec::new();
     raw.try_reserve_exact(capacity)
         .map_err(|_| WriterError::AllocationFailed {
@@ -4478,7 +4593,17 @@ fn encode_table_metadata(
         append_u64(&mut raw, stream.file_offset);
         append_u64(&mut raw, stream.uncompressed_size);
     }
-    append_u64(&mut raw, 0);
+    // Separate-column streams: count, then per stream its id, its column count,
+    // and each column's uncompressed and compressed frame size in schema order.
+    append_u64(&mut raw, usize_u64(packed.separate.len())?);
+    for entry in &packed.separate {
+        append_u64(&mut raw, entry.stream_id);
+        append_u64(&mut raw, usize_u64(entry.columns.len())?);
+        for (uncompressed, compressed) in &entry.columns {
+            append_u64(&mut raw, *uncompressed);
+            append_u64(&mut raw, *compressed);
+        }
+    }
     append_u64(&mut raw, usize_u64(packed.tables.len())?);
     for table in &packed.tables {
         append_u64(&mut raw, table.stream_id);

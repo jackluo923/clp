@@ -57,6 +57,16 @@ impl Default for PackedStreamLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecodedPackedStream {
     bytes: Vec<u8>,
+    column_layout: Option<Vec<ColumnSlot>>,
+}
+
+/// One value column of a projected separate-column stream: its byte length within the table,
+/// and whether its frame was inflated. A column that was not is a zero-filled gap of that length
+/// which the table decoder steps over without reading.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ColumnSlot {
+    pub size: usize,
+    pub loaded: bool,
 }
 
 impl DecodedPackedStream {
@@ -161,7 +171,10 @@ fn decode_frame<R: Read>(
         advertised_decompressed_size,
         limits,
     )? {
-        return Ok(DecodedPackedStream { bytes: Vec::new() });
+        return Ok(DecodedPackedStream {
+            bytes: Vec::new(),
+            column_layout: None,
+        });
     }
 
     let mut decoder = zstd::stream::read::Decoder::new(compressed)
@@ -170,7 +183,46 @@ fn decode_frame<R: Read>(
     let bytes = decode_exact_output(&mut decoder, advertised_decompressed_size)?;
     validate_compressed_tail(decoder.finish(), advertised_compressed_size)?;
 
-    Ok(DecodedPackedStream { bytes })
+    Ok(DecodedPackedStream {
+        bytes,
+        column_layout: None,
+    })
+}
+
+impl DecodedPackedStream {
+    /// Assembles a stream from per-column pieces: `None` for a column left unloaded.
+    ///
+    /// The result is laid out exactly as the whole-frame stream would be, with unloaded
+    /// columns zero-filled, and carries the layout so the decoder can skip them.
+    #[must_use]
+    pub fn from_columns(columns: Vec<Option<Vec<u8>>>, sizes: &[usize]) -> Self {
+        let total: usize = sizes.iter().sum();
+        let mut bytes = Vec::with_capacity(total);
+        let mut layout = Vec::with_capacity(sizes.len());
+        for (column, &size) in columns.into_iter().zip(sizes) {
+            match column {
+                Some(data) => {
+                    debug_assert_eq!(data.len(), size);
+                    bytes.extend_from_slice(&data);
+                    layout.push(ColumnSlot { size, loaded: true });
+                }
+                None => {
+                    bytes.resize(bytes.len() + size, 0);
+                    layout.push(ColumnSlot { size, loaded: false });
+                }
+            }
+        }
+        Self {
+            bytes,
+            column_layout: Some(layout),
+        }
+    }
+
+    /// The per-column layout of a projected stream, or `None` for a whole stream.
+    #[must_use]
+    pub fn column_layout(&self) -> Option<&[ColumnSlot]> {
+        self.column_layout.as_deref()
+    }
 }
 
 const fn validate_frame_sizes(

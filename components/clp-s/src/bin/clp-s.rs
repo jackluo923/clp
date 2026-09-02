@@ -166,6 +166,11 @@ struct CompressArgs {
     /// Maximum bytes accepted for one JSON document.
     #[arg(long, default_value_t = 512_u64 * 1024 * 1024)]
     max_document_size: u64,
+    /// Store each schema table of at least this many uncompressed bytes as one zstd frame per
+    /// column, so a reader can inflate only the columns a query needs. Zero keeps the shared
+    /// per-stream frame. Archives written with this set need a reader that supports it.
+    #[arg(long, default_value_t = 0)]
+    separate_columns_min_size: u64,
     /// Path of the authoritative timestamp field.
     #[arg(long)]
     timestamp_key: Option<String>,
@@ -466,6 +471,7 @@ fn run_compress(arguments: &CompressArgs) -> CliResult<()> {
     let writer_options = WriterOptions::new(arguments.compression_level)
         .with_limits(WriterLimits::new(u64::MAX, u64::MAX, u64::MAX, u64::MAX))
         .with_minimum_packed_stream_size(arguments.min_table_size)
+        .with_separate_columns_min_size(arguments.separate_columns_min_size)
         .with_log_order(!arguments.representation.disable_log_order);
     let mut archive_set = ArchiveSetWriter::new(
         publisher,

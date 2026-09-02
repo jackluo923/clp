@@ -9,6 +9,7 @@ use super::column::ColumnError;
 use super::column::ColumnLimits;
 use super::column::SchemaTable;
 use super::column::decode_schema_table;
+use super::packed_stream::ColumnSlot;
 use super::dictionary::ArrayDictionary;
 use super::dictionary::LogTypeDictionary;
 use super::dictionary::VariableDictionary;
@@ -71,6 +72,8 @@ impl<'stream, 'archive> DecodedSchemaTable<'stream, 'archive> {
 pub struct SchemaTableStream<'stream, 'archive> {
     stream_id: u64,
     stream_bytes: &'stream [u8],
+    /// Per-column load state of a projected separate-column stream, if any.
+    column_layout: Option<&'stream [ColumnSlot]>,
     tables: &'archive [SchemaTableMetadata],
     first_table_index: usize,
     next_table_index: usize,
@@ -98,6 +101,7 @@ impl<'stream, 'archive> SchemaTableStream<'stream, 'archive> {
     pub fn new(
         stream_id: u64,
         stream_bytes: &'stream [u8],
+        column_layout: Option<&'stream [ColumnSlot]>,
         table_metadata: &'archive TableMetadata,
         schema_map: &'archive SchemaMap,
         schema_tree: &'archive SchemaTree,
@@ -153,6 +157,7 @@ impl<'stream, 'archive> SchemaTableStream<'stream, 'archive> {
         Ok(Self {
             stream_id,
             stream_bytes,
+            column_layout,
             tables,
             first_table_index,
             next_table_index: 0,
@@ -226,6 +231,7 @@ impl<'stream, 'archive> SchemaTableStream<'stream, 'archive> {
             })?;
         let decoded = decode_schema_table(
             table_bytes,
+            self.column_layout,
             schema,
             self.schema_tree,
             table.message_count(),
@@ -742,6 +748,7 @@ mod tests {
         let mut tables = SchemaTableStream::new(
             0,
             stream.as_bytes(),
+            None,
             catalog.table_metadata(),
             catalog.schema_map(),
             catalog.schema_tree(),
@@ -817,6 +824,7 @@ mod tests {
             SchemaTableStream::new(
                 stream_id,
                 bytes,
+                None,
                 catalog.table_metadata(),
                 catalog.schema_map(),
                 catalog.schema_tree(),
@@ -871,6 +879,7 @@ mod tests {
         let mut tables = SchemaTableStream::new(
             0,
             &bytes,
+            None,
             &metadata,
             &schemas,
             &tree,
@@ -930,6 +939,7 @@ mod tests {
         let mut tables = SchemaTableStream::new(
             0,
             &bytes,
+            None,
             &metadata,
             &supplied_schemas,
             &tree,
@@ -960,6 +970,7 @@ mod tests {
         let mut tables = SchemaTableStream::new(
             0,
             &[],
+            None,
             &metadata,
             &schemas,
             &tree,
@@ -993,6 +1004,7 @@ mod tests {
             SchemaTableStream::new(
                 0,
                 stream.as_bytes(),
+                None,
                 catalog.table_metadata(),
                 catalog.schema_map(),
                 catalog.schema_tree(),

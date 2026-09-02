@@ -18,7 +18,10 @@ use clp_s::archive::ColumnData;
 use clp_s::archive::DecodedPackedStream;
 use clp_s::archive::DecodedSchemaTable;
 use clp_s::archive::NodeType;
+use clp_s::archive::SchemaEntry;
 use clp_s::archive::SchemaTree;
+use clp_s::archive::is_value_bearing;
+use clp_s::LogOrderLocator;
 use clp_s::archive::append_clp_message_bounded;
 use clp_s::search::ArchiveSearchOptions;
 use clp_s::search::ColumnNamespace;
@@ -182,6 +185,8 @@ pub struct ProjectedScanner {
     options: ArchiveSearchOptions,
     /// Candidate schema nodes per requested field, in request order.
     field_nodes: Vec<Vec<u32>>,
+    /// Sorted schema nodes the scan reads, or `None` to read every column.
+    wanted_nodes: Option<Vec<u32>>,
     field_count: usize,
     stream_index: usize,
     stream_count: usize,
@@ -210,41 +215,46 @@ fn any_dictionary_backed(tree: &SchemaTree, nodes: &[u32]) -> bool {
     })
 }
 
-/// Whether evaluating `parsed` or projecting `field_nodes` can consult a dictionary.
+/// Every schema node the scan reads: the projected fields plus each node a predicate compares.
 ///
-/// The three dictionaries are decoded eagerly by default, and on a string-heavy archive that
-/// costs more than reading the tables. A scan that only reads and filters integers, floats,
-/// booleans and timestamps never looks anything up, so it can leave them unloaded. The check is
-/// conservative: a wildcard, a non-default namespace, or a path that resolves to any
-/// dictionary-backed node under any type keeps the dictionaries.
-fn query_needs_dictionaries(parsed: &ParsedQuery, tree: &SchemaTree, field_nodes: &[Vec<u32>]) -> bool {
-    if field_nodes.iter().any(|nodes| any_dictionary_backed(tree, nodes)) {
-        return true;
-    }
+/// `None` means the set cannot be pinned down (a wildcard, an unfamiliar namespace or expression
+/// kind), so the scan must load every column and every dictionary. A range-index selector reads
+/// the log-order column, so that node joins the set when one is present.
+fn wanted_nodes(parsed: &ParsedQuery, tree: &SchemaTree, field_nodes: &[Vec<u32>]) -> Option<Vec<u32>> {
+    let mut nodes: Vec<u32> = field_nodes.iter().flatten().copied().collect();
+    let mut needs_log_order = false;
     for node in parsed.nodes() {
         let path = match node.kind() {
             ExpressionKind::Predicate(predicate) => predicate.path(),
             ExpressionKind::List(list) => list.path(),
             ExpressionKind::Not { .. } | ExpressionKind::Boolean { .. } => continue,
             // ExpressionKind is non-exhaustive. A kind this code does not know
-            // may read anything, so it keeps the dictionaries.
-            _ => return true,
+            // may read anything.
+            _ => return None,
         };
         match path.namespace() {
             ColumnNamespace::Default => {}
-            // A range-index selector reads metadata, never a table column.
-            ColumnNamespace::RangeIndex => continue,
-            _ => return true,
+            ColumnNamespace::RangeIndex => {
+                needs_log_order = true;
+                continue;
+            }
+            _ => return None,
         }
         if path.components().iter().any(PathComponent::is_wildcard) {
-            return true;
+            return None;
         }
         let components: Vec<&str> = path.components().iter().map(PathComponent::value).collect();
-        if any_dictionary_backed(tree, &resolve_path(tree, &components)) {
-            return true;
+        nodes.extend(resolve_path(tree, &components));
+    }
+    if needs_log_order {
+        match LogOrderLocator::discover(tree) {
+            Ok(Some(locator)) => nodes.push(locator.node_id()),
+            _ => return None,
         }
     }
-    false
+    nodes.sort_unstable();
+    nodes.dedup();
+    Some(nodes)
 }
 
 impl ProjectedScanner {
@@ -276,7 +286,14 @@ impl ProjectedScanner {
         // it knows passes the unset ones as empty strings.
         let force_eager = std::env::var("CLP_RUST_EAGER_DICTIONARIES")
             .is_ok_and(|value| !value.is_empty() && value != "0");
-        if force_eager || query_needs_dictionaries(&parsed, catalog.schema_tree(), &field_nodes) {
+        let wanted_nodes = wanted_nodes(&parsed, catalog.schema_tree(), &field_nodes);
+        // The dictionaries are decoded eagerly by default, and on a string-heavy archive that
+        // costs more than reading the tables. A scan that only touches integers, floats,
+        // booleans and timestamps never looks anything up, so it can leave them unloaded.
+        let needs_dictionaries = wanted_nodes
+            .as_deref()
+            .is_none_or(|nodes| any_dictionary_backed(catalog.schema_tree(), nodes));
+        if force_eager || needs_dictionaries {
             let limits = options.catalog();
             let variable = reader
                 .read_variable_dictionary(catalog.metadata(), limits.variable_dictionary())
@@ -300,6 +317,7 @@ impl ProjectedScanner {
             options,
             field_count: fields.len(),
             field_nodes,
+            wanted_nodes,
             stream_index: 0,
             stream_count,
             stream: None,
@@ -382,21 +400,58 @@ impl ProjectedScanner {
     /// would need each row's `log_event_idx`, which is inside the stream being skipped.
     fn load_next_stream(&mut self) -> Result<bool, ScanError> {
         let stream_id = self.stream_index as u64;
-        let stream = self
-            .reader
-            .read_packed_stream(
+        let mask = self.projection_mask(stream_id);
+        let stream = match mask.as_deref() {
+            Some(wanted) => self.reader.read_packed_stream_projected(
+                self.catalog.metadata(),
+                self.catalog.table_metadata(),
+                self.stream_index,
+                wanted,
+                self.options.packed_stream(),
+            ),
+            None => self.reader.read_packed_stream(
                 self.catalog.metadata(),
                 self.catalog.table_metadata(),
                 self.stream_index,
                 self.options.packed_stream(),
-            )
-            .map_err(|source| {
-                ScanError::Archive(format!(
-                    "failed to read packed stream {stream_id}: {source}"
-                ))
-            })?;
+            ),
+        }
+        .map_err(|source| {
+            ScanError::Archive(format!(
+                "failed to read packed stream {stream_id}: {source}"
+            ))
+        })?;
         self.stream = Some(stream);
         Ok(true)
+    }
+
+    /// Which value-bearing columns of a separate-column stream the scan reads, in column order.
+    ///
+    /// `None` when the stream shares one frame across its tables, or when the wanted set is
+    /// unknown, in which case every column is inflated.
+    fn projection_mask(&self, stream_id: u64) -> Option<Vec<bool>> {
+        let wanted = self.wanted_nodes.as_deref()?;
+        let table_metadata = self.catalog.table_metadata();
+        table_metadata.separate_columns_for(stream_id)?;
+        let tables = table_metadata.schema_tables();
+        let first = tables.partition_point(|table| table.stream_id() < stream_id);
+        let table = tables
+            .get(first)
+            .filter(|table| table.stream_id() == stream_id)?;
+        let schema = self.catalog.schema_map().get(table.schema_id())?;
+        let tree = self.catalog.schema_tree();
+        schema
+            .entries()
+            .iter()
+            .filter_map(|entry| {
+                let SchemaEntry::Node(node_id) = *entry else {
+                    return None;
+                };
+                let node = tree.get(node_id as usize)?;
+                is_value_bearing(node.node_type()).then(|| wanted.binary_search(&node_id).is_ok())
+            })
+            .collect::<Vec<bool>>()
+            .into()
     }
 
     /// Projects the current stream's matched rows in one forward pass.

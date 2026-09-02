@@ -278,6 +278,7 @@ impl ArchiveCatalog {
         SchemaTableStream::new(
             stream_id,
             stream.as_bytes(),
+            stream.column_layout(),
             &self.table_metadata,
             &self.schema_map,
             &self.schema_tree,

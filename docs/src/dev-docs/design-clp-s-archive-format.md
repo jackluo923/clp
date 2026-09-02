@@ -455,8 +455,14 @@ repeat packed_stream_count times:
     u64le file_offset
     u64le uncompressed_size
 
-# Reserved separate-column facility
-u64le separate_column_schema_count   # always 0 in current output
+# Separate-column streams (zero entries in default output)
+u64le separate_column_stream_count
+repeat separate_column_stream_count times:
+    u64le stream_id
+    u64le column_count
+    repeat column_count times:
+        u64le uncompressed_size
+        u64le compressed_size
 
 # Schema-table metadata
 u64le schema_table_count
@@ -482,8 +488,17 @@ sorts schema tables by decreasing uncompressed table size before packing them. I
 stream after its accumulated size becomes strictly greater than the configured minimum table size,
 or after the final table.
 
-The reserved `separate_column_schema_count` is always zero. The current reader rejects any nonzero
-value and rejects `schema_table_count == 0`.
+The separate-column section is empty by default, which reproduces the C++ layout byte for byte.
+With `--separate-columns-min-size N`, the Rust writer stores every schema table of at least `N`
+uncompressed bytes (and more than one column) in its own packed stream, written as one zstd frame
+per value-bearing column in flattened schema-entry order, empty columns included as zero-length
+frames. The section lists those streams by increasing `stream_id` with the size of each frame, so a
+reader can seek to and inflate only the columns a query needs. The frames of a stream are
+contiguous and, taken in order, decompress to exactly the shared-frame bytes, so a reader that
+ignores the section can still inflate the stream frame by frame. The reader requires each listed
+stream to hold exactly one schema table at offset zero and the frame sizes to sum to the stream's
+compressed and uncompressed extents. The pinned C++ reader rejects any nonzero count. The reader
+rejects `schema_table_count == 0` whenever streams exist.
 
 **Confirmed empty-input quirk:** Compressing `/dev/null` with the pinned C++ CLI succeeds. With
 default log-order metadata it emits a 402-byte SFA; with `--disable-log-order` it emits 280 bytes.

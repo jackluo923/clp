@@ -529,6 +529,28 @@ pub trait ArchiveReader {
         stream_id: usize,
         limits: PackedStreamLimits,
     ) -> Result<DecodedPackedStream, PackedStreamError>;
+
+    /// Reads one packed stream, inflating only the value-bearing columns flagged in `wanted`
+    /// when the stream stores one zstd frame per column.
+    ///
+    /// `wanted` is indexed by column position within the stream's single table. Unloaded
+    /// columns come back zero-filled and are marked in the stream's column layout so the table
+    /// decoder skips them. A shared-frame stream ignores `wanted` and inflates everything.
+    ///
+    /// # Errors
+    ///
+    /// As for [`ArchiveReader::read_packed_stream`].
+    fn read_packed_stream_projected(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        table_metadata: &TableMetadata,
+        stream_id: usize,
+        wanted: &[bool],
+        limits: PackedStreamLimits,
+    ) -> Result<DecodedPackedStream, PackedStreamError> {
+        let _ = wanted;
+        self.read_packed_stream(metadata, table_metadata, stream_id, limits)
+    }
 }
 
 impl<R: Read + Seek> ArchiveReader for SingleFileArchiveReader<R> {
@@ -547,6 +569,17 @@ impl<R: Read + Seek> ArchiveReader for SingleFileArchiveReader<R> {
         limits: PackedStreamLimits,
     ) -> Result<DecodedPackedStream, PackedStreamError> {
         Self::read_packed_stream(self, metadata, table_metadata, stream_id, limits)
+    }
+
+    fn read_packed_stream_projected(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        table_metadata: &TableMetadata,
+        stream_id: usize,
+        wanted: &[bool],
+        limits: PackedStreamLimits,
+    ) -> Result<DecodedPackedStream, PackedStreamError> {
+        self.read_packed_stream_frames(metadata, table_metadata, stream_id, Some(wanted), limits)
     }
     fn read_variable_dictionary(
         &mut self,
@@ -587,6 +620,17 @@ impl<S: DirectoryArchiveSource> ArchiveReader for DirectoryArchiveReader<S> {
         limits: PackedStreamLimits,
     ) -> Result<DecodedPackedStream, PackedStreamError> {
         Self::read_packed_stream(self, metadata, table_metadata, stream_id, limits)
+    }
+
+    fn read_packed_stream_projected(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        table_metadata: &TableMetadata,
+        stream_id: usize,
+        wanted: &[bool],
+        limits: PackedStreamLimits,
+    ) -> Result<DecodedPackedStream, PackedStreamError> {
+        self.read_packed_stream_frames(metadata, table_metadata, stream_id, Some(wanted), limits)
     }
     fn read_variable_dictionary(
         &mut self,

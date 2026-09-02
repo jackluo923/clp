@@ -461,6 +461,7 @@ pub struct WriterOptions {
     minimum_packed_stream_size: u64,
     uncompressed_size: u64,
     record_log_order: bool,
+    separate_columns_min_size: u64,
 }
 
 impl WriterOptions {
@@ -475,7 +476,26 @@ impl WriterOptions {
             minimum_packed_stream_size: Self::DEFAULT_MINIMUM_PACKED_STREAM_SIZE,
             uncompressed_size: 0,
             record_log_order: true,
+            separate_columns_min_size: 0,
         }
+    }
+
+    /// Writes each schema table at least this many uncompressed bytes as its own packed stream,
+    /// with one zstd frame per column, so a reader can inflate only the columns a query needs.
+    ///
+    /// Zero, the default, keeps every table in the shared per-stream frame and produces the same
+    /// bytes as before. Archives written with this set are readable only by readers that decode
+    /// the separate-column section of the table metadata.
+    #[must_use]
+    pub const fn with_separate_columns_min_size(mut self, size: u64) -> Self {
+        self.separate_columns_min_size = size;
+        self
+    }
+
+    /// Returns the separate-column threshold; zero disables it.
+    #[must_use]
+    pub const fn separate_columns_min_size(self) -> u64 {
+        self.separate_columns_min_size
     }
 
     /// Replaces the writer resource limits.

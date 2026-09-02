@@ -14,6 +14,8 @@ const COUNT_SIZE: u64 = 8;
 const PACKED_STREAM_ENTRY_SIZE: u64 = 8 + 8;
 const SCHEMA_TABLE_ENTRY_SIZE: u64 = 8 + 8 + 4 + 8;
 const FIXED_SECTION_SIZE: u64 = COUNT_SIZE + COUNT_SIZE + COUNT_SIZE;
+const SEPARATE_STREAM_HEADER_SIZE: u64 = 8 + 8;
+const COLUMN_FRAME_ENTRY_SIZE: u64 = 8 + 8;
 
 /// Resource limits applied while decoding a table-metadata section.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -141,6 +143,16 @@ pub struct PackedStreamMetadata {
 }
 
 impl PackedStreamMetadata {
+    /// Describes one column frame of a separate-column stream, for the frame decoder.
+    #[must_use]
+    pub(super) const fn for_frame(compressed_size: u64, uncompressed_size: u64) -> Self {
+        Self {
+            file_offset: 0,
+            compressed_size,
+            uncompressed_size,
+        }
+    }
+
     /// Returns the stream's byte offset relative to the start of `/0`.
     #[must_use]
     pub const fn file_offset(&self) -> u64 {
@@ -216,6 +228,53 @@ pub struct TableMetadata {
     table_indexes: HashMap<i32, usize>,
     total_uncompressed_stream_size: u64,
     record_count: u64,
+    separate_columns: Vec<SeparateColumnStream>,
+}
+
+/// One column's zstd frame inside a separate-column packed stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ColumnFrame {
+    uncompressed_size: u64,
+    compressed_size: u64,
+}
+
+impl ColumnFrame {
+    /// Bytes the frame inflates to.
+    #[must_use]
+    pub const fn uncompressed_size(self) -> u64 {
+        self.uncompressed_size
+    }
+
+    /// Bytes the frame occupies in `/0`.
+    #[must_use]
+    pub const fn compressed_size(self) -> u64 {
+        self.compressed_size
+    }
+}
+
+/// A packed stream holding one schema table as one zstd frame per value column.
+///
+/// The frames sit back to back in the stream's compressed range, in the order the schema lists
+/// its value-bearing columns, and their inflated bytes concatenate to exactly what a shared-frame
+/// stream would hold for the same table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SeparateColumnStream {
+    stream_id: u64,
+    columns: Vec<ColumnFrame>,
+}
+
+impl SeparateColumnStream {
+    /// The packed stream this describes.
+    #[must_use]
+    pub const fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    /// Per-column frames in schema order.
+    #[must_use]
+    pub fn columns(&self) -> &[ColumnFrame] {
+        &self.columns
+    }
 }
 
 impl TableMetadata {
@@ -233,6 +292,14 @@ impl TableMetadata {
 
     /// Returns schema tables in physical decompression order.
     #[must_use]
+    /// The column frames of `stream_id`, when it is a separate-column stream.
+    pub fn separate_columns_for(&self, stream_id: u64) -> Option<&SeparateColumnStream> {
+        self.separate_columns
+            .binary_search_by_key(&stream_id, |entry| entry.stream_id)
+            .ok()
+            .map(|index| &self.separate_columns[index])
+    }
+
     pub fn schema_tables(&self) -> &[SchemaTableMetadata] {
         &self.schema_tables
     }
@@ -306,7 +373,7 @@ fn decode_entries<R: Read>(
     limits: TableMetadataLimits,
 ) -> Result<TableMetadata, TableMetadataError> {
     let decoded_streams = decode_packed_streams(reader, tables_compressed_size, limits)?;
-    reject_separate_columns(read_u64(reader)?)?;
+    let separate_columns = decode_separate_columns(reader, &decoded_streams.entries, limits)?;
     let decoded_tables = decode_schema_tables(
         reader,
         schema_map,
@@ -315,12 +382,14 @@ fn decode_entries<R: Read>(
         limits,
     )?;
 
+    validate_separate_columns(&separate_columns, &decoded_streams.entries, &decoded_tables.entries)?;
     Ok(TableMetadata {
         packed_streams: decoded_streams.entries,
         schema_tables: decoded_tables.entries,
         table_indexes: decoded_tables.indexes,
         total_uncompressed_stream_size: decoded_streams.total_uncompressed_size,
         record_count: decoded_tables.record_count,
+        separate_columns,
     })
 }
 
@@ -433,12 +502,104 @@ const fn validate_packed_stream(
     Ok(())
 }
 
-const fn reject_separate_columns(count: u64) -> Result<(), TableMetadataError> {
-    if 0 == count {
-        Ok(())
-    } else {
-        Err(TableMetadataError::UnsupportedSeparateColumnSchemas { actual: count })
+/// Decodes the separate-column section: a count, then per stream its id, its column count, and
+/// each column's uncompressed and compressed frame size.
+fn decode_separate_columns<R: Read>(
+    reader: &mut R,
+    packed_streams: &[PackedStreamMetadata],
+    limits: TableMetadataLimits,
+) -> Result<Vec<SeparateColumnStream>, TableMetadataError> {
+    let count = read_u64(reader)?;
+    let stream_count = u64::try_from(packed_streams.len()).map_err(|_| TableMetadataError::SizeOverflow)?;
+    if count > stream_count {
+        return Err(TableMetadataError::SeparateColumnStreamCountTooLarge {
+            actual: count,
+            stream_count,
+        });
     }
+    let capacity = usize::try_from(count).map_err(|_| TableMetadataError::SizeOverflow)?;
+    let mut entries: Vec<SeparateColumnStream> = Vec::new();
+    entries
+        .try_reserve_exact(capacity)
+        .map_err(|_| TableMetadataError::AllocationFailed { requested: capacity })?;
+    let mut declared_bytes = 0_u64;
+    for _ in 0..capacity {
+        let stream_id = read_u64(reader)?;
+        if stream_id >= stream_count {
+            return Err(TableMetadataError::PackedStreamIdOutOfBounds {
+                table_index: entries.len(),
+                stream_id,
+                packed_stream_count: stream_count,
+            });
+        }
+        if let Some(previous) = entries.last()
+            && stream_id <= previous.stream_id
+        {
+            return Err(TableMetadataError::NonMonotonicSeparateColumnStream {
+                previous: previous.stream_id,
+                actual: stream_id,
+            });
+        }
+        let column_count = read_u64(reader)?;
+        declared_bytes = declared_bytes
+            .checked_add(SEPARATE_STREAM_HEADER_SIZE)
+            .and_then(|bytes| column_count.checked_mul(COLUMN_FRAME_ENTRY_SIZE).and_then(|c| bytes.checked_add(c)))
+            .ok_or(TableMetadataError::SizeOverflow)?;
+        check_decompressed_size(declared_bytes, limits)?;
+        let column_capacity = usize::try_from(column_count).map_err(|_| TableMetadataError::SizeOverflow)?;
+        let mut columns = Vec::new();
+        columns
+            .try_reserve_exact(column_capacity)
+            .map_err(|_| TableMetadataError::AllocationFailed { requested: column_capacity })?;
+        for _ in 0..column_capacity {
+            columns.push(ColumnFrame {
+                uncompressed_size: read_u64(reader)?,
+                compressed_size: read_u64(reader)?,
+            });
+        }
+        entries.push(SeparateColumnStream { stream_id, columns });
+    }
+    Ok(entries)
+}
+
+/// A separate-column stream holds exactly one table at offset zero, and its frames account for
+/// the stream's whole compressed and uncompressed extent.
+fn validate_separate_columns(
+    entries: &[SeparateColumnStream],
+    packed_streams: &[PackedStreamMetadata],
+    schema_tables: &[SchemaTableMetadata],
+) -> Result<(), TableMetadataError> {
+    for entry in entries {
+        let stream_index = usize::try_from(entry.stream_id).map_err(|_| TableMetadataError::SizeOverflow)?;
+        let stream = &packed_streams[stream_index];
+        let (mut uncompressed, mut compressed) = (0_u64, 0_u64);
+        for frame in &entry.columns {
+            uncompressed = uncompressed
+                .checked_add(frame.uncompressed_size)
+                .ok_or(TableMetadataError::SizeOverflow)?;
+            compressed = compressed
+                .checked_add(frame.compressed_size)
+                .ok_or(TableMetadataError::SizeOverflow)?;
+        }
+        if uncompressed != stream.uncompressed_size || compressed != stream.compressed_size {
+            return Err(TableMetadataError::SeparateColumnFramesMismatch {
+                stream_id: entry.stream_id,
+                uncompressed,
+                compressed,
+                stream_uncompressed: stream.uncompressed_size,
+                stream_compressed: stream.compressed_size,
+            });
+        }
+        let tables: Vec<&SchemaTableMetadata> =
+            schema_tables.iter().filter(|table| table.stream_id == entry.stream_id).collect();
+        if 1 != tables.len() || 0 != tables[0].stream_offset {
+            return Err(TableMetadataError::SeparateColumnStreamNotSingleTable {
+                stream_id: entry.stream_id,
+                tables: tables.len(),
+            });
+        }
+    }
+    Ok(())
 }
 
 struct SchemaTableDecodeState {
@@ -828,6 +989,20 @@ pub enum TableMetadataError {
     EmptyPackedStreamList,
     /// The reserved separate-column facility is not supported by v0.5.
     UnsupportedSeparateColumnSchemas { actual: u64 },
+    /// More separate-column streams were declared than packed streams exist.
+    SeparateColumnStreamCountTooLarge { actual: u64, stream_count: u64 },
+    /// Separate-column stream IDs must strictly increase.
+    NonMonotonicSeparateColumnStream { previous: u64, actual: u64 },
+    /// A separate-column stream's frames do not sum to the stream's extent.
+    SeparateColumnFramesMismatch {
+        stream_id: u64,
+        uncompressed: u64,
+        compressed: u64,
+        stream_uncompressed: u64,
+        stream_compressed: u64,
+    },
+    /// A separate-column stream must hold exactly one table at offset zero.
+    SeparateColumnStreamNotSingleTable { stream_id: u64, tables: usize },
     /// No schema table was available where a table was required.
     EmptySchemaTableList,
     /// The first packed stream did not begin at offset zero in `/0`.
@@ -952,7 +1127,11 @@ impl Display for TableMetadataError {
             | Self::MissingSection
             | Self::MissingTablesSection
             | Self::SectionOutsideArchive
-            | Self::TablesSectionOutsideArchive => format_section_error(self, formatter),
+            | Self::TablesSectionOutsideArchive
+            | Self::SeparateColumnStreamCountTooLarge { .. }
+            | Self::NonMonotonicSeparateColumnStream { .. }
+            | Self::SeparateColumnFramesMismatch { .. }
+            | Self::SeparateColumnStreamNotSingleTable { .. } => format_section_error(self, formatter),
         }
     }
 }
@@ -1149,6 +1328,28 @@ fn format_section_error(error: &TableMetadataError, formatter: &mut Formatter<'_
             formatter,
             "table metadata declares {actual} unsupported separate-column schemas"
         ),
+        TableMetadataError::SeparateColumnStreamCountTooLarge { actual, stream_count } => write!(
+            formatter,
+            "table metadata declares {actual} separate-column streams but only {stream_count} packed streams"
+        ),
+        TableMetadataError::NonMonotonicSeparateColumnStream { previous, actual } => write!(
+            formatter,
+            "separate-column stream {actual} follows stream {previous}; IDs must increase"
+        ),
+        TableMetadataError::SeparateColumnFramesMismatch {
+            stream_id,
+            uncompressed,
+            compressed,
+            stream_uncompressed,
+            stream_compressed,
+        } => write!(
+            formatter,
+            "separate-column stream {stream_id} frames sum to {uncompressed}/{compressed} bytes against a stream of {stream_uncompressed}/{stream_compressed}"
+        ),
+        TableMetadataError::SeparateColumnStreamNotSingleTable { stream_id, tables } => write!(
+            formatter,
+            "separate-column stream {stream_id} holds {tables} tables; exactly one at offset zero is required"
+        ),
         TableMetadataError::TrailingDecompressedData => {
             formatter.write_str("data follows the declared table-metadata entries")
         }
@@ -1342,13 +1543,105 @@ mod tests {
         ));
     }
 
+    /// Like `compressed_section`, with real separate-column entries in the reserved slot.
+    fn compressed_section_separate(
+        streams: &[Stream],
+        separate: &[(u64, &[(u64, u64)])],
+        tables: &[Table],
+    ) -> Vec<u8> {
+        let mut raw = u64::try_from(streams.len())
+            .expect("stream count fits u64")
+            .to_le_bytes()
+            .to_vec();
+        for &(offset, size) in streams {
+            raw.extend_from_slice(&offset.to_le_bytes());
+            raw.extend_from_slice(&size.to_le_bytes());
+        }
+        raw.extend_from_slice(
+            &u64::try_from(separate.len())
+                .expect("separate stream count fits u64")
+                .to_le_bytes(),
+        );
+        for &(stream_id, columns) in separate {
+            raw.extend_from_slice(&stream_id.to_le_bytes());
+            raw.extend_from_slice(
+                &u64::try_from(columns.len())
+                    .expect("column count fits u64")
+                    .to_le_bytes(),
+            );
+            for &(uncompressed, compressed) in columns {
+                raw.extend_from_slice(&uncompressed.to_le_bytes());
+                raw.extend_from_slice(&compressed.to_le_bytes());
+            }
+        }
+        raw.extend_from_slice(
+            &u64::try_from(tables.len())
+                .expect("table count fits u64")
+                .to_le_bytes(),
+        );
+        for &(stream_id, offset, schema_id, messages) in tables {
+            raw.extend_from_slice(&stream_id.to_le_bytes());
+            raw.extend_from_slice(&offset.to_le_bytes());
+            raw.extend_from_slice(&schema_id.to_le_bytes());
+            raw.extend_from_slice(&messages.to_le_bytes());
+        }
+        zstd::stream::encode_all(raw.as_slice(), 3).expect("compress table metadata")
+    }
+
     #[test]
-    fn rejects_reserved_separate_columns() {
-        let separate = compressed_section(&[(0, 1)], 1, &[(0, 0, 7, 1)]);
+    fn decodes_separate_column_streams() {
+        let section =
+            compressed_section_separate(&[(0, 10)], &[(0, &[(4, 5), (6, 4)])], &[(0, 0, 7, 1)]);
+        let metadata = decode(&section, &[7], 9).expect("decode separate-column stream");
+        let columns = metadata
+            .separate_columns_for(0)
+            .expect("stream 0 stores one frame per column")
+            .columns();
+        assert_eq!(columns.len(), 2);
+        assert_eq!(
+            (columns[0].uncompressed_size(), columns[0].compressed_size()),
+            (4, 5)
+        );
+        assert_eq!(
+            (columns[1].uncompressed_size(), columns[1].compressed_size()),
+            (6, 4)
+        );
+        assert!(metadata.separate_columns_for(1).is_none());
+    }
+
+    #[test]
+    fn rejects_inconsistent_separate_column_streams() {
+        let mismatched =
+            compressed_section_separate(&[(0, 10)], &[(0, &[(4, 5), (5, 4)])], &[(0, 0, 7, 1)]);
         assert!(matches!(
-            decode(&separate, &[7], 1),
-            Err(TableMetadataError::UnsupportedSeparateColumnSchemas { actual: 1 })
+            decode(&mismatched, &[7], 9),
+            Err(TableMetadataError::SeparateColumnFramesMismatch { stream_id: 0, .. })
         ));
+        let too_many = compressed_section_separate(
+            &[(0, 10)],
+            &[(0, &[(10, 9)]), (1, &[(0, 0)])],
+            &[(0, 0, 7, 1)],
+        );
+        assert!(matches!(
+            decode(&too_many, &[7], 9),
+            Err(TableMetadataError::SeparateColumnStreamCountTooLarge {
+                actual: 2,
+                stream_count: 1
+            })
+        ));
+        let two_tables = compressed_section_separate(
+            &[(0, 10)],
+            &[(0, &[(10, 9)])],
+            &[(0, 0, 7, 1), (0, 4, 8, 1)],
+        );
+        let result = decode(&two_tables, &[7, 8], 9);
+        assert!(
+            matches!(
+                result,
+                Err(TableMetadataError::SeparateColumnStreamNotSingleTable { stream_id: 0, tables: 2 })
+            ),
+            "{result:?}"
+        );
     }
 
     #[test]

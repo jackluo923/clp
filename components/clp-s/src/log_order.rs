@@ -542,6 +542,10 @@ trait TableView<'table> {
     fn message_count(&self) -> usize;
     fn len(&self) -> usize;
     fn column(&self, column_index: usize) -> Option<TableColumnView<'table>>;
+    /// Whether the table omits columns a projected read left unloaded.
+    fn is_projected(&self) -> bool {
+        false
+    }
 }
 
 impl<'table> TableView<'table> for SchemaTable<'table, '_> {
@@ -551,6 +555,10 @@ impl<'table> TableView<'table> for SchemaTable<'table, '_> {
 
     fn len(&self) -> usize {
         Self::len(self)
+    }
+
+    fn is_projected(&self) -> bool {
+        Self::is_projected(self)
     }
 
     fn column(&self, column_index: usize) -> Option<TableColumnView<'table>> {
@@ -643,7 +651,11 @@ fn locate_in_table<'table, T: TreeView + ?Sized, V: TableView<'table> + ?Sized>(
     }
 
     let expected_column_count = count_value_columns(schema_tree, schema_id, entries)?;
-    if expected_column_count != table.len() {
+    // A projected table omits the columns its read left unloaded, so it may hold fewer columns
+    // than the schema declares. More than declared is corrupt either way.
+    let projected = table.is_projected();
+    if table.len() > expected_column_count || (!projected && expected_column_count != table.len())
+    {
         return Err(LogOrderError::ColumnCountMismatch {
             schema_id,
             expected: expected_column_count,
@@ -669,12 +681,25 @@ fn locate_in_table<'table, T: TreeView + ?Sized, V: TableView<'table> + ?Sized>(
             continue;
         }
 
-        let column = table
-            .column(column_index)
-            .ok_or(LogOrderError::MissingTableColumn {
-                schema_id,
-                column_index,
-            })?;
+        // Columns keep schema-entry order. In a projected table the next column may belong to a
+        // later entry, which means this entry's column was not loaded; the reserved field itself
+        // must be present for the table to be usable here.
+        let next = table.column(column_index);
+        let unloaded = projected
+            && next.is_none_or(|column| column.schema_entry_index > schema_entry_index);
+        if unloaded {
+            if Some(node_id) == target_node_id {
+                return Err(LogOrderError::MissingTableColumn {
+                    schema_id,
+                    column_index,
+                });
+            }
+            continue;
+        }
+        let column = next.ok_or(LogOrderError::MissingTableColumn {
+            schema_id,
+            column_index,
+        })?;
         validate_column(
             schema_id,
             column_index,
@@ -1199,6 +1224,108 @@ mod tests {
             },
             locate_in_table(&tree, 10, &[node(1)], 1, &empty_table, Some(nodes))
                 .expect_err("column count must correspond")
+        );
+    }
+
+    /// A table whose read left some schema columns unloaded.
+    struct ProjectedTable<'table> {
+        message_count: usize,
+        columns: &'table [TableColumnView<'table>],
+    }
+
+    impl<'table> TableView<'table> for ProjectedTable<'table> {
+        fn message_count(&self) -> usize {
+            self.message_count
+        }
+
+        fn len(&self) -> usize {
+            self.columns.len()
+        }
+
+        fn column(&self, column_index: usize) -> Option<TableColumnView<'table>> {
+            self.columns.get(column_index).copied()
+        }
+
+        fn is_projected(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn locates_in_projected_tables_by_schema_entry() {
+        let tree = canonical_tree();
+        let tree = TestTree(&tree);
+        let nodes = discover_nodes(&tree)
+            .expect("valid metadata")
+            .expect("log order present");
+        let entries = [node(3), node(1), node(4)];
+
+        // Only the reserved field survived the projection: it sits at column 0 but entry 1.
+        let deltas = encode_deltas(&[4, 1]);
+        let only_log_order = [TableColumnView {
+            schema_entry_index: 1,
+            node_id: 1,
+            node_type: NodeType::DeltaInteger,
+            encoded_deltas: Some(&deltas),
+        }];
+        let table = ProjectedTable {
+            message_count: 2,
+            columns: &only_log_order,
+        };
+        let located = locate_in_table(&tree, 5, &entries, 3, &table, Some(nodes))
+            .expect("projected table validates")
+            .expect("log order present");
+        assert_eq!(1, located.schema_entry_index());
+        assert_eq!(0, located.column_index());
+        assert_eq!(Some(4), located.cursor().next());
+
+        // The projection dropped the reserved field itself.
+        let without_log_order = [TableColumnView {
+            schema_entry_index: 0,
+            node_id: 3,
+            node_type: NodeType::Integer,
+            encoded_deltas: None,
+        }];
+        let table = ProjectedTable {
+            message_count: 2,
+            columns: &without_log_order,
+        };
+        assert_eq!(
+            LogOrderError::MissingTableColumn {
+                schema_id: 5,
+                column_index: 1,
+            },
+            locate_in_table(&tree, 5, &entries, 3, &table, Some(nodes))
+                .expect_err("the reserved field must be loaded")
+        );
+
+        // More columns than the schema declares is corrupt even when projected.
+        let too_many = [
+            TableColumnView {
+                schema_entry_index: 0,
+                node_id: 3,
+                node_type: NodeType::Integer,
+                encoded_deltas: None,
+            },
+            TableColumnView {
+                schema_entry_index: 1,
+                node_id: 1,
+                node_type: NodeType::DeltaInteger,
+                encoded_deltas: Some(&deltas),
+            },
+        ];
+        let table = ProjectedTable {
+            message_count: 2,
+            columns: &too_many,
+        };
+        assert_eq!(
+            LogOrderError::ColumnCountMismatch {
+                schema_id: 6,
+                expected: 1,
+                actual: 2,
+            },
+            locate_in_table(&tree, 6, &[node(1)], 1, &table, Some(nodes))
+                .expect_err("column count above the schema is corrupt")
         );
     }
 

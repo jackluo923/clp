@@ -5,6 +5,7 @@ use std::fmt::Formatter;
 use std::iter::FusedIterator;
 
 use super::dictionary::ArrayDictionary;
+use super::packed_stream::ColumnSlot;
 use super::dictionary::LogTypeDictionary;
 use super::dictionary::LogTypeDictionaryEntry;
 use super::dictionary::LogTypeVariableKind;
@@ -125,6 +126,7 @@ impl Default for ColumnLimits {
 pub struct SchemaTable<'table, 'archive> {
     message_count: usize,
     columns: Vec<Column<'table, 'archive>>,
+    projected: bool,
 }
 
 impl<'table, 'archive> SchemaTable<'table, 'archive> {
@@ -150,6 +152,16 @@ impl<'table, 'archive> SchemaTable<'table, 'archive> {
     #[must_use]
     pub const fn len(&self) -> usize {
         self.columns.len()
+    }
+
+    /// Whether a projected read left some of the schema's columns out of this table.
+    ///
+    /// Columns keep schema-entry order either way; consumers that pair columns with schema
+    /// entries by position must go through [`Column::schema_entry_index`] instead when this is
+    /// set.
+    #[must_use]
+    pub const fn is_projected(&self) -> bool {
+        self.projected
     }
 
     /// Returns whether the schema has no value-bearing columns.
@@ -1048,6 +1060,7 @@ impl<'table, 'archive> TimestampColumn<'table, 'archive> {
 #[allow(clippy::too_many_arguments)]
 pub fn decode_schema_table<'table, 'archive>(
     table_bytes: &'table [u8],
+    column_layout: Option<&[ColumnSlot]>,
     schema: &SchemaDefinition,
     schema_tree: &SchemaTree,
     message_count: u64,
@@ -1088,6 +1101,8 @@ pub fn decode_schema_table<'table, 'archive>(
         })?;
     let mut cursor = TableCursor::new(table_bytes);
     let mut total_encoded_variables = 0_u64;
+    let mut value_column_index = 0_usize;
+    let mut projected = false;
 
     for (schema_entry_index, entry) in schema.entries().iter().enumerate() {
         let SchemaEntry::Node(node_id) = *entry else {
@@ -1100,10 +1115,21 @@ pub fn decode_schema_table<'table, 'archive>(
         if !is_value_bearing(node_type) {
             continue;
         }
+        let column_index = value_column_index;
+        value_column_index += 1;
         let context = ColumnContext {
-            column_index: columns.len(),
+            column_index,
             node_id,
         };
+        // A projected separate-column stream leaves unwanted columns unloaded. Their bytes are
+        // still in the table, zero-filled, so step over them and leave the column out.
+        if let Some(slot) = column_layout.and_then(|layout| layout.get(column_index)) {
+            if !slot.loaded {
+                cursor.skip(context, slot.size)?;
+                projected = true;
+                continue;
+            }
+        }
         let data = decode_column(
             &mut cursor,
             context,
@@ -1131,6 +1157,7 @@ pub fn decode_schema_table<'table, 'archive>(
     Ok(SchemaTable {
         message_count,
         columns,
+        projected,
     })
 }
 
@@ -1252,7 +1279,8 @@ fn count_value_columns(
     Ok(count)
 }
 
-const fn is_value_bearing(node_type: NodeType) -> bool {
+/// Whether a node of this type owns a column in its schema table.
+pub const fn is_value_bearing(node_type: NodeType) -> bool {
     !matches!(
         node_type,
         NodeType::Object | NodeType::Null | NodeType::StructuredArray | NodeType::Metadata
@@ -2119,6 +2147,11 @@ impl<'a> TableCursor<'a> {
         Ok(decode_u64_chunk(self.take(context, U64_SIZE)?))
     }
 
+    /// Steps over `size` bytes without decoding them.
+    fn skip(&mut self, context: ColumnContext, size: usize) -> Result<(), ColumnError> {
+        self.take(context, size).map(|_| ())
+    }
+
     fn take(&mut self, context: ColumnContext, size: usize) -> Result<&'a [u8], ColumnError> {
         let remaining = self.remaining();
         if size > remaining {
@@ -2372,6 +2405,7 @@ mod tests {
     ) -> Result<SchemaTable<'table, 'archive>, ColumnError> {
         decode_schema_table(
             bytes,
+            None,
             schema,
             tree,
             message_count,
