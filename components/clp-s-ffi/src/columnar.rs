@@ -272,7 +272,10 @@ impl ProjectedScanner {
         let mut options = *options;
         // A measurement hook: force the eager load so the two paths can be timed
         // in one binary. Not a supported setting.
-        let force_eager = std::env::var_os("CLP_RUST_EAGER_DICTIONARIES").is_some();
+        // Set-but-empty must read as off: a runner that forwards every variable
+        // it knows passes the unset ones as empty strings.
+        let force_eager = std::env::var("CLP_RUST_EAGER_DICTIONARIES")
+            .is_ok_and(|value| !value.is_empty() && value != "0");
         if force_eager || query_needs_dictionaries(&parsed, catalog.schema_tree(), &field_nodes) {
             let limits = options.catalog();
             let variable = reader
