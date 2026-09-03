@@ -1823,7 +1823,11 @@ impl<R: Read> KvIrReader<R> {
     /// Returns counters accumulated so far.
     #[must_use]
     pub const fn stats(&self) -> KvIrStats {
-        self.stats
+        // Carried here rather than stored on every consumed byte, which put a write in the
+        // innermost read loop for a counter only this accessor reads.
+        let mut stats = self.stats;
+        stats.input_bytes = self.input_offset;
+        stats
     }
 
     /// Returns the underlying input, discarding unread buffered bytes.
@@ -1848,7 +1852,7 @@ impl<R: Read> KvIrReader<R> {
         while self.read_next_item(sink)?.is_some() {
             // The incremental operation owns all protocol state transitions.
         }
-        Ok(self.stats)
+        Ok(self.stats())
     }
 
     /// Decodes and synchronously emits at most one complete item.
@@ -3125,6 +3129,7 @@ impl<R: Read> KvIrReader<R> {
         Ok(u64::from_be_bytes(self.read_array(context)?))
     }
 
+    #[inline]
     fn read_array<const N: usize>(
         &mut self,
         context: KvIrTruncatedContext,
@@ -3180,6 +3185,7 @@ impl<R: Read> KvIrReader<R> {
         Ok(())
     }
 
+    #[inline]
     fn read_unit_byte(&mut self, context: KvIrTruncatedContext) -> Result<u8, KvIrError> {
         self.check_unit_growth(1)?;
         self.unit.try_reserve(1).map_err(|_| {
@@ -3193,6 +3199,7 @@ impl<R: Read> KvIrReader<R> {
         Ok(value)
     }
 
+    #[inline]
     fn read_unit_bytes(
         &mut self,
         count: usize,
@@ -3224,6 +3231,7 @@ impl<R: Read> KvIrReader<R> {
         Ok(())
     }
 
+    #[inline]
     fn read_stream_byte(&mut self, context: KvIrTruncatedContext) -> Result<u8, KvIrError> {
         self.check_stream_growth(1)?;
         if !self.has_input()? {
@@ -3245,6 +3253,7 @@ impl<R: Read> KvIrReader<R> {
         Ok(())
     }
 
+    #[inline]
     fn check_unit_growth(&self, additional: usize) -> Result<(), KvIrError> {
         let next = self
             .unit
@@ -3262,6 +3271,7 @@ impl<R: Read> KvIrReader<R> {
         Ok(())
     }
 
+    #[inline]
     fn check_stream_growth(&self, additional: usize) -> Result<(), KvIrError> {
         let additional =
             u64::try_from(additional).map_err(|_| self.error(KvIrErrorKind::SizeOverflow))?;
@@ -3279,6 +3289,7 @@ impl<R: Read> KvIrReader<R> {
         Ok(())
     }
 
+    #[inline]
     fn consume_buffered(&mut self, count: usize) -> Result<(), KvIrError> {
         self.input_start = self
             .input_start
@@ -3293,11 +3304,24 @@ impl<R: Read> KvIrReader<R> {
             .stream_bytes
             .checked_add(count)
             .ok_or_else(|| self.error(KvIrErrorKind::SizeOverflow))?;
-        self.stats.input_bytes = self.input_offset;
         Ok(())
     }
 
+    #[inline]
     fn has_input(&mut self) -> Result<bool, KvIrError> {
+        if self.input_start != self.input_end {
+            return Ok(true);
+        }
+        self.refill()
+    }
+
+    /// Reads the next block, and is where every byte of I/O cost lives.
+    ///
+    /// Split out so the buffered case above stays small enough to inline: that runs once per
+    /// byte of a stream, and this runs once per 8 KiB of it.
+    #[cold]
+    #[inline(never)]
+    fn refill(&mut self) -> Result<bool, KvIrError> {
         while self.input_start == self.input_end && !self.reached_eof {
             match self.input.read(&mut self.input_buffer) {
                 Ok(0) => self.reached_eof = true,
