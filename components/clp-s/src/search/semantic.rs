@@ -2541,6 +2541,16 @@ struct Evaluator<'compiled, 'query, 'archive, 'table> {
     clp_scratch: Vec<u8>,
     array_scratch: ArrayScratch,
     range_work: Vec<RangeState<'archive>>,
+    /// Rows a guarded range-index predicate can accept, as a half-open table-local range.
+    ///
+    /// A query whose root conjunction carries a `$`-namespace predicate cannot match a row that
+    /// predicate rejects, and rows inside a table are in log order, so the rows it accepts are one
+    /// contiguous run. Column scans write only inside that run and leave the rest of each leaf's
+    /// bitmap at its default, which the final conjunction turns into a non-match either way.
+    ///
+    /// Per-row failures outside the run are no longer raised, since those rows are never read.
+    /// Schema-level refusals still are: every leaf is still evaluated, over an empty row range.
+    row_span: Option<(usize, usize)>,
 }
 
 impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive, 'table> {
@@ -2558,6 +2568,51 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
             clp_scratch: Vec::new(),
             array_scratch: ArrayScratch::default(),
             range_work: Vec::new(),
+            row_span: None,
+        }
+    }
+
+    /// Returns the node index of a range-index predicate every matching row must satisfy.
+    ///
+    /// Only the root's top-level conjunction qualifies. Under an `OR` a rejected row can still
+    /// match through the other branch, and under a `NOT` the accepted rows are the complement of a
+    /// run rather than a run, so neither is descended into.
+    fn guarded_range_index_node(&self) -> Option<usize> {
+        let mut pending = vec![self.compiled.query.root()];
+        let mut found = None;
+        while let Some(node) = pending.pop() {
+            let index = node.index();
+            match self.compiled.nodes.get(index)? {
+                CompiledNode::Boolean {
+                    operator: BooleanOperator::And,
+                    left,
+                    right,
+                } => {
+                    pending.push(*left);
+                    pending.push(*right);
+                }
+                CompiledNode::Predicate(predicate_index) => {
+                    let predicate = self.compiled.predicates.get(*predicate_index)?;
+                    if matches!(predicate.resolved, ResolvedPath::RangeIndex) && !predicate.negated
+                    {
+                        if found.is_some() {
+                            // Two selectors accept two runs whose union need not be one run.
+                            return None;
+                        }
+                        found = Some(index);
+                    }
+                }
+                _ => {}
+            }
+        }
+        found
+    }
+
+    fn evaluate_node(&mut self, index: usize) -> Result<Vec<u8>, SearchError> {
+        match self.compiled.nodes.get(index).copied() {
+            Some(CompiledNode::Predicate(predicate)) => self.evaluate_predicate(predicate),
+            Some(CompiledNode::List(list)) => self.evaluate_list(list),
+            _ => Err(SearchError::SizeOverflow),
         }
     }
 
@@ -2566,7 +2621,22 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
             .try_reserve_exact(self.compiled.nodes.len())
             .map_err(|_| allocation(SearchResource::CompiledProgram, self.compiled.nodes.len()))?;
         self.states.resize_with(self.compiled.nodes.len(), || None);
+        // Answer the range-index selector before anything is decoded. It alone decides which rows
+        // of this table the query can reach, so a table it excludes needs no column read at all,
+        // and a table it narrows needs the other predicates evaluated over that run only.
+        if let Some(node_index) = self.guarded_range_index_node() {
+            let bitmap = self.evaluate_node(node_index)?;
+            // A table the selector excludes yields an empty span rather than an early answer, so
+            // no column byte is read while the schema checks every other leaf performs still run
+            // and still report what they refuse to evaluate.
+            self.row_span = Some(true_span(&bitmap).unwrap_or((0, 0)));
+            self.states[node_index] = Some(bitmap);
+        }
         for (index, node) in self.compiled.nodes.iter().copied().enumerate() {
+            if self.states[index].is_some() {
+                // The range-index pre-pass already produced this node's rows.
+                continue;
+            }
             let expression = NodeId::new(index);
             let bitmap = match node {
                 CompiledNode::Predicate(predicate) => self.evaluate_predicate(predicate)?,
@@ -2917,11 +2987,19 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
         column: ColumnData<'table, 'archive>,
         bitmap: &mut [u8],
     ) -> Result<(), SearchError> {
+        // Rows outside the guarded range-index run cannot match, so they are neither read nor
+        // written and keep this leaf's default.
+        let rows = bitmap.len();
+        let (skip, bitmap) = match self.row_span {
+            Some((start, end)) if start < rows => (start, &mut bitmap[start..end.min(rows)]),
+            Some(_) => (0, &mut bitmap[..0]),
+            None => (0, bitmap),
+        };
         match column {
             ColumnData::Integer(column) => {
                 or_i64_matches(
                     bitmap,
-                    column.iter(),
+                    column.iter().skip(skip),
                     filter.predicate,
                     filter.value.timestamp_nanoseconds,
                 );
@@ -2929,23 +3007,23 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
             ColumnData::DeltaInteger(column) => {
                 or_i64_matches(
                     bitmap,
-                    column.values(),
+                    column.values().skip(skip),
                     filter.predicate,
                     filter.value.timestamp_nanoseconds,
                 );
             }
             ColumnData::Float(column) => {
-                or_matches(bitmap, column.iter(), |value| {
+                or_matches(bitmap, column.iter().skip(skip), |value| {
                     scalar_f64_matches(value, filter.predicate, filter.value.timestamp_nanoseconds)
                 });
             }
             ColumnData::FormattedFloat(column) => {
-                or_matches(bitmap, column.values().iter(), |value| {
+                or_matches(bitmap, column.values().iter().skip(skip), |value| {
                     scalar_f64_matches(value, filter.predicate, filter.value.timestamp_nanoseconds)
                 });
             }
             ColumnData::DictionaryFloat(column) => {
-                or_matches(bitmap, column.ids().iter(), |id| {
+                or_matches(bitmap, column.ids().iter().skip(skip), |id| {
                     filter.value.dictionary_float_ids.binary_search(&id).is_ok()
                 });
             }
@@ -2954,15 +3032,15 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
                     Literal::Boolean(value) => *value,
                     _ => return Ok(()),
                 };
-                or_matches(bitmap, column.iter(), |value| value == expected);
+                or_matches(bitmap, column.iter().skip(skip), |value| value == expected);
             }
             ColumnData::VarString(column) => {
-                or_matches(bitmap, column.ids().iter(), |id| {
+                or_matches(bitmap, column.ids().iter().skip(skip), |id| {
                     filter.value.variable_ids.binary_search(&id).is_ok()
                 });
             }
             ColumnData::ClpString(column) => {
-                self.scan_clp(filter.expression, filter.predicate, column, bitmap)?;
+                self.scan_clp(filter.expression, filter.predicate, column, skip, bitmap)?;
             }
             ColumnData::UnstructuredArray(_) => return Err(SearchError::SizeOverflow),
             ColumnData::DeprecatedDateString(_) => {
@@ -2973,12 +3051,12 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
             }
             ColumnData::Timestamp(column) => {
                 let Some(timestamp_nanoseconds) = filter.value.timestamp_nanoseconds else {
-                    or_matches(bitmap, column.epochs().values(), |value| {
+                    or_matches(bitmap, column.epochs().values().skip(skip), |value| {
                         numeric_value_matches_i64(value, filter.predicate)
                     });
                     return Ok(());
                 };
-                or_matches(bitmap, column.epochs().values(), |value| {
+                or_matches(bitmap, column.epochs().values().skip(skip), |value| {
                     compare(value, timestamp_nanoseconds, filter.predicate.operator())
                 });
             }
@@ -2991,9 +3069,11 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
         expression: NodeId,
         predicate: PredicateRef<'_>,
         column: crate::archive::ClpStringColumn<'table, 'archive>,
+        row_offset: usize,
         bitmap: &mut [u8],
     ) -> Result<(), SearchError> {
-        for (row, destination) in bitmap.iter_mut().enumerate() {
+        for (offset, destination) in bitmap.iter_mut().enumerate() {
+            let row = row_offset + offset;
             let record = column.record(row).ok_or(SearchError::SizeOverflow)?;
             self.clp_scratch.clear();
             append_clp_message_bounded(
@@ -3257,17 +3337,31 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
             return Ok(bitmap);
         };
 
-        // The column is delta encoded, so it is walked once rather than indexed per row.
+        // The column is delta encoded, so it is walked once rather than indexed per row. Entries
+        // are validated sorted and disjoint and a table's rows are written in log order, so the
+        // entry covering the previous row is at or before the one covering this row and a single
+        // forward cursor replaces a scan of the entries per row. A stream whose indexes are not
+        // monotonic restarts the cursor rather than reporting the wrong entry.
+        let mut cursor = 0_usize;
+        let mut previous = 0_u64;
         for (row, log_event_idx) in column.cursor().enumerate().take(row_count) {
             if log_event_idx < 0 {
                 continue;
             }
             let idx = log_event_idx.cast_unsigned();
-            for (start, end, result) in &evaluated {
-                if idx >= *start && idx < *end {
-                    bitmap[row] = *result as u8;
-                    break;
-                }
+            if idx < previous {
+                cursor = 0;
+            }
+            previous = idx;
+            while cursor < evaluated.len() && idx >= evaluated[cursor].1 {
+                cursor += 1;
+            }
+            let Some((start, _, result)) = evaluated.get(cursor) else {
+                // Past every entry. A later row with a smaller index still resets the cursor.
+                continue;
+            };
+            if idx >= *start {
+                bitmap[row] = *result as u8;
             }
         }
         Ok(bitmap)
@@ -3302,6 +3396,13 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
     const fn release_bitmap(&mut self, len: usize) {
         self.live_bitmap_bytes -= len;
     }
+}
+
+/// Returns the half-open run of rows a range-index bitmap marks true, or `None` for no row.
+fn true_span(bitmap: &[u8]) -> Option<(usize, usize)> {
+    let first = bitmap.iter().position(|value| Tri::True as u8 == *value)?;
+    let last = bitmap.iter().rposition(|value| Tri::True as u8 == *value)?;
+    Some((first, last + 1))
 }
 
 fn or_matches<T>(
