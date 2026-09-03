@@ -89,6 +89,7 @@ pub use metadata::MetadataLimits;
 pub use metadata::SFA_SECTION_NAMES;
 pub use metadata::SectionDirectory;
 pub use packed_stream::ColumnSlot;
+pub use packed_stream::ColumnTruncation;
 pub use packed_stream::DecodedPackedStream;
 pub use packed_stream::PackedStreamError;
 pub use packed_stream::PackedStreamLimits;

@@ -60,13 +60,37 @@ pub struct DecodedPackedStream {
     column_layout: Option<Vec<ColumnSlot>>,
 }
 
-/// One value column of a projected separate-column stream: its byte length within the table,
-/// and whether its frame was inflated. A column that was not is a zero-filled gap of that length
-/// which the table decoder steps over without reading.
+/// One value column of a projected separate-column stream.
+///
+/// `size` is the column's length in a whole table; `stored` is how much of it the stream actually
+/// holds, which is all of it, none of it for a column the projection skipped, or a leading part
+/// for a column read only as far as the rows a query can match. The buffer holds exactly the
+/// stored bytes of each column in order, so a column that was skipped or cut short occupies
+/// nothing, and the table decoder reads each column for the rows its stored bytes cover.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ColumnSlot {
     pub size: usize,
+    pub stored: usize,
     pub loaded: bool,
+}
+
+impl ColumnSlot {
+    /// Returns how many of `rows` this column holds, given a whole column covers all of them.
+    #[must_use]
+    pub const fn stored_rows(&self, rows: usize) -> usize {
+        if self.stored >= self.size {
+            return rows;
+        }
+        if 0 == self.size || 0 == rows {
+            return 0;
+        }
+        let width = self.size / rows;
+        if 0 == width {
+            return 0;
+        }
+        // `stored` is a whole number of rows by construction, so this divides exactly.
+        self.stored / width
+    }
 }
 
 impl DecodedPackedStream {
@@ -126,6 +150,153 @@ pub fn decode_packed_stream<R: Read>(
         metadata.uncompressed_size(),
         limits,
     )
+}
+
+/// How far into a stream's columns a scan can reach.
+///
+/// A query whose range-index selector accepts one source file needs only the rows up to that
+/// file's last, so every column after it is decompressed for nothing. Columns named truncatable
+/// are read that far and zero-filled beyond, which the table decoder lays out exactly as a whole
+/// read would. Only fixed-width columns free of referential validation qualify, since a row's byte
+/// offset must be known without reading and an unread tail must stay structurally valid.
+#[derive(Clone, Copy, Debug)]
+pub struct ColumnTruncation<'a> {
+    /// The log-order column, read first and in full so the stopping row can be found.
+    pub log_order_column: usize,
+    /// The first log event no accepted source file reaches.
+    pub limit: u64,
+    /// Rows the table holds.
+    pub total_rows: usize,
+    /// Whether each column may stop early, indexed as the stream's columns are.
+    pub truncatable: &'a [bool],
+}
+
+impl ColumnTruncation<'_> {
+    /// Returns the row to stop at: the first whose log event index reaches the limit.
+    ///
+    /// The log-order column holds one little-endian delta per row and a row's index is the running
+    /// sum, as the engine's own cursor reads it. A column whose indexes do not increase yields the
+    /// whole table, since a later row could then still be one an accepted file covers.
+    #[must_use]
+    pub(super) fn row_limit(&self, deltas: &[u8]) -> usize {
+        let mut current = 0_i64;
+        let mut previous = 0_i64;
+        let mut crossed = None;
+        // The whole column is walked even once the limit is reached. Stopping there would only
+        // prove the rows before it are in order, and the engine, which resets its own cursor when
+        // an index goes backwards, would still accept rows after a later decrease. Reading less
+        // than the engine can accept would silently drop those rows, so a decrease anywhere means
+        // the table is read whole.
+        for (row, delta) in deltas
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .enumerate()
+            .take(self.total_rows)
+        {
+            current = current.wrapping_add(i64::from_le_bytes(*delta));
+            if current < previous {
+                return self.total_rows;
+            }
+            previous = current;
+            if crossed.is_none() && current >= 0 && current.cast_unsigned() >= self.limit {
+                crossed = Some(row);
+            }
+        }
+        crossed.unwrap_or(self.total_rows)
+    }
+
+    /// Returns the byte prefix of column `index` a scan needs, or `None` for all of it.
+    #[must_use]
+    pub(super) fn prefix(&self, index: usize, size: usize, rows: usize) -> Option<usize> {
+        if !self.truncatable.get(index).copied().unwrap_or(false) {
+            return None;
+        }
+        if 0 == self.total_rows || rows >= self.total_rows {
+            return None;
+        }
+        // A column whose bytes do not divide evenly across rows is not the fixed-width layout this
+        // can address, whatever its type says.
+        if 0 != size % self.total_rows {
+            return None;
+        }
+        Some(size / self.total_rows * rows)
+    }
+}
+
+/// Inflates only the first `prefix` bytes of one frame.
+///
+/// zstd decodes forward, so a reader that needs rows up to some point still pays for everything
+/// before them but nothing after. The frame is left unfinished on purpose, so the trailing-byte
+/// check a whole-frame read performs does not apply and the caller is responsible for treating the
+/// missing tail as unread rather than as data.
+///
+/// # Errors
+///
+/// Returns the same framing, resource, and I/O errors a whole-frame read does, except those that
+/// can only be raised at the end of a frame.
+pub(super) fn decode_packed_stream_prefix<R: Read>(
+    compressed: Take<R>,
+    metadata: &PackedStreamMetadata,
+    prefix: u64,
+    limits: PackedStreamLimits,
+) -> Result<Vec<u8>, PackedStreamError> {
+    if prefix >= metadata.uncompressed_size() {
+        return Ok(decode_frame(
+            compressed,
+            metadata.compressed_size(),
+            metadata.uncompressed_size(),
+            limits,
+        )?
+        .bytes);
+    }
+    if validate_frame_sizes(
+        compressed.limit(),
+        metadata.compressed_size(),
+        metadata.uncompressed_size(),
+        limits,
+    )? {
+        return Ok(Vec::new());
+    }
+    let mut decoder = zstd::stream::read::Decoder::new(compressed)
+        .map_err(|source| classify_decoder_error(source, prefix, 0))?
+        .single_frame();
+    decode_prefix_output(&mut decoder, prefix)
+}
+
+/// Reads exactly `prefix` decompressed bytes, leaving whatever follows unread.
+fn decode_prefix_output<R: Read>(
+    decoder: &mut R,
+    prefix: u64,
+) -> Result<Vec<u8>, PackedStreamError> {
+    let allocation_size = usize::try_from(prefix).map_err(|_| PackedStreamError::SizeOverflow)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(allocation_size)
+        .map_err(|_| PackedStreamError::AllocationFailed {
+            requested: allocation_size,
+        })?;
+    let mut bounded = decoder.take(prefix);
+    loop {
+        match bounded.read_to_end(&mut bytes) {
+            Ok(_) => break,
+            Err(source) if io::ErrorKind::Interrupted == source.kind() => {}
+            Err(source) => {
+                return Err(classify_decoder_error(
+                    source,
+                    prefix,
+                    usize_to_u64(bytes.len())?,
+                ));
+            }
+        }
+    }
+    if bytes.len() != allocation_size {
+        return Err(PackedStreamError::DecompressedSizeMismatch {
+            advertised: prefix,
+            actual: usize_to_u64(bytes.len())?,
+        });
+    }
+    Ok(bytes)
 }
 
 /// Selects and bounds one packed stream relative to the physical `/0` member.
@@ -192,23 +363,31 @@ fn decode_frame<R: Read>(
 impl DecodedPackedStream {
     /// Assembles a stream from per-column pieces: `None` for a column left unloaded.
     ///
-    /// The result is laid out exactly as the whole-frame stream would be, with unloaded
-    /// columns zero-filled, and carries the layout so the decoder can skip them.
+    /// Only the bytes actually read are stored, so a skipped or early-stopped column costs
+    /// nothing. The layout records what each column would have held, so the decoder can tell how
+    /// many rows it got.
     #[must_use]
     pub fn from_columns(columns: Vec<Option<Vec<u8>>>, sizes: &[usize]) -> Self {
-        let total: usize = sizes.iter().sum();
-        let mut bytes = Vec::with_capacity(total);
+        let mut bytes = Vec::new();
         let mut layout = Vec::with_capacity(sizes.len());
         for (column, &size) in columns.into_iter().zip(sizes) {
             match column {
                 Some(data) => {
-                    debug_assert_eq!(data.len(), size);
-                    bytes.extend_from_slice(&data);
-                    layout.push(ColumnSlot { size, loaded: true });
+                    debug_assert!(data.len() <= size);
+                    let stored = data.len().min(size);
+                    bytes.extend_from_slice(&data[..stored]);
+                    layout.push(ColumnSlot {
+                        size,
+                        stored,
+                        loaded: true,
+                    });
                 }
                 None => {
-                    bytes.resize(bytes.len() + size, 0);
-                    layout.push(ColumnSlot { size, loaded: false });
+                    layout.push(ColumnSlot {
+                        size,
+                        stored: 0,
+                        loaded: false,
+                    });
                 }
             }
         }

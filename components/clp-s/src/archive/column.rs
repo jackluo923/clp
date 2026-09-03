@@ -1121,20 +1121,25 @@ pub fn decode_schema_table<'table, 'archive>(
             column_index,
             node_id,
         };
-        // A projected separate-column stream leaves unwanted columns unloaded. Their bytes are
-        // still in the table, zero-filled, so step over them and leave the column out.
+        // A projected separate-column stream holds only the bytes it read: nothing for a column
+        // the projection skipped, and a leading part for one read only as far as the rows a query
+        // can match. Both are decoded for exactly the rows present rather than stepped over.
+        let mut column_rows = message_count;
         if let Some(slot) = column_layout.and_then(|layout| layout.get(column_index)) {
             if !slot.loaded {
-                cursor.skip(context, slot.size)?;
                 projected = true;
                 continue;
+            }
+            column_rows = slot.stored_rows(message_count);
+            if column_rows < message_count {
+                projected = true;
             }
         }
         let data = decode_column(
             &mut cursor,
             context,
             node_type,
-            message_count,
+            column_rows,
             variable_dictionary,
             logtype_dictionary,
             array_dictionary,

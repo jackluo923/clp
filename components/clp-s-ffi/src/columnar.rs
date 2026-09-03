@@ -15,10 +15,12 @@
 use clp_s::ArchiveReader;
 use clp_s::archive::ArchiveCatalog;
 use clp_s::archive::ColumnData;
+use clp_s::archive::ColumnTruncation;
 use clp_s::archive::DecodedPackedStream;
 use clp_s::archive::DecodedSchemaTable;
 use clp_s::archive::NodeType;
 use clp_s::archive::SchemaEntry;
+use clp_s::archive::SchemaTableMetadata;
 use clp_s::archive::SchemaTree;
 use clp_s::archive::is_value_bearing;
 use clp_s::LogOrderLocator;
@@ -187,6 +189,11 @@ pub struct ProjectedScanner {
     field_nodes: Vec<Vec<u32>>,
     /// Sorted schema nodes the scan reads, or `None` to read every column.
     wanted_nodes: Option<Vec<u32>>,
+    /// Log-event ranges the query's range-index selector accepts, when one governs every match.
+    ///
+    /// A row outside them cannot match, and rows are written in log order, so a column needs
+    /// inflating only as far as the last row any range reaches.
+    accepted_ranges: Option<Vec<(u64, u64)>>,
     field_count: usize,
     stream_index: usize,
     stream_count: usize,
@@ -309,6 +316,15 @@ impl ProjectedScanner {
             // Nothing will look an ID up, so decoding need not check them either.
             options = options.with_columns(options.columns().with_dictionary_validation(false));
         }
+        // Compiling here answers which source files the selector accepts once, rather than once
+        // per stream, and the answer outlives the compiled query it came from.
+        let accepted_ranges = parsed
+            .compile_for_archive(&catalog, options.search())
+            .map_err(|source| ScanError::Archive(format!("failed to compile query: {source}")))?
+            .accepted_log_event_ranges()
+            .map_err(|source| {
+                ScanError::Archive(format!("failed to read the range index: {source}"))
+            })?;
         let stream_count = catalog.table_metadata().packed_streams().len();
         Ok(Self {
             reader,
@@ -318,6 +334,7 @@ impl ProjectedScanner {
             field_count: fields.len(),
             field_nodes,
             wanted_nodes,
+            accepted_ranges,
             stream_index: 0,
             stream_count,
             stream: None,
@@ -401,12 +418,28 @@ impl ProjectedScanner {
     fn load_next_stream(&mut self) -> Result<bool, ScanError> {
         let stream_id = self.stream_index as u64;
         let mask = self.projection_mask(stream_id);
+        let truncate = match mask.as_deref() {
+            Some(wanted) => self.plan_truncation(stream_id, wanted),
+            None => None,
+        };
+        let total_rows = self
+            .stream_table(stream_id)
+            .and_then(|table| usize::try_from(table.message_count()).ok())
+            .unwrap_or(0);
         let stream = match mask.as_deref() {
             Some(wanted) => self.reader.read_packed_stream_projected(
                 self.catalog.metadata(),
                 self.catalog.table_metadata(),
                 self.stream_index,
                 wanted,
+                truncate
+                    .as_ref()
+                    .map(|(log_order_column, limit, mask)| ColumnTruncation {
+                        log_order_column: *log_order_column,
+                        limit: *limit,
+                        total_rows,
+                        truncatable: mask,
+                    }),
                 self.options.packed_stream(),
             ),
             None => self.reader.read_packed_stream(
@@ -429,29 +462,100 @@ impl ProjectedScanner {
     ///
     /// `None` when the stream shares one frame across its tables, or when the wanted set is
     /// unknown, in which case every column is inflated.
+    /// Plans how far into this stream's columns the scan needs to read.
+    ///
+    /// Costs nothing but metadata: the reader stops each column at the row where the log-order
+    /// column, which it reads first either way, reaches the first log event no accepted source
+    /// file covers.
+    fn plan_truncation(&self, stream_id: u64, wanted: &[bool]) -> Option<(usize, u64, Vec<bool>)> {
+        let accepted = self.accepted_ranges.as_ref()?;
+        let limit = accepted.iter().map(|(_, end)| *end).max()?;
+        // A selector reaching the newest source file leaves nothing after it to skip, which is the
+        // usual shape of a dashboard query, so it plans nothing rather than paying to find out.
+        let last = self
+            .catalog
+            .metadata()
+            .range_index()
+            .map(|index| {
+                index
+                    .entries()
+                    .iter()
+                    .map(clp_s::archive::RangeIndexEntry::end_index)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        if limit >= last {
+            return None;
+        }
+        let nodes = self.column_nodes(stream_id)?;
+        let tree = self.catalog.schema_tree();
+        let log_order = LogOrderLocator::discover(tree).ok()??.node_id();
+        let log_order_column = nodes.iter().position(|node| *node == log_order)?;
+        let mut truncatable = Vec::with_capacity(nodes.len());
+        for (index, node_id) in nodes.iter().enumerate() {
+            let fixed = tree
+                .get(*node_id as usize)
+                .is_some_and(|node| Self::truncatable(node.node_type()));
+            truncatable.push(
+                fixed && index != log_order_column && wanted.get(index).copied() == Some(true),
+            );
+        }
+        truncatable
+            .iter()
+            .any(|value| *value)
+            .then_some((log_order_column, limit, truncatable))
+    }
+
     fn projection_mask(&self, stream_id: u64) -> Option<Vec<bool>> {
         let wanted = self.wanted_nodes.as_deref()?;
+        self.column_nodes(stream_id)
+            .map(|nodes| nodes.iter().map(|id| wanted.binary_search(id).is_ok()).collect())
+    }
+
+    /// Returns the schema node behind each value-bearing column of a separate-column stream's
+    /// single table, in the order the stream stores them.
+    fn column_nodes(&self, stream_id: u64) -> Option<Vec<u32>> {
         let table_metadata = self.catalog.table_metadata();
         table_metadata.separate_columns_for(stream_id)?;
-        let tables = table_metadata.schema_tables();
-        let first = tables.partition_point(|table| table.stream_id() < stream_id);
-        let table = tables
-            .get(first)
-            .filter(|table| table.stream_id() == stream_id)?;
+        let table = self.stream_table(stream_id)?;
         let schema = self.catalog.schema_map().get(table.schema_id())?;
         let tree = self.catalog.schema_tree();
-        schema
-            .entries()
-            .iter()
-            .filter_map(|entry| {
-                let SchemaEntry::Node(node_id) = *entry else {
-                    return None;
-                };
-                let node = tree.get(node_id as usize)?;
-                is_value_bearing(node.node_type()).then(|| wanted.binary_search(&node_id).is_ok())
-            })
-            .collect::<Vec<bool>>()
-            .into()
+        let mut nodes = Vec::new();
+        for entry in schema.entries() {
+            let SchemaEntry::Node(node_id) = *entry else {
+                continue;
+            };
+            let node = tree.get(node_id as usize)?;
+            if is_value_bearing(node.node_type()) {
+                nodes.push(node_id);
+            }
+        }
+        Some(nodes)
+    }
+
+    fn stream_table(&self, stream_id: u64) -> Option<&SchemaTableMetadata> {
+        let tables = self.catalog.table_metadata().schema_tables();
+        let first = tables.partition_point(|table| table.stream_id() < stream_id);
+        tables
+            .get(first)
+            .filter(|table| table.stream_id() == stream_id)
+    }
+
+    /// Whether a column of this type can be read as a prefix of its bytes.
+    ///
+    /// Three things have to hold. A row's byte offset must follow from the column's size, so the
+    /// layout has to be one fixed-width value per row. That layout must be a single run of values,
+    /// since a column stored as two sections back to back would have its second section cut away
+    /// entirely rather than shortened, which is why timestamps, stored as deltas then pattern IDs,
+    /// and formatted floats, stored as values then descriptors, are read whole. And the unread
+    /// tail must stay structurally valid as zeroes, which rules out the dictionary-backed columns
+    /// whose IDs are checked against a dictionary while decoding.
+    const fn truncatable(node_type: NodeType) -> bool {
+        matches!(
+            node_type,
+            NodeType::Integer | NodeType::DeltaInteger | NodeType::Float | NodeType::Boolean
+        )
     }
 
     /// Projects the current stream's matched rows in one forward pass.

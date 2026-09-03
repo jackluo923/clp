@@ -675,6 +675,92 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
     ///
     /// Returns a structured error for a foreign table, bitmap/scratch limits, checked allocation,
     /// unsupported terminal range-index values, or corrupt CLP reconstruction.
+    /// Returns the node index of a range-index predicate every matching row must satisfy.
+    ///
+    /// Only the root's top-level conjunction qualifies. Under an `OR` a rejected row can still
+    /// match through the other branch, and under a `NOT` the accepted rows are the complement of a
+    /// run rather than a run, so neither is descended into.
+    fn guarded_range_index_node(&self) -> Option<usize> {
+        let mut pending = vec![self.query.root()];
+        let mut found = None;
+        while let Some(node) = pending.pop() {
+            let index = node.index();
+            match self.nodes.get(index)? {
+                CompiledNode::Boolean {
+                    operator: BooleanOperator::And,
+                    left,
+                    right,
+                } => {
+                    pending.push(*left);
+                    pending.push(*right);
+                }
+                CompiledNode::Predicate(predicate_index) => {
+                    let predicate = self.predicates.get(*predicate_index)?;
+                    if matches!(predicate.resolved, ResolvedPath::RangeIndex) && !predicate.negated
+                    {
+                        if found.is_some() {
+                            // Two selectors accept two runs whose union need not be one run.
+                            return None;
+                        }
+                        found = Some(index);
+                    }
+                }
+                _ => {}
+            }
+        }
+        found
+    }
+
+    /// Returns the log-event ranges this query's range-index selector accepts.
+    ///
+    /// `None` means no single selector governs every match, so every row of every table is a
+    /// candidate. Otherwise a row whose `log_event_idx` falls outside every returned range cannot
+    /// match, which lets a reader stop inflating a column once it is past the last such row.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same evaluation errors testing the selector against the range index would.
+    pub fn accepted_log_event_ranges(&self) -> Result<Option<Vec<(u64, u64)>>, SearchError> {
+        let Some(node_index) = self.guarded_range_index_node() else {
+            return Ok(None);
+        };
+        let Some(CompiledNode::Predicate(predicate_index)) = self.nodes.get(node_index).copied()
+        else {
+            return Ok(None);
+        };
+        let compiled = self
+            .predicates
+            .get(predicate_index)
+            .ok_or(SearchError::SizeOverflow)?;
+        let Some(range_index) = self.catalog.metadata().range_index() else {
+            return Ok(None);
+        };
+        let expression = self
+            .query
+            .node(compiled.expression)
+            .ok_or(SearchError::SizeOverflow)?;
+        let ExpressionKind::Predicate(predicate) = expression.kind() else {
+            return Ok(None);
+        };
+        let predicate = PredicateRef::from_predicate(predicate);
+        let mut work = Vec::new();
+        let mut accepted = Vec::new();
+        for entry in range_index.entries() {
+            let result = evaluate_range_fields(
+                entry.fields(),
+                compiled.expression,
+                compiled.negated,
+                predicate,
+                self.options,
+                &mut work,
+            )?;
+            if Tri::True == result {
+                accepted.push((entry.start_index(), entry.end_index()));
+            }
+        }
+        Ok(Some(accepted))
+    }
+
     pub fn match_table(
         &self,
         decoded: &DecodedSchemaTable<'_, '_>,
@@ -2572,40 +2658,8 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
         }
     }
 
-    /// Returns the node index of a range-index predicate every matching row must satisfy.
-    ///
-    /// Only the root's top-level conjunction qualifies. Under an `OR` a rejected row can still
-    /// match through the other branch, and under a `NOT` the accepted rows are the complement of a
-    /// run rather than a run, so neither is descended into.
     fn guarded_range_index_node(&self) -> Option<usize> {
-        let mut pending = vec![self.compiled.query.root()];
-        let mut found = None;
-        while let Some(node) = pending.pop() {
-            let index = node.index();
-            match self.compiled.nodes.get(index)? {
-                CompiledNode::Boolean {
-                    operator: BooleanOperator::And,
-                    left,
-                    right,
-                } => {
-                    pending.push(*left);
-                    pending.push(*right);
-                }
-                CompiledNode::Predicate(predicate_index) => {
-                    let predicate = self.compiled.predicates.get(*predicate_index)?;
-                    if matches!(predicate.resolved, ResolvedPath::RangeIndex) && !predicate.negated
-                    {
-                        if found.is_some() {
-                            // Two selectors accept two runs whose union need not be one run.
-                            return None;
-                        }
-                        found = Some(index);
-                    }
-                }
-                _ => {}
-            }
-        }
-        found
+        self.compiled.guarded_range_index_node()
     }
 
     fn evaluate_node(&mut self, index: usize) -> Result<Vec<u8>, SearchError> {

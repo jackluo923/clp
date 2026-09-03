@@ -33,6 +33,8 @@ use super::table_metadata::PackedStreamMetadata;
 use super::packed_stream::PackedStreamError;
 use super::packed_stream::PackedStreamLimits;
 use super::packed_stream::decode_packed_stream;
+use super::packed_stream::decode_packed_stream_prefix;
+use super::packed_stream::ColumnTruncation;
 use super::packed_stream::packed_stream_range;
 use super::schema_map::SchemaMap;
 use super::schema_map::SchemaMapError;
@@ -274,7 +276,8 @@ impl<R: Read + Seek> SingleFileArchiveReader<R> {
     ) -> Result<DecodedPackedStream, PackedStreamError> {
         // A separate-column stream is several frames; inflate them in order.
         if table_metadata.separate_columns_for(stream_id as u64).is_some() {
-            return self.read_packed_stream_frames(metadata, table_metadata, stream_id, None, limits);
+            return self
+                .read_packed_stream_frames(metadata, table_metadata, stream_id, None, None, limits);
         }
         let tables_section = metadata
             .directory()
@@ -314,6 +317,7 @@ impl<R: Read + Seek> SingleFileArchiveReader<R> {
         table_metadata: &TableMetadata,
         stream_id: usize,
         wanted: Option<&[bool]>,
+        truncate: Option<ColumnTruncation<'_>>,
         limits: PackedStreamLimits,
     ) -> Result<DecodedPackedStream, PackedStreamError> {
         let Some(separate) = table_metadata.separate_columns_for(stream_id as u64) else {
@@ -326,28 +330,67 @@ impl<R: Read + Seek> SingleFileArchiveReader<R> {
         let tables_range = tables_section.range();
         let tables_size = tables_range.end - tables_range.start;
         let (_, relative_range) = packed_stream_range(table_metadata, stream_id, tables_size)?;
-        let mut columns = Vec::with_capacity(separate.columns().len());
-        let mut sizes = Vec::with_capacity(separate.columns().len());
-        let mut offset = tables_range.start + relative_range.start;
-        for (index, frame) in separate.columns().iter().enumerate() {
-            let size = usize::try_from(frame.uncompressed_size())
-                .map_err(|_| PackedStreamError::SizeOverflow)?;
-            sizes.push(size);
-            let load = wanted.is_none_or(|mask| mask.get(index).copied().unwrap_or(true));
-            let end = offset
+        let frames = separate.columns();
+        let mut offsets = Vec::with_capacity(frames.len());
+        let mut sizes = Vec::with_capacity(frames.len());
+        let mut cursor = tables_range.start + relative_range.start;
+        for frame in frames {
+            let end = cursor
                 .checked_add(frame.compressed_size())
                 .ok_or(PackedStreamError::SizeOverflow)?;
-            if load && 0 != size {
-                let frame_meta = PackedStreamMetadata::for_frame(frame.compressed_size(), frame.uncompressed_size());
-                let compressed = self.reader_for_range(offset..end).map_err(PackedStreamError::Io)?;
-                let decoded = decode_packed_stream(compressed, &frame_meta, limits)?;
-                columns.push(Some(decoded.into_bytes()));
-            } else if load {
-                columns.push(Some(Vec::new()));
-            } else {
-                columns.push(None);
+            offsets.push((cursor, end));
+            sizes.push(
+                usize::try_from(frame.uncompressed_size())
+                    .map_err(|_| PackedStreamError::SizeOverflow)?,
+            );
+            cursor = end;
+        }
+        let mut columns: Vec<Option<Vec<u8>>> = vec![None; frames.len()];
+        let mut read = vec![false; frames.len()];
+
+        // The log-order column decides how far the others are worth reading, so it goes first and
+        // whole. Everything after the row it stops at belongs to source files the query excluded.
+        let mut rows = None;
+        if let Some(plan) = truncate
+            && let Some(frame) = frames.get(plan.log_order_column)
+            && let Some(&(start, end)) = offsets.get(plan.log_order_column)
+            && 0 != sizes[plan.log_order_column]
+        {
+            let frame_meta =
+                PackedStreamMetadata::for_frame(frame.compressed_size(), frame.uncompressed_size());
+            let compressed = self.reader_for_range(start..end).map_err(PackedStreamError::Io)?;
+            let bytes = decode_packed_stream(compressed, &frame_meta, limits)?.into_bytes();
+            rows = Some(plan.row_limit(&bytes));
+            columns[plan.log_order_column] = Some(bytes);
+            read[plan.log_order_column] = true;
+        }
+
+        for (index, frame) in frames.iter().enumerate() {
+            if read[index] {
+                continue;
             }
-            offset = end;
+            if !wanted.is_none_or(|mask| mask.get(index).copied().unwrap_or(true)) {
+                continue;
+            }
+            let size = sizes[index];
+            if 0 == size {
+                columns[index] = Some(Vec::new());
+                continue;
+            }
+            let (start, end) = offsets[index];
+            let frame_meta =
+                PackedStreamMetadata::for_frame(frame.compressed_size(), frame.uncompressed_size());
+            let compressed = self.reader_for_range(start..end).map_err(PackedStreamError::Io)?;
+            let prefix = rows.and_then(|rows| {
+                truncate.and_then(|plan| plan.prefix(index, size, rows))
+            });
+            let decoded = match prefix {
+                Some(prefix) => {
+                    decode_packed_stream_prefix(compressed, &frame_meta, prefix as u64, limits)?
+                }
+                None => decode_packed_stream(compressed, &frame_meta, limits)?.into_bytes(),
+            };
+            columns[index] = Some(decoded);
         }
         Ok(DecodedPackedStream::from_columns(columns, &sizes))
     }

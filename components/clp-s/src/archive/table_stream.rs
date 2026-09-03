@@ -126,10 +126,27 @@ impl<'stream, 'archive> SchemaTableStream<'stream, 'archive> {
 
         let actual_size =
             u64::try_from(stream_bytes.len()).map_err(|_| TableStreamError::SizeOverflow)?;
-        if actual_size != stream.uncompressed_size() {
+        // A projected stream carries only the bytes it read: nothing for a column the projection
+        // skipped, and a leading part for one read as far as the rows a query can match. Its
+        // layout says what that adds up to, and a whole stream advertises the same total.
+        let expected_size = match column_layout {
+            Some(layout) => {
+                let mut total = 0_u64;
+                for slot in layout {
+                    total = total
+                        .checked_add(
+                            u64::try_from(slot.stored).map_err(|_| TableStreamError::SizeOverflow)?,
+                        )
+                        .ok_or(TableStreamError::SizeOverflow)?;
+                }
+                total
+            }
+            None => stream.uncompressed_size(),
+        };
+        if actual_size != expected_size {
             return Err(TableStreamError::StreamLengthMismatch {
                 stream_id,
-                advertised: stream.uncompressed_size(),
+                advertised: expected_size,
                 actual: actual_size,
             });
         }
@@ -206,7 +223,12 @@ impl<'stream, 'archive> SchemaTableStream<'stream, 'archive> {
         table: &'archive SchemaTableMetadata,
         table_index: usize,
     ) -> Result<DecodedSchemaTable<'stream, 'archive>, TableStreamError> {
-        let range = checked_table_range(table, table_index, self.stream_id)?;
+        // A stream stored column by column holds exactly one table, so it spans everything read.
+        let range = if self.column_layout.is_some() {
+            0..self.stream_bytes.len()
+        } else {
+            checked_table_range(table, table_index, self.stream_id)?
+        };
         let table_bytes =
             self.stream_bytes
                 .get(range)

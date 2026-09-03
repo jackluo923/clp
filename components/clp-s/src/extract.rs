@@ -37,6 +37,7 @@ use crate::archive::ArchiveCatalogLimits;
 use crate::archive::ArchiveMetadata;
 use crate::archive::ArrayDictionary;
 use crate::archive::ColumnLimits;
+use crate::archive::ColumnTruncation;
 use crate::archive::DecodedPackedStream;
 use crate::archive::DecodedSchemaTable;
 use crate::archive::DictionaryError;
@@ -546,9 +547,10 @@ pub trait ArchiveReader {
         table_metadata: &TableMetadata,
         stream_id: usize,
         wanted: &[bool],
+        truncate: Option<ColumnTruncation<'_>>,
         limits: PackedStreamLimits,
     ) -> Result<DecodedPackedStream, PackedStreamError> {
-        let _ = wanted;
+        let _ = (wanted, truncate);
         self.read_packed_stream(metadata, table_metadata, stream_id, limits)
     }
 }
@@ -577,9 +579,17 @@ impl<R: Read + Seek> ArchiveReader for SingleFileArchiveReader<R> {
         table_metadata: &TableMetadata,
         stream_id: usize,
         wanted: &[bool],
+        truncate: Option<ColumnTruncation<'_>>,
         limits: PackedStreamLimits,
     ) -> Result<DecodedPackedStream, PackedStreamError> {
-        self.read_packed_stream_frames(metadata, table_metadata, stream_id, Some(wanted), limits)
+        self.read_packed_stream_frames(
+            metadata,
+            table_metadata,
+            stream_id,
+            Some(wanted),
+            truncate,
+            limits,
+        )
     }
     fn read_variable_dictionary(
         &mut self,
@@ -628,9 +638,17 @@ impl<S: DirectoryArchiveSource> ArchiveReader for DirectoryArchiveReader<S> {
         table_metadata: &TableMetadata,
         stream_id: usize,
         wanted: &[bool],
+        truncate: Option<ColumnTruncation<'_>>,
         limits: PackedStreamLimits,
     ) -> Result<DecodedPackedStream, PackedStreamError> {
-        self.read_packed_stream_frames(metadata, table_metadata, stream_id, Some(wanted), limits)
+        self.read_packed_stream_frames(
+            metadata,
+            table_metadata,
+            stream_id,
+            Some(wanted),
+            truncate,
+            limits,
+        )
     }
     fn read_variable_dictionary(
         &mut self,
