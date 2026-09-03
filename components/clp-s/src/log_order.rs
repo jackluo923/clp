@@ -735,7 +735,12 @@ fn locate_in_table<'table, T: TreeView + ?Sized, V: TableView<'table> + ?Sized>(
                 .message_count()
                 .checked_mul(I64_SIZE)
                 .ok_or(LogOrderError::SizeOverflow)?;
-            if expected_bytes != encoded_deltas.len() {
+            // A projected read stops this column at the last row its query can reach, so it may
+            // hold whole rows and fewer of them. Anything else is still a length mismatch.
+            let truncated = table.is_projected()
+                && encoded_deltas.len() < expected_bytes
+                && 0 == encoded_deltas.len() % I64_SIZE;
+            if expected_bytes != encoded_deltas.len() && !truncated {
                 return Err(LogOrderError::LogEventIndexLengthMismatch {
                     schema_id,
                     column_index,
@@ -748,7 +753,7 @@ fn locate_in_table<'table, T: TreeView + ?Sized, V: TableView<'table> + ?Sized>(
                 node_id,
                 schema_entry_index,
                 column_index,
-                message_count: table.message_count(),
+                message_count: encoded_deltas.len() / I64_SIZE,
                 encoded_deltas,
             });
         }

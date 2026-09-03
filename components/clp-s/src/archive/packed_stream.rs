@@ -172,40 +172,6 @@ pub struct ColumnTruncation<'a> {
 }
 
 impl ColumnTruncation<'_> {
-    /// Returns the row to stop at: the first whose log event index reaches the limit.
-    ///
-    /// The log-order column holds one little-endian delta per row and a row's index is the running
-    /// sum, as the engine's own cursor reads it. A column whose indexes do not increase yields the
-    /// whole table, since a later row could then still be one an accepted file covers.
-    #[must_use]
-    pub(super) fn row_limit(&self, deltas: &[u8]) -> usize {
-        let mut current = 0_i64;
-        let mut previous = 0_i64;
-        let mut crossed = None;
-        // The whole column is walked even once the limit is reached. Stopping there would only
-        // prove the rows before it are in order, and the engine, which resets its own cursor when
-        // an index goes backwards, would still accept rows after a later decrease. Reading less
-        // than the engine can accept would silently drop those rows, so a decrease anywhere means
-        // the table is read whole.
-        for (row, delta) in deltas
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .enumerate()
-            .take(self.total_rows)
-        {
-            current = current.wrapping_add(i64::from_le_bytes(*delta));
-            if current < previous {
-                return self.total_rows;
-            }
-            previous = current;
-            if crossed.is_none() && current >= 0 && current.cast_unsigned() >= self.limit {
-                crossed = Some(row);
-            }
-        }
-        crossed.unwrap_or(self.total_rows)
-    }
-
     /// Returns the byte prefix of column `index` a scan needs, or `None` for all of it.
     #[must_use]
     pub(super) fn prefix(&self, index: usize, size: usize, rows: usize) -> Option<usize> {
@@ -222,6 +188,75 @@ impl ColumnTruncation<'_> {
         }
         Some(size / self.total_rows * rows)
     }
+}
+
+/// Rows decoded per block while looking for where a log-order column crosses a limit.
+///
+/// A whole number of rows so a block boundary is always a row boundary.
+const LOG_ORDER_BLOCK_ROWS: usize = 8192;
+
+/// Bytes per row in a log-order column: one little-endian `i64` delta.
+const LOG_ORDER_ROW_BYTES: usize = 8;
+
+/// Inflates a log-order column only as far as the rows a query can reach.
+///
+/// This is the column read to decide where the others stop, so it cannot be given a byte count
+/// in advance. It is pulled a block at a time and abandoned once its running index reaches
+/// `limit`, which is the first log event no accepted source file covers.
+///
+/// A record's log event index comes from a counter the writer only ever increments, and rows
+/// enter a schema's table in arrival order, so the index rises down a table and a row past the
+/// crossing cannot belong to an accepted file.
+///
+/// Returns the bytes read, always a whole number of rows, and the row the crossing happened at.
+///
+/// # Errors
+///
+/// As for a whole-frame read, minus what only the end of a frame can raise.
+pub(super) fn decode_log_order_prefix<R: Read>(
+    compressed: Take<R>,
+    metadata: &PackedStreamMetadata,
+    limit: u64,
+    limits: PackedStreamLimits,
+) -> Result<(Vec<u8>, usize), PackedStreamError> {
+    if validate_frame_sizes(
+        compressed.limit(),
+        metadata.compressed_size(),
+        metadata.uncompressed_size(),
+        limits,
+    )? {
+        return Ok((Vec::new(), 0));
+    }
+    let total = usize::try_from(metadata.uncompressed_size())
+        .map_err(|_| PackedStreamError::SizeOverflow)?;
+    let mut decoder = zstd::stream::read::Decoder::new(compressed)
+        .map_err(|source| classify_decoder_error(source, metadata.uncompressed_size(), 0))?
+        .single_frame();
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(total)
+        .map_err(|_| PackedStreamError::AllocationFailed { requested: total })?;
+    let block = LOG_ORDER_BLOCK_ROWS * LOG_ORDER_ROW_BYTES;
+    let mut current = 0_i64;
+    let mut scanned = 0_usize;
+    while bytes.len() < total {
+        let want = block.min(total - bytes.len());
+        let start = bytes.len();
+        let mut chunk = decode_prefix_output(&mut decoder, usize_to_u64(want)?)?;
+        bytes.append(&mut chunk);
+        for delta in bytes[start..].as_chunks::<LOG_ORDER_ROW_BYTES>().0 {
+            current = current.wrapping_add(i64::from_le_bytes(*delta));
+            scanned += 1;
+            if current >= 0 && current.cast_unsigned() >= limit {
+                // Drop the rows past the crossing so this column reports the same count as the
+                // ones truncated to match it, rather than the whole block it was read in.
+                let rows = scanned - 1;
+                bytes.truncate(rows * LOG_ORDER_ROW_BYTES);
+                return Ok((bytes, rows));
+            }
+        }
+    }
+    Ok((bytes, total / LOG_ORDER_ROW_BYTES))
 }
 
 /// Inflates only the first `prefix` bytes of one frame.

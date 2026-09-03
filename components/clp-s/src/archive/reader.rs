@@ -32,6 +32,7 @@ use super::packed_stream::DecodedPackedStream;
 use super::table_metadata::PackedStreamMetadata;
 use super::packed_stream::PackedStreamError;
 use super::packed_stream::PackedStreamLimits;
+use super::packed_stream::decode_log_order_prefix;
 use super::packed_stream::decode_packed_stream;
 use super::packed_stream::decode_packed_stream_prefix;
 use super::packed_stream::ColumnTruncation;
@@ -359,8 +360,9 @@ impl<R: Read + Seek> SingleFileArchiveReader<R> {
             let frame_meta =
                 PackedStreamMetadata::for_frame(frame.compressed_size(), frame.uncompressed_size());
             let compressed = self.reader_for_range(start..end).map_err(PackedStreamError::Io)?;
-            let bytes = decode_packed_stream(compressed, &frame_meta, limits)?.into_bytes();
-            rows = Some(plan.row_limit(&bytes));
+            let (bytes, crossed) =
+                decode_log_order_prefix(compressed, &frame_meta, plan.limit, limits)?;
+            rows = Some(crossed);
             columns[plan.log_order_column] = Some(bytes);
             read[plan.log_order_column] = true;
         }
