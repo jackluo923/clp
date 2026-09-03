@@ -1121,6 +1121,16 @@ impl<'a> KvIrLogEvent<'a> {
         }
     }
 
+    /// Returns each pair's namespace and node ID, leaving its value in the unit buffer.
+    ///
+    /// [`Self::pairs`] rebuilds a whole [`KvIrPair`] per element: a match over the value kind and
+    /// two byte-span resolutions. A caller that only files pairs under their node never reads the
+    /// value, and resolving one for it is the largest avoidable cost in a scan, so this yields the
+    /// two fields such a caller does read.
+    pub fn pair_slots(&self) -> impl ExactSizeIterator<Item = (KvIrNamespace, u32)> + 'a {
+        self.pairs.iter().map(|pair| (pair.namespace, pair.node_id))
+    }
+
     /// Returns the number of node-ID/value pairs in this event.
     #[must_use]
     pub const fn pair_count(&self) -> usize {
