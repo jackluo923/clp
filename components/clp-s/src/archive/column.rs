@@ -127,6 +127,7 @@ pub struct SchemaTable<'table, 'archive> {
     message_count: usize,
     columns: Vec<Column<'table, 'archive>>,
     projected: bool,
+    matchable_rows: usize,
 }
 
 impl<'table, 'archive> SchemaTable<'table, 'archive> {
@@ -152,6 +153,16 @@ impl<'table, 'archive> SchemaTable<'table, 'archive> {
     #[must_use]
     pub const fn len(&self) -> usize {
         self.columns.len()
+    }
+
+    /// Returns the rows a projected read reached, which is every row of a whole read.
+    ///
+    /// A column read only as far as the rows a query can match ends there, and the reader stops
+    /// at that row only after proving no later row is one the query accepts. So nothing beyond
+    /// this can match, and a consumer that would otherwise walk every row can stop here.
+    #[must_use]
+    pub const fn matchable_rows(&self) -> usize {
+        self.matchable_rows
     }
 
     /// Whether a projected read left some of the schema's columns out of this table.
@@ -1103,6 +1114,7 @@ pub fn decode_schema_table<'table, 'archive>(
     let mut total_encoded_variables = 0_u64;
     let mut value_column_index = 0_usize;
     let mut projected = false;
+    let mut matchable_rows = message_count;
 
     for (schema_entry_index, entry) in schema.entries().iter().enumerate() {
         let SchemaEntry::Node(node_id) = *entry else {
@@ -1133,6 +1145,7 @@ pub fn decode_schema_table<'table, 'archive>(
             column_rows = slot.stored_rows(message_count);
             if column_rows < message_count {
                 projected = true;
+                matchable_rows = matchable_rows.min(column_rows);
             }
         }
         let data = decode_column(
@@ -1163,6 +1176,7 @@ pub fn decode_schema_table<'table, 'archive>(
         message_count,
         columns,
         projected,
+        matchable_rows,
     })
 }
 

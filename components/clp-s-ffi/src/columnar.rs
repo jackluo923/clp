@@ -26,6 +26,7 @@ use clp_s::archive::is_value_bearing;
 use clp_s::LogOrderLocator;
 use clp_s::archive::append_clp_message_bounded;
 use clp_s::search::ArchiveSearchOptions;
+use clp_s::search::DictionaryMatches;
 use clp_s::search::ColumnNamespace;
 use clp_s::search::ExpressionKind;
 use clp_s::search::ParsedQuery;
@@ -189,6 +190,12 @@ pub struct ProjectedScanner {
     field_nodes: Vec<Vec<u32>>,
     /// Sorted schema nodes the scan reads, or `None` to read every column.
     wanted_nodes: Option<Vec<u32>>,
+    /// Dictionary matches this query has already resolved against this archive.
+    ///
+    /// The query is compiled once per packed stream and once per buffer refill, and resolving a
+    /// string predicate reads every dictionary entry, so without this a string-filtered scan pays
+    /// for the whole dictionary a dozen times over.
+    dictionary_matches: DictionaryMatches,
     /// Log-event ranges the query's range-index selector accepts, when one governs every match.
     ///
     /// A row outside them cannot match, and rows are written in log order, so a column needs
@@ -334,6 +341,7 @@ impl ProjectedScanner {
             field_count: fields.len(),
             field_nodes,
             wanted_nodes,
+            dictionary_matches: DictionaryMatches::new(),
             accepted_ranges,
             stream_index: 0,
             stream_count,
@@ -569,7 +577,11 @@ impl ProjectedScanner {
         };
         let compiled = self
             .parsed
-            .compile_for_archive(&self.catalog, self.options.search())
+            .compile_for_archive_reusing(
+                &self.catalog,
+                self.options.search(),
+                &mut self.dictionary_matches,
+            )
             .map_err(|source| ScanError::Archive(format!("failed to compile query: {source}")))?;
         let mut tables = self
             .catalog

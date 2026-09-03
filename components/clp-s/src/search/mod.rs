@@ -117,6 +117,7 @@ pub use results_cache::SearchResultsCacheAdapter;
 pub use results_cache::SearchResultsCacheAdapterError;
 pub use results_cache::SearchResultsCacheBatchSink;
 pub use results_cache::SearchResultsCacheOptions;
+pub use semantic::DictionaryMatches;
 pub use semantic::AuthoritativeTimestampRange;
 pub use semantic::CompiledQuery;
 pub use semantic::MatchBitmap;

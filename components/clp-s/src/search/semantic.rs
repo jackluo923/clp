@@ -632,7 +632,26 @@ impl ParsedQuery {
         catalog: &'archive ArchiveCatalog,
         options: SearchOptions,
     ) -> Result<CompiledQuery<'query, 'archive>, SearchError> {
-        CompiledQuery::compile(self, catalog, options)
+        CompiledQuery::compile(self, catalog, options, None)
+    }
+
+    /// Compiles against one archive, reusing the dictionary matches in `matches` and recording
+    /// any it had to resolve.
+    ///
+    /// A scan that compiles the same query once per packed stream pays for the dictionary once
+    /// this way rather than once per stream. The cache belongs to one query and one archive;
+    /// using it with either changed answers from the wrong dictionary.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::compile_for_archive`].
+    pub fn compile_for_archive_reusing<'query, 'archive>(
+        &'query self,
+        catalog: &'archive ArchiveCatalog,
+        options: SearchOptions,
+        matches: &mut DictionaryMatches,
+    ) -> Result<CompiledQuery<'query, 'archive>, SearchError> {
+        CompiledQuery::compile(self, catalog, options, Some(matches))
     }
 }
 
@@ -641,6 +660,7 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
         query: &'query ParsedQuery,
         catalog: &'archive ArchiveCatalog,
         options: SearchOptions,
+        matches: Option<&mut DictionaryMatches>,
     ) -> Result<Self, SearchError> {
         let limits = options.limits();
         check_limit(
@@ -652,7 +672,7 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
         validate_archive_tables(catalog, limits)?;
         let authoritative_timestamp_range =
             compile_authoritative_timestamp_range(catalog, options)?;
-        let mut builder = Compiler::new(query, catalog, options, schema_index)?;
+        let mut builder = Compiler::new(query, catalog, options, schema_index, matches)?;
         builder.compile_nodes()?;
         Ok(Self {
             query,
@@ -1762,7 +1782,8 @@ struct EvaluationFilter<'value, 'query> {
     predicate: PredicateRef<'query>,
 }
 
-struct Compiler<'query, 'archive> {
+struct Compiler<'query, 'archive, 'cache> {
+    matches: Option<&'cache mut DictionaryMatches>,
     query: &'query ParsedQuery,
     catalog: &'archive ArchiveCatalog,
     options: SearchOptions,
@@ -1784,12 +1805,13 @@ struct CompileCounters {
     dictionary_matches: usize,
 }
 
-impl<'query, 'archive> Compiler<'query, 'archive> {
+impl<'query, 'archive, 'cache> Compiler<'query, 'archive, 'cache> {
     fn new(
         query: &'query ParsedQuery,
         catalog: &'archive ArchiveCatalog,
         options: SearchOptions,
         schema_index: SchemaIndex,
+        matches: Option<&'cache mut DictionaryMatches>,
     ) -> Result<Self, SearchError> {
         let mut nodes = Vec::new();
         nodes
@@ -1810,6 +1832,7 @@ impl<'query, 'archive> Compiler<'query, 'archive> {
             .map_err(|_| allocation(SearchResource::CompiledProgram, list_count))?;
         let negated = compute_negations(query)?;
         Ok(Self {
+            matches,
             query,
             catalog,
             options,
@@ -1874,7 +1897,7 @@ impl<'query, 'archive> Compiler<'query, 'archive> {
     ) -> Result<usize, SearchError> {
         let predicate = PredicateRef::from_predicate(predicate);
         let resolved = self.resolve_path(predicate.path())?;
-        let value = self.compile_value(expression, predicate, &resolved)?;
+        let value = self.compile_value(expression, 0, predicate, &resolved)?;
         let compiled = CompiledPredicate {
             expression,
             negated: *self
@@ -1914,9 +1937,9 @@ impl<'query, 'archive> Compiler<'query, 'archive> {
             .try_reserve_exact(list.values().len())
             .map_err(|_| allocation(SearchResource::CompiledProgram, list.values().len()))?;
         if let Some(resolved) = &resolved {
-            for value in list.values() {
+            for (value_index, value) in list.values().iter().enumerate() {
                 let predicate = PredicateRef::equality(list.path(), value);
-                values.push(self.compile_value(expression, predicate, resolved)?);
+                values.push(self.compile_value(expression, value_index, predicate, resolved)?);
             }
         }
         let index = self.lists.len();
@@ -1948,6 +1971,7 @@ impl<'query, 'archive> Compiler<'query, 'archive> {
     fn compile_value(
         &mut self,
         expression: NodeId,
+        value_index: usize,
         predicate: PredicateRef<'_>,
         resolved: &ResolvedPath,
     ) -> Result<CompiledValue, SearchError> {
@@ -1970,21 +1994,53 @@ impl<'query, 'archive> Compiler<'query, 'archive> {
                 .is_some_and(|node| NodeType::DictionaryFloat == node.node_type())
         });
         if has_var_string && variable_pattern(predicate).is_some() {
-            compiled.variable_ids =
-                self.match_dictionary(predicate, DictionaryMatchKind::String)?;
+            compiled.variable_ids = self.matching_dictionary_ids(
+                expression,
+                value_index,
+                predicate,
+                DictionaryMatchKind::String,
+            )?;
         }
         if has_dictionary_float {
             if numeric_literal(predicate.value()).is_some() {
-                compiled.dictionary_float_ids =
-                    self.match_dictionary(predicate, DictionaryMatchKind::Float)?;
+                compiled.dictionary_float_ids = self.matching_dictionary_ids(
+                    expression,
+                    value_index,
+                    predicate,
+                    DictionaryMatchKind::Float,
+                )?;
             } else if let Some(timestamp_nanoseconds) = compiled.timestamp_nanoseconds {
-                compiled.dictionary_float_ids = self.match_dictionary(
+                compiled.dictionary_float_ids = self.matching_dictionary_ids(
+                    expression,
+                    value_index,
                     predicate,
                     DictionaryMatchKind::Timestamp(timestamp_nanoseconds),
                 )?;
             }
         }
         Ok(compiled)
+    }
+
+    /// Returns the dictionary IDs a predicate accepts, reading the dictionary only if this
+    /// query has not already resolved this value against this archive.
+    fn matching_dictionary_ids(
+        &mut self,
+        expression: NodeId,
+        value_index: usize,
+        predicate: PredicateRef<'_>,
+        kind: DictionaryMatchKind,
+    ) -> Result<Vec<u64>, SearchError> {
+        let node = expression.index();
+        if let Some(matches) = self.matches.as_deref()
+            && let Some(ids) = matches.get(node, value_index, kind)
+        {
+            return Ok(ids.to_vec());
+        }
+        let ids = self.match_dictionary(predicate, kind)?;
+        if let Some(matches) = self.matches.as_deref_mut() {
+            matches.insert(node, value_index, kind, &ids);
+        }
+        Ok(ids)
     }
 
     fn match_dictionary(
@@ -2039,11 +2095,46 @@ impl<'query, 'archive> Compiler<'query, 'archive> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DictionaryMatchKind {
     String,
     Float,
     Timestamp(i64),
+}
+
+/// Dictionary matches one query has already resolved against one archive.
+///
+/// Finding which dictionary entries a predicate accepts means reading every entry, which on a
+/// string-heavy archive costs more than the rest of compiling the query. Neither the dictionary
+/// nor the query changes while one archive is scanned, so a caller that compiles the same query
+/// again for the same archive can carry this across and pay for each distinct scan once.
+#[derive(Debug, Default)]
+pub struct DictionaryMatches {
+    entries: Vec<(usize, usize, DictionaryMatchKind, Vec<u64>)>,
+}
+
+impl DictionaryMatches {
+    /// Returns an empty cache.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    fn get(&self, node: usize, value: usize, kind: DictionaryMatchKind) -> Option<&[u64]> {
+        self.entries
+            .iter()
+            .find(|(n, v, k, _)| *n == node && *v == value && *k == kind)
+            .map(|(_, _, _, ids)| ids.as_slice())
+    }
+
+    fn insert(&mut self, node: usize, value: usize, kind: DictionaryMatchKind, ids: &[u64]) {
+        if self.entries.try_reserve(1).is_err() {
+            return;
+        }
+        self.entries.push((node, value, kind, ids.to_vec()));
+    }
 }
 
 fn compile_literal(
@@ -3391,6 +3482,9 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
             return Ok(bitmap);
         };
 
+        // A truncated read stopped at the last row any accepted source file reaches, so walking
+        // past it would only relabel rows already known not to match.
+        let row_count = row_count.min(self.decoded.table().matchable_rows());
         // The column is delta encoded, so it is walked once rather than indexed per row. Entries
         // are validated sorted and disjoint and a table's rows are written in log order, so the
         // entry covering the previous row is at or before the one covering this row and a single
