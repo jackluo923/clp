@@ -1204,6 +1204,7 @@ mod tests {
     use crate::archive::ArchiveCatalogLimits;
     use crate::archive::ColumnData;
     use crate::archive::ColumnLimits;
+    use crate::archive::ColumnTruncation;
     use crate::archive::DictionaryLimits;
     use crate::archive::LogTypeDictionaryEntry;
     use crate::archive::MetadataLimits;
@@ -1378,6 +1379,115 @@ mod tests {
             .expect("finish log-order archive")
             .into_inner()
             .into_inner()
+    }
+
+    fn separate_column_archive(rows: i64) -> Vec<u8> {
+        // Every table wide enough to have columns is stored one zstd frame per column.
+        let mut archive = OpenArchive::new(
+            Cursor::new(Vec::new()),
+            WriterOptions::default().with_separate_columns_min_size(1),
+        );
+        for row in 0..rows {
+            let fields = [FieldRef::new(b"n".as_slice(), ValueRef::I64(row))];
+            archive
+                .append_record(RecordRef::new(&fields))
+                .expect("append separate-column record");
+        }
+        archive
+            .finish()
+            .expect("finish separate-column archive")
+            .into_inner()
+            .into_inner()
+    }
+
+    /// Reads the `n` column of stream 0, however much of it the read asked for.
+    fn separate_column_values(
+        catalog: &crate::archive::ArchiveCatalog,
+        stream: &crate::archive::DecodedPackedStream,
+    ) -> Vec<i64> {
+        let mut tables = catalog
+            .schema_tables(0, stream, ColumnLimits::default())
+            .expect("open separate-column stream");
+        let decoded = tables
+            .next()
+            .expect("stream holds one table")
+            .expect("decode separate-column table");
+        for column in decoded.table().columns() {
+            if let ColumnData::Integer(values) = column.data() {
+                return values.iter().collect();
+            }
+        }
+        Vec::new()
+    }
+
+    #[test]
+    fn separate_column_streams_agree_whole_projected_and_truncated() {
+        let rows = 64_i64;
+        let bytes = separate_column_archive(rows);
+        let mut reader =
+            SingleFileArchiveReader::open(Cursor::new(bytes)).expect("open separate-column archive");
+        let catalog = reader
+            .read_catalog(ArchiveCatalogLimits::default())
+            .expect("read separate-column catalog");
+        let table_metadata = catalog.table_metadata();
+        assert!(
+            table_metadata.separate_columns_for(0).is_some(),
+            "the writer stored the table column by column"
+        );
+        let columns = table_metadata
+            .separate_columns_for(0)
+            .expect("stream 0 stores one frame per column")
+            .columns()
+            .len();
+        assert_eq!(2, columns, "log order and the value column");
+        let expected: Vec<i64> = (0..rows).collect();
+
+        // Whole read.
+        let whole = reader
+            .read_packed_stream(
+                catalog.metadata(),
+                table_metadata,
+                0,
+                PackedStreamLimits::default(),
+            )
+            .expect("read the stream whole");
+        assert_eq!(expected, separate_column_values(&catalog, &whole));
+
+        // Projected read: both columns wanted, which is what a scan filtering on log order asks
+        // for. The values must not move because the stream stores them column by column.
+        let projected = reader
+            .read_packed_stream_frames(
+                catalog.metadata(),
+                table_metadata,
+                0,
+                Some(&[true, true]),
+                None,
+                PackedStreamLimits::default(),
+            )
+            .expect("read the stream projected");
+        assert_eq!(expected, separate_column_values(&catalog, &projected));
+
+        // Truncated read: stop where the log-event index reaches half way. The value column then
+        // holds exactly those rows, and they are the same values the whole read produced.
+        let half = usize::try_from(rows / 2).expect("half fits usize");
+        let truncated = reader
+            .read_packed_stream_frames(
+                catalog.metadata(),
+                table_metadata,
+                0,
+                Some(&[true, true]),
+                Some(ColumnTruncation {
+                    log_order_column: 0,
+                    limit: rows.cast_unsigned() / 2,
+                    total_rows: usize::try_from(rows).expect("rows fit usize"),
+                    truncatable: &[false, true],
+                }),
+                PackedStreamLimits::default(),
+            )
+            .expect("read the stream truncated");
+        let values = separate_column_values(&catalog, &truncated);
+        assert_eq!(half, values.len(), "only the rows the query can match");
+        assert_eq!(expected[..half], values[..]);
     }
 
     const TIMESTAMP_SOURCE: &[u8] =
