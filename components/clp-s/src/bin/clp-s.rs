@@ -171,6 +171,12 @@ struct CompressArgs {
     /// per-stream frame. Archives written with this set need a reader that supports it.
     #[arg(long, default_value_t = 0)]
     separate_columns_min_size: u64,
+    /// Disable adaptive per-column numeric encoding (enabled by default). Adaptive encoding stores
+    /// each integer or float column with the smallest of a set of lightweight codecs chosen by
+    /// post-zstd size, and stamps archive version 0.6.0. Disabling it restores byte-identical 0.5.0
+    /// output that the C++ reference reads.
+    #[arg(long, default_value_t = false)]
+    no_adaptive_numeric_columns: bool,
     /// Path of the authoritative timestamp field.
     #[arg(long)]
     timestamp_key: Option<String>,
@@ -472,6 +478,7 @@ fn run_compress(arguments: &CompressArgs) -> CliResult<()> {
         .with_limits(WriterLimits::new(u64::MAX, u64::MAX, u64::MAX, u64::MAX))
         .with_minimum_packed_stream_size(arguments.min_table_size)
         .with_separate_columns_min_size(arguments.separate_columns_min_size)
+        .with_adaptive_numeric_columns(!arguments.no_adaptive_numeric_columns)
         .with_log_order(!arguments.representation.disable_log_order);
     let mut archive_set = ArchiveSetWriter::new(
         publisher,

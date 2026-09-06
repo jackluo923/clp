@@ -462,6 +462,7 @@ pub struct WriterOptions {
     uncompressed_size: u64,
     record_log_order: bool,
     separate_columns_min_size: u64,
+    adaptive_numeric_columns: bool,
 }
 
 impl WriterOptions {
@@ -477,6 +478,9 @@ impl WriterOptions {
             uncompressed_size: 0,
             record_log_order: true,
             separate_columns_min_size: 0,
+            // Library default stays conservative (0.5.0, C++-reference-compatible). The `clp-s`
+            // compression CLI turns this on by default; embedders opt in via the builder.
+            adaptive_numeric_columns: false,
         }
     }
 
@@ -496,6 +500,29 @@ impl WriterOptions {
     #[must_use]
     pub const fn separate_columns_min_size(self) -> u64 {
         self.separate_columns_min_size
+    }
+
+    /// Enables or disables adaptive per-column numeric encoding.
+    ///
+    /// When enabled (the default), every schema table that holds an integer or float column is
+    /// written one zstd frame per column (as with `separate_columns_min_size`), and each numeric
+    /// column is stored with the smallest of a small menu of lightweight codecs — integers via
+    /// frame-of-reference / delta / dictionary / run-length / constant / plain, floats via
+    /// byte-stream-split / dictionary / run-length / constant / plain — chosen by post-zstd size.
+    /// Such an archive is stamped version 0.6.0 so 0.5.x readers refuse it rather than misread the
+    /// variable-width columns.
+    ///
+    /// Disabling it restores byte-identical 0.5.0 output (the format the C++ reference reads).
+    #[must_use]
+    pub const fn with_adaptive_numeric_columns(mut self, enabled: bool) -> Self {
+        self.adaptive_numeric_columns = enabled;
+        self
+    }
+
+    /// Returns whether adaptive per-column numeric encoding is enabled.
+    #[must_use]
+    pub const fn adaptive_numeric_columns(self) -> bool {
+        self.adaptive_numeric_columns
     }
 
     /// Replaces the writer resource limits.
@@ -868,8 +895,20 @@ impl EncodedEmptyArchive {
             options.limits.archive,
         )?;
 
+        // Stamp the adaptive-integer format version only when the opt-in flag is set, so default
+        // writes remain byte-identical 0.5.0 archives that 0.5.x readers still accept.
+        let version = if options.adaptive_numeric_columns() {
+            crate::archive::ArchiveVersion::ADAPTIVE_NUMERIC
+        } else {
+            crate::archive::ArchiveVersion::CURRENT
+        };
         Ok(Self {
-            header: ArchiveHeader::new(options.uncompressed_size, archive_size, metadata_size_u32),
+            header: ArchiveHeader::new_with_version(
+                version,
+                options.uncompressed_size,
+                archive_size,
+                metadata_size_u32,
+            ),
             metadata,
             sections,
             archive_size,
@@ -1488,6 +1527,188 @@ mod tests {
         let values = separate_column_values(&catalog, &truncated);
         assert_eq!(half, values.len(), "only the rows the query can match");
         assert_eq!(expected[..half], values[..]);
+    }
+
+    /// Builds a single-integer-column archive with adaptive integer encoding enabled.
+    fn adaptive_column_archive(values: &[i64]) -> Vec<u8> {
+        let mut archive = OpenArchive::new(
+            Cursor::new(Vec::new()),
+            WriterOptions::default().with_adaptive_numeric_columns(true),
+        );
+        for &value in values {
+            let fields = [FieldRef::new(b"n".as_slice(), ValueRef::I64(value))];
+            archive
+                .append_record(RecordRef::new(&fields))
+                .expect("append adaptive-column record");
+        }
+        archive
+            .finish()
+            .expect("finish adaptive-column archive")
+            .into_inner()
+            .into_inner()
+    }
+
+    /// Reads the sole integer column back through the whole materialize + decode pipeline, and
+    /// returns the archive version alongside it.
+    fn adaptive_column_values(bytes: Vec<u8>) -> (crate::archive::ArchiveVersion, Vec<i64>) {
+        let mut reader =
+            SingleFileArchiveReader::open(Cursor::new(bytes)).expect("open adaptive archive");
+        let catalog = reader
+            .read_catalog(ArchiveCatalogLimits::default())
+            .expect("read adaptive catalog");
+        let version = catalog.version();
+        let stream = reader
+            .read_packed_stream(
+                catalog.metadata(),
+                catalog.table_metadata(),
+                0,
+                PackedStreamLimits::default(),
+            )
+            .expect("read adaptive stream");
+        let stream = catalog
+            .materialize_adaptive_numerics(0, stream, ColumnLimits::default())
+            .expect("materialize adaptive integer columns");
+        let mut tables = catalog
+            .schema_tables(0, &stream, ColumnLimits::default())
+            .expect("open adaptive stream tables");
+        let decoded = tables
+            .next()
+            .expect("stream holds one table")
+            .expect("decode adaptive table");
+        let mut out = Vec::new();
+        for column in decoded.table().columns() {
+            if let ColumnData::Integer(values) = column.data() {
+                out = values.iter().collect();
+            }
+        }
+        (version, out)
+    }
+
+    #[test]
+    fn adaptive_numeric_columns_round_trip_through_every_scheme() {
+        let cases: Vec<Vec<i64>> = vec![
+            (0..500).collect(),                                    // monotonic -> delta
+            vec![7; 500],                                          // constant
+            (0..500).map(|i| i % 50).collect(),                    // bounded / low cardinality
+            (0i64..500).map(|i| i.wrapping_mul(2_654_435_761)).collect(), // high cardinality
+            (0..500).map(|i| -i).collect(),                        // negative, monotonic down
+            vec![i64::MIN, i64::MAX, 0, -1, 1, i64::MIN],          // extremes
+        ];
+        for values in cases {
+            let bytes = adaptive_column_archive(&values);
+            let (version, decoded) = adaptive_column_values(bytes);
+            assert_eq!(
+                version,
+                crate::archive::ArchiveVersion::ADAPTIVE_NUMERIC,
+                "an adaptive archive is stamped 0.6.0"
+            );
+            assert_eq!(decoded, values, "the column round-trips through the adaptive pipeline");
+        }
+    }
+
+    #[test]
+    fn adaptive_flag_off_keeps_default_version_and_values() {
+        // With the flag off, the writer produces a plain 0.5.0 archive that still reads correctly.
+        let mut archive = OpenArchive::new(Cursor::new(Vec::new()), WriterOptions::default());
+        let expected: Vec<i64> = (0..64).collect();
+        for &value in &expected {
+            archive
+                .append_record(RecordRef::new(&[FieldRef::new(
+                    b"n".as_slice(),
+                    ValueRef::I64(value),
+                )]))
+                .expect("append default record");
+        }
+        let bytes = archive
+            .finish()
+            .expect("finish default archive")
+            .into_inner()
+            .into_inner();
+        let (version, decoded) = adaptive_column_values(bytes);
+        assert_eq!(
+            version,
+            crate::archive::ArchiveVersion::CURRENT,
+            "default output stays 0.5.0"
+        );
+        assert_eq!(decoded, expected);
+    }
+
+    /// Builds a single-float-column archive with adaptive numeric encoding enabled.
+    fn adaptive_float_archive(values: &[f64]) -> Vec<u8> {
+        let mut archive = OpenArchive::new(
+            Cursor::new(Vec::new()),
+            WriterOptions::default().with_adaptive_numeric_columns(true),
+        );
+        for &value in values {
+            let fields = [FieldRef::new(b"x".as_slice(), ValueRef::F64(value))];
+            archive
+                .append_record(RecordRef::new(&fields))
+                .expect("append adaptive-float record");
+        }
+        archive
+            .finish()
+            .expect("finish adaptive-float archive")
+            .into_inner()
+            .into_inner()
+    }
+
+    /// Reads the sole float column back through the whole materialize + decode pipeline, returning
+    /// the raw bit patterns (so NaN payloads and signed zero compare exactly).
+    fn adaptive_float_column_bits(bytes: Vec<u8>) -> (crate::archive::ArchiveVersion, Vec<u64>) {
+        let mut reader =
+            SingleFileArchiveReader::open(Cursor::new(bytes)).expect("open adaptive-float archive");
+        let catalog = reader
+            .read_catalog(ArchiveCatalogLimits::default())
+            .expect("read adaptive-float catalog");
+        let version = catalog.version();
+        let stream = reader
+            .read_packed_stream(
+                catalog.metadata(),
+                catalog.table_metadata(),
+                0,
+                PackedStreamLimits::default(),
+            )
+            .expect("read adaptive-float stream");
+        let stream = catalog
+            .materialize_adaptive_numerics(0, stream, ColumnLimits::default())
+            .expect("materialize adaptive float columns");
+        let mut tables = catalog
+            .schema_tables(0, &stream, ColumnLimits::default())
+            .expect("open adaptive-float stream tables");
+        let decoded = tables
+            .next()
+            .expect("stream holds one table")
+            .expect("decode adaptive-float table");
+        let mut out = Vec::new();
+        for column in decoded.table().columns() {
+            if let ColumnData::Float(values) = column.data() {
+                out = values.iter().map(f64::to_bits).collect();
+            }
+        }
+        (version, out)
+    }
+
+    #[test]
+    fn adaptive_float_columns_round_trip_bit_exact() {
+        let cases: Vec<Vec<f64>> = vec![
+            (0..500).map(|i| 20.0 + f64::from(i) * 0.01).collect(), // smoothly varying
+            vec![3.141_592_653_589_793; 500],                       // constant
+            (0..500).map(|i| [1.5, -2.25, 0.0, 100.125][i % 4]).collect(), // low cardinality
+            // Finite edge values the writer accepts, including signed zero and the extremes.
+            // (NaN/inf are rejected at ingest, so the codec's handling of them is unit-tested in
+            // `adaptive_float` instead.)
+            vec![0.0, -0.0, f64::MIN, f64::MAX, f64::MIN_POSITIVE, -1.0, 1.0, 123.456],
+        ];
+        for values in cases {
+            let expected: Vec<u64> = values.iter().map(|v| v.to_bits()).collect();
+            let (version, bits) = adaptive_float_column_bits(adaptive_float_archive(&values));
+            assert_eq!(
+                version,
+                crate::archive::ArchiveVersion::ADAPTIVE_NUMERIC,
+                "an adaptive archive is stamped 0.6.0"
+            );
+            assert_eq!(bits, expected, "float column round-trips bit-exact");
+        }
     }
 
     const TIMESTAMP_SOURCE: &[u8] =

@@ -505,6 +505,15 @@ pub enum TableStreamError {
         /// Column-layer failure.
         source: ColumnError,
     },
+    /// An adaptive-integer column stream could not be decoded during materialization.
+    AdaptiveNumeric {
+        /// Table's opaque schema ID.
+        schema_id: i32,
+        /// Zero-based value-column index within the table.
+        column_index: usize,
+        /// Adaptive-decode failure.
+        source: crate::adaptive_int::AdaptiveDecodeError,
+    },
     /// Checked size arithmetic or conversion overflowed.
     SizeOverflow,
 }
@@ -594,6 +603,14 @@ impl Display for TableStreamError {
                 formatter,
                 "schema table {table_index} (schema {schema_id}) is corrupt: {source}"
             ),
+            Self::AdaptiveNumeric {
+                schema_id,
+                column_index,
+                source,
+            } => write!(
+                formatter,
+                "adaptive integer column {column_index} (schema {schema_id}) is corrupt: {source}"
+            ),
             Self::SizeOverflow => formatter.write_str("packed-stream table size overflow"),
         }
     }
@@ -603,6 +620,7 @@ impl Error for TableStreamError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Column { source, .. } => Some(source),
+            Self::AdaptiveNumeric { source, .. } => Some(source),
             _ => None,
         }
     }

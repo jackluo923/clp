@@ -358,7 +358,10 @@ impl EncodedDirectoryArchive {
             archive_size,
             limits.max_archive_size(),
         )?;
-        let header = ArchiveHeader::new(
+        // Preserve the version the base encoder stamped (e.g. 0.6.0 for adaptive integer columns);
+        // rebuilding only the size fields must not silently reset it to the default.
+        let header = ArchiveHeader::new_with_version(
+            self.header.version(),
             self.header.uncompressed_size(),
             archive_size,
             metadata_size_u32,

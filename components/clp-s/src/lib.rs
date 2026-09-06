@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+mod adaptive_float;
+mod adaptive_int;
 pub mod archive;
 mod extract;
 mod extraction_plan;

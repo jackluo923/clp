@@ -389,6 +389,9 @@ pub fn search_archive<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
             )
             .map_err(|source| ArchiveSearchError::PackedStream { stream_id, source })?;
         stats.add_stream(stream.len())?;
+        let stream = catalog
+            .materialize_adaptive_numerics(stream_id, stream, options.columns)
+            .map_err(|source| ArchiveSearchError::TableStream { stream_id, source })?;
         let tables = catalog
             .schema_tables(stream_id, &stream, options.columns)
             .map_err(|source| ArchiveSearchError::TableStream { stream_id, source })?;

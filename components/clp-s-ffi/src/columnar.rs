@@ -462,6 +462,16 @@ impl ProjectedScanner {
                 "failed to read packed stream {stream_id}: {source}"
             ))
         })?;
+        // Rewrite adaptive integer columns back to plain 8-byte values so the fixed-stride table
+        // decoder and random-access cell reader are unchanged (a no-op for 0.5.x archives).
+        let stream = self
+            .catalog
+            .materialize_adaptive_numerics(stream_id, stream, self.options.columns())
+            .map_err(|source| {
+                ScanError::Archive(format!(
+                    "failed to materialize adaptive columns in stream {stream_id}: {source}"
+                ))
+            })?;
         self.stream = Some(stream);
         Ok(true)
     }
@@ -500,11 +510,15 @@ impl ProjectedScanner {
         let tree = self.catalog.schema_tree();
         let log_order = LogOrderLocator::discover(tree).ok()??.node_id();
         let log_order_column = nodes.iter().position(|node| *node == log_order)?;
+        // Adaptive numeric columns are variable-width, so their bytes cannot be prefix-cut by the
+        // fixed-stride truncation; they are always read whole and materialized afterwards.
+        let adaptive = self.catalog.version().supports_adaptive_numeric();
         let mut truncatable = Vec::with_capacity(nodes.len());
         for (index, node_id) in nodes.iter().enumerate() {
-            let fixed = tree
-                .get(*node_id as usize)
-                .is_some_and(|node| Self::truncatable(node.node_type()));
+            let node_type = tree.get(*node_id as usize).map(|node| node.node_type());
+            let adaptive_numeric = adaptive
+                && matches!(node_type, Some(NodeType::Integer | NodeType::Float));
+            let fixed = node_type.is_some_and(Self::truncatable) && !adaptive_numeric;
             truncatable.push(
                 fixed && index != log_order_column && wanted.get(index).copied() == Some(true),
             );

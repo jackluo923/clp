@@ -31,6 +31,12 @@ impl ArchiveVersion {
     /// Archive version emitted by the reference implementation when this crate was introduced.
     pub const CURRENT: Self = Self::new(0, 5, 0);
 
+    /// First version whose separate-column integer streams may carry an adaptive-encoding header
+    /// (frame-of-reference / delta / dictionary / run-length). Stamped only when the opt-in
+    /// `--adaptive-integer-columns` writer flag is set; a 0.5.x reader refuses it rather than
+    /// misreading the variable-width columns as fixed 8-byte values.
+    pub const ADAPTIVE_NUMERIC: Self = Self::new(0, 6, 0);
+
     /// Creates a version from its semantic components.
     #[must_use]
     pub const fn new(major: u8, minor: u8, patch: u16) -> Self {
@@ -61,14 +67,24 @@ impl ArchiveVersion {
 
     /// Whether this crate's readers can decode an archive stamped with this version.
     ///
-    /// Any patch release of the supported major.minor line is accepted. A patch bump records a
+    /// Any patch release of a supported major.minor line is accepted. A patch bump records a
     /// writer change rather than a layout change: 0.5.1 added RFC 2822 timestamp parsing and left
     /// every section byte-identical, so rejecting it would refuse archives this crate decodes
-    /// correctly. A differing major or minor is still refused, because that is where layout
+    /// correctly. The 0.6 line is also accepted: it is 0.5 plus optional adaptive-integer column
+    /// encodings this crate's reader understands ([`Self::supports_adaptive_numeric`]). A differing
+    /// major, or a minor outside {5, 6}, is still refused, because that is where unknown layout
     /// changes land, and reading one as if it were 0.5 would misparse rather than fail.
     #[must_use]
     pub const fn is_readable(self) -> bool {
-        self.major == Self::CURRENT.major && self.minor == Self::CURRENT.minor
+        self.major == Self::CURRENT.major
+            && (self.minor == Self::CURRENT.minor || self.minor == Self::ADAPTIVE_NUMERIC.minor)
+    }
+
+    /// Whether a separate-column integer stream in an archive at this version may carry an adaptive
+    /// per-column encoding header. False for 0.5.x, where such columns are always plain 8-byte.
+    #[must_use]
+    pub const fn supports_adaptive_numeric(self) -> bool {
+        self.to_wire() >= Self::ADAPTIVE_NUMERIC.to_wire()
     }
 
     /// Returns the major version component.
@@ -225,8 +241,27 @@ impl ArchiveHeader {
         compressed_size: u64,
         metadata_section_size: u32,
     ) -> Self {
+        Self::new_with_version(
+            ArchiveVersion::CURRENT,
+            uncompressed_size,
+            compressed_size,
+            metadata_section_size,
+        )
+    }
+
+    /// Creates a header stamped with an explicit archive version, using zeroed reserved fields.
+    ///
+    /// Used to stamp the [`ArchiveVersion::ADAPTIVE_NUMERIC`] version only when the opt-in adaptive
+    /// integer encoding is actually enabled, so default writes stay byte-identical at 0.5.0.
+    #[must_use]
+    pub const fn new_with_version(
+        version: ArchiveVersion,
+        uncompressed_size: u64,
+        compressed_size: u64,
+        metadata_section_size: u32,
+    ) -> Self {
         Self {
-            version: ArchiveVersion::CURRENT,
+            version,
             uncompressed_size,
             compressed_size,
             reserved_padding: [0; 4],
@@ -378,15 +413,28 @@ mod tests {
     }
 
     #[test]
-    fn accepts_every_patch_of_the_supported_line() {
+    fn accepts_every_patch_of_the_supported_lines() {
         assert!(ArchiveVersion::CURRENT.is_readable());
         // 0.5.1 is what the reference C++ writer emits after the RFC 2822 timestamp change.
         assert!(ArchiveVersion::new(0, 5, 1).is_readable());
         assert!(ArchiveVersion::new(0, 5, u16::MAX).is_readable());
-        // A different minor or major changes the layout, so it stays refused.
+        // 0.6 adds opt-in adaptive integer columns this crate's reader understands.
+        assert!(ArchiveVersion::ADAPTIVE_NUMERIC.is_readable());
+        assert!(ArchiveVersion::new(0, 6, 7).is_readable());
+        // A minor outside the supported set, or a different major, changes the layout unknowably,
+        // so it stays refused.
         assert!(!ArchiveVersion::new(0, 4, 0).is_readable());
-        assert!(!ArchiveVersion::new(0, 6, 0).is_readable());
+        assert!(!ArchiveVersion::new(0, 7, 0).is_readable());
         assert!(!ArchiveVersion::new(1, 5, 0).is_readable());
+    }
+
+    #[test]
+    fn adaptive_integer_support_starts_at_0_6_0() {
+        assert_eq!(0x0006_0000, ArchiveVersion::ADAPTIVE_NUMERIC.to_wire());
+        assert!(!ArchiveVersion::CURRENT.supports_adaptive_numeric());
+        assert!(!ArchiveVersion::new(0, 5, u16::MAX).supports_adaptive_numeric());
+        assert!(ArchiveVersion::ADAPTIVE_NUMERIC.supports_adaptive_numeric());
+        assert!(ArchiveVersion::new(0, 6, 3).supports_adaptive_numeric());
     }
 
     #[test]

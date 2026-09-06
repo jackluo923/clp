@@ -750,6 +750,9 @@ fn extract_unordered<A: ArchiveReader + ?Sized, S: JsonlRecordSink + ?Sized>(
         let stream = read_stream(reader, catalog, stream_index, &state.options.limits)?;
         state.stats.add_stream(len_u64(stream.len())?)?;
         let stream_id = len_u64(stream_index)?;
+        let stream = catalog
+            .materialize_adaptive_numerics(stream_id, stream, state.options.limits.columns)
+            .map_err(|source| ExtractionError::TableStream { stream_id, source })?;
         let tables = catalog
             .schema_tables(stream_id, &stream, state.options.limits.columns)
             .map_err(|source| ExtractionError::TableStream { stream_id, source })?;
@@ -879,6 +882,10 @@ fn read_all_streams<A: ArchiveReader + ?Sized, S: JsonlRecordSink + ?Sized>(
     for stream_index in 0..stream_count {
         let stream = read_stream(reader, catalog, stream_index, &state.options.limits)?;
         state.stats.add_stream(len_u64(stream.len())?)?;
+        let stream_id = len_u64(stream_index)?;
+        let stream = catalog
+            .materialize_adaptive_numerics(stream_id, stream, state.options.limits.columns)
+            .map_err(|source| ExtractionError::TableStream { stream_id, source })?;
         streams.push(stream);
     }
     Ok(streams)

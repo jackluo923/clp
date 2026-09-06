@@ -504,7 +504,13 @@ fn both_layouts_match_the_deterministic_cpp_archive_and_extract() {
         let archives_path = temporary.path().join("archives");
         fs::write(&input_path, INPUT).expect("write parse-many fixture");
 
-        let mut arguments = vec!["c".as_ref(), "--disable-log-order".as_ref()];
+        // Byte-exactness is validated against the C++ 0.5.0 reference, so opt out of the CLI's
+        // default adaptive numeric encoding (which would produce a 0.6.0 archive).
+        let mut arguments = vec![
+            "c".as_ref(),
+            "--no-adaptive-numeric-columns".as_ref(),
+            "--disable-log-order".as_ref(),
+        ];
         if single_file {
             arguments.push("--single-file-archive".as_ref());
         }
@@ -878,6 +884,7 @@ fn timestamp_key_matches_the_deterministic_cpp_archive() {
 
     let result = clp_s(&[
         "c".as_ref(),
+        "--no-adaptive-numeric-columns".as_ref(),
         "--disable-log-order".as_ref(),
         "--single-file-archive".as_ref(),
         "--timestamp-key".as_ref(),
@@ -1535,6 +1542,7 @@ fn structurize_arrays_matches_the_exact_cpp_single_file_archive() {
 
     let result = clp_s(&[
         "c".as_ref(),
+        "--no-adaptive-numeric-columns".as_ref(),
         "--single-file-archive".as_ref(),
         "--disable-log-order".as_ref(),
         "--structurize-arrays".as_ref(),

@@ -43,6 +43,8 @@ use super::timestamp::TimestampRef;
 use super::timestamp::TimestampReservations;
 use super::timestamp::prepare_reservations as prepare_timestamp_reservations;
 use crate::LOG_EVENT_IDX_KEY;
+use crate::adaptive_float;
+use crate::adaptive_int;
 use crate::archive::NodeType;
 use crate::archive::SchemaEntry;
 use crate::ingest::KvIrEncodedVariable;
@@ -4405,6 +4407,7 @@ fn pack_tables(
             requested: order.len(),
         })?;
     let min_separate = options.separate_columns_min_size();
+    let adaptive = options.adaptive_numeric_columns();
     let mut grouped = Vec::new();
     grouped
         .try_reserve_exact(order.len())
@@ -4413,9 +4416,12 @@ fn pack_tables(
         })?;
     for table_index in order.iter().copied() {
         let table = &tables[table_index];
-        let separate = 0 != min_separate
+        // Adaptive integer encoding needs per-column zstd frames, so it rides the separate-column
+        // path. Unlike the size-threshold trigger, it also applies to single-column tables.
+        let separate = (0 != min_separate
             && usize_u64(table.uncompressed_size)? >= min_separate
-            && table.columns.len() > 1;
+            && table.columns.len() > 1)
+            || (adaptive && table_has_numeric_column(table));
         if separate {
             encode_separate_table(table, options, &mut packed)?;
         } else {
@@ -4449,11 +4455,116 @@ fn pack_tables(
     Ok(packed)
 }
 
+/// Whether any of a table's value columns is a plain integer or float, i.e. a candidate for
+/// adaptive per-column numeric encoding.
+fn table_has_numeric_column(table: &TableBuilder) -> bool {
+    table
+        .columns
+        .iter()
+        .any(|column| matches!(column.node_type, NodeType::Integer | NodeType::Float))
+}
+
+/// Runs the per-column bake-off: zstd-compress each candidate encoding on its own and append the
+/// smallest compressed frame to `out`, returning the chosen encoding's uncompressed (pre-zstd)
+/// byte length. Ties keep the earliest candidate, which is plain.
+fn write_best_candidate(
+    candidates: Vec<Vec<u8>>,
+    level: i32,
+    out: &mut Vec<u8>,
+) -> Result<u64, WriterError> {
+    let mut best_frame: Option<Vec<u8>> = None;
+    let mut best_uncompressed = 0_usize;
+    for candidate in candidates {
+        let mut frame = Vec::new();
+        {
+            let mut encoder =
+                zstd::stream::write::Encoder::new(&mut frame, level).map_err(WriterError::Io)?;
+            encoder.write_all(&candidate).map_err(WriterError::Io)?;
+            encoder.finish().map_err(WriterError::Io)?;
+        }
+        let better = match &best_frame {
+            None => true,
+            Some(current) => frame.len() < current.len(),
+        };
+        if better {
+            best_frame = Some(frame);
+            best_uncompressed = candidate.len();
+        }
+    }
+    let frame = best_frame.expect("candidates is never empty");
+    out.extend_from_slice(&frame);
+    usize_u64(best_uncompressed)
+}
+
+/// Standard (non-adaptive) fixed-width frame for a column, used as the fallback when a numeric
+/// column is unexpectedly not `Fixed`.
+fn encode_plain_column(
+    column: &TableColumn,
+    level: i32,
+    out: &mut Vec<u8>,
+) -> Result<u64, WriterError> {
+    let uncompressed = usize_u64(column.encoded_len())?;
+    if 0 != uncompressed {
+        let mut encoder =
+            zstd::stream::write::Encoder::new(&mut *out, level).map_err(WriterError::Io)?;
+        column.write_to(&mut encoder)?;
+        encoder.finish().map_err(WriterError::Io)?;
+    }
+    Ok(uncompressed)
+}
+
+/// Encodes one integer column with the smallest adaptive scheme (see [`adaptive_int::candidates`])
+/// and appends its zstd frame to `out`. The reader inverts it via [`adaptive_int::decode`].
+fn encode_adaptive_integer_column(
+    column: &TableColumn,
+    level: i32,
+    out: &mut Vec<u8>,
+) -> Result<u64, WriterError> {
+    // Integer columns are always `Fixed`; keep a defensive fallback to the standard path.
+    let TableColumnData::Fixed(bytes) = &column.data else {
+        return encode_plain_column(column, level, out);
+    };
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    let values: Vec<i64> = bytes
+        .chunks_exact(size_of::<i64>())
+        .map(|chunk| i64::from_le_bytes(chunk.try_into().expect("8-byte chunk")))
+        .collect();
+    write_best_candidate(adaptive_int::candidates(&values), level, out)
+}
+
+/// Encodes one float column with the smallest adaptive scheme (see [`adaptive_float::candidates`])
+/// and appends its zstd frame to `out`. Operates on the raw IEEE bit patterns so `NaN`/`inf`/`-0.0`
+/// round-trip exactly; the reader inverts it via [`adaptive_float::decode`].
+fn encode_adaptive_float_column(
+    column: &TableColumn,
+    level: i32,
+    out: &mut Vec<u8>,
+) -> Result<u64, WriterError> {
+    // Float columns are always `Fixed`; keep a defensive fallback to the standard path.
+    let TableColumnData::Fixed(bytes) = &column.data else {
+        return encode_plain_column(column, level, out);
+    };
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    let bits: Vec<u64> = bytes
+        .chunks_exact(size_of::<u64>())
+        .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("8-byte chunk")))
+        .collect();
+    write_best_candidate(adaptive_float::candidates(&bits), level, out)
+}
+
 /// Writes one table as its own packed stream, one zstd frame per column.
 ///
-/// The stream's uncompressed bytes are identical to what `encode_table_stream` would write for
-/// this table alone, so a reader that inflates every frame in order needs no other change. A
-/// reader that knows the frame boundaries can inflate only the columns it needs.
+/// Without adaptive numeric encoding, each column frame's uncompressed bytes are identical to what
+/// `encode_table_stream` would write for this table alone, so a reader that inflates every frame in
+/// order needs no other change, and one that knows the frame boundaries can inflate only the
+/// columns it needs. With `adaptive_numeric_columns`, an integer or float column's frame instead
+/// holds a self-describing adaptive-encoding stream (a scheme byte + encoded payload); such a frame
+/// must be inverted by `materialize_adaptive_numerics` before the fixed-stride table decoder reads
+/// it, which the reader does whenever the archive version supports adaptive numeric columns.
 fn encode_separate_table(
     table: &TableBuilder,
     options: WriterOptions,
@@ -4469,17 +4580,17 @@ fn encode_separate_table(
         })?;
     let mut uncompressed_size = 0_u64;
     for column in &table.columns {
-        let uncompressed = usize_u64(column.encoded_len())?;
         let start = packed.compressed.len();
-        if 0 != uncompressed {
-            let mut encoder = zstd::stream::write::Encoder::new(
-                &mut packed.compressed,
-                options.compression_level(),
-            )
-            .map_err(WriterError::Io)?;
-            column.write_to(&mut encoder)?;
-            encoder.finish().map_err(WriterError::Io)?;
-        }
+        let level = options.compression_level();
+        let uncompressed = match (options.adaptive_numeric_columns(), column.node_type) {
+            (true, NodeType::Integer) => {
+                encode_adaptive_integer_column(column, level, &mut packed.compressed)?
+            }
+            (true, NodeType::Float) => {
+                encode_adaptive_float_column(column, level, &mut packed.compressed)?
+            }
+            _ => encode_plain_column(column, level, &mut packed.compressed)?,
+        };
         let compressed = usize_u64(packed.compressed.len() - start)?;
         columns.push((uncompressed, compressed));
         uncompressed_size = uncompressed_size

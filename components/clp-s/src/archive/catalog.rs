@@ -5,7 +5,9 @@ use std::fmt::Formatter;
 use std::io::Read;
 use std::io::Seek;
 
+use super::ArchiveVersion;
 use super::column::ColumnLimits;
+use super::column::is_value_bearing;
 use super::dictionary::ArrayDictionary;
 use super::dictionary::DictionaryError;
 use super::dictionary::DictionaryLimits;
@@ -18,6 +20,7 @@ use super::packed_stream::DecodedPackedStream;
 use super::range_index::RangeIndexError;
 use super::reader::SingleFileArchiveReader;
 use super::schema::NodeType;
+use super::schema_map::SchemaEntry;
 use super::schema_map::SchemaMap;
 use super::schema_map::SchemaMapError;
 use super::schema_map::SchemaMapLimits;
@@ -180,6 +183,7 @@ impl ArchiveCatalogLimits {
 /// can reuse one bounded buffer instead of materializing the complete archive.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArchiveCatalog {
+    version: ArchiveVersion,
     metadata: ArchiveMetadata,
     schema_tree: SchemaTree,
     schema_map: SchemaMap,
@@ -215,6 +219,12 @@ impl ArchiveCatalog {
     #[must_use]
     pub const fn metadata(&self) -> &ArchiveMetadata {
         &self.metadata
+    }
+
+    /// Returns the archive format version from the fixed header.
+    #[must_use]
+    pub const fn version(&self) -> ArchiveVersion {
+        self.version
     }
 
     /// Returns the schema tree.
@@ -289,6 +299,122 @@ impl ArchiveCatalog {
             limits,
         )
     }
+
+    /// Rewrites the adaptive per-column integer streams of a decoded separate-column stream back to
+    /// the canonical raw 8-byte little-endian layout, so [`Self::schema_tables`] and its
+    /// fixed-stride column readers decode them unchanged.
+    ///
+    /// Call this after [`SingleFileArchiveReader::read_packed_stream`] only for archives whose
+    /// version [`supports_adaptive_numeric`](super::ArchiveVersion::supports_adaptive_numeric); a
+    /// 0.5.x archive's integer columns are already plain and must not be reinterpreted. A grouped
+    /// (shared-frame) stream never carries adaptive columns and is returned untouched, as is a
+    /// separate stream with no integer columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream's schema is unknown or an integer column stream is corrupt.
+    pub fn materialize_adaptive_numerics(
+        &self,
+        stream_id: u64,
+        stream: DecodedPackedStream,
+        limits: ColumnLimits,
+    ) -> Result<DecodedPackedStream, TableStreamError> {
+        // Only 0.6+ archives carry adaptive columns; 0.5.x integer columns are already plain.
+        if !self.version.supports_adaptive_numeric() {
+            return Ok(stream);
+        }
+        // Only separate-column streams carry per-column frames (and thus adaptive columns).
+        let Some(layout) = stream.column_layout() else {
+            return Ok(stream);
+        };
+        // A separate-column stream holds exactly one table; resolve its schema and row count.
+        let table = self
+            .table_metadata
+            .schema_tables()
+            .iter()
+            .find(|table| table.stream_id() == stream_id)
+            .ok_or(TableStreamError::StreamHasNoTables { stream_id })?;
+        // A CONSTANT/RLE frame is a few bytes regardless of row count, so bound the expansion by
+        // the same message limit `decode_schema_table` enforces. Over the limit, leave the stream
+        // un-materialized: the subsequent decode rejects the oversized table cleanly instead of
+        // this allocating message_count * 8 bytes up front.
+        if table.message_count() > limits.max_messages() {
+            return Ok(stream);
+        }
+        let schema_id = table.schema_id();
+        let schema =
+            self.schema_map
+                .get(schema_id)
+                .ok_or(TableStreamError::UnknownSchemaId {
+                    table_index: 0,
+                    schema_id,
+                })?;
+        let message_count =
+            usize::try_from(table.message_count()).map_err(|_| TableStreamError::SizeOverflow)?;
+
+        // Node type of each value column, in schema (== column layout) order.
+        let node_types: Vec<NodeType> = schema
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                SchemaEntry::Node(node_id) => Some(*node_id),
+                SchemaEntry::UnorderedContainer { .. } => None,
+            })
+            .filter_map(|node_id| {
+                self.schema_tree
+                    .get(usize::try_from(node_id).ok()?)
+                    .map(super::schema_tree::SchemaNode::node_type)
+            })
+            .filter(|node_type| is_value_bearing(*node_type))
+            .collect();
+
+        // Walk the concatenated per-column bytes, decoding each loaded numeric (integer or float)
+        // column back to raw 8-byte values and copying every other column verbatim.
+        let bytes = stream.as_bytes();
+        let mut columns: Vec<Option<Vec<u8>>> = Vec::with_capacity(layout.len());
+        let mut sizes: Vec<usize> = Vec::with_capacity(layout.len());
+        let mut offset = 0_usize;
+        let mut changed = false;
+        for (column_index, slot) in layout.iter().enumerate() {
+            let stored = &bytes[offset..offset + slot.stored];
+            offset += slot.stored;
+            let node_type = node_types.get(column_index).copied();
+            let decode_err = |source| TableStreamError::AdaptiveNumeric {
+                schema_id,
+                column_index,
+                source,
+            };
+            if !slot.loaded {
+                columns.push(None);
+                sizes.push(slot.size);
+            } else if node_type == Some(NodeType::Integer) && !stored.is_empty() {
+                let values = crate::adaptive_int::decode(stored, message_count).map_err(decode_err)?;
+                let mut raw = Vec::with_capacity(values.len() * 8);
+                for value in values {
+                    raw.extend_from_slice(&value.to_le_bytes());
+                }
+                sizes.push(raw.len());
+                columns.push(Some(raw));
+                changed = true;
+            } else if node_type == Some(NodeType::Float) && !stored.is_empty() {
+                let bits = crate::adaptive_float::decode(stored, message_count).map_err(decode_err)?;
+                let mut raw = Vec::with_capacity(bits.len() * 8);
+                for value in bits {
+                    raw.extend_from_slice(&value.to_le_bytes());
+                }
+                sizes.push(raw.len());
+                columns.push(Some(raw));
+                changed = true;
+            } else {
+                columns.push(Some(stored.to_vec()));
+                sizes.push(slot.size);
+            }
+        }
+        if !changed {
+            return Ok(stream);
+        }
+        Ok(DecodedPackedStream::from_columns(columns, &sizes))
+    }
 }
 
 /// Layout-independent inputs needed to assemble an [`ArchiveCatalog`].
@@ -296,6 +422,10 @@ impl ArchiveCatalog {
 /// The outer readers retain responsibility for selecting bounded physical members. All semantic
 /// cross-validation is intentionally shared here so the SFA and directory paths cannot drift.
 pub(super) trait CatalogSectionSource {
+    /// The archive format version from the fixed header, used to gate version-specific decoding
+    /// such as adaptive integer columns.
+    fn catalog_version(&self) -> ArchiveVersion;
+
     fn catalog_metadata(
         &mut self,
         limits: MetadataLimits,
@@ -344,6 +474,7 @@ pub(super) fn load_catalog<S: CatalogSectionSource>(
     source: &mut S,
     limits: &ArchiveCatalogLimits,
 ) -> Result<ArchiveCatalog, ArchiveCatalogError> {
+    let version = source.catalog_version();
     let metadata = source
         .catalog_metadata(limits.metadata)
         .map_err(ArchiveCatalogError::Metadata)?;
@@ -389,6 +520,7 @@ pub(super) fn load_catalog<S: CatalogSectionSource>(
     .map_err(ArchiveCatalogError::TimestampPatterns)?;
 
     Ok(ArchiveCatalog {
+        version,
         metadata,
         schema_tree,
         schema_map,
@@ -402,6 +534,10 @@ pub(super) fn load_catalog<S: CatalogSectionSource>(
 }
 
 impl<R: Read + Seek> CatalogSectionSource for SingleFileArchiveReader<R> {
+    fn catalog_version(&self) -> ArchiveVersion {
+        self.header().version()
+    }
+
     fn catalog_metadata(
         &mut self,
         limits: MetadataLimits,

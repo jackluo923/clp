@@ -733,6 +733,10 @@ impl<S: DirectoryArchiveSource> DirectoryArchiveReader<S> {
 }
 
 impl<S: DirectoryArchiveSource> CatalogSectionSource for DirectoryArchiveReader<S> {
+    fn catalog_version(&self) -> super::ArchiveVersion {
+        self.header().version()
+    }
+
     fn catalog_metadata(
         &mut self,
         limits: MetadataLimits,
