@@ -677,6 +677,15 @@ impl PrimitiveArchive {
         self.tables.tables.len()
     }
 
+    /// Returns each schema-table's current physical message count, indexed by `schema_id`.
+    ///
+    /// A table's `schema_id` equals its creation index, so the returned vector is directly
+    /// indexable by `schema_id`. Used to compute a member's per-table physical row span (the
+    /// difference between the counts at source open and close) for span-based member slicing.
+    pub(super) fn table_message_counts(&self) -> Vec<u64> {
+        self.tables.table_message_counts()
+    }
+
     pub(super) const fn resident_bytes(&self) -> u64 {
         self.resident_bytes
     }
@@ -3813,6 +3822,11 @@ struct TableSet {
 }
 
 impl TableSet {
+    /// Physical message count of each table, indexed by `schema_id` (== creation index).
+    fn table_message_counts(&self) -> Vec<u64> {
+        self.tables.iter().map(|table| table.message_count).collect()
+    }
+
     fn find_schema(&self, entries: &[u32], ordered_entry_count: usize) -> Option<usize> {
         if let Some(index) = self.last_table_index
             && self.tables[index].entries == entries

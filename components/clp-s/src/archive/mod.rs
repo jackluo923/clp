@@ -94,6 +94,7 @@ pub use packed_stream::DecodedPackedStream;
 pub use packed_stream::PackedStreamError;
 pub use packed_stream::PackedStreamLimits;
 pub use packed_stream::decode_packed_stream;
+pub use range_index::PhysicalRowSpan;
 pub use range_index::RangeIndex;
 pub use range_index::RangeIndexEntry;
 pub use range_index::RangeIndexError;

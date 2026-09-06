@@ -262,8 +262,14 @@ fn wanted_nodes(parsed: &ParsedQuery, tree: &SchemaTree, field_nodes: &[Vec<u32>
     }
     if needs_log_order {
         match LogOrderLocator::discover(tree) {
+            // Column present: a range selector places rows by walking it, so it joins the set.
             Ok(Some(locator)) => nodes.push(locator.node_id()),
-            _ => return None,
+            // Span-based member slicing: no per-row column exists; the selector resolves through
+            // the range-index physical spans and needs no extra column read, so keep projecting the
+            // query's own columns rather than falling back to reading every column.
+            Ok(None) => {}
+            // Discovery genuinely failed: fall back to reading every column.
+            Err(_) => return None,
         }
     }
     nodes.sort_unstable();

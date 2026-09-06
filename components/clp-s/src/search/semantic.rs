@@ -3476,9 +3476,30 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
         )
         .map_err(|_| SearchError::SizeOverflow)?;
         let Some(column) = located else {
-            // Without the metadata column a row cannot be placed in log order, so no entry can be
-            // shown to cover or exclude it. Leaving the default keeps the predicate unproven
-            // rather than answering it from positions that do not mean what it needs.
+            // Span-based member slicing: the archive dropped the per-row `log_event_idx` column and
+            // instead records each member's per-schema-table physical row spans in the range index.
+            // Place rows by this table's span directly rather than walking the absent column. Within
+            // a table a member's rows are contiguous, so one span per (member, schema) is exact.
+            // An archive with neither the column nor spans sets nothing here and leaves the
+            // predicate unproven, matching the previous no-column behavior.
+            let schema_id = self.decoded.schema().id();
+            let matchable = row_count.min(self.decoded.table().matchable_rows());
+            for (entry, (_, _, result)) in range_index.entries().iter().zip(&evaluated) {
+                for span in entry.physical_spans() {
+                    if span.schema_id() != schema_id {
+                        continue;
+                    }
+                    let start = usize::try_from(span.row_start())
+                        .unwrap_or(usize::MAX)
+                        .min(matchable);
+                    let end = usize::try_from(span.row_end())
+                        .unwrap_or(usize::MAX)
+                        .min(matchable);
+                    if let Some(slots) = bitmap.get_mut(start..end) {
+                        slots.fill(*result as u8);
+                    }
+                }
+            }
             return Ok(bitmap);
         };
 

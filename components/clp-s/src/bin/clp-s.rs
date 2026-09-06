@@ -215,6 +215,12 @@ struct CompressionRepresentationArgs {
     /// Omit archive-global log-order and range-index metadata.
     #[arg(long)]
     disable_log_order: bool,
+    /// Drop the per-row `log_event_idx` column while keeping range-index member metadata, recording
+    /// each member's per-schema-table physical row spans instead. `$_filename` / member pruning keep
+    /// working (and get faster) through those spans; global cross-schema ordered extraction becomes
+    /// unavailable. Recovers the column's storage (~9-22%). Requires adaptive numeric columns.
+    #[arg(long, conflicts_with_all = ["disable_log_order", "no_adaptive_numeric_columns"])]
+    no_log_order_column: bool,
 }
 
 #[derive(Debug, Args)]
@@ -479,7 +485,8 @@ fn run_compress(arguments: &CompressArgs) -> CliResult<()> {
         .with_minimum_packed_stream_size(arguments.min_table_size)
         .with_separate_columns_min_size(arguments.separate_columns_min_size)
         .with_adaptive_numeric_columns(!arguments.no_adaptive_numeric_columns)
-        .with_log_order(!arguments.representation.disable_log_order);
+        .with_log_order(!arguments.representation.disable_log_order)
+        .with_log_order_column(!arguments.representation.no_log_order_column);
     let mut archive_set = ArchiveSetWriter::new(
         publisher,
         stats,

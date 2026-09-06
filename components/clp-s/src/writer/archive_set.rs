@@ -32,6 +32,7 @@ use super::ReplayableRecordEventSource;
 use super::WriterError;
 use super::WriterOptions;
 use crate::archive::DirectoryArchiveMember;
+use crate::archive::PhysicalRowSpan;
 use crate::archive::RangeIndex;
 use crate::archive::RangeIndexError;
 use crate::archive::RangeIndexLimits;
@@ -184,6 +185,10 @@ pub struct ArchiveSetRange {
     end_index: u64,
     #[serde(rename = "f")]
     fields: BTreeMap<String, RangeIndexValue>,
+    /// Per-schema-table physical row spans for this member. Empty (and omitted from the wire) when
+    /// the archive carries the per-row `log_event_idx` column instead of span-based member slicing.
+    #[serde(rename = "p", skip_serializing_if = "Vec::is_empty")]
+    physical_spans: Vec<PhysicalRowSpan>,
     #[serde(rename = "s")]
     start_index: u64,
 }
@@ -232,18 +237,59 @@ impl Serialize for RangeIndexValue {
     }
 }
 
+impl Serialize for PhysicalRowSpan {
+    /// Emits a compact fixed 3-element `MessagePack` array `[schema_id, row_start, row_count]`.
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer, {
+        (self.schema_id(), self.row_start(), self.row_count()).serialize(serializer)
+    }
+}
+
 #[derive(Debug)]
 struct ActiveSource {
     context: ArchiveSourceContext,
     split_number: u64,
     start_index: u64,
+    /// Per-schema-table physical message count at source open, indexed by `schema_id`. A schema
+    /// created after this source opened is absent here and treated as starting at zero.
+    table_row_starts: Vec<u64>,
 }
 
 impl ActiveSource {
-    fn close_at(&self, end_index: u64) -> ArchiveSetRange {
+    /// Closes the source range at `end_index`.
+    ///
+    /// When `emit_spans` is set, records each schema-table's physical row span for this member as
+    /// the difference between the table's message count now (`table_counts_now`, indexed by
+    /// `schema_id`) and at source open. Tables the member did not touch (zero delta) are omitted.
+    fn close_at(
+        &self,
+        end_index: u64,
+        table_counts_now: &[u64],
+        emit_spans: bool,
+    ) -> ArchiveSetRange {
+        let physical_spans = if emit_spans {
+            table_counts_now
+                .iter()
+                .enumerate()
+                .filter_map(|(schema_index, &end_count)| {
+                    let start_count =
+                        self.table_row_starts.get(schema_index).copied().unwrap_or(0);
+                    let row_count = end_count.saturating_sub(start_count);
+                    if 0 == row_count {
+                        return None;
+                    }
+                    let schema_id = i32::try_from(schema_index).ok()?;
+                    Some(PhysicalRowSpan::new(schema_id, start_count, row_count))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         ArchiveSetRange {
             end_index,
             fields: self.context.fields_for_split(self.split_number),
+            physical_spans,
             start_index: self.start_index,
         }
     }
@@ -599,7 +645,10 @@ impl<S: FinalizedArchiveSink, C: ArchiveSetStatsCallback> ArchiveSetWriter<S, C>
         &mut self,
         context: ArchiveSourceContext,
     ) -> Result<(), ArchiveSetError<S::Error, C::Error>> {
-        let start_index = self.open()?.record_count();
+        let (start_index, table_row_starts) = {
+            let archive = self.open()?;
+            (archive.record_count(), archive.table_message_counts())
+        };
         if self.active_source.is_some() {
             return Err(ArchiveSetError::SourceAlreadyOpen);
         }
@@ -607,6 +656,7 @@ impl<S: FinalizedArchiveSink, C: ArchiveSetStatsCallback> ArchiveSetWriter<S, C>
             context,
             split_number: 0,
             start_index,
+            table_row_starts,
         });
         Ok(())
     }
@@ -655,7 +705,10 @@ impl<S: FinalizedArchiveSink, C: ArchiveSetStatsCallback> ArchiveSetWriter<S, C>
             return Err(error);
         }
         if self.options.writer.records_log_order() {
-            self.closed_ranges.push(source.close_at(end_index));
+            let table_counts = self.open()?.table_message_counts();
+            let emit_spans = self.options.writer.emits_row_spans();
+            self.closed_ranges
+                .push(source.close_at(end_index, &table_counts, emit_spans));
         }
         Ok(())
     }
@@ -982,10 +1035,15 @@ impl<S: FinalizedArchiveSink, C: ArchiveSetStatsCallback> ArchiveSetWriter<S, C>
             return Err(self.state_error());
         };
         let record_count = open.record_count();
+        let table_counts = open.table_message_counts();
         let encoded_data_size = open.encoded_data_size();
         let (begin_timestamp, end_timestamp) = open.timestamp_bounds();
         let uncompressed_size = open.uncompressed_size();
-        let range_index = self.take_range_index(record_count);
+        let range_index = self.take_range_index(
+            record_count,
+            &table_counts,
+            self.options.writer.emits_row_spans(),
+        );
         let range_index_packet = if range_index.is_empty() {
             None
         } else {
@@ -1033,10 +1091,16 @@ impl<S: FinalizedArchiveSink, C: ArchiveSetStatsCallback> ArchiveSetWriter<S, C>
         result
     }
 
-    fn take_range_index(&mut self, end_index: u64) -> Arc<[ArchiveSetRange]> {
+    fn take_range_index(
+        &mut self,
+        end_index: u64,
+        table_counts: &[u64],
+        emit_spans: bool,
+    ) -> Arc<[ArchiveSetRange]> {
         if self.options.writer.records_log_order() {
             if let Some(source) = &self.active_source {
-                self.closed_ranges.push(source.close_at(end_index));
+                self.closed_ranges
+                    .push(source.close_at(end_index, table_counts, emit_spans));
             }
         } else {
             debug_assert_eq!(0, self.closed_ranges.len());
@@ -1078,6 +1142,9 @@ impl<S: FinalizedArchiveSink, C: ArchiveSetStatsCallback> ArchiveSetWriter<S, C>
                             .checked_add(1)
                             .expect("source split overflow was checked before finalization");
                         source.start_index = 0;
+                        // The following archive starts fresh: every schema-table begins at row 0,
+                        // so the member's per-table span baselines reset to empty.
+                        source.table_row_starts = Vec::new();
                     }
                     ArchiveSetState::Open(Box::new(OpenDirectoryArchive::new(
                         self.options.writer.with_uncompressed_size(0),

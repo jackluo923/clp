@@ -92,7 +92,7 @@ impl OpenDirectoryArchive {
         self.records.append(
             record,
             self.options.limits(),
-            self.options.records_log_order(),
+            self.options.emits_log_order_column(),
         )
     }
 
@@ -111,7 +111,7 @@ impl OpenDirectoryArchive {
         self.records.append_events(
             events,
             self.options.limits(),
-            self.options.records_log_order(),
+            self.options.emits_log_order_column(),
         )
     }
 
@@ -129,7 +129,7 @@ impl OpenDirectoryArchive {
         self.records.try_append_events(
             events,
             self.options.limits(),
-            self.options.records_log_order(),
+            self.options.emits_log_order_column(),
         )
     }
 
@@ -142,7 +142,7 @@ impl OpenDirectoryArchive {
         self.records.try_append_replayable_events(
             source,
             self.options.limits(),
-            self.options.records_log_order(),
+            self.options.emits_log_order_column(),
         )
     }
 
@@ -156,6 +156,15 @@ impl OpenDirectoryArchive {
     #[must_use]
     pub const fn schema_count(&self) -> usize {
         self.records.schema_count()
+    }
+
+    /// Returns each schema-table's current physical message count, indexed by `schema_id`.
+    ///
+    /// Used to compute a member's per-table physical row spans at source open and close for
+    /// span-based member slicing.
+    #[must_use]
+    pub fn table_message_counts(&self) -> Vec<u64> {
+        self.records.table_message_counts()
     }
 
     /// Returns owned key, schema-entry, dictionary-value, and encoded-column payload bytes.

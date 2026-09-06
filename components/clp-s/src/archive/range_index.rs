@@ -147,11 +147,62 @@ impl RangeIndexValue {
     }
 }
 
+/// The physical row range one member (source file) occupies within one schema-table.
+///
+/// Emitted only when the writer drops the per-row `log_event_idx` column in favor of span-based
+/// member slicing. `$_filename` resolution then seeks `[row_start, row_start + row_count)` in the
+/// table for `schema_id`, instead of walking the column. Within a table `log_event_idx` is
+/// monotonic and members append in order, so a member's rows are contiguous and expressible as a
+/// single span per schema-table it touches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalRowSpan {
+    schema_id: i32,
+    row_start: u64,
+    row_count: u64,
+}
+
+impl PhysicalRowSpan {
+    /// Creates a span addressing `[row_start, row_start + row_count)` in table `schema_id`.
+    #[must_use]
+    pub const fn new(schema_id: i32, row_start: u64, row_count: u64) -> Self {
+        Self {
+            schema_id,
+            row_start,
+            row_count,
+        }
+    }
+
+    /// The schema-table identifier the span addresses.
+    #[must_use]
+    pub const fn schema_id(self) -> i32 {
+        self.schema_id
+    }
+
+    /// Inclusive first physical row within the table.
+    #[must_use]
+    pub const fn row_start(self) -> u64 {
+        self.row_start
+    }
+
+    /// Number of contiguous physical rows the member occupies in the table.
+    #[must_use]
+    pub const fn row_count(self) -> u64 {
+        self.row_count
+    }
+
+    /// Exclusive last physical row within the table.
+    #[must_use]
+    pub const fn row_end(self) -> u64 {
+        self.row_start.saturating_add(self.row_count)
+    }
+}
+
 /// One structurally validated range-index entry.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RangeIndexEntry {
     range: Range<u64>,
     fields: BTreeMap<String, RangeIndexValue>,
+    physical_spans: Vec<PhysicalRowSpan>,
 }
 
 impl RangeIndexEntry {
@@ -183,6 +234,15 @@ impl RangeIndexEntry {
     #[must_use]
     pub fn field(&self, name: &str) -> Option<&RangeIndexValue> {
         self.fields.get(name)
+    }
+
+    /// Returns the per-schema-table physical row spans this member occupies.
+    ///
+    /// Empty for archives that carry the per-row `log_event_idx` column instead; non-empty only
+    /// for span-based member slicing, where it replaces the column for `$_filename` resolution.
+    #[must_use]
+    pub fn physical_spans(&self) -> &[PhysicalRowSpan] {
+        &self.physical_spans
     }
 }
 
@@ -325,6 +385,7 @@ impl<'a> MessagePackReader<'a> {
         let mut start = None;
         let mut end = None;
         let mut fields = None;
+        let mut physical_spans = None;
         for _ in 0..member_count {
             let key = self.read_string("range-index entry key")?;
             if !keys.insert(key.clone()) {
@@ -337,6 +398,7 @@ impl<'a> MessagePackReader<'a> {
                 "s" => start = Some(self.read_index(entry_index, "s")?),
                 "e" => end = Some(self.read_index(entry_index, "e")?),
                 "f" => fields = Some(self.read_fields()?),
+                "p" => physical_spans = Some(self.read_physical_spans(entry_index)?),
                 _ => {
                     self.read_value(0)?;
                 }
@@ -365,7 +427,47 @@ impl<'a> MessagePackReader<'a> {
         Ok(RangeIndexEntry {
             range: start..end,
             fields,
+            physical_spans: physical_spans.unwrap_or_default(),
         })
+    }
+
+    /// Reads the optional `"p"` physical-row-span array: `[[schema_id, row_start, row_count], ...]`.
+    ///
+    /// Each span is a fixed 3-element `MessagePack` array. `schema_id` is a non-negative table
+    /// index (`i32`); `row_start`/`row_count` are `u64`. A dedicated typed reader (rather than the
+    /// generic value reader) keeps the structure typed and bounds the count by the collection limit.
+    fn read_physical_spans(
+        &mut self,
+        entry_index: u64,
+    ) -> Result<Vec<PhysicalRowSpan>, RangeIndexError> {
+        let span_count = self.read_array_len("range-index physical spans")?;
+        check_limit(
+            RangeIndexResource::CollectionEntries,
+            u64::from(span_count),
+            u64::from(self.limits.collection_entries),
+        )?;
+        self.check_element_bytes("range-index physical spans", span_count, 3)?;
+        let capacity = usize::try_from(span_count).map_err(|_| RangeIndexError::SizeOverflow {
+            context: "range-index physical span count",
+        })?;
+        let mut spans = Vec::with_capacity(capacity);
+        for _ in 0..span_count {
+            let element_count = self.read_array_len("range-index physical span")?;
+            if 3 != element_count {
+                return Err(RangeIndexError::MalformedPhysicalSpan {
+                    entry_index,
+                    element_count,
+                });
+            }
+            let schema_id = self.read_index(entry_index, "p.schema_id")?;
+            let schema_id = i32::try_from(schema_id).map_err(|_| RangeIndexError::SizeOverflow {
+                context: "range-index physical span schema id",
+            })?;
+            let row_start = self.read_index(entry_index, "p.row_start")?;
+            let row_count = self.read_index(entry_index, "p.row_count")?;
+            spans.push(PhysicalRowSpan::new(schema_id, row_start, row_count));
+        }
+        Ok(spans)
     }
 
     fn read_fields(&mut self) -> Result<BTreeMap<String, RangeIndexValue>, RangeIndexError> {
@@ -964,6 +1066,13 @@ pub enum RangeIndexError {
         /// Number of archive-local log events.
         record_count: u64,
     },
+    /// A `"p"` physical-row-span element was not a 3-element `[schema_id, row_start, row_count]`.
+    MalformedPhysicalSpan {
+        /// Zero-based range entry index.
+        entry_index: u64,
+        /// Element count found instead of 3.
+        element_count: u32,
+    },
 }
 
 impl Display for RangeIndexError {
@@ -1066,6 +1175,14 @@ impl Display for RangeIndexError {
                 formatter,
                 "range index entry {entry_index} ends at {end} outside record domain \
                  0..{record_count}"
+            ),
+            Self::MalformedPhysicalSpan {
+                entry_index,
+                element_count,
+            } => write!(
+                formatter,
+                "range index entry {entry_index} has a physical span with {element_count} elements, \
+                 expected 3"
             ),
         }
     }

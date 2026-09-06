@@ -461,6 +461,7 @@ pub struct WriterOptions {
     minimum_packed_stream_size: u64,
     uncompressed_size: u64,
     record_log_order: bool,
+    emit_log_order_column: bool,
     separate_columns_min_size: u64,
     adaptive_numeric_columns: bool,
 }
@@ -477,6 +478,7 @@ impl WriterOptions {
             minimum_packed_stream_size: Self::DEFAULT_MINIMUM_PACKED_STREAM_SIZE,
             uncompressed_size: 0,
             record_log_order: true,
+            emit_log_order_column: true,
             separate_columns_min_size: 0,
             // Library default stays conservative (0.5.0, C++-reference-compatible). The `clp-s`
             // compression CLI turns this on by default; embedders opt in via the builder.
@@ -562,6 +564,21 @@ impl WriterOptions {
         self
     }
 
+    /// Enables or disables the per-row `log_event_idx` column while keeping member-range tracking.
+    ///
+    /// Enabled by default. When disabled (and [`records_log_order`](Self::records_log_order) stays
+    /// on), the archive omits the per-row column and instead records each member's per-schema-table
+    /// physical row spans in the range index. `$_filename` / member pruning resolve through those
+    /// spans; global cross-schema ordered extraction (which needs the per-row column) becomes
+    /// unavailable. This is the storage-recovery mode: it drops the largest incompressible column
+    /// while keeping filename filtering. Requires adaptive numeric columns (the 0.6.0 line) so the
+    /// span-bearing archive is refused by 0.5.x readers.
+    #[must_use]
+    pub const fn with_log_order_column(mut self, enabled: bool) -> Self {
+        self.emit_log_order_column = enabled;
+        self
+    }
+
     /// Zstd compression level used for every frame.
     #[must_use]
     pub const fn compression_level(self) -> i32 {
@@ -590,6 +607,25 @@ impl WriterOptions {
     #[must_use]
     pub const fn records_log_order(self) -> bool {
         self.record_log_order
+    }
+
+    /// Returns whether the per-row `log_event_idx` column is emitted.
+    ///
+    /// True only when member-range tracking is on and the column is not explicitly dropped. When
+    /// false with member tracking on, physical row spans are emitted instead
+    /// ([`emits_row_spans`](Self::emits_row_spans)).
+    #[must_use]
+    pub const fn emits_log_order_column(self) -> bool {
+        self.record_log_order && self.emit_log_order_column
+    }
+
+    /// Returns whether per-member physical row spans are emitted in the range index.
+    ///
+    /// True when member-range tracking is on but the per-row column is dropped — the span-based
+    /// member-slicing mode that keeps `$_filename` while recovering the column's storage.
+    #[must_use]
+    pub const fn emits_row_spans(self) -> bool {
+        self.record_log_order && !self.emit_log_order_column
     }
 }
 
@@ -653,7 +689,7 @@ impl<W> OpenArchive<W> {
     /// domains, checked arithmetic, or bounded allocation failure.
     pub fn append_record(&mut self, record: RecordRef<'_>) -> Result<(), AppendError> {
         self.records
-            .append(record, self.options.limits, self.options.record_log_order)
+            .append(record, self.options.limits, self.options.emits_log_order_column())
     }
 
     /// Validates and atomically appends one flat borrowed record traversal.
@@ -670,7 +706,7 @@ impl<W> OpenArchive<W> {
     where
         I: IntoIterator<Item = RecordEventRef<'record>>, {
         self.records
-            .append_events(events, self.options.limits, self.options.record_log_order)
+            .append_events(events, self.options.limits, self.options.emits_log_order_column())
     }
 
     /// Validates and atomically appends a fallible flat borrowed record traversal.
@@ -686,7 +722,7 @@ impl<W> OpenArchive<W> {
     where
         I: IntoIterator<Item = Result<RecordEventRef<'record>, E>>, {
         self.records
-            .try_append_events(events, self.options.limits, self.options.record_log_order)
+            .try_append_events(events, self.options.limits, self.options.emits_log_order_column())
     }
 
     /// Returns the number of successfully appended records.
