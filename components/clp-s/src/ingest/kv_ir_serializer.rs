@@ -17,12 +17,22 @@ use super::KvIrEncoding;
 use super::KvIrNodeType;
 use super::json_canonical::CanonicalJsonLimits;
 use super::json_canonical::CanonicalJsonScratch;
+use super::kv_ir_adaptive::ADAPTIVE_CONTROL_TAG;
+use super::kv_ir_adaptive::CommittedScheme;
+use super::kv_ir_adaptive::WarmupBuffer;
+use super::kv_ir_adaptive::{self};
 
 const FOUR_BYTE_MAGIC: [u8; 4] = [0xfd, 0x2f, 0xb5, 0x29];
 const EIGHT_BYTE_MAGIC: [u8; 4] = [0xfd, 0x2f, 0xb5, 0x30];
-const METADATA_SUFFIX: &[u8] = b"\"VARIABLES_SCHEMA_ID\":\"com.yscope.clp.VariablesSchemaV2\",\
+const METADATA_SUFFIX_HEAD: &[u8] = b"\"VARIABLES_SCHEMA_ID\":\"com.yscope.clp.VariablesSchemaV2\",\
     \"VARIABLE_ENCODING_METHODS_ID\":\"com.yscope.clp.VariableEncodingMethodsV1\",\
-    \"VERSION\":\"0.1.0\"}";
+    \"VERSION\":\"";
+const METADATA_SUFFIX_TAIL: &[u8] = b"\"}";
+/// Baseline KV-IR protocol version stamped when adaptive numeric encoding is off.
+const KV_IR_VERSION_BASE: &[u8] = b"0.1.0";
+/// Protocol version stamped when adaptive numeric encoding is on, so a reader pinned to the
+/// baseline hard-refuses a stream carrying adaptive control records / value tags it cannot decode.
+const KV_IR_VERSION_ADAPTIVE: &[u8] = b"0.2.0";
 const MEBIBYTE: u64 = 1024 * 1024;
 
 const INTEGER_PLACEHOLDER: u8 = 0x11;
@@ -163,6 +173,7 @@ impl Default for KvIrSerializerLimits {
 pub struct KvIrSerializerOptions {
     encoding: KvIrEncoding,
     limits: KvIrSerializerLimits,
+    adaptive_warmup: Option<u32>,
 }
 
 impl KvIrSerializerOptions {
@@ -171,12 +182,22 @@ impl KvIrSerializerOptions {
         Self {
             encoding,
             limits: KvIrSerializerLimits::DEFAULT,
+            adaptive_warmup: None,
         }
     }
 
     #[must_use]
     pub const fn with_limits(mut self, limits: KvIrSerializerLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Enables online adaptive numeric encoding with the given per-field warmup window (values
+    /// observed on the canonical encoding before a scheme is chosen). Off by default; enabling it
+    /// stamps the stream with the adaptive protocol version so baseline readers refuse it.
+    #[must_use]
+    pub const fn with_adaptive_numeric(mut self, warmup_values: u32) -> Self {
+        self.adaptive_warmup = Some(warmup_values);
         self
     }
 
@@ -188,6 +209,11 @@ impl KvIrSerializerOptions {
     #[must_use]
     pub const fn limits(self) -> KvIrSerializerLimits {
         self.limits
+    }
+
+    #[must_use]
+    pub const fn adaptive_warmup(self) -> Option<u32> {
+        self.adaptive_warmup
     }
 }
 
@@ -757,6 +783,39 @@ const fn node_type_hash_tag(node_type: KvIrNodeType) -> u8 {
     }
 }
 
+/// Per-field state for online adaptive numeric encoding, indexed by node id within a namespace.
+///
+/// A field starts `NotSeen`, becomes `Warmup` on its first numeric value, and then transitions
+/// exactly once — at an event commit — to either `Plain` (canonical encoding kept; the bake-off
+/// found no win) or `Committed` (a scheme was chosen and its control record emitted). Transitions
+/// happen only at commit so a rolled-back event never corrupts this state.
+#[derive(Debug)]
+enum FieldCodec {
+    NotSeen,
+    Warmup(WarmupBuffer),
+    Plain,
+    Committed(CommittedScheme),
+}
+
+/// A numeric value observed while staging an event, recorded verbatim so the commit step can fold
+/// it into the field's warmup/running state after the event is known to have succeeded.
+#[derive(Debug)]
+enum JournalValue {
+    Int(i64),
+    Float(f64),
+}
+
+/// One journaled numeric leaf from the event currently being staged.
+#[derive(Debug)]
+struct AdaptiveJournalEntry {
+    auto_generated: bool,
+    node_id: u32,
+    value: JournalValue,
+    /// Whether this value was actually emitted with the adaptive value tag (vs the canonical tag).
+    /// Only adaptively-emitted delta values advance the running `last` at commit.
+    emitted_adaptive: bool,
+}
+
 /// Reusable current-protocol KV-IR serializer.
 #[derive(Debug)]
 pub struct KvIrSerializer {
@@ -773,6 +832,12 @@ pub struct KvIrSerializer {
     current_utc_offset: i64,
     stats: KvIrSerializerStats,
     finished: bool,
+    /// Adaptive per-field codec state, one slot per node id in each namespace. Empty when adaptive
+    /// numeric encoding is disabled.
+    auto_codecs: Vec<FieldCodec>,
+    user_codecs: Vec<FieldCodec>,
+    /// Numeric leaves staged in the current event, drained at commit / cleared at rollback.
+    adaptive_journal: Vec<AdaptiveJournalEntry>,
 }
 
 impl KvIrSerializer {
@@ -790,7 +855,11 @@ impl KvIrSerializer {
         user_defined_metadata_json: Option<&[u8]>,
     ) -> Result<Self, KvIrSerializerError> {
         let mut pending = Vec::new();
-        let metadata = Self::metadata_json(options.limits, user_defined_metadata_json)?;
+        let metadata = Self::metadata_json(
+            options.limits,
+            user_defined_metadata_json,
+            options.adaptive_warmup.is_some(),
+        )?;
         let magic = match options.encoding {
             KvIrEncoding::FourByte => FOUR_BYTE_MAGIC,
             KvIrEncoding::EightByte => EIGHT_BYTE_MAGIC,
@@ -847,6 +916,9 @@ impl KvIrSerializer {
                 ..KvIrSerializerStats::default()
             },
             finished: false,
+            auto_codecs: Vec::new(),
+            user_codecs: Vec::new(),
+            adaptive_journal: Vec::new(),
         })
     }
 
@@ -979,6 +1051,7 @@ impl KvIrSerializer {
         self.schema_stage.clear();
         self.sequential_stage.clear();
         self.user_values_stage.clear();
+        self.adaptive_journal.clear();
 
         let result =
             self.serialize_one_map(KvIrSerializerInput::AutoGenerated, auto_generated, true);
@@ -991,6 +1064,7 @@ impl KvIrSerializer {
             self.schema_stage.clear();
             self.sequential_stage.clear();
             self.user_values_stage.clear();
+            self.adaptive_journal.clear();
             return Err(source);
         }
 
@@ -1024,6 +1098,7 @@ impl KvIrSerializer {
     fn metadata_json(
         limits: KvIrSerializerLimits,
         user_metadata: Option<&[u8]>,
+        adaptive: bool,
     ) -> Result<Vec<u8>, KvIrSerializerError> {
         let mut metadata = Vec::new();
         if let Some(source) = user_metadata {
@@ -1067,13 +1142,21 @@ impl KvIrSerializer {
         } else {
             metadata.push(b'{');
         }
-        checked_extend(
-            &mut metadata,
-            METADATA_SUFFIX,
-            limits.metadata_bytes.min(u64::from(u16::MAX)),
-            KvIrSerializerLimitResource::MetadataBytes,
-            "metadata",
-        )?;
+        let metadata_limit = limits.metadata_bytes.min(u64::from(u16::MAX));
+        let version = if adaptive {
+            KV_IR_VERSION_ADAPTIVE
+        } else {
+            KV_IR_VERSION_BASE
+        };
+        for chunk in [METADATA_SUFFIX_HEAD, version, METADATA_SUFFIX_TAIL] {
+            checked_extend(
+                &mut metadata,
+                chunk,
+                metadata_limit,
+                KvIrSerializerLimitResource::MetadataBytes,
+                "metadata",
+            )?;
+        }
         Ok(metadata)
     }
 
@@ -1342,30 +1425,91 @@ impl KvIrSerializer {
         node_id: u32,
         value: Primitive<'_>,
     ) -> Result<(), KvIrSerializerError> {
+        let limit = self.options.limits.event_output_bytes;
+        // The node id always goes in the sequential stage; only the *value* is split between the
+        // sequential (auto) and user-value (user) stages, matching the decoder's grouping.
         encode_node_id(
             &mut self.sequential_stage,
             node_id,
             auto_generated,
             [0x65, 0x66, 0x67],
-            self.options.limits.event_output_bytes,
+            limit,
         )?;
-        if auto_generated {
-            serialize_primitive(
-                self.options.encoding,
-                value,
-                &mut self.sequential_stage,
-                &mut self.logtype,
-                self.options.limits.event_output_bytes,
-            )
-        } else {
-            serialize_primitive(
-                self.options.encoding,
-                value,
-                &mut self.user_values_stage,
-                &mut self.logtype,
-                self.options.limits.event_output_bytes,
-            )
+
+        // Fast path: adaptive disabled, or the value is not a number. Emit the canonical encoding
+        // and skip journaling entirely.
+        let numeric =
+            self.options.adaptive_warmup.is_some() && matches!(value, Primitive::Integer(_) | Primitive::Float(_));
+        if !numeric {
+            let stage = if auto_generated {
+                &mut self.sequential_stage
+            } else {
+                &mut self.user_values_stage
+            };
+            return serialize_primitive(self.options.encoding, value, stage, &mut self.logtype, limit);
         }
+
+        // `int_opt` is the value reinterpreted as an integer, or `None` for a float that is not an
+        // exact integer (which can never be encoded adaptively and must stay canonical).
+        let (journal_value, int_opt) = match value {
+            Primitive::Integer(v) => (JournalValue::Int(v), Some(v)),
+            Primitive::Float(f) => (JournalValue::Float(f), CommittedScheme::try_float_as_int(f)),
+            _ => unreachable!("guarded by `numeric`"),
+        };
+
+        // Read-only look-up: if this field is already committed to a scheme and the value is
+        // representable, plan its adaptive payload. The codec borrow ends with this block.
+        let plan = int_opt.and_then(|int_value| {
+            let codecs = if auto_generated {
+                &self.auto_codecs
+            } else {
+                &self.user_codecs
+            };
+            match codecs.get(node_id as usize) {
+                Some(FieldCodec::Committed(scheme)) => Some(scheme.plan_payload(int_value)),
+                _ => None,
+            }
+        });
+
+        let emitted_adaptive = if let Some(plan) = plan {
+            // Stage the tagged adaptive value through a fixed stack buffer (no self borrow, no
+            // per-value allocation), then copy it into the value stage under the output limit.
+            let mut buffer = [0u8; kv_ir_adaptive::MAX_ADAPTIVE_VALUE_LEN];
+            let len = kv_ir_adaptive::write_tagged_value(&mut buffer, plan);
+            let stage = if auto_generated {
+                &mut self.sequential_stage
+            } else {
+                &mut self.user_values_stage
+            };
+            checked_extend(
+                stage,
+                &buffer[..len],
+                limit,
+                KvIrSerializerLimitResource::EventOutputBytes,
+                "event value staging",
+            )?;
+            true
+        } else {
+            let stage = if auto_generated {
+                &mut self.sequential_stage
+            } else {
+                &mut self.user_values_stage
+            };
+            serialize_primitive(self.options.encoding, value, stage, &mut self.logtype, limit)?;
+            false
+        };
+
+        // Record the value so the commit step can advance warmup / running state transactionally.
+        self.adaptive_journal
+            .try_reserve(1)
+            .map_err(|_| allocation("adaptive journal", 1))?;
+        self.adaptive_journal.push(AdaptiveJournalEntry {
+            auto_generated,
+            node_id,
+            value: journal_value,
+            emitted_adaptive,
+        });
+        Ok(())
     }
 
     fn append_pending(&mut self, bytes: &[u8]) -> Result<(), KvIrSerializerError> {
@@ -1441,6 +1585,9 @@ impl KvIrSerializer {
         self.pending.extend_from_slice(&self.sequential_stage);
         self.pending.extend_from_slice(&self.user_values_stage);
         self.stats = stats;
+        // Fold this event's numeric leaves into per-field adaptive state now that the event has been
+        // appended, emitting any scheme-switch control records after the event bytes.
+        self.apply_adaptive_journal()?;
         Ok(event_bytes)
     }
 
@@ -1450,6 +1597,120 @@ impl KvIrSerializer {
         self.schema_stage.clear();
         self.sequential_stage.clear();
         self.user_values_stage.clear();
+        self.adaptive_journal.clear();
+    }
+
+    /// Returns a mutable reference to a field's codec slot within `auto`/`user` codec vectors,
+    /// growing the vector with [`FieldCodec::NotSeen`] as needed. Node ids are bounded per namespace
+    /// by the schema-node limit, so this cannot grow without bound.
+    fn codec_slot_mut(&mut self, auto_generated: bool, index: usize) -> &mut FieldCodec {
+        let codecs = if auto_generated {
+            &mut self.auto_codecs
+        } else {
+            &mut self.user_codecs
+        };
+        if codecs.len() <= index {
+            codecs.resize_with(index + 1, || FieldCodec::NotSeen);
+        }
+        &mut codecs[index]
+    }
+
+    /// Appends an adaptive scheme-switch control record to the pending output. Because a field's
+    /// values while it was warming up were emitted with canonical (tag-dispatched) encodings, this
+    /// record only affects the [`ADAPTIVE_VALUE_TAG`] values emitted for the field in *later*
+    /// events, so its exact position after the current event is not correctness-critical.
+    fn emit_control_record(
+        &mut self,
+        auto_generated: bool,
+        node_id: u32,
+        scheme: &CommittedScheme,
+    ) -> Result<(), KvIrSerializerError> {
+        // Wire layout: `0x3e`, body length as a big-endian u16, then the body. The length prefix
+        // lets a decoder read exactly the record's bytes (and lets a future reader skip an
+        // unrecognized one), which keeps the control record self-delimiting among the units.
+        let mut body = Vec::new();
+        kv_ir_adaptive::write_control_record(&mut body, auto_generated, node_id, scheme);
+        let body_len =
+            u16::try_from(body.len()).map_err(|_| KvIrSerializerError::SizeOverflow)?;
+        let mut record = Vec::with_capacity(3 + body.len());
+        record.push(ADAPTIVE_CONTROL_TAG);
+        record.extend_from_slice(&body_len.to_be_bytes());
+        record.extend_from_slice(&body);
+        self.append_pending(&record)
+    }
+
+    /// Transitions one warmed-up field: if the bake-off finds a winning scheme, emits its control
+    /// record and returns [`FieldCodec::Committed`]; otherwise returns [`FieldCodec::Plain`]. Below
+    /// the warmup threshold the field stays in [`FieldCodec::Warmup`].
+    fn resolve_warmup(
+        &mut self,
+        auto_generated: bool,
+        node_id: u32,
+        buffer: WarmupBuffer,
+        warmup_values: u32,
+    ) -> Result<FieldCodec, KvIrSerializerError> {
+        if buffer.len() < warmup_values as usize {
+            return Ok(FieldCodec::Warmup(buffer));
+        }
+        match buffer.decide() {
+            Some(scheme) => {
+                // Only mark the field committed once its control record is safely in the stream, so
+                // a decoder never meets an adaptive value it has no scheme for.
+                self.emit_control_record(auto_generated, node_id, &scheme)?;
+                Ok(FieldCodec::Committed(scheme))
+            }
+            None => Ok(FieldCodec::Plain),
+        }
+    }
+
+    /// Applies the current event's journaled numeric leaves to per-field adaptive state. No-op when
+    /// adaptive encoding is disabled (the journal is then always empty).
+    fn apply_adaptive_journal(&mut self) -> Result<(), KvIrSerializerError> {
+        let Some(warmup_values) = self.options.adaptive_warmup else {
+            return Ok(());
+        };
+        let journal = std::mem::take(&mut self.adaptive_journal);
+        let mut result = Ok(());
+        for entry in &journal {
+            let index = entry.node_id as usize;
+            let slot = std::mem::replace(
+                self.codec_slot_mut(entry.auto_generated, index),
+                FieldCodec::NotSeen,
+            );
+            let next = match slot {
+                FieldCodec::NotSeen => {
+                    let mut buffer = WarmupBuffer::new(matches!(entry.value, JournalValue::Float(_)));
+                    push_journal_value(&mut buffer, &entry.value);
+                    self.resolve_warmup(entry.auto_generated, entry.node_id, buffer, warmup_values)
+                }
+                FieldCodec::Warmup(mut buffer) => {
+                    push_journal_value(&mut buffer, &entry.value);
+                    self.resolve_warmup(entry.auto_generated, entry.node_id, buffer, warmup_values)
+                }
+                FieldCodec::Plain => Ok(FieldCodec::Plain),
+                FieldCodec::Committed(mut scheme) => {
+                    if entry.emitted_adaptive {
+                        if let Some(int_value) = journal_int_value(&entry.value) {
+                            scheme.advance(int_value);
+                        }
+                    }
+                    Ok(FieldCodec::Committed(scheme))
+                }
+            };
+            match next {
+                Ok(codec) => *self.codec_slot_mut(entry.auto_generated, index) = codec,
+                Err(source) => {
+                    // The field's slot stays NotSeen; it simply re-warms next time. Stop here and
+                    // surface the error (only reachable when the pending output limit is hit).
+                    result = Err(source);
+                    break;
+                }
+            }
+        }
+        // Reuse the journal's allocation for the next event.
+        self.adaptive_journal = journal;
+        self.adaptive_journal.clear();
+        result
     }
 
     fn compact_pending(&mut self) {
@@ -2506,6 +2767,25 @@ fn append_limited(
         KvIrSerializerLimitResource::ScalarBytes,
         "array JSON or CLP logtype",
     )
+}
+
+/// Pushes a journaled value into a field's warmup buffer, dispatching int vs float so a float that
+/// is not an exact integer disqualifies the field from switching.
+fn push_journal_value(buffer: &mut WarmupBuffer, value: &JournalValue) {
+    match *value {
+        JournalValue::Int(v) => buffer.push_int(v),
+        JournalValue::Float(f) => buffer.push_float(f),
+    }
+}
+
+/// Returns the integer form of a journaled value for advancing delta state: the value itself for an
+/// integer, or its exact-integer reinterpretation for a float (already known to exist because the
+/// value was emitted adaptively).
+fn journal_int_value(value: &JournalValue) -> Option<i64> {
+    match *value {
+        JournalValue::Int(v) => Some(v),
+        JournalValue::Float(f) => CommittedScheme::try_float_as_int(f),
+    }
 }
 
 fn checked_push(

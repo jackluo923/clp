@@ -27,6 +27,12 @@ use super::NdjsonInvalidRecordKind;
 use super::NdjsonLimitResource;
 use super::NdjsonLimits;
 use super::NdjsonResource;
+use super::kv_ir_adaptive::ADAPTIVE_CONTROL_TAG;
+use super::kv_ir_adaptive::ADAPTIVE_VALUE_TAG;
+use super::kv_ir_adaptive::CommittedScheme;
+use super::kv_ir_adaptive::Cursor as AdaptiveCursor;
+use super::kv_ir_adaptive::Scheme as AdaptiveScheme;
+use super::kv_ir_adaptive::read_control_record;
 use super::parser::Frame;
 use super::parser::ParseFailure;
 use super::parser::StoredEvent;
@@ -38,6 +44,10 @@ const GIBIBYTE: u64 = 1024 * MEBIBYTE;
 const FOUR_BYTE_MAGIC: [u8; 4] = [0xfd, 0x2f, 0xb5, 0x29];
 const EIGHT_BYTE_MAGIC: [u8; 4] = [0xfd, 0x2f, 0xb5, 0x30];
 const CURRENT_VERSION: &str = "0.1.0";
+/// Protocol version stamped when the writer enabled online adaptive numeric encoding. A stream at
+/// this version may carry adaptive control records (`0x3e`) and adaptive value tags (`0x55`); a
+/// baseline-only reader rejects it, while this reader accepts both versions.
+const ADAPTIVE_VERSION: &str = "0.2.0";
 const EMPTY_SCHEMA_INDEX_SLOT: u32 = 0;
 const LINEAR_SCHEMA_SCAN_LIMIT: usize = 32;
 
@@ -487,6 +497,9 @@ pub enum KvIrInvalidData {
     UnknownValueTag(u8),
     InvalidStringLength,
     InvalidEncodedTextTag(u8),
+    /// An adaptive numeric control record (`0x3e`) or value (`0x55`) was structurally invalid, or a
+    /// value referenced a field with no committed adaptive scheme.
+    MalformedAdaptiveNumeric,
 }
 
 impl Display for KvIrInvalidData {
@@ -563,6 +576,9 @@ impl Display for KvIrInvalidData {
             Self::InvalidStringLength => formatter.write_str("invalid negative string length"),
             Self::InvalidEncodedTextTag(tag) => {
                 write!(formatter, "invalid encoded text component tag 0x{tag:02x}")
+            }
+            Self::MalformedAdaptiveNumeric => {
+                formatter.write_str("malformed adaptive numeric control record or value")
             }
         }
     }
@@ -1770,6 +1786,11 @@ pub struct KvIrReader<R> {
     in_stream: bool,
     stats: KvIrStats,
     finished: bool,
+    /// Per-field committed adaptive schemes, indexed by node id within each namespace. A slot is
+    /// `Some` once an adaptive control record (`0x3e`) has been read for that field; adaptive value
+    /// tags (`0x55`) then decode through it. Both cleared at each stream start.
+    auto_adaptive: Vec<Option<CommittedScheme>>,
+    user_adaptive: Vec<Option<CommittedScheme>>,
 }
 
 impl<R: Read> KvIrReader<R> {
@@ -1811,6 +1832,8 @@ impl<R: Read> KvIrReader<R> {
             in_stream: false,
             stats: KvIrStats::default(),
             finished: false,
+            auto_adaptive: Vec::new(),
+            user_adaptive: Vec::new(),
         }
     }
 
@@ -1931,31 +1954,44 @@ impl<R: Read> KvIrReader<R> {
         sink: &mut S,
     ) -> Result<KvIrItemKind, KvIrReadError<S::Error>> {
         let limits = self.options.limits;
-        let unit_index = self.next_unit_index;
-        let unit_actual = unit_index
-            .checked_add(1)
-            .ok_or_else(|| KvIrReadError::Reader(self.error(KvIrErrorKind::SizeOverflow)))?;
-        if unit_actual > limits.units_per_stream {
-            return Err(KvIrReadError::Reader(self.error(KvIrErrorKind::Limit(
-                KvIrLimitViolation::new(
-                    KvIrLimitResource::UnitsPerStream,
-                    unit_actual,
-                    limits.units_per_stream,
-                ),
-            ))));
-        }
-        let total_units = self
-            .stats
-            .units
-            .checked_add(1)
-            .ok_or_else(|| KvIrReadError::Reader(self.error(KvIrErrorKind::SizeOverflow)))?;
+        // Adaptive control records (`0x3e`) are internal state units: they update per-field decode
+        // state and are consumed transparently, so this loop skips over any run of them and yields
+        // the first real unit for the dispatch below.
+        let (unit_index, unit_actual, total_units, unit_offset, tag) = loop {
+            let unit_index = self.next_unit_index;
+            let unit_actual = unit_index
+                .checked_add(1)
+                .ok_or_else(|| KvIrReadError::Reader(self.error(KvIrErrorKind::SizeOverflow)))?;
+            if unit_actual > limits.units_per_stream {
+                return Err(KvIrReadError::Reader(self.error(KvIrErrorKind::Limit(
+                    KvIrLimitViolation::new(
+                        KvIrLimitResource::UnitsPerStream,
+                        unit_actual,
+                        limits.units_per_stream,
+                    ),
+                ))));
+            }
+            let total_units = self
+                .stats
+                .units
+                .checked_add(1)
+                .ok_or_else(|| KvIrReadError::Reader(self.error(KvIrErrorKind::SizeOverflow)))?;
 
-        self.current_unit_index = Some(unit_index);
-        self.unit.clear();
-        let unit_offset = self.input_offset;
-        let tag = self
-            .read_unit_byte(KvIrTruncatedContext::UnitTag)
-            .map_err(KvIrReadError::Reader)?;
+            self.current_unit_index = Some(unit_index);
+            self.unit.clear();
+            let unit_offset = self.input_offset;
+            let tag = self
+                .read_unit_byte(KvIrTruncatedContext::UnitTag)
+                .map_err(KvIrReadError::Reader)?;
+
+            if tag == ADAPTIVE_CONTROL_TAG {
+                self.read_adaptive_control().map_err(KvIrReadError::Reader)?;
+                self.stats.units = total_units;
+                self.next_unit_index = unit_actual;
+                continue;
+            }
+            break (unit_index, unit_actual, total_units, unit_offset, tag);
+        };
 
         let (kind, ended, next_event_index, result) = match tag {
             0x00 => {
@@ -2285,7 +2321,7 @@ impl<R: Read> KvIrReader<R> {
                 })
             })?;
         self.protocol_version.push_str(version);
-        if self.protocol_version == CURRENT_VERSION {
+        if self.protocol_version == CURRENT_VERSION || self.protocol_version == ADAPTIVE_VERSION {
             return Ok(());
         }
 
@@ -2342,6 +2378,8 @@ impl<R: Read> KvIrReader<R> {
         self.schema_keys.clear();
         self.auto_schema_index.clear();
         self.user_schema_index.clear();
+        self.auto_adaptive.clear();
+        self.user_adaptive.clear();
         self.auto_schema.try_reserve(1).map_err(|_| {
             self.error(KvIrErrorKind::AllocationFailed {
                 resource: KvIrResource::SchemaNodes,
@@ -2710,6 +2748,7 @@ impl<R: Read> KvIrReader<R> {
             0x56 => StoredValueKind::Float {
                 bits: self.read_u64(KvIrTruncatedContext::IntegerPayload)?,
             },
+            ADAPTIVE_VALUE_TAG => self.read_adaptive_value(namespace, node_id)?,
             0x57 => StoredValueKind::Boolean(true),
             0x58 => StoredValueKind::Boolean(false),
             0x41..=0x43 => StoredValueKind::String(self.read_string(tag, StringPacket::Ordinary)?),
@@ -2730,6 +2769,179 @@ impl<R: Read> KvIrReader<R> {
             node_id,
             raw: ByteSpan::new(start, self.unit.len()),
             kind,
+        })
+    }
+
+    /// Reads the body of an adaptive control record (`0x3e` already consumed) and installs the
+    /// committed scheme for the field it names. Wire layout after the tag: `u16` big-endian body
+    /// length, then the body parsed by [`read_control_record`].
+    fn read_adaptive_control(&mut self) -> Result<(), KvIrError> {
+        let body_len = usize::from(u16::from_be_bytes(
+            self.read_array(KvIrTruncatedContext::IntegerPayload)?,
+        ));
+        let body_start = self.unit.len();
+        self.read_unit_bytes(body_len, KvIrTruncatedContext::IntegerPayload)?;
+        let record = {
+            let body = &self.unit[body_start..body_start + body_len];
+            let mut cursor = AdaptiveCursor::new(body);
+            let record = read_control_record(&mut cursor).map_err(|_| {
+                self.error(KvIrErrorKind::Invalid(
+                    KvIrInvalidData::MalformedAdaptiveNumeric,
+                ))
+            })?;
+            // The record must consume exactly its declared body.
+            if cursor.consumed() != body_len {
+                return Err(self.error(KvIrErrorKind::Invalid(
+                    KvIrInvalidData::MalformedAdaptiveNumeric,
+                )));
+            }
+            record
+        };
+        self.install_adaptive_scheme(record.auto_generated, record.node_id, record.scheme)
+    }
+
+    /// Installs a committed adaptive scheme for `node_id` in the given namespace, bounding the node
+    /// id by the declared schema so a malformed id cannot force a large allocation.
+    fn install_adaptive_scheme(
+        &mut self,
+        auto_generated: bool,
+        node_id: u32,
+        scheme: CommittedScheme,
+    ) -> Result<(), KvIrError> {
+        let index = node_id as usize;
+        let schema_len = if auto_generated {
+            self.auto_schema.len()
+        } else {
+            self.user_schema.len()
+        };
+        if index >= schema_len {
+            return Err(self.error(KvIrErrorKind::Invalid(
+                KvIrInvalidData::MalformedAdaptiveNumeric,
+            )));
+        }
+        let needed = index + 1;
+        let current_len = if auto_generated {
+            self.auto_adaptive.len()
+        } else {
+            self.user_adaptive.len()
+        };
+        if current_len < needed {
+            let reserve = needed - current_len;
+            let reserved = if auto_generated {
+                self.auto_adaptive.try_reserve(reserve)
+            } else {
+                self.user_adaptive.try_reserve(reserve)
+            };
+            if reserved.is_err() {
+                return Err(self.error(KvIrErrorKind::AllocationFailed {
+                    resource: KvIrResource::SchemaNodes,
+                    requested_additional: reserve,
+                }));
+            }
+            if auto_generated {
+                self.auto_adaptive.resize_with(needed, || None);
+            } else {
+                self.user_adaptive.resize_with(needed, || None);
+            }
+        }
+        if auto_generated {
+            self.auto_adaptive[index] = Some(scheme);
+        } else {
+            self.user_adaptive[index] = Some(scheme);
+        }
+        Ok(())
+    }
+
+    /// Decodes one adaptive value (`0x55` already consumed) for a field committed to a scheme,
+    /// reconstructing the original `i64` — or the original `f64` for a float-as-int field.
+    fn read_adaptive_value(
+        &mut self,
+        namespace: KvIrNamespace,
+        node_id: u32,
+    ) -> Result<StoredValueKind, KvIrError> {
+        let index = node_id as usize;
+        // Phase 1: read the scheme's kind and float flag (both `Copy`) and drop the borrow, so the
+        // stream reads in phase 2 do not conflict with it.
+        let (kind, is_float) = {
+            let table = match namespace {
+                KvIrNamespace::AutoGenerated => &self.auto_adaptive,
+                KvIrNamespace::UserGenerated => &self.user_adaptive,
+            };
+            match table.get(index).and_then(Option::as_ref) {
+                Some(scheme) => (scheme.kind(), scheme.is_float()),
+                None => {
+                    return Err(self.error(KvIrErrorKind::Invalid(
+                        KvIrInvalidData::MalformedAdaptiveNumeric,
+                    )));
+                }
+            }
+        };
+
+        // Phase 2: pull the payload varints from the stream.
+        let mut delta = 0_i64;
+        let mut code = 0_u64;
+        let mut literal = 0_i64;
+        let mut escaped = false;
+        match kind {
+            AdaptiveScheme::Delta | AdaptiveScheme::For => {
+                delta = self.read_svarint_unit(KvIrTruncatedContext::IntegerPayload)?;
+            }
+            AdaptiveScheme::Dict => {
+                code = self.read_uvarint_unit(KvIrTruncatedContext::IntegerPayload)?;
+                if code == 0 {
+                    literal = self.read_svarint_unit(KvIrTruncatedContext::IntegerPayload)?;
+                    escaped = true;
+                }
+            }
+        }
+
+        // Phase 3: reconstruct the value, advancing per-field delta state.
+        let mut lookup_failed = false;
+        let value = {
+            let table = match namespace {
+                KvIrNamespace::AutoGenerated => &mut self.auto_adaptive,
+                KvIrNamespace::UserGenerated => &mut self.user_adaptive,
+            };
+            let scheme = table[index]
+                .as_mut()
+                .expect("adaptive scheme present from phase 1");
+            match kind {
+                AdaptiveScheme::Delta => {
+                    let value = scheme.last().wrapping_add(delta);
+                    scheme.set_last(value);
+                    value
+                }
+                AdaptiveScheme::For => scheme.base().wrapping_add(delta),
+                AdaptiveScheme::Dict => {
+                    if escaped {
+                        literal
+                    } else {
+                        match scheme.dict_lookup(code) {
+                            Some(value) => value,
+                            None => {
+                                lookup_failed = true;
+                                0
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        if lookup_failed {
+            return Err(self.error(KvIrErrorKind::Invalid(
+                KvIrInvalidData::MalformedAdaptiveNumeric,
+            )));
+        }
+
+        Ok(if is_float {
+            StoredValueKind::Float {
+                bits: (value as f64).to_bits(),
+            }
+        } else {
+            StoredValueKind::Integer(KvIrInteger {
+                value,
+                width: KvIrIntegerWidth::Eight,
+            })
         })
     }
 
@@ -3127,6 +3339,37 @@ impl<R: Read> KvIrReader<R> {
 
     fn read_u64(&mut self, context: KvIrTruncatedContext) -> Result<u64, KvIrError> {
         Ok(u64::from_be_bytes(self.read_array(context)?))
+    }
+
+    /// Reads an unsigned LEB128 varint from the stream into the current unit. Used only by the
+    /// adaptive numeric decode path; rejects overlong encodings that spill past bit 63.
+    fn read_uvarint_unit(&mut self, context: KvIrTruncatedContext) -> Result<u64, KvIrError> {
+        let mut result: u64 = 0;
+        let mut shift: u32 = 0;
+        loop {
+            if shift >= 64 {
+                return Err(self.error(KvIrErrorKind::Invalid(
+                    KvIrInvalidData::MalformedAdaptiveNumeric,
+                )));
+            }
+            let byte = self.read_unit_byte(context)?;
+            result |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                if shift == 63 && byte > 0x01 {
+                    return Err(self.error(KvIrErrorKind::Invalid(
+                        KvIrInvalidData::MalformedAdaptiveNumeric,
+                    )));
+                }
+                return Ok(result);
+            }
+            shift += 7;
+        }
+    }
+
+    /// Reads a zigzag-then-LEB128 signed varint from the stream into the current unit.
+    fn read_svarint_unit(&mut self, context: KvIrTruncatedContext) -> Result<i64, KvIrError> {
+        let value = self.read_uvarint_unit(context)?;
+        Ok(((value >> 1) as i64) ^ -((value & 1) as i64))
     }
 
     #[inline]

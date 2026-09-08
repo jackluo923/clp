@@ -12,6 +12,7 @@ mod container_archive;
 mod input;
 pub(crate) mod json_canonical;
 mod kv_ir;
+mod kv_ir_adaptive;
 mod kv_ir_archive;
 mod kv_ir_owned_event;
 mod kv_ir_serializer;

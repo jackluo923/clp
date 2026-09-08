@@ -24,6 +24,8 @@ use super::KvIrOwnedEventNode;
 use super::KvIrOwnedValue;
 use super::KvIrReadError;
 use super::KvIrReader;
+use super::KvIrSerializer;
+use super::KvIrSerializerOptions;
 use super::KvIrSink;
 use super::KvIrStats;
 use super::KvIrTruncatedContext;
@@ -1308,4 +1310,152 @@ fn empty_and_partial_magic_are_truncation_not_clean_eof() {
             )
         });
     }
+}
+
+/// A constant nested auto-generated map — `{"level":{"info":{"seq":7}}}` — matching the shape the
+/// oracle fixtures use. `seq` is constant, so with adaptive encoding on it should switch (its deltas
+/// are all zero) and still decode back to 7.
+fn adaptive_auto_map() -> Vec<u8> {
+    vec![
+        0x81, 0xa5, b'l', b'e', b'v', b'e', b'l', 0x81, 0xa4, b'i', b'n', b'f', b'o', 0x81, 0xa3,
+        b's', b'e', b'q', 0x07,
+    ]
+}
+
+/// A user map `{"mono": <i64>, "temp": <f64>, "code": <i64>}` built with explicit msgpack int64 /
+/// float64 tags so the encoded width does not depend on magnitude. `mono` drives the delta scheme,
+/// `temp` the float-as-int path, and `code` (a few large repeated values) the dictionary scheme.
+fn adaptive_user_map(mono: i64, temp: f64, code: i64) -> Vec<u8> {
+    let mut bytes = vec![0x83];
+    bytes.extend_from_slice(&[0xa4, b'm', b'o', b'n', b'o']);
+    bytes.push(0xd3);
+    bytes.extend_from_slice(&mono.to_be_bytes());
+    bytes.extend_from_slice(&[0xa4, b't', b'e', b'm', b'p']);
+    bytes.push(0xcb);
+    bytes.extend_from_slice(&temp.to_bits().to_be_bytes());
+    bytes.extend_from_slice(&[0xa4, b'c', b'o', b'd', b'e']);
+    bytes.push(0xd3);
+    bytes.extend_from_slice(&code.to_be_bytes());
+    bytes
+}
+
+fn first_value<F, T>(event: &OwnedEvent, mut pick: F) -> T
+where
+    F: FnMut(&OwnedPair) -> Option<T>,
+{
+    event
+        .pairs
+        .iter()
+        .find_map(|pair| pick(pair))
+        .expect("event carries the expected field")
+}
+
+/// End-to-end: serialize many events with adaptive numeric encoding on, then read the bytes back
+/// through the real reader and assert every numeric value is recovered exactly. This exercises the
+/// whole streaming path — warmup, scheme-switch control records (delta, frame-of-reference, and
+/// dictionary-with-escape), adaptive value tags, the auto and user namespaces, and float-as-int
+/// restoration — that the codec unit tests cannot reach.
+#[test]
+fn adaptive_numeric_round_trips_through_reader() {
+    let warmup = 4;
+    let event_count = 24_i64;
+    // A few large, repeated values so the `code` field's bake-off picks the dictionary scheme.
+    let palette = [4_000_000_001_i64, 4_000_000_050, 4_000_000_099];
+    let mut serializer = KvIrSerializer::new(
+        KvIrSerializerOptions::new(KvIrEncoding::FourByte).with_adaptive_numeric(warmup),
+        None,
+    )
+    .expect("create serializer");
+
+    let mut expected: Vec<(i64, u64, i64)> = Vec::new();
+    for index in 0..event_count {
+        // `mono` climbs monotonically (delta); `temp` is an exact integer stored as a float
+        // (float-as-int); `code` repeats a small palette (dictionary), except one post-warmup value
+        // that is off the table so the reader must take the dictionary escape.
+        let mono = 1_000_000_000 + index * 13;
+        let temp = (500 + (index % 5) * 7 - 14) as f64;
+        let code = if index == 17 {
+            9_999_999_999
+        } else {
+            palette[(index % 3) as usize]
+        };
+        expected.push((mono, temp.to_bits(), code));
+        serializer
+            .serialize_log_event_from_msgpack_maps(
+                &adaptive_auto_map(),
+                &adaptive_user_map(mono, temp, code),
+            )
+            .expect("serialize event");
+    }
+    serializer.finish().expect("finish stream");
+    let bytes = serializer.pending_output().to_vec();
+
+    let (_stats, capture) = decode(bytes.as_slice(), KvIrOptions::default());
+
+    // Enabling adaptive stamps the adaptive protocol version.
+    assert_eq!(capture.versions, vec!["0.2.0".to_owned()]);
+    assert_eq!(capture.events.len(), event_count as usize);
+
+    // Resolve each user field's node id so the two integer fields can be told apart.
+    let user_node = |key: &[u8]| -> u32 {
+        capture
+            .schemas
+            .iter()
+            .find(|node| node.namespace == KvIrNamespace::UserGenerated && node.key == key)
+            .expect("schema node for user key")
+            .node_id
+    };
+    let mono_id = user_node(b"mono");
+    let temp_id = user_node(b"temp");
+    let code_id = user_node(b"code");
+
+    let user_int = |event: &OwnedEvent, node_id: u32| -> i64 {
+        first_value(event, |pair| match (pair.namespace, pair.node_id, &pair.value) {
+            (KvIrNamespace::UserGenerated, id, OwnedValue::Integer(value, _)) if id == node_id => {
+                Some(*value)
+            }
+            _ => None,
+        })
+    };
+
+    for (index, event) in capture.events.iter().enumerate() {
+        let seq = first_value(event, |pair| match (pair.namespace, &pair.value) {
+            (KvIrNamespace::AutoGenerated, OwnedValue::Integer(value, _)) => Some(*value),
+            _ => None,
+        });
+        let temp_bits = first_value(event, |pair| match (pair.namespace, pair.node_id, &pair.value) {
+            (KvIrNamespace::UserGenerated, id, OwnedValue::Float(bits)) if id == temp_id => {
+                Some(*bits)
+            }
+            _ => None,
+        });
+        assert_eq!(seq, 7, "event {index} auto seq");
+        assert_eq!(user_int(event, mono_id), expected[index].0, "event {index} mono");
+        assert_eq!(temp_bits, expected[index].1, "event {index} temp");
+        assert_eq!(user_int(event, code_id), expected[index].2, "event {index} code");
+    }
+}
+
+/// Adaptive off (the default) must stay byte-identical to the baseline: same protocol version, same
+/// output. Combined with the cpp-oracle tests this guards against the adaptive plumbing perturbing
+/// the default stream.
+#[test]
+fn adaptive_disabled_keeps_baseline_version_and_bytes() {
+    let build = |options: KvIrSerializerOptions| {
+        let mut serializer = KvIrSerializer::new(options, None).expect("create serializer");
+        for index in 0..8_i64 {
+            serializer
+                .serialize_log_event_from_msgpack_maps(
+                    &adaptive_auto_map(),
+                    &adaptive_user_map(1_000 + index, index as f64, index),
+                )
+                .expect("serialize event");
+        }
+        serializer.finish().expect("finish stream");
+        serializer.pending_output().to_vec()
+    };
+
+    let baseline = build(KvIrSerializerOptions::new(KvIrEncoding::FourByte));
+    let (_stats, capture) = decode(baseline.as_slice(), KvIrOptions::default());
+    assert_eq!(capture.versions, vec!["0.1.0".to_owned()]);
 }
