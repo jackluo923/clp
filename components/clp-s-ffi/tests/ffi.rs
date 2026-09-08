@@ -1327,7 +1327,7 @@ fn kv_ir_serializer_validates_options_pointer_shapes_limits_and_short_errors() {
     assert!(error.required > text.len());
 
     let options = ClpSKvIrSerializerOptions {
-        reserved: [0, 0, 1, 0],
+        reserved: [0, 1, 0],
         ..ClpSKvIrSerializerOptions::default()
     };
     // SAFETY: Every pointer names live storage; the nonzero reserved field is tested.

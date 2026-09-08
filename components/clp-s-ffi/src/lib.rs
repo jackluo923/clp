@@ -261,8 +261,14 @@ pub struct ClpSKvIrSerializerOptions {
     pub max_values_per_map: u64,
     /// Maximum bytes in one `MessagePack` scalar, or zero for the default.
     pub max_scalar_bytes: u64,
+    /// Online adaptive numeric encoding warmup, in values observed per field before a codec is
+    /// chosen. Zero disables adaptive numeric encoding (the default). Carved from the ABI-v1
+    /// reserved block, so the structure size and every other field offset are unchanged.
+    pub adaptive_warmup: u32,
+    /// Padding that keeps the trailing `reserved` block eight-byte aligned; must be zero.
+    pub reserved_padding: u32,
     /// Reserved for ABI-compatible extension; every element must be zero in ABI v1.
-    pub reserved: [u64; 4],
+    pub reserved: [u64; 3],
 }
 
 impl Default for ClpSKvIrSerializerOptions {
@@ -279,7 +285,9 @@ impl Default for ClpSKvIrSerializerOptions {
             max_nesting_depth: 0,
             max_values_per_map: 0,
             max_scalar_bytes: 0,
-            reserved: [0; 4],
+            adaptive_warmup: 0,
+            reserved_padding: 0,
+            reserved: [0; 3],
         }
     }
 }
@@ -543,7 +551,9 @@ const _: () = {
     assert!(std::mem::offset_of!(ClpSKvIrSerializerOptions, max_nesting_depth) == 48);
     assert!(std::mem::offset_of!(ClpSKvIrSerializerOptions, max_values_per_map) == 56);
     assert!(std::mem::offset_of!(ClpSKvIrSerializerOptions, max_scalar_bytes) == 64);
-    assert!(std::mem::offset_of!(ClpSKvIrSerializerOptions, reserved) == 72);
+    assert!(std::mem::offset_of!(ClpSKvIrSerializerOptions, adaptive_warmup) == 72);
+    assert!(std::mem::offset_of!(ClpSKvIrSerializerOptions, reserved_padding) == 76);
+    assert!(std::mem::offset_of!(ClpSKvIrSerializerOptions, reserved) == 80);
     assert!(std::mem::size_of::<ClpSKvIrSerializerOptions>() == 104);
 
     assert!(std::mem::offset_of!(ClpSKvIrPendingView, data) == 0);
@@ -915,7 +925,7 @@ unsafe fn kv_ir_serializer_options(
             options.struct_size
         )));
     }
-    if options.reserved.iter().any(|value| 0 != *value) {
+    if 0 != options.reserved_padding || options.reserved.iter().any(|value| 0 != *value) {
         return Err(ApiError::InvalidArgument(
             "KV-IR serializer options reserved fields must be zero".to_owned(),
         ));
@@ -963,7 +973,13 @@ unsafe fn kv_ir_serializer_options(
             options.max_scalar_bytes,
             defaults.max_scalar_bytes(),
         ));
-    Ok(KvIrSerializerOptions::new(encoding).with_limits(limits))
+    let serializer_options = KvIrSerializerOptions::new(encoding).with_limits(limits);
+    let serializer_options = if 0 == options.adaptive_warmup {
+        serializer_options
+    } else {
+        serializer_options.with_adaptive_numeric(options.adaptive_warmup)
+    };
+    Ok(serializer_options)
 }
 
 /// Decodes nullable metadata, preserving the distinction between absent and present-but-empty.

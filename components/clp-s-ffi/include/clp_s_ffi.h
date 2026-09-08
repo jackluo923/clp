@@ -101,7 +101,11 @@ typedef struct clp_s_kv_ir_serializer_options {
     uint64_t max_nesting_depth;
     uint64_t max_values_per_map;
     uint64_t max_scalar_bytes;
-    uint64_t reserved[4];
+    /* Online adaptive numeric encoding warmup (values per field before a codec is chosen); zero
+     * disables it. Carved from the reserved block, so the struct size is unchanged. */
+    uint32_t adaptive_warmup;
+    uint32_t reserved_padding;
+    uint64_t reserved[3];
 } clp_s_kv_ir_serializer_options;
 
 /**
@@ -705,7 +709,11 @@ CLP_S_ABI_STATIC_ASSERT(
         "KV-IR options scalar limit offset"
 );
 CLP_S_ABI_STATIC_ASSERT(
-        offsetof(clp_s_kv_ir_serializer_options, reserved) == 72,
+        offsetof(clp_s_kv_ir_serializer_options, adaptive_warmup) == 72,
+        "KV-IR options adaptive warmup offset"
+);
+CLP_S_ABI_STATIC_ASSERT(
+        offsetof(clp_s_kv_ir_serializer_options, reserved) == 80,
         "KV-IR options reserved offset"
 );
 CLP_S_ABI_STATIC_ASSERT(
