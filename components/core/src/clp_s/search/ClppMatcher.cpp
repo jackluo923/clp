@@ -223,6 +223,22 @@ auto ClppMatcher::decompose_by_log_shapes(std::string_view query)
     return matches;
 }
 
+auto ClppMatcher::ensure_parser() -> ystdlib::error_handling::Result<void> {
+    if (nullptr != m_parser) {
+        return ystdlib::error_handling::success();
+    }
+    PROFILE_SCOPE("clpp_parser_init");
+    std::string spec;
+    {
+        PROFILE_SCOPE("parsing_spec_read");
+        spec = YSTDLIB_ERROR_HANDLING_TRYX(m_archive_reader->read_parsing_spec());
+    }
+    m_parser = std::make_unique<log_surgeon::Parser>(
+            log_surgeon::ParsingSpecBuilder{std::move(spec)}.build()
+    );
+    return ystdlib::error_handling::success();
+}
+
 auto ClppMatcher::decompose_by_engine(
         std::string_view query,
         std::vector<clpp::log_shape_id_t> const& log_shape_ids,
@@ -240,13 +256,7 @@ auto ClppMatcher::decompose_by_engine(
         log_shapes.emplace_back(entries.at(shape_id).get_value());
     }
 
-    if (nullptr == m_parser) {
-        PROFILE_SCOPE("clpp_parser_init");
-        m_parser = std::make_unique<log_surgeon::Parser>(log_surgeon::ParsingSpecBuilder{
-                YSTDLIB_ERROR_HANDLING_TRYX(m_archive_reader->read_parsing_spec())
-        }
-                                                                 .build());
-    }
+    YSTDLIB_ERROR_HANDLING_TRYV(ensure_parser());
     auto interpretations_by_shape{clpp::decompose_by_log_shapes(*m_parser, query, log_shapes)};
     for (size_t local_id{0}; local_id < interpretations_by_shape.size(); ++local_id) {
         auto const log_shape_id{log_shape_ids.at(local_id)};
@@ -262,12 +272,8 @@ auto ClppMatcher::decompose_by_engine(
 
 auto ClppMatcher::decompose_by_rule_name(std::string_view query, std::string_view rule_name)
         -> ystdlib::error_handling::Result<std::vector<InterpretationMatch>> {
-    if (nullptr == m_parser) {
-        m_parser = std::make_unique<log_surgeon::Parser>(log_surgeon::ParsingSpecBuilder{
-                YSTDLIB_ERROR_HANDLING_TRYX(m_archive_reader->read_parsing_spec())
-        }
-                                                                 .build());
-    }
+    PROFILE_SCOPE("clpp_decompose_by_rule_name");
+    YSTDLIB_ERROR_HANDLING_TRYV(ensure_parser());
     auto interpretations{clpp::decompose_by_rule_name(*m_parser, query, rule_name)};
     std::vector<InterpretationMatch> matches;
     matches.reserve(interpretations.size());

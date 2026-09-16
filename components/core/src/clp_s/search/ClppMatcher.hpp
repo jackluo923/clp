@@ -130,6 +130,13 @@ private:
     ) -> ystdlib::error_handling::Result<void>;
 
     /**
+     * Builds the engine parser from the archive's parsing spec on first use.
+     * @return A void result on success, or an error code indicating the failure:
+     * - Forwards `ArchiveReader::read_parsing_spec`'s return values.
+     */
+    [[nodiscard]] auto ensure_parser() -> ystdlib::error_handling::Result<void>;
+
+    /**
      * Get the parent rule shapes named `rule_name` from `log_shape_id` or the entire log shape if
      * `rule_name` is empty.
      * @throw Propagates `ArchiveReader::get_parent_rule_shapes`'s exceptions.
