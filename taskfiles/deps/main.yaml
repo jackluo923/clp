@@ -311,13 +311,15 @@ tasks:
       - task: "yscope-dev-utils:remote:download-and-extract-tar"
         vars:
           CHECKSUM_FILE: "{{.G_DEPS_CPP_CHECKSUMS_DIR}}/{{.LIB_NAME}}.md5"
-          FILE_SHA256: "b2ec002751ef087d497c542df8603100eeb9f530c96e4115855b6438959552fa"
+          FILE_SHA256: "7f8bb69f7feb6e134dc46b67b552aa33bf04d1f100b97642307e2a1632dc3b6f"
           OUTPUT_DIR: "{{.OUTPUT_DIR}}"
-          URL: "https://github.com/modelconsumer/log-surgeon/archive/bb41b06.tar.gz"
+          URL: "https://github.com/jackluo923/log-surgeon/archive/96a4fb4.tar.gz"
       - |-
         . "{{.G_RUST_TOOLCHAIN_ENV_FILE}}"
         cd "{{.SRC_DIR}}"
-        cargo build --release
+        # NOTE: `--no-default-features` drops the `jit` feature: the Cranelift JIT costs ~7 s per
+        # process in `Parser::new` and does not pay for itself in clp-s.
+        cargo build --release --no-default-features
         mkdir -p "{{.INSTALL_INCLUDE_DIR}}" "{{.INSTALL_LIB_DIR}}" "{{.INSTALL_CMAKE_DIR}}"
         cp "{{.G_BUILD_DIR}}/rust-targets/release/liblog_surgeon.a" "{{.INSTALL_LIB_DIR}}"
         cp -r "{{.SRC_DIR}}/cxx/log_surgeon" "{{.INSTALL_INCLUDE_DIR}}"
