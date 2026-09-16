@@ -200,10 +200,29 @@ private:
     ) -> std::shared_ptr<ast::Expression>;
 
     /**
-     * Reads the dictionaries needed to read the columns in the given schema view, recursing into
-     * unordered object sub-schemas.
+     * The dictionaries a set of schemas needs, as a bitmask of `DictionaryNeed` flags.
      */
-    auto read_dictionaries_for_schema(SchemaView const& schema) -> void;
+    enum DictionaryNeed : uint8_t {
+        cVarDict = 1U << 0U,
+        cLogTypeDict = 1U << 1U,
+        cArrayDict = 1U << 2U,
+        cLogShapeDict = 1U << 3U,
+        cParentRuleShapes = 1U << 4U,
+    };
+
+    /**
+     * Records the dictionaries needed to read the columns in the given schema view, recursing into
+     * unordered object sub-schemas.
+     * @param schema
+     * @param needs Bitmask of `DictionaryNeed` flags to OR the schema's needs into.
+     */
+    auto collect_dictionary_needs(SchemaView const& schema, uint8_t& needs) -> void;
+
+    /**
+     * Reads the dictionaries flagged in `needs`.
+     * @param needs Bitmask of `DictionaryNeed` flags.
+     */
+    auto read_dictionaries(uint8_t needs) -> void;
 
     // Data members
     std::unordered_map<uint32_t, std::set<std::shared_ptr<ast::ColumnDescriptor>>>

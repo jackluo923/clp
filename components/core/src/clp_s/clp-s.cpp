@@ -522,14 +522,18 @@ bool search_archive(
     }
 
     // Narrow against schemas
-    auto match_pass = std::make_shared<SchemaMatch>(
-            archive_reader,
-            !command_line_arguments.get_ignore_case()
-    );
-    if (expr = match_pass->run(expr); std::dynamic_pointer_cast<ast::EmptyExpr>(expr)) {
-        record_early_termination(cTerminationStageSchemaMatching);
-        SPDLOG_INFO("No matching schemas for query '{}'", query);
-        return true;
+    std::shared_ptr<SchemaMatch> match_pass;
+    {
+        PROFILE_SCOPE("schema_match");
+        match_pass = std::make_shared<SchemaMatch>(
+                archive_reader,
+                !command_line_arguments.get_ignore_case()
+        );
+        if (expr = match_pass->run(expr); std::dynamic_pointer_cast<ast::EmptyExpr>(expr)) {
+            record_early_termination(cTerminationStageSchemaMatching);
+            SPDLOG_INFO("No matching schemas for query '{}'", query);
+            return true;
+        }
     }
 
     // Populate projection
@@ -588,7 +592,11 @@ bool search_archive(
             std::move(output_handler.value()),
             command_line_arguments.get_ignore_case()
     );
-    auto const success{output.filter()};
+    bool success{false};
+    {
+        PROFILE_SCOPE("output_filter");
+        success = output.filter();
+    }
     if (nullptr != telemetry_span) {
         if (false == success) {
             telemetry_span->set_error("archive filtering failed");

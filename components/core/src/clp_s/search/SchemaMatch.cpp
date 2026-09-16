@@ -36,6 +36,7 @@
 #include <clp_s/search/ast/StringLiteral.hpp>
 #include <clpp/Defs.hpp>
 #include <clpp/Interpretation.hpp>
+#include <utils/profiling/ScopedProfiler.hpp>
 
 using clp_s::search::ast::AndExpr;
 using clp_s::search::ast::ColumnDescriptor;
@@ -81,7 +82,10 @@ SchemaMatch::SchemaMatch(std::shared_ptr<ArchiveReader> archive_reader, bool cas
 
 std::shared_ptr<Expression> SchemaMatch::run(std::shared_ptr<Expression>& expr) {
     ConstantProp propagate_empty;
-    expr = populate_column_mapping(expr);
+    {
+        PROFILE_SCOPE("schema_match_populate_column_mapping");
+        expr = populate_column_mapping(expr);
+    }
     expr = propagate_empty.run(expr);
     if (std::dynamic_pointer_cast<EmptyExpr>(expr)) {
         return expr;
@@ -90,6 +94,7 @@ std::shared_ptr<Expression> SchemaMatch::run(std::shared_ptr<Expression>& expr) 
     // if we had ambiguous column descriptors containing regex which were
     // resolved we need to restandardize the expression
     if (false == m_unresolved_descriptor_to_descriptor.empty() || m_clpp_decomposed_query) {
+        PROFILE_SCOPE("schema_match_restandardize");
         m_column_to_descriptor.clear();
         m_unresolved_descriptor_to_descriptor.clear();
 
@@ -98,19 +103,33 @@ std::shared_ptr<Expression> SchemaMatch::run(std::shared_ptr<Expression>& expr) 
         expr = populate_column_mapping(expr);
     }
 
-    populate_schema_mapping();
+    {
+        PROFILE_SCOPE("schema_match_populate_schema_mapping");
+        populate_schema_mapping();
+    }
 
-    expr = intersect_schemas(expr);
-    expr = propagate_empty.run(expr);
+    {
+        PROFILE_SCOPE("schema_match_intersect_schemas");
+        expr = intersect_schemas(expr);
+        expr = propagate_empty.run(expr);
+    }
 
     if (std::dynamic_pointer_cast<EmptyExpr>(expr)) {
         return expr;
     }
 
-    split_expression_by_schema(expr, m_schema_to_query, m_matched_schema_ids);
+    {
+        PROFILE_SCOPE("schema_match_split_by_schema");
+        split_expression_by_schema(expr, m_schema_to_query, m_matched_schema_ids);
+    }
 
-    for (auto const schema_id : m_matched_schema_ids) {
-        read_dictionaries_for_schema((*m_schemas)[schema_id].get_view());
+    {
+        PROFILE_SCOPE("schema_match_read_dictionaries");
+        uint8_t needs{0};
+        for (auto const schema_id : m_matched_schema_ids) {
+            collect_dictionary_needs((*m_schemas)[schema_id].get_view(), needs);
+        }
+        read_dictionaries(needs);
     }
 
     return expr;
@@ -820,21 +839,19 @@ void SchemaMatch::add_searched_column_to_schema(int32_t schema, int32_t column) 
     m_schema_to_searched_columns[schema].insert(column);
 }
 
-auto SchemaMatch::read_dictionaries_for_schema(SchemaView const& schema) -> void {
+auto SchemaMatch::collect_dictionary_needs(SchemaView const& schema, uint8_t& needs) -> void {
     schema.visit_entries(
             [&](SchemaNode::id_t column_id) -> bool {
                 switch (m_tree->get_node(column_id).get_type()) {
                     case NodeType::DictionaryFloat:
                     case NodeType::VarString:
-                        m_archive_reader->get_variable_dictionary();
+                        needs |= cVarDict;
                         break;
                     case NodeType::ClpString:
-                        m_archive_reader->get_variable_dictionary();
-                        m_archive_reader->get_log_type_dictionary();
+                        needs |= cVarDict | cLogTypeDict;
                         break;
                     case NodeType::UnstructuredArray:
-                        m_archive_reader->get_variable_dictionary();
-                        m_archive_reader->get_array_dictionary();
+                        needs |= cVarDict | cArrayDict;
                         break;
                     default:
                         break;
@@ -843,14 +860,32 @@ auto SchemaMatch::read_dictionaries_for_schema(SchemaView const& schema) -> void
             },
             [&](UnorderedObject const& obj) -> bool {
                 if (NodeType::LogMessage == obj.type) {
-                    m_archive_reader->get_log_shape_dictionary();
+                    needs |= cLogShapeDict;
                 } else if (NodeType::ParentRule == obj.type) {
-                    m_archive_reader->get_parent_rule_shapes();
+                    needs |= cParentRuleShapes;
                 }
-                read_dictionaries_for_schema(obj.sub_schema);
+                collect_dictionary_needs(obj.sub_schema, needs);
                 return false;
             }
     );
+}
+
+auto SchemaMatch::read_dictionaries(uint8_t needs) -> void {
+    if (0 != (needs & cVarDict)) {
+        m_archive_reader->get_variable_dictionary();
+    }
+    if (0 != (needs & cLogTypeDict)) {
+        m_archive_reader->get_log_type_dictionary();
+    }
+    if (0 != (needs & cArrayDict)) {
+        m_archive_reader->get_array_dictionary();
+    }
+    if (0 != (needs & cLogShapeDict)) {
+        m_archive_reader->get_log_shape_dictionary();
+    }
+    if (0 != (needs & cParentRuleShapes)) {
+        m_archive_reader->get_parent_rule_shapes();
+    }
 }
 
 LiteralType

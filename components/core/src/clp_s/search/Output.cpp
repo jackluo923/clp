@@ -17,6 +17,8 @@
 #include "ast/OrExpr.hpp"
 #include "EvaluateTimestampIndex.hpp"
 
+#include <utils/profiling/ScopedProfiler.hpp>
+
 using clp_s::search::ast::AndExpr;
 using clp_s::search::ast::ColumnDescriptor;
 using clp_s::search::ast::DescriptorList;
@@ -76,26 +78,36 @@ bool Output::filter() {
         return true;
     }
 
-    m_query_runner.global_init();
+    {
+        PROFILE_SCOPE("query_runner_global_init");
+        m_query_runner.global_init();
+    }
     m_archive_reader->open_packed_streams();
 
     std::string message;
     auto const archive_id = m_archive_reader->get_archive_id();
     bool scanned_any_ert{false};
     for (int32_t schema_id : matched_schemas) {
-        if (EvaluatedValue::False == m_query_runner.schema_init(schema_id)) {
-            continue;
+        {
+            PROFILE_SCOPE("query_runner_schema_init");
+            if (EvaluatedValue::False == m_query_runner.schema_init(schema_id)) {
+                continue;
+            }
         }
         scanned_any_ert = true;
         ++m_result_metrics.num_schemas_scanned;
         m_result_metrics.num_messages_evaluated
                 += m_archive_reader->get_num_messages_for_schema(schema_id);
 
-        auto& reader = m_archive_reader->read_schema_table(
-                schema_id,
-                m_output_handler->should_output_metadata(),
-                m_should_marshal_records
-        );
+        PROFILE_SCOPE("schema_scan");
+        auto& reader = [&]() -> SchemaReader& {
+            PROFILE_SCOPE("read_schema_table");
+            return m_archive_reader->read_schema_table(
+                    schema_id,
+                    m_output_handler->should_output_metadata(),
+                    m_should_marshal_records
+            );
+        }();
         auto& filter = m_query_runner.prepare_filter(reader);
         if (nullptr != dynamic_cast<ColumnScan*>(&filter)) {
             ++m_result_metrics.num_column_scan_filters;
