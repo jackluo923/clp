@@ -152,6 +152,14 @@ private:
     ) const -> std::unordered_set<int32_t>;
 
     /**
+     * Reads the archive's rule value index and builds the per-shape tables (`m_shape_ok`,
+     * `m_compact_shapes` or `m_shape_skeletons`) on first use, so queries that never decompose
+     * against the log shapes (leaf, shape and parent-rule queries) do not pay for them.
+     * @throw Propagates `ArchiveReader::get_rule_value_index`'s exceptions.
+     */
+    auto prepare_shapes() -> void;
+
+    /**
      * Selects the shapes that could possibly match `query`, so the expensive per-shape query
      * intersection only runs on candidates.
      *
@@ -181,6 +189,8 @@ private:
     ArchiveReader* m_archive_reader;
     bool m_case_sensitive{false};
     std::vector<std::unordered_set<int32_t>> m_schemas_by_log_shape;
+    // Whether `prepare_shapes` has run; the members below it are empty until then.
+    bool m_shapes_prepared{false};
     // Per log shape ID: false if the shape is malformed and must always be a candidate.
     std::vector<bool> m_shape_ok;
     // Per log shape ID: a placeholder-as-wildcard tokenization of the shape, built once (only when

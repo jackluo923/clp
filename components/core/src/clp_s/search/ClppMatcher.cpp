@@ -49,8 +49,15 @@ ClppMatcher::ClppMatcher(ArchiveReader* archive_reader, bool case_sensitive)
             m_schemas_by_log_shape.at(*log_shape_id).emplace(schema_id);
         }
     }
+}
 
-    auto const& shape_entries{log_shape_dict->get_entries()};
+auto ClppMatcher::prepare_shapes() -> void {
+    if (m_shapes_prepared) {
+        return;
+    }
+    m_shapes_prepared = true;
+    PROFILE_SCOPE("clpp_prepare_shapes");
+    auto const& shape_entries{m_archive_reader->get_log_shape_dictionary()->get_entries()};
     m_shape_ok.assign(shape_entries.size(), false);
     {
         PROFILE_SCOPE("rule_value_index_read");
@@ -161,6 +168,7 @@ auto ClppMatcher::to_interpretation(ShapeInterpretation const& interpretation) c
 auto ClppMatcher::decompose_by_log_shapes(std::string_view query)
         -> ystdlib::error_handling::Result<std::vector<InterpretationMatch>> {
     PROFILE_SCOPE("clpp_decompose_by_log_shapes");
+    prepare_shapes();
     // Without an index, only hand the shapes that could possibly match to the engine; each dropped
     // shape would otherwise pay a per-shape query intersection and an NFA rebuild.
     auto const candidate_ids{select_candidate_shapes(query)};
