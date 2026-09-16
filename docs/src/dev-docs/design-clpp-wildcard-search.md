@@ -1,7 +1,7 @@
 # clpp wildcard search: from 20–40 s to ~150 ms per query
 
-Branch `clpp-wildcard-search` (`jackluo923/clp`): seven code commits on top of the oss baseline
-`772db1bb` — one per clp-s optimization plus a dependency bump (§5) — followed by this document. The Rust engine changes live in
+Branch `clpp-wildcard-search` (`jackluo923/clp`): eight code commits on top of the oss baseline
+`772db1bb` — one per clp-s optimization plus a dependency bump (§5) — and this document. The Rust engine changes live in
 `jackluo923/log-surgeon`, branch `clpp-search-prefilter` (`bb41b06` + two commits), which the bump
 pins. Build and run instructions: §4.
 
@@ -20,8 +20,76 @@ same data — by
 3. using the column filters to **skip whole schema tables** before they are decompressed, and
    vectorising numeric wildcard leaves in `ColumnScan`.
 
-Hive 24-hour log, 6,864,523 records, 1,270 log shapes, 1,283 schemas; median of 3 wall-clock runs
-of `clp-s s … --count`:
+Hive 24-hour log, 6,864,523 records, 1,270 log shapes, 1,283 schemas; every cell is the median of
+3 wall-clock runs of `clp-s s … --count` unless footnoted. A clpp wildcard can target three
+different things (§A.6), and each takes a different path through the code, so the results are
+grouped by target:
+
+1. **a log shape or a leaf value** — `shape(message): "*Receiving BP-*"`,
+   `message.blockID.blockNum: 1073746491`. Dictionary and column lookups; oss clpp was already fast
+   here, so the bar is "no regression".
+2. **a parent variable, with the wildcard inside it** — `message.blockPoolID: BP-1121897155-*`.
+   The engine decomposes the wildcard against that one rule's sub-patterns
+   (`decompose_by_rule_name`); oss clpp paid the ~7 s engine JIT on every such query.
+3. **the whole message field** — `message: *blk_1073746491_5667*`. The query is decomposed against
+   every log shape; 20–40 s in oss clpp, and what §§1–3 are about.
+
+### Category 1 — log shape and leaf values (already fast in oss clpp)
+
+| query | count | clp-s¹ | oss clpp | **optimized clpp** | vs clp-s¹ | vs oss clpp |
+|---|---|---|---|---|---|---|
+| `message.blockID.blockNum: 1073746491` | 23 | 2.44 s | 0.070 s | **0.071 s** | 34× | 0.99× |
+| `message.blockID.blockNum: 10737464*` | 2,608 | 2.43 s | 0.171 s | **0.082 s** | 30× | 2.1× |
+| `message.blockID.blockNum: 1073746491 AND message.blockID.genStamp: 5667` | 23 | 0.63 s | 0.069 s | **0.073 s** | 8.6× | 0.95× |
+| `message.blockPoolID.poolID: 1121897155` | 109,484 | 2.39 s | 0.068 s | **0.071 s** | 34× | 0.96× |
+| `message.containerID.appSeq: 0099` | 114,918 | 0.76 s | 0.116 s | **0.072 s** | 11× | 1.6× |
+| `message.attemptID.type: m` | 980,424 | 1.33 s | 0.148 s | **0.139 s** | 9.6× | 1.06× |
+| `message.hostPort.host: 172.31.17.31` | 159 | 0.64 s | 0.135 s | **0.064 s** | 10× | 2.1× |
+| `shape(message): "*Receiving BP-*"` | 20,500 | 0.60 s | 0.062 s | **0.067 s** | 9.0× | 0.93× |
+| `shape(message): "*PacketResponder*" AND message.blockID.blockNum: 1073746491` | 3 | 1.68 s | 0.064 s | **0.065 s** | 26× | 0.98× |
+| `shape(message): "*%blockID.blockNum%*" AND message.hostPort.host: 172.31.17.31` | 104 | 1.78 s | 0.061 s | **0.066 s** | 27× | 0.92× |
+| **mean speedup (geometric, 10 queries)** | | | | | **17×** | **1.2×** |
+
+Both clpp builds sit at the ~60–70 ms process floor; the optimized build wins where a leaf value
+is a wildcard or a string (§2.3, §2.4) and is within ±6 ms (noise) elsewhere. The first optimized
+build *had* regressed this category to 96–166 ms because it read the value index and built the
+compact shapes for every query; commit `4a0b3b61` builds them only on the first whole-message
+decomposition (`ClppMatcher::prepare_shapes`).
+
+### Category 2 — parent variable, wildcard inside it
+
+| query | count | clp-s¹ | oss clpp | **optimized clpp** | vs clp-s¹ | vs oss clpp |
+|---|---|---|---|---|---|---|
+| `message.blockPoolID: BP-1121897155-*` | 109,484 | 0.64 s | 7.29 s | **0.166 s** | 3.9× | 44× |
+| `message.blockPoolID: *-1427088167814` | 109,484 | 2.33 s | 7.30 s | **0.163 s** | 14× | 45× |
+| `message.containerID: container_1427088391284_0099_*` | 114,917 | 0.69 s | 7.34 s | **0.165 s** | 4.2× | 44× |
+| `message.containerID: *_0099_01_000001` | 114,918 | 0.67 s | 7.41 s | **0.164 s** | 4.1× | 45× |
+| `message.attemptID: attempt_1427088391284_0059_*` | 33,187 | 0.73 s | 7.13 s | **0.255 s** | 2.9× | 28× |
+| `message.attemptID: *_m_000001_0` | 13,587 | 0.76 s | 7.15 s | **0.242 s** | 3.1× | 30× |
+| `message.jobID: job_1427088391284_0*` | 44,824 | 0.93 s | 7.41 s | **0.171 s** | 5.4× | 43× |
+| `message.yarnAppID: *_0036` | 2,070 | 0.80 s | 7.38 s | **0.164 s** | 4.9× | 45× |
+| `message.taskID: *_m_000001` | 540 | 0.79 s | 7.42 s | **0.156 s** | 5.1× | 48× |
+| `message.blockID: *_5667` | 23 | 0.62 s | 7.03 s | **0.164 s** | 3.8× | 43× |
+| `message.blockID: blk_1073746491_?667` | 23 | 1.75 s | 7.47 s | **0.171 s** | 10× | 44× |
+| `message.prefix: "INFO org.apache.hadoop.hdfs.*"` | 160,501 | 0.63 s | 7.43 s | **0.181 s** | 3.5× | 41× |
+| `message.prefix: "WARN *"` | 15,544 | 0.60 s | 7.42 s | **0.161 s** | 3.8× | 46× |
+| `message.byteSize: *MB` | 207 | 0.60 s | 7.33 s | **0.153 s** | 3.9× | 48× |
+| **mean speedup (geometric, 14 queries)** | | | | | **4.7×** | **42×** |
+
+The 7 s is the engine JIT in `Parser::new` (§A.2), paid once per process. Without it the parser
+build is 85–90 ms of the optimized build's ~165 ms — 15 ms to read the 279 KB `parsing_specification`
+section and ~70 ms in `ParsingSpecBuilder::build` (rule regexes → per-rule automata, search NFA,
+cached-DFA setup; `telemetry-cat2-final.log`) — the decomposition itself is under a millisecond,
+and the rest is the same dictionary read and schema scan the other categories pay. That parser
+build is the next lever for this category (§7). The `attemptID` rows are slower because the
+schemas that hold `attempt_…` values are large: 1.7 M records across 30 schemas for the first row
+(109 K across 45 for the `blockPoolID` rows), so `read_schema_table` costs 80 ms instead of 8.
+One quirk inherited from oss and left alone: a `*` that has to cover
+exactly one trailing sub-pattern after a delimiter (`message.jobID: job_1427088391284_*`,
+`message.blockID: blk_1073746491_*`) returns 0 in **both** builds, while `job_1427088391284_0*`
+returns 44,824 and `blk_1073746491_?667` 23 — see §A.6.
+
+### Category 3 — the whole message field
 
 | query | count | clp-s | oss clpp | **optimized clpp** | vs clp-s | vs oss clpp |
 |---|---|---|---|---|---|---|
@@ -36,25 +104,38 @@ of `clp-s s … --count`:
 | `*type=LAST_IN_PIPELINE*` | 5,920 | 0.61 s | 22.0 s | **0.126 s** | 4.8× | 175× |
 | `*DataNode*` | 67,412 | 0.63 s | 21.8 s | **0.146 s** | 4.3× | 149× |
 | `*INFO*` | 6,706,343 | 0.64 s | 21.7 s | **0.45 s** | 1.4× | 48× |
-| `*a*b*` | 2,946,453 | 1.64 s | 215 s² | **0.67 s** | 2.4× | 321× |
-| `*?????*` | 6,863,835 | 1.43 s | 475 s¹ ² | **0.89 s** | 1.6× | 534× |
+| `*a*b*` | 2,946,453 | 1.64 s | 215 s³ | **0.67 s** | 2.4× | 321× |
+| `*?????*` | 6,863,835 | 1.43 s | 475 s² ³ | **0.89 s** | 1.6× | 534× |
 | `*zzzz*` (no match) | 0 | 0.025 s | 22.7 s | **0.065 s** | 0.38× | 349× |
 | **mean speedup (geometric, 14 queries)** | | | | | **3.8×** | **170×** |
 
-¹ oss clpp returns **6,864,518** here, not 6,863,835: it over-matches the 683 records whose message
+¹ clp-s (non-CLP+) stores `message` as one string and cannot address a leaf or a parent variable
+at all, so the `clp-s` cell in categories 1–2 is the *nearest full-message substring query*
+(`message: *1121897155*` for `message.blockPoolID.poolID: 1121897155`, `message: *BP-1121897155-*`
+for `message.blockPoolID: BP-1121897155-*`), which usually over-matches — 129,079 instead of
+109,484 in both of those. The exact substitute query and its count for every row are listed in
+§A.6; "vs clp-s" in those two tables therefore compares a precise clpp query against a looser
+clp-s one, and is a lower bound on the gap.
+² oss clpp returns **6,864,518** here, not 6,863,835: it over-matches the 683 records whose message
 is ` ` or ` OK` (2–4 characters). The raw JSONL has exactly 6,863,835 records with a message of
 ≥ 5 characters, which is what clp-s, the optimized build, and the optimized build's engine
 fallback path (`diff-2.log`) all return — so the over-match is confined to the oss build (unpatched
 engine + oss matcher) and was not investigated further.
-² Single runs (`bench-pristine.log`, heavy block); every other cell is a median of 3. oss clpp
+³ Single runs (`bench-pristine.log`, heavy block); every other cell is a median of 3. oss clpp
 values for the first block-ID, `*Exception*` and `*.log*` rows were re-measured on an idle machine
 (`bench-pristine-three.log`) after an earlier single run under load had given 31.4/28.6/29.3 s.
 
 *clp-s* = the same `clp-s` binary without `--experimental` (regular, non-CLP+ mode), archive `hive-24hr-plain`;
 *oss clpp* = branch HEAD `772db1bb` with the unpatched engine, archive `hive-24hr-clpp-cached`;
-*optimized clpp* = branch head `2c9b2b26` with the patched no-jit engine (§4.1), archive `hive-24hr-clpp-cvf`.
-Every count agrees across the three except `*?????*` on oss clpp (footnote ¹); a 43-query
-differential and a decode-and-grep of the raw log agree too (§6).
+*optimized clpp* = branch head `90fb2a04` with the patched no-jit engine (§4.1), archive
+`hive-24hr-clpp-cvf`. Categories 1–2 were measured on `4a0b3b61` (`bench-cat-final.log`,
+`bench-cat-oss.log`, `bench-cat-nearest-clps.log`, `bench-nearest2-clps.log`); category 3 on
+`2c9b2b26` and re-measured on `4a0b3b61` within ±6 ms of every cell (`bench-final-cvf-lazy.log`),
+since the lazy build does not touch the whole-message path; `90fb2a04` only adds profiling
+scopes (two category-2 rows re-checked: 165/163 ms).
+Every count agrees between oss clpp and the optimized build in all three tables except `*?????*`
+(footnote ²); clp-s agrees on category 3; a 43-query differential and a decode-and-grep of the raw
+log agree too (§6).
 
 Costs: the archive grows 3.6 % (42.59 → 44.10 MB, still 20 % smaller than clp-s's
 55.38 MB) and single-threaded ingest goes from 31 s to 34–36 s (three runs). Both sections are
@@ -74,6 +155,7 @@ Pipeline order; impact figures are for the block-ID query unless stated (23.3 s 
 | 5 | Column value filters in the archive | At ingest, for every column of every schema table, store min/max and a Bloom filter of its values (1.37 MB). At search, before decompressing a table, check whether the leaf value could be in it; skip the table if not. | Tables read 367 → 12, messages scanned 5.19 M → 154 K; 0.38 → 0.14 s (2.7×); `*Exception*` 356 → 126 ms; `*.log*` 462 → 165 ms |
 | 6 | Vectorised numeric wildcards | `5667*` on an integer column used to force the slow per-message evaluator; now the column is scanned in bulk with a digit-pattern matcher. | `*5667*` 2.6 → 0.5 s (5×) |
 | 7 | Decomposer (dynamic-programming) micro-optimizations | Reuse the alignment memo table across shapes with generation stamps instead of clearing it; when a `*` slides over literal text, only probe positions where the next literal could start. | Decomposition 49 → 17 ms (`telemetry-final.log`; the 49 ms profile is in the session transcript only) — ~12 % of the final 145 ms |
+| 8 | Build the shape tables only for whole-message queries | The value index read and the compact-shape build (#3, #4; ~35 ms) ran in the matcher's constructor, i.e. for every `--experimental` query. Leaf, shape and parent-variable queries never decompose against the log shapes, so they now skip it (`ClppMatcher::prepare_shapes`, on first use). | Category 1: 96–166 → 65–140 ms, back to parity with oss clpp; category 2: 195–281 → 153–255 ms |
 
 ---
 
@@ -120,7 +202,8 @@ ingest  (JsonParser::parse_str_field, --experimental only)
   └─ every schema table, per column ─► clp_s::ColumnValueFilter ► section /column_value_filters
 
 search  (message: <wildcard>)
-  ClppMatcher ctor         read /rule_value_index; intern rule names; one CompactShape per log shape
+  ClppMatcher              prepare_shapes (first whole-message query only): read /rule_value_index;
+                           intern rule names; one CompactShape per log shape
   ShapeDecomposer          per shape: DP over (shape position, query token), every placeholder piece
                            certified by its RuleSignature → interpretations (segments + leaves)
                            engine fallback: capped shapes, leaves on unbounded rules, malformed shapes,
@@ -322,16 +405,24 @@ From `telemetry-final.log` (`--enable-telemetry`, profiler scopes; `search_archi
 | phase | ms | notes |
 |---|---|---|
 | process start, archive open, metadata | ~26 | wall − `search_archive`; shared with clp-s |
-| `ClppMatcher` ctor | 36 | value index read 15, `CompactShape` build 15, schema→shape index ~6 |
+| `ClppMatcher::prepare_shapes` (the ctor before `4a0b3b61`) | 36 | value index read 15, `CompactShape` build 15, schema→shape index ~6 (the last stays in the ctor) |
 | local decomposition, 1,270 shapes | 17 | 395 interpretations; the 1,263 for `*5667*` cost 11 |
 | `SchemaMatch` dictionaries + rest | 33 | 28 is the variable-dictionary read for the string type variants |
 | `Output::filter` | 32 | 12 schemas / 154,338 messages: `read_schema_table` 15, scan 19, `global_init` 6 |
+
+A parent-variable query (category 2, `message.blockPoolID: BP-1121897155-*`, 143 ms
+`search_archive` of a 165 ms wall clock; `telemetry-cat2-final.log`) has a different profile: no
+shape tables and no decomposition to speak of, but 89 ms building the engine parser
+(`clpp_parser_init`: 15 ms `parsing_spec_read` + ~70 ms `ParsingSpecBuilder::build`), 26 ms of
+dictionaries, 6 ms matcher ctor, and 13 ms of `Output::filter` over 45 schemas. A leaf query
+(category 1) skips all of the clpp-specific work: `schema_match` 33 ms, `Output::filter` 12 ms.
 
 ### 3.3 Costs
 
 | | clp-s | oss clpp | + rule value index | + column value filters (final) |
 |---|---|---|---|---|
 | archive bytes | 55,379,378 | 42,589,517 | 42,736,318 (+0.34 %) | 44,102,522 (+3.55 %) |
+| compression ratio (2,353,623,901 B input) | 42.5× | 55.3× | 55.1× | 53.4× |
 | single-threaded ingest | 10 s | 31 s | 38 s | 34–36 s |
 
 Every other section is byte-identical across the three clpp archives except `header`, which grows by
@@ -433,12 +524,15 @@ CLP_TELEMETRY_ENDPOINT=ostream build/core/clp-s --experimental s --enable-teleme
   | grep -E 'count|clp\.query\.(num_|search_archive)'
 ```
 
-Queries take the `message: <wildcard>` form; use the closing `*` for a contains query (§A.5).
+Whole-message queries take the `message: <wildcard>` form; use the closing `*` for a contains
+query (§A.5). Leaf and parent-variable queries name the node (`message.blockID.blockNum: 1073746491`,
+`message.blockPoolID: BP-1121897155-*`); a value containing a space or colon must be quoted
+(`message.prefix: "WARN *"`).
 Counters worth reading: `num_clpp_shapes_decomposed_locally` / `_by_engine` (a non-zero engine
 count means a shape fell back — capped, unbounded rule, malformed, or a case-insensitive/unparsable
 query), `num_query_runner_filters` (0 = every leaf stayed on the vectorised `ColumnScan` path),
 `num_schemas_scanned` / `num_messages_evaluated` (what the column filters left), and the
-`clpp_matcher_init.*` / `output_filter.schema_scan.*` durations (§3.2).
+`clpp_prepare_shapes.*` / `clpp_parser_init.*` / `output_filter.schema_scan.*` durations (§3.2).
 
 Regular clp-s for comparison is the same binary without `--experimental` on an archive ingested
 without `--experimental` (`hive-24hr-plain`).
@@ -446,17 +540,24 @@ without `--experimental` (`hive-24hr-plain`).
 ### 4.5 Benchmark scripts
 
 In `/home/jack/.claude/jobs/3c7496e2/tmp` (job scratch, not durable): `bench-final2.sh <clp-s>
-<archive> <queries-file>` prints count + median/min of 3 wall-clock runs per query;
+<archive> <queries-file>` prints count + median/min of 3 wall-clock runs per query, prefixing each
+line with `message: ` (category 3); `bench-cat.sh <clp-s> <archive> <queries-file> [flags]` is
+the same with the full KQL on each line and the flags (`--experimental`) passed through
+(categories 1–2 and the clp-s substitutes);
 `bench-reg.sh` is the clp-s (non-CLP+) variant; `diff-run.sh <clp-s> <archive-a> <archive-b>
 <queries-file>` flags count mismatches between two archives; `telemetry-final.sh` captures the
 §3.2 profile; `ingest-hive.sh <out>` times an ingest. The `final-queries.txt` / `diff-queries.txt`
-lists are the 17-query set (the 14 rows above plus `*IOException*`, `*PacketResponder*`,
-`*ERROR*`) and the 43-query differential set.
+lists are the 17-query set (the 14 category-3 rows plus `*IOException*`, `*PacketResponder*`,
+`*ERROR*`) and the 43-query differential set; `cat1-final.txt` / `cat2-final.txt` are the
+category-1/2 rows and `cat-nearest.txt`, `nearest2.txt`, `cat2-new-nearest.txt` their clp-s
+substitutes (§A.6).
 
 ## 5. Deliverables
 
-Branch `clpp-wildcard-search` = `772db1bb` + seven code commits + this document; each of the six clp-s commits was built
-and unit-tested on its own (the intermediate prototype commit `8498cfba` on branch `clpp` and its
+Branch `clpp-wildcard-search` = `772db1bb` + eight code commits + this document (the two commits
+after the document were added when the per-category benchmark exposed the category-1 regression);
+each of the eight clp-s commits was built and unit-tested on its own (the intermediate prototype
+commit `8498cfba` on branch `clpp` and its
 `CLPP_RULE_VALUE_INDEX` side file are superseded and not in this history):
 
 | commit | optimization | files |
@@ -468,8 +569,11 @@ and unit-tested on its own (the intermediate prototype commit `8498cfba` on bran
 | `5a9375bf` clp-s: Store per-column value filters in CLP+ archives and skip schema tables that cannot match | §2.3 | `ColumnValueFilter.{hpp,cpp}`, `SchemaWriter`, `ColumnWriter`, `ArchiveWriter`, `ArchiveReader`, `QueryRunner`, CMake, test |
 | `2c9b2b26` clp-s: Evaluate numeric wildcard leaves on the ColumnScan fast path | §2.4 | `ColumnScan.cpp` |
 | `9f66d6db` deps: Bump log-surgeon to a fork with the search prefilter and intersection optimizations; build it without the JIT feature | §2.5, §A.2 | `taskfiles/deps/main.yaml` |
+| `c095de9d` docs: Add the CLP+ wildcard-search optimization design doc | this document | `docs/src/dev-docs/design-clpp-wildcard-search.md`, `index.md` |
+| `4a0b3b61` clp-s: Build the clpp shape tables only when a query decomposes against the log shapes | §0.1 #8 | `ClppMatcher.{hpp,cpp}` |
+| `90fb2a04` clp-s: Share the engine parser initialization between the clpp decomposition paths and profile it | instrumentation for §3.2 (category 2) | `ClppMatcher.{hpp,cpp}` |
 
-Relative to the baseline (clp-s commits only): 37 files (10 new), +4,121/−85 lines. The diff contains no reformat-only hunks;
+Relative to the baseline (clp-s commits only): 37 files (10 new), +4,163/−96 lines. The diff contains no reformat-only hunks;
 the one mechanical change is `SchemaWriter::append_column` gaining the node id (ten call sites in
 `ArchiveWriter::initialize_schema_writer`), which the column filters need to key filters per node.
 
@@ -502,15 +606,19 @@ them (or an archive without them) takes the engine path with the skeleton filter
 |---|---|
 | 43-query differential, archive without vs with column filters, same binary (`diff-cvf-2.log`) | all counts identical |
 | 43-query differential, engine path vs local decomposer (`diff-1.log`, `diff-2.log`) | all counts identical |
-| clp-s vs optimized clpp, the 14 queries above | all counts identical |
+| clp-s vs optimized clpp, the 14 category-3 queries | all counts identical |
+| oss clpp vs optimized clpp, the 10 category-1 and 14 category-2 queries (`bench-cat-oss.log`, `bench-cat-final.log`) | all counts identical |
 | engine path with the full patch (commit `f787c380` binary, `bench-skeleton-patched*.log`) vs final, 17 queries | all counts identical, including 6,863,835 for `*?????*` |
 | decode-and-grep of the raw 2.35 GB log (`blk_` 161,615; block ID 26; `Exception` 123,309; `.log` 35,198; `IOException` 27; `PacketReceiver` 6; `datanode` 130,410) | match |
 | `[ClppShapeDecomposer]` differential vs a reference wildcard matcher (8 synthetic shapes + the real hive shape), `[ClppRuleValueIndex]` brute-force soundness, `[ColumnValueFilter]`, `[ClppShapeQueryMatcher]` (`verify-misc.log`) | 14 cases, 37,693 assertions pass |
 | full `unitTest` (165 cases, `unittest-full-2.log`) | 162 pass; the 3 failures are the known environmental ones — `std::bad_alloc` in `parser.ingest()` at `clp_s_test_utils.cpp:62` and the `compress_archive` sites `test-clp_s-search.cpp:285` / `test-clp_s-end_to_end.cpp:274` — the same three that fail on unmodified HEAD in this container (2026-09-15 baseline: 151 cases, 3 failed) |
+| full `unitTest` on `4a0b3b61` (165 cases) | 164 pass; the one failure is `test-GrepCore.cpp` `process_raw_query` `[dfa_search]`, which fails whenever `unitTest` is linked against a from-source log-surgeon instead of the container's prebuilt one (a version mismatch in the clp — not clp-s — grep test, unrelated to this branch); the `[ClppShapeDecomposer],[ClppShapeQueryMatcher],[ClppRuleValueIndex],[ColumnValueFilter],[clp-s]` subset passes on `90fb2a04` (30 cases, 633,553 assertions) |
 | Rust: 49 log-surgeon lib unit tests (5 in `prefilter.rs`, `job2-fulltest-nodflt.log`); `prefilter_never_drops_a_match` (8 shapes × 317 queries, 0 false negatives); FFI differential patched vs unpatched engine (`ffi/out_patched.txt` = `ffi/out_pristine.txt`) | pass / identical output |
 | earlier adversarial passes on the value index: 23,617 shape×query cross-check vs brute-force substitution (`crosscheck_kgram.out`), exhaustive small-shape DP proof and ASan/UBSan runs (session transcript only) | 0 unsound; a positive control reported 17,613 (`crosscheck_kgram.selftest.out`) |
 
-Reproduce: `bench-final2.sh <clp-s> <archive> <queries>` (clpp, median of 3), `bench-reg.sh`
+Reproduce: `bench-final2.sh <clp-s> <archive> <queries>` (clpp, category 3, median of 3),
+`bench-cat.sh <clp-s> <archive> <queries> [--experimental]` (full KQL per line: categories 1–2 and
+the clp-s substitutes), `bench-reg.sh`
 (clp-s), `telemetry-final.sh`, `ingest-hive.sh <out>` — in the job's scratch directory
 (`/home/jack/.claude/jobs/3c7496e2/tmp`) alongside the logs named above.
 
@@ -519,11 +627,18 @@ Reproduce: `bench-final2.sh <clp-s> <archive> <queries>` (clpp, median of 3), `b
 1. Skip the variable-dictionary read (~26 ms) when no `VarString` leaf survives the column filters
    — requires running the filter pass before `populate_string_queries`.
 2. Cache the value index and `CompactShape`s across queries in a long-lived process (~29 ms per
-   query); they are per-archive constants.
-3. Column filters for more column kinds (delta-encoded timestamps, floats) and a per-schema
+   whole-message query); they are per-archive constants.
+3. Parent-variable queries (category 2) spend 85–90 ms of ~165 ms building the engine parser
+   (§3.2): cache the parser per archive in a long-lived process, or make
+   `ParsingSpecBuilder::build` cheaper for a cached spec (only the parsing DFA comes from the
+   cache; the rule regexes are re-parsed and the search NFA rebuilt every time — not yet profiled
+   on the Rust side). Would roughly halve this category.
+4. Column filters for more column kinds (delta-encoded timestamps, floats) and a per-schema
    signature for string leaves whose dictionary match set exceeds 256 IDs.
-4. Upstream the two engine commits to `modelconsumer/log-surgeon` (rebase onto `log-mechanic`,
+5. Upstream the two engine commits to `modelconsumer/log-surgeon` (rebase onto `log-mechanic`,
    which now carries overlapping work — §5) so the pin can return to upstream.
+6. The category-2 zero-result quirk (§A.6) — an oss engine behaviour, but worth a fix while the
+   fork is being upstreamed.
 
 ---
 
@@ -573,12 +688,60 @@ rule ids removed.
 The clp-s (non-CLP+) engine needs the *closing* `*` for a contains query: `message: *Exception` returns
 nothing there (re-checked in `verify-misc.log`) while `*Exception*` returns 123,309; clpp treats
 both as contains. All comparisons use the
-`*X*` form, on which the engines agree exactly. Regular clp-s cannot express the leaf-scoped
-queries clpp exists for (`message.blockID.blockNum: *1073746491*`, 23 matches in 0.55 s) at all.
+`*X*` form, on which the engines agree exactly. Regular clp-s cannot express the leaf-scoped or
+parent-variable queries clpp exists for (`message.blockID.blockNum: *1073746491*`, 23 matches in
+0.55 s) at all — the §0 category-1/2 tables use the nearest substring query instead (§A.6).
 
 ### A.6 Query categories
 
 `SchemaMatch::build_clpp_query_filter` routes a wildcard by target: (1) log shape + leaf values
-via `build_shape_match_filter` (already fast), (2) a named parent variable via
+via `build_shape_match_filter` (already fast in oss), (2) a named parent variable via
 `decompose_by_rule_name`, (3) the message field — the empty-`rule_name` branch from
-`build_ls_rule_name`, which is what everything in this document targets.
+`build_ls_rule_name`, which is what §§1–3 target. Category 1 also covers `shape(message): "…"`,
+a wildcard on the log shape's text in which `%rule.leaf%` stands for a placeholder.
+
+The clp-s substitute used for each category-1/2 row of §0 (clp-s, archive `hive-24hr-plain`,
+median of 3; `bench-cat-nearest-clps.log`, `bench-nearest2-clps.log`):
+
+| clpp query (count) | clp-s substitute | count | ms |
+|---|---|---|---|
+| `message.blockID.blockNum: 1073746491` (23) | `message: *1073746491*` | 26 | 2,437 |
+| `message.blockID.blockNum: 10737464*` (2,608) | `message: *10737464*` | 2,865 | 2,430 |
+| `…blockNum: 1073746491 AND …genStamp: 5667` (23) | `message: *1073746491_5667*` | 26 | 628 |
+| `message.blockPoolID.poolID: 1121897155` (109,484) | `message: *1121897155*` | 129,079 | 2,391 |
+| `message.containerID.appSeq: 0099` (114,918) | `message: *_0099_*` | 114,923 | 764 |
+| `message.attemptID.type: m` (980,424) | `message: *_m_*` | 1,406,166 | 1,327 |
+| `message.hostPort.host: 172.31.17.31` (159) | `message: *172.31.17.31*` | 1,621 | 636 |
+| `shape(message): "*Receiving BP-*"` (20,500) | `message: "*Receiving BP-*"` | 20,500 | 600 |
+| `shape(message): "*PacketResponder*" AND …blockNum: 1073746491` (3) | `message: *PacketResponder*1073746491*` | 3 | 1,680 |
+| `shape(message): "*%blockID.blockNum%*" AND …host: 172.31.17.31` (104) | `message: *blk_*172.31.17.31*` | 645 | 1,784 |
+| `message.blockPoolID: BP-1121897155-*` (109,484) | `message: *BP-1121897155-*` | 129,079 | 641 |
+| `message.blockPoolID: *-1427088167814` (109,484) | `message: *-1427088167814*` | 129,079 | 2,332 |
+| `message.containerID: container_1427088391284_0099_*` (114,917) | `message: *container_1427088391284_0099_*` | 114,919 | 691 |
+| `message.containerID: *_0099_01_000001` (114,918) | `message: *_0099_01_000001*` | 114,919 | 667 |
+| `message.attemptID: attempt_1427088391284_0059_*` (33,187) | `message: *attempt_1427088391284_0059_*` | 41,130 | 733 |
+| `message.attemptID: *_m_000001_0` (13,587) | `message: *_m_000001_0*` | 18,516 | 757 |
+| `message.jobID: job_1427088391284_0*` (44,824) | `message: *job_1427088391284_0*` | 470,231 | 930 |
+| `message.yarnAppID: *_0036` (2,070) | `message: *_0036*` | 56,186 | 801 |
+| `message.taskID: *_m_000001` (540) | `message: *_m_000001*` | 20,526 | 790 |
+| `message.blockID: *_5667` (23) | `message: *_5667*` | 26 | 620 |
+| `message.blockID: blk_1073746491_?667` (23) | `message: *blk_1073746491_?667*` | 26 | 1,754 |
+| `message.prefix: "INFO org.apache.hadoop.hdfs.*"` (160,501) | `message: "*INFO org.apache.hadoop.hdfs.*"` | 160,501 | 629 |
+| `message.prefix: "WARN *"` (15,544) | `message: "*WARN *"` | 19,684 | 605 |
+| `message.byteSize: *MB` (207) | `message: *MB*` | 353,392 | 599 |
+
+The substitute's count differs wherever the value also occurs in messages where it is not parsed
+as that variable (`blk_…_5667` in three more messages, e.g. inside a `blockIDList`; `1121897155`
+in 19,595 more, where it is not a `blockPoolID`) — which is the point of the scoped query.
+
+**Category-2 zero-result quirk (oss behaviour, both builds).** A parent-variable wildcard whose
+`*` must cover exactly one trailing sub-pattern after a delimiter returns nothing:
+`message.jobID: job_1427088391284_*` 0 (but `job_1427088391284_0*` 44,824),
+`message.blockID: blk_1073746491_*` 0 (but `blk_1073746491_5*` and `blk_1073746491_?667` 23),
+`message.yarnAppID: application_1427088391284_*`, `message.taskID: task_1427088391284_0059_m_*`,
+`message.appAttemptID: appattempt_1427088391284_0059_*`, `message.blockID: blk_*_5667`,
+`message.blockPoolID: BP-*-172.31.17.135-*`, `message.hostPort: "172.31.17.31:*"` all 0.
+Telemetry shows `num_clpp_interpretations: 0` — the engine's `search_by_name` produces no
+interpretation, before any archive data is touched — and oss clpp (`772db1bb`, unpatched engine)
+gives the same 0 for the two cases checked (`job_…_*`, `blk_…_*`; `probe-oss.txt`). Not
+investigated; the §0 rows avoid the pattern.
