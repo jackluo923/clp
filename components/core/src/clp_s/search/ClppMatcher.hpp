@@ -2,9 +2,11 @@
 #define CLP_S_SEARCH_CLPPMATCHER_HPP
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <unordered_set>
 #include <vector>
@@ -13,6 +15,7 @@
 #include <ystdlib/error_handling/Result.hpp>
 
 #include <clp_s/ArchiveReader.hpp>
+#include <clp_s/search/ClppShapeQueryMatcher.hpp>
 #include <clpp/Defs.hpp>
 #include <clpp/Interpretation.hpp>
 
@@ -72,6 +75,8 @@ private:
     // Methods
     /**
      * Decomposes `query` against the log shapes returning interpretations that matched a log shape.
+     * Shapes that cannot match are dropped by the skeleton filter and the rest are handed to the
+     * engine.
      * @return The matching interpretations, or an error code indicating the failure:
      * - Forwards `ArchiveReader::read_parsing_spec`'s return values.
      */
@@ -86,6 +91,17 @@ private:
      */
     [[nodiscard]] auto decompose_by_rule_name(std::string_view query, std::string_view rule_name)
             -> ystdlib::error_handling::Result<std::vector<InterpretationMatch>>;
+
+    /**
+     * Runs the engine on `log_shape_ids` and appends the resulting interpretations to `matches`.
+     * @return A void result on success, or an error code indicating the failure:
+     * - Forwards `ArchiveReader::read_parsing_spec`'s return values.
+     */
+    [[nodiscard]] auto decompose_by_engine(
+            std::string_view query,
+            std::vector<clpp::log_shape_id_t> const& log_shape_ids,
+            std::vector<InterpretationMatch>& matches
+    ) -> ystdlib::error_handling::Result<void>;
 
     /**
      * Get the parent rule shapes named `rule_name` from `log_shape_id` or the entire log shape if
@@ -109,10 +125,27 @@ private:
             ShapePredicate const& shape_matches
     ) const -> std::unordered_set<int32_t>;
 
+    /**
+     * Selects the shapes that could possibly match `query`, so the expensive per-shape query
+     * intersection only runs on candidates.
+     *
+     * The test is a sound necessary condition (see `shape_may_match`): a shape is dropped only when
+     * it provably cannot match. When the query cannot be reasoned about (invalid escape) or the
+     * match is case-insensitive, every shape is returned.
+     * @param query A wildcard pattern.
+     * @return The candidate log shape IDs in ascending order.
+     */
+    [[nodiscard]] auto select_candidate_shapes(std::string_view query) const
+            -> std::vector<clpp::log_shape_id_t>;
+
     // Data members
     ArchiveReader* m_archive_reader;
     bool m_case_sensitive{false};
     std::vector<std::unordered_set<int32_t>> m_schemas_by_log_shape;
+    // Per log shape ID: false if the shape is malformed and must always be a candidate.
+    std::vector<bool> m_shape_ok;
+    // Per log shape ID: a placeholder-as-wildcard tokenization of the shape, built once.
+    std::vector<std::vector<ShapeToken>> m_shape_skeletons;
     std::unique_ptr<log_surgeon::Parser> m_parser;
 };
 
