@@ -1589,6 +1589,7 @@ auto JsonParser::parse_str_field(
 
         auto const rule_name{match.get_rule_name()};
         auto const lexeme{match.get_lexeme()};
+        auto const qualified_name{match.get_fully_qualified_name()};
         auto const parent_node_id{update_open_parent_scopes(
                 match,
                 open_scopes,
@@ -1607,6 +1608,14 @@ auto JsonParser::parse_str_field(
                     float_node_id.has_value())
                 {
                     node_id = float_node_id.value();
+                    if (false == m_retain_float_format) {
+                        // The value is stored as a bare double, so the text it is searched and
+                        // printed as may differ from the lexeme; the rule's values cannot be bounded
+                        // by the lexemes alone.
+                        YSTDLIB_ERROR_HANDLING_TRYV(
+                                m_archive_writer->mark_rule_unbounded(qualified_name)
+                        );
+                    }
                     break;
                 }
                 SPDLOG_WARN(
@@ -1636,11 +1645,12 @@ auto JsonParser::parse_str_field(
             m_current_parsed_message.add_unordered_value(lexeme);
         }
         m_current_schema.insert_unordered(node_id);
+        YSTDLIB_ERROR_HANDLING_TRYV(m_archive_writer->add_rule_value(qualified_name, lexeme));
 
         log_shape.escape_and_append(
                 field_value.substr(log_msg_pos, match.range.start - log_msg_pos)
         );
-        log_shape.append_placeholder(match.get_fully_qualified_name());
+        log_shape.append_placeholder(qualified_name);
         log_msg_pos = match.range.end;
     }
     log_shape.escape_and_append(field_value.substr(log_msg_pos));

@@ -30,6 +30,7 @@
 #include <clpp/ErrorCode.hpp>
 #include <clpp/LogShapeStat.hpp>
 #include <clpp/ParentRuleShapes.hpp>
+#include <clpp/RuleValueIndex.hpp>
 #include <clpp/TextShape.hpp>
 
 namespace clp_s {
@@ -127,6 +128,15 @@ auto ArchiveWriter::close(std::optional<std::string_view> parsing_spec_str, bool
         }
         files.emplace_back(
                 std::string(constants::cArchiveLogShapeStatsFile),
+                compressed_size.value()
+        );
+
+        compressed_size = close_rule_value_index();
+        if (compressed_size.has_error()) {
+            throw OperationFailed(ErrorCodeFailure, __FILENAME__, __LINE__);
+        }
+        files.emplace_back(
+                std::string(constants::cArchiveRuleValueIndexFile),
                 compressed_size.value()
         );
 
@@ -546,6 +556,26 @@ ArchiveWriter::update_parent_rule_shapes(clpp::log_shape_id_t id, clpp::ParentRu
     return ystdlib::error_handling::success();
 }
 
+auto ArchiveWriter::add_rule_value(std::string_view rule, std::string_view value)
+        -> ystdlib::error_handling::Result<void> {
+    if (false == m_clpp.has_value()) {
+        return clpp::ClppErrorCode{clpp::ClppErrorCodeEnum::Unsupported};
+    }
+
+    m_clpp->rule_value_index.add_value(rule, value);
+    return ystdlib::error_handling::success();
+}
+
+auto ArchiveWriter::mark_rule_unbounded(std::string_view rule)
+        -> ystdlib::error_handling::Result<void> {
+    if (false == m_clpp.has_value()) {
+        return clpp::ClppErrorCode{clpp::ClppErrorCodeEnum::Unsupported};
+    }
+
+    m_clpp->rule_value_index.mark_unbounded(rule);
+    return ystdlib::error_handling::success();
+}
+
 auto ArchiveWriter::update_log_shape_dict(clpp::TextShape<std::string> const& log_shape)
         -> ystdlib::error_handling::Result<std::pair<clpp::log_shape_id_t, bool>> {
     if (false == m_clpp.has_value()) {
@@ -605,6 +635,29 @@ auto ArchiveWriter::close_log_shape_stats() -> ystdlib::error_handling::Result<s
     writer.close();
 
     m_clpp->log_shape_stats.clear();
+    return compressed_size;
+}
+
+auto ArchiveWriter::close_rule_value_index() -> ystdlib::error_handling::Result<size_t> {
+    if (false == m_clpp.has_value()) {
+        return clpp::ClppErrorCode{clpp::ClppErrorCodeEnum::Unsupported};
+    }
+
+    FileWriter writer{};
+    writer.open(
+            m_archive_path + std::string{constants::cArchiveRuleValueIndexFile},
+            FileWriter::OpenMode::CreateForWriting
+    );
+
+    ZstdCompressor compressor{};
+    compressor.open(writer, m_compression_level);
+    YSTDLIB_ERROR_HANDLING_TRYX(m_clpp->rule_value_index.compress(compressor));
+
+    compressor.close();
+    auto compressed_size{writer.get_pos()};
+    writer.close();
+
+    m_clpp->rule_value_index = clpp::RuleValueIndex{};
     return compressed_size;
 }
 

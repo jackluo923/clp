@@ -29,6 +29,7 @@
 #include <clpp/Defs.hpp>
 #include <clpp/LogShapeStat.hpp>
 #include <clpp/ParentRuleShapes.hpp>
+#include <clpp/RuleValueIndex.hpp>
 
 namespace clp_s {
 class ArchiveReader {
@@ -176,6 +177,13 @@ public:
     auto get_parent_rule_shapes() -> clpp::ParentRuleShapesArray const&;
 
     /**
+     * @return The archive's rule value index, or nullptr if the archive predates the index (or is
+     * not a CLP+ archive).
+     * @throws OperationFailed if the section exists but cannot be read.
+     */
+    auto get_rule_value_index() -> clpp::RuleValueIndex const*;
+
+    /**
      * Writes decoded messages to a file.
      * @param writer
      */
@@ -240,6 +248,7 @@ private:
         std::shared_ptr<LogShapeDictionaryReader> log_shape_dict;
         std::optional<clpp::LogShapeStatArray> log_shape_stats;
         std::optional<clpp::ParentRuleShapesArray> parent_rule_shapes;
+        std::optional<clpp::RuleValueIndex> rule_value_index;
     };
 
     // Methods
@@ -333,6 +342,13 @@ private:
      * @throws
      */
     auto read_parent_rule_shapes() -> ystdlib::error_handling::Result<clpp::ParentRuleShapesArray>;
+
+    /**
+     * Reads the rule value index from the archive.
+     * @return The read index, or an error code indicating the failure:
+     * - Forwards `clpp::RuleValueIndex::decompress`'s return values on failure.
+     */
+    auto read_rule_value_index() -> ystdlib::error_handling::Result<clpp::RuleValueIndex>;
 
     // Data members
     bool m_is_open;

@@ -11,6 +11,8 @@ if(CLP_BUILD_CLP_S_CLP_DEPENDENCIES)
                 LogShapeStat.hpp
                 ParentRuleShapes.cpp
                 ParentRuleShapes.hpp
+                RuleValueIndex.cpp
+                RuleValueIndex.hpp
                 TextShape.hpp
                 utils.cpp
                 utils.hpp

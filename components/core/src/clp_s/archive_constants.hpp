@@ -28,6 +28,7 @@ constexpr char cArchiveVarDictFile[] = "/var.dict";
 constexpr std::string_view cArchiveParsingSpecFile{"/parsing_specification"};
 constexpr std::string_view cArchiveParentRuleShapesFile{"/parent_rule_shapes"};
 constexpr std::string_view cArchiveLogShapeStatsFile{"/log_shape_stats"};
+constexpr std::string_view cArchiveRuleValueIndexFile{"/rule_value_index"};
 
 // Schema tree constants
 constexpr char cRootNodeName[] = "";

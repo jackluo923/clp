@@ -678,6 +678,7 @@ set(SOURCE_FILES_unitTest
         tests/TestOutputCleaner.hpp
         tests/test-BoundedReader.cpp
         tests/test-BufferedReader.cpp
+        tests/test-ClppRuleValueIndex.cpp
         tests/test-EncodedVariableInterpreter.cpp
         tests/test-encoding_methods.cpp
         tests/test-ffi_IrUnitHandlerReq.cpp

@@ -31,6 +31,7 @@
 #include <clpp/Defs.hpp>
 #include <clpp/LogShapeStat.hpp>
 #include <clpp/ParentRuleShapes.hpp>
+#include <clpp/RuleValueIndex.hpp>
 #include <clpp/TextShape.hpp>
 
 namespace clp_s {
@@ -316,12 +317,32 @@ public:
     auto update_parent_rule_shapes(clpp::log_shape_id_t id, clpp::ParentRuleShapes& shapes)
             -> ystdlib::error_handling::Result<void>;
 
+    /**
+     * Records that the leaf rule `rule` took the value `value`, so that the archive's rule value
+     * index can bound the values of each log shape placeholder at search time.
+     * @param rule The fully-qualified rule name (the placeholder name in the log shape).
+     * @param value
+     * @return A void result on success, or an error code indicating the failure:
+     * - clpp::ClppErrorCodeEnum::Unsupported if not using CLP+.
+     */
+    auto add_rule_value(std::string_view rule, std::string_view value)
+            -> ystdlib::error_handling::Result<void>;
+
+    /**
+     * Marks `rule` as unbounded in the rule value index, so no search-time query on it is pruned.
+     * @param rule The fully-qualified rule name (the placeholder name in the log shape).
+     * @return A void result on success, or an error code indicating the failure:
+     * - clpp::ClppErrorCodeEnum::Unsupported if not using CLP+.
+     */
+    auto mark_rule_unbounded(std::string_view rule) -> ystdlib::error_handling::Result<void>;
+
 private:
     // Types
     struct Clpp {
         std::shared_ptr<VariableDictionaryWriter> log_shape_dict;
         clpp::LogShapeStatArray log_shape_stats;
         clpp::ParentRuleShapesArray parent_rule_shapes;
+        clpp::RuleValueIndex rule_value_index;
     };
 
     // Methods
@@ -357,6 +378,15 @@ private:
      * - clpp::ClppErrorCodeEnum::Unsupported if not using CLP+.
      */
     [[nodiscard]] auto close_parent_rule_shapes() -> ystdlib::error_handling::Result<size_t>;
+
+    /**
+     * Compresses, stores, and clears the rule value index. The index is not cleared if the result
+     * is an error.
+     * @return A result containing the compressed size in bytes or an error code indicating the
+     * failure:
+     * - clpp::ClppErrorCodeEnum::Unsupported if not using CLP+.
+     */
+    [[nodiscard]] auto close_rule_value_index() -> ystdlib::error_handling::Result<size_t>;
 
     /**
      * Compresses and stores the parsing specification to the archive.

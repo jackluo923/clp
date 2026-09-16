@@ -27,6 +27,7 @@
 #include <clpp/ErrorCode.hpp>
 #include <clpp/LogShapeStat.hpp>
 #include <clpp/ParentRuleShapes.hpp>
+#include <clpp/RuleValueIndex.hpp>
 
 namespace clp_s {
 void ArchiveReader::open(Path const& archive_path, Options const& options) {
@@ -260,6 +261,8 @@ auto ArchiveReader::ensure_section_readable(std::string_view section) -> void {
             get_parent_rule_shapes();
         } else if (constants::cArchiveLogShapeStatsFile == prior) {
             get_log_shape_stats();
+        } else if (constants::cArchiveRuleValueIndexFile == prior) {
+            std::ignore = get_rule_value_index();
         } else if (constants::cArchiveParsingSpecFile == prior) {
             std::ignore = read_parsing_spec();
         } else {
@@ -340,6 +343,24 @@ auto ArchiveReader::get_parent_rule_shapes() -> clpp::ParentRuleShapesArray cons
         m_clpp->parent_rule_shapes = result.value();
     }
     return m_clpp->parent_rule_shapes.value();
+}
+
+auto ArchiveReader::get_rule_value_index() -> clpp::RuleValueIndex const* {
+    if (false == m_clpp.has_value()
+        || false == m_archive_reader_adaptor->has_section(constants::cArchiveRuleValueIndexFile))
+    {
+        return nullptr;
+    }
+    if (false == m_clpp->rule_value_index.has_value()) {
+        ensure_section_readable(constants::cArchiveRuleValueIndexFile);
+        m_read_sections.emplace(constants::cArchiveRuleValueIndexFile);
+        auto result{read_rule_value_index()};
+        if (result.has_error()) {
+            throw OperationFailed(ErrorCodeFailure, __FILENAME__, __LINE__);
+        }
+        m_clpp->rule_value_index = std::move(result.value());
+    }
+    return &m_clpp->rule_value_index.value();
 }
 
 void ArchiveReader::open_packed_streams() {
@@ -642,6 +663,7 @@ void ArchiveReader::close() {
         if (m_clpp->parent_rule_shapes) {
             m_clpp->parent_rule_shapes->clear();
         }
+        m_clpp->rule_value_index.reset();
     } else {
         m_log_dict->close();
     }
@@ -715,5 +737,21 @@ auto ArchiveReader::read_parent_rule_shapes()
     decompressor.close();
     m_archive_reader_adaptor->checkin_reader_for_section(constants::cArchiveParentRuleShapesFile);
     return shapes;
+}
+
+auto ArchiveReader::read_rule_value_index()
+        -> ystdlib::error_handling::Result<clpp::RuleValueIndex> {
+    constexpr size_t cDecompressorFileReadBufferCapacity{64UL * 1024};
+    auto reader{m_archive_reader_adaptor->checkout_reader_for_section(
+            constants::cArchiveRuleValueIndexFile
+    )};
+    ZstdDecompressor decompressor{};
+    decompressor.open(*reader, cDecompressorFileReadBufferCapacity);
+
+    auto index{YSTDLIB_ERROR_HANDLING_TRYX(clpp::RuleValueIndex::decompress(decompressor))};
+
+    decompressor.close();
+    m_archive_reader_adaptor->checkin_reader_for_section(constants::cArchiveRuleValueIndexFile);
+    return index;
 }
 }  // namespace clp_s
