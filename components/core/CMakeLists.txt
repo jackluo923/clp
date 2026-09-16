@@ -679,6 +679,7 @@ set(SOURCE_FILES_unitTest
         tests/test-BoundedReader.cpp
         tests/test-BufferedReader.cpp
         tests/test-ClppRuleValueIndex.cpp
+        tests/test-ClppShapeDecomposer.cpp
         tests/test-ClppShapeQueryMatcher.cpp
         tests/test-EncodedVariableInterpreter.cpp
         tests/test-encoding_methods.cpp

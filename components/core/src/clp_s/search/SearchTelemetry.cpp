@@ -74,6 +74,13 @@ constexpr std::string_view cAttrNumArchiveRecordsMatchingQuery{
 constexpr std::string_view cAttrNumArchiveSchemas{"clp.query.num_archive_schemas"};
 constexpr std::string_view cAttrNumBytesOutput{"clp.query.num_bytes_output"};
 constexpr std::string_view cAttrNumClppInterpretations{"clp.query.num_clpp_interpretations"};
+constexpr std::string_view cAttrNumClppCandidateShapes{"clp.query.num_clpp_candidate_shapes"};
+constexpr std::string_view cAttrNumClppShapesDecomposedLocally{
+        "clp.query.num_clpp_shapes_decomposed_locally"
+};
+constexpr std::string_view cAttrNumClppShapesDecomposedByEngine{
+        "clp.query.num_clpp_shapes_decomposed_by_engine"
+};
 constexpr std::string_view cAttrNumColumnScanFilters{"clp.query.num_column_scan_filters"};
 constexpr std::string_view cAttrNumMatchedSchemas{"clp.query.num_matched_schemas"};
 constexpr std::string_view cAttrNumMessagesEvaluated{"clp.query.num_messages_evaluated"};
@@ -345,6 +352,18 @@ public:
         m_span->SetAttribute(
                 to_nostd_string_view(cAttrNumClppInterpretations),
                 to_int64_attribute(metrics.num_clpp_interpretations)
+        );
+        m_span->SetAttribute(
+                to_nostd_string_view(cAttrNumClppCandidateShapes),
+                to_int64_attribute(metrics.num_clpp_candidate_shapes)
+        );
+        m_span->SetAttribute(
+                to_nostd_string_view(cAttrNumClppShapesDecomposedLocally),
+                to_int64_attribute(metrics.num_clpp_shapes_decomposed_locally)
+        );
+        m_span->SetAttribute(
+                to_nostd_string_view(cAttrNumClppShapesDecomposedByEngine),
+                to_int64_attribute(metrics.num_clpp_shapes_decomposed_by_engine)
         );
         m_span->SetAttribute(
                 to_nostd_string_view(cAttrNumColumnScanFilters),

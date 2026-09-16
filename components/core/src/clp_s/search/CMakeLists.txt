@@ -10,6 +10,7 @@ set(
         ColumnScan.hpp
         ClppMatcher.cpp
         ClppMatcher.hpp
+        ClppShapeDecomposer.hpp
         ClppShapeQueryMatcher.hpp
         EvaluateRangeIndexFilters.cpp
         EvaluateRangeIndexFilters.hpp

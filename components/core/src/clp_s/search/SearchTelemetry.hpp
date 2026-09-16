@@ -82,6 +82,9 @@ struct SearchResultMetrics {
     uint64_t num_archive_schemas{};
     uint64_t num_bytes_output{};
     uint64_t num_clpp_interpretations{};
+    uint64_t num_clpp_candidate_shapes{};
+    uint64_t num_clpp_shapes_decomposed_locally{};
+    uint64_t num_clpp_shapes_decomposed_by_engine{};
     uint64_t num_column_scan_filters{};
     uint64_t num_matched_schemas{};
     uint64_t num_messages_evaluated{};

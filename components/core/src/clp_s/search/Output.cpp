@@ -50,6 +50,11 @@ bool Output::filter() {
     auto const& schema_ids = m_archive_reader->get_schema_ids();
     m_result_metrics.num_archive_schemas = schema_ids.size();
     m_result_metrics.num_clpp_interpretations = m_match->get_num_clpp_interpretations();
+    auto const& clpp_stats{m_match->get_clpp_matcher_stats()};
+    m_result_metrics.num_clpp_candidate_shapes = clpp_stats.num_candidate_shapes;
+    m_result_metrics.num_clpp_shapes_decomposed_locally = clpp_stats.num_shapes_decomposed_locally;
+    m_result_metrics.num_clpp_shapes_decomposed_by_engine
+            = clpp_stats.num_shapes_decomposed_by_engine;
     for (auto schema_id : schema_ids) {
         m_result_metrics.num_archive_records
                 += m_archive_reader->get_num_messages_for_schema(schema_id);

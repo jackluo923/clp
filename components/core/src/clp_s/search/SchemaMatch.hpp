@@ -77,6 +77,13 @@ public:
         return m_num_clpp_interpretations;
     }
 
+    /**
+     * @return How the clpp decomposition was served (see `ClppMatcher::Stats`).
+     */
+    [[nodiscard]] auto get_clpp_matcher_stats() const -> ClppMatcher::Stats const& {
+        return m_clpp_matcher.get_stats();
+    }
+
 private:
     // Methods
     /**

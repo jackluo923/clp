@@ -424,14 +424,17 @@ auto SchemaMatch::populate_column_mapping(
                         matched = true;
                         continue;
                     }
-                    if (auto result{build_clpp_query_filter(
-                                column,
-                                cur_node_id,
-                                dynamic_cast<FilterExpr const&>(*expr.get())
-                        )};
+                    auto const& filter{dynamic_cast<FilterExpr const&>(*expr.get())};
+                    if (auto result{build_clpp_query_filter(column, cur_node_id, filter)};
                         nullptr != result)
                     {
                         return std::make_tuple(true, std::move(result));
+                    }
+                    if (false == filter.is_inverted()) {
+                        // No message of this node can satisfy the filter; replacing it with empty
+                        // lets the caller fold the expression instead of resolving (and
+                        // decomposing) it again after re-standardization.
+                        return std::make_tuple(true, EmptyExpr::create());
                     }
                     continue;
                 }

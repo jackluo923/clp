@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -15,9 +16,11 @@
 #include <ystdlib/error_handling/Result.hpp>
 
 #include <clp_s/ArchiveReader.hpp>
+#include <clp_s/search/ClppShapeDecomposer.hpp>
 #include <clp_s/search/ClppShapeQueryMatcher.hpp>
 #include <clpp/Defs.hpp>
 #include <clpp/Interpretation.hpp>
+#include <clpp/RuleValueIndex.hpp>
 
 namespace clp_s::search {
 /**
@@ -34,6 +37,23 @@ public:
         std::unordered_set<int32_t> schema_ids;
         clpp::Interpretation interpretation;
     };
+
+    /**
+     * Counters describing how the last `decompose_query` call was served, for telemetry.
+     */
+    struct Stats {
+        // Log shapes handed to a decomposer (all shapes when the local decomposer is the filter).
+        size_t num_candidate_shapes{0};
+        // Candidate shapes decomposed by the value-index-certified enumerator.
+        size_t num_shapes_decomposed_locally{0};
+        // Candidate shapes handed to the log-surgeon engine.
+        size_t num_shapes_decomposed_by_engine{0};
+    };
+
+    // Constants
+    // Per shape, the number of locally-enumerated interpretations past which the shape is handed to
+    // the engine, whose regex-based decomposition prunes what the value index cannot.
+    static constexpr size_t cMaxLocalInterpretationsPerShape{64};
 
     // Constructors
     /**
@@ -71,12 +91,18 @@ public:
     [[nodiscard]] auto decompose_query(std::string_view query, std::string_view rule_name)
             -> ystdlib::error_handling::Result<std::vector<InterpretationMatch>>;
 
+    [[nodiscard]] auto get_stats() const -> Stats const& { return m_stats; }
+
 private:
     // Methods
     /**
      * Decomposes `query` against the log shapes returning interpretations that matched a log shape.
-     * Shapes that cannot match are dropped by the skeleton filter and the rest are handed to the
-     * engine.
+     *
+     * When the archive carries a rule value index, every shape is decomposed locally by
+     * `ShapeDecomposer` (which doubles as the shape filter); a shape whose local decomposition is
+     * not conclusive (too many interpretations, or a leaf on a rule the index cannot bound) is
+     * handed to the engine instead. Without an index, shapes that cannot match are dropped by the
+     * skeleton filter and the rest are handed to the engine.
      * @return The matching interpretations, or an error code indicating the failure:
      * - Forwards `ArchiveReader::read_parsing_spec`'s return values.
      */
@@ -138,15 +164,38 @@ private:
     [[nodiscard]] auto select_candidate_shapes(std::string_view query) const
             -> std::vector<clpp::log_shape_id_t>;
 
+    /**
+     * Interns a placeholder rule name, resolving its value signature from the archive's index.
+     * @param rule
+     * @return The rule's ID.
+     */
+    [[nodiscard]] auto intern_rule(std::string_view rule) -> rule_id_t;
+
+    /**
+     * Converts a locally-enumerated interpretation to the engine's representation.
+     */
+    [[nodiscard]] auto to_interpretation(ShapeInterpretation const& interpretation) const
+            -> clpp::Interpretation;
+
     // Data members
     ArchiveReader* m_archive_reader;
     bool m_case_sensitive{false};
     std::vector<std::unordered_set<int32_t>> m_schemas_by_log_shape;
     // Per log shape ID: false if the shape is malformed and must always be a candidate.
     std::vector<bool> m_shape_ok;
-    // Per log shape ID: a placeholder-as-wildcard tokenization of the shape, built once.
+    // Per log shape ID: a placeholder-as-wildcard tokenization of the shape, built once (only when
+    // the archive has no rule value index).
     std::vector<std::vector<ShapeToken>> m_shape_skeletons;
+    // The archive's rule value index, or nullptr if it has none.
+    clpp::RuleValueIndex const* m_rule_value_index{nullptr};
+    // Per log shape ID: the shape's parts with interned rule IDs (only when the index is present).
+    std::vector<CompactShape> m_compact_shapes;
+    // Interned rule names and, per rule ID, the rule's value signature (nullptr if unbounded).
+    std::unordered_map<std::string, rule_id_t> m_rule_ids;
+    std::vector<std::string> m_rule_names;
+    std::vector<clpp::RuleSignature const*> m_rule_signatures;
     std::unique_ptr<log_surgeon::Parser> m_parser;
+    Stats m_stats;
 };
 
 template <typename ShapePredicate>
