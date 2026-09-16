@@ -52,6 +52,16 @@ public:
      * @return the total size of header data that will be written to the compressor in bytes
      */
     [[nodiscard]] virtual auto get_total_header_size() const -> size_t { return 0; }
+
+    /**
+     * Appends the keys identifying the column's values (see `ColumnValueFilter`) to `keys`, so a
+     * search can skip the table when a predicate on this column cannot match.
+     * @param keys
+     * @return Whether the column type supports value filters; nothing is appended otherwise.
+     */
+    [[nodiscard]] virtual auto append_value_filter_keys(std::vector<int64_t>& keys) const -> bool {
+        return false;
+    }
 };
 
 class Int64ColumnWriter : public BaseColumnWriter {
@@ -60,6 +70,8 @@ public:
     auto add_value(ParsedMessage::variable_t& value) -> size_t override;
 
     auto store(ZstdCompressor& compressor) -> void override;
+
+    [[nodiscard]] auto append_value_filter_keys(std::vector<int64_t>& keys) const -> bool override;
 
 private:
     // Data members
@@ -210,6 +222,8 @@ public:
     auto add_value(ParsedMessage::variable_t& value) -> size_t override;
 
     auto store(ZstdCompressor& compressor) -> void override;
+
+    [[nodiscard]] auto append_value_filter_keys(std::vector<int64_t>& keys) const -> bool override;
 
 private:
     // Data members

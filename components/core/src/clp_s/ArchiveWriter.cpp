@@ -140,6 +140,11 @@ auto ArchiveWriter::close(std::optional<std::string_view> parsing_spec_str, bool
                 compressed_size.value()
         );
 
+        files.emplace_back(
+                std::string(constants::cArchiveColumnValueFiltersFile),
+                store_column_value_filters()
+        );
+
         if (false == parsing_spec_str.has_value() || parsing_spec_str.value().empty()) {
             SPDLOG_ERROR("A non-empty parsing specification is required for CLP+ archives.");
             throw OperationFailed(ErrorCodeBadParam, __FILENAME__, __LINE__);
@@ -381,38 +386,46 @@ void ArchiveWriter::initialize_schema_writer(SchemaWriter* writer, Schema const&
         auto const& node = m_schema_tree.get_node(id);
         switch (node.get_type()) {
             case NodeType::Integer:
-                writer->append_column(std::make_unique<Int64ColumnWriter>());
+                writer->append_column(id, std::make_unique<Int64ColumnWriter>());
                 break;
             case NodeType::Float:
-                writer->append_column(std::make_unique<FloatColumnWriter>());
+                writer->append_column(id, std::make_unique<FloatColumnWriter>());
                 break;
             case NodeType::FormattedFloat:
-                writer->append_column(std::make_unique<FormattedFloatColumnWriter>());
+                writer->append_column(id, std::make_unique<FormattedFloatColumnWriter>());
                 break;
             case NodeType::DictionaryFloat:
-                writer->append_column(std::make_unique<DictionaryFloatColumnWriter>(m_var_dict));
+                writer->append_column(
+                        id,
+                        std::make_unique<DictionaryFloatColumnWriter>(m_var_dict)
+                );
                 break;
             case NodeType::ClpString:
                 writer->append_column(
+                        id,
                         std::make_unique<ClpStringColumnWriter>(m_var_dict, m_log_dict)
                 );
                 break;
             case NodeType::VarString:
-                writer->append_column(std::make_unique<VariableStringColumnWriter>(m_var_dict));
+                writer->append_column(
+                        id,
+                        std::make_unique<VariableStringColumnWriter>(m_var_dict)
+                );
                 break;
             case NodeType::Boolean:
-                writer->append_column(std::make_unique<BooleanColumnWriter>());
+                writer->append_column(id, std::make_unique<BooleanColumnWriter>());
                 break;
             case NodeType::UnstructuredArray:
                 writer->append_column(
+                        id,
                         std::make_unique<ClpStringColumnWriter>(m_var_dict, m_array_dict)
                 );
                 break;
             case NodeType::DeltaInteger:
-                writer->append_column(std::make_unique<DeltaEncodedInt64ColumnWriter>());
+                writer->append_column(id, std::make_unique<DeltaEncodedInt64ColumnWriter>());
                 break;
             case NodeType::Timestamp:
-                writer->append_column(std::make_unique<TimestampColumnWriter>());
+                writer->append_column(id, std::make_unique<TimestampColumnWriter>());
                 break;
             case NodeType::DeprecatedDateString:
             case NodeType::Metadata:
@@ -658,6 +671,43 @@ auto ArchiveWriter::close_rule_value_index() -> ystdlib::error_handling::Result<
     writer.close();
 
     m_clpp->rule_value_index = clpp::RuleValueIndex{};
+    return compressed_size;
+}
+
+auto ArchiveWriter::store_column_value_filters() -> size_t {
+    FileWriter writer{};
+    writer.open(
+            m_archive_path + std::string{constants::cArchiveColumnValueFiltersFile},
+            FileWriter::OpenMode::CreateForWriting
+    );
+    ZstdCompressor compressor{};
+    compressor.open(writer, m_compression_level);
+
+    /**
+     * Column value filters schema
+     * ---------------------------
+     * - Number of schema tables: <64-bit integer>
+     * - For each schema table:
+     *   - Schema ID: <32-bit integer>
+     *   - Number of filtered columns: <64-bit integer>
+     *   - For each filtered column:
+     *     - Schema tree node ID: <32-bit integer>
+     *     - The column's `ColumnValueFilter`
+     */
+    compressor.write_numeric_value<uint64_t>(m_id_to_schema_writer.size());
+    for (auto const& [schema_id, schema_writer] : m_id_to_schema_writer) {
+        auto const filters{schema_writer->build_value_filters()};
+        compressor.write_numeric_value<int32_t>(schema_id);
+        compressor.write_numeric_value<uint64_t>(filters.size());
+        for (auto const& [node_id, filter] : filters) {
+            compressor.write_numeric_value<int32_t>(node_id);
+            filter.compress(compressor);
+        }
+    }
+
+    compressor.close();
+    auto const compressed_size{writer.get_pos()};
+    writer.close();
     return compressed_size;
 }
 

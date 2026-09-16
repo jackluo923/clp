@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -15,6 +16,7 @@
 #include <ystdlib/error_handling/Result.hpp>
 
 #include <clp_s/ArchiveReaderAdaptor.hpp>
+#include <clp_s/ColumnValueFilter.hpp>
 #include <clp_s/DictionaryEntry.hpp>
 #include <clp_s/DictionaryReader.hpp>
 #include <clp_s/InputConfig.hpp>
@@ -184,6 +186,15 @@ public:
     auto get_rule_value_index() -> clpp::RuleValueIndex const*;
 
     /**
+     * @param schema_id
+     * @param node_id
+     * @return The value filter for column `node_id` of schema table `schema_id`, or nullptr if the
+     * archive has no column value filters or the column has none.
+     * @throws OperationFailed if the section exists but cannot be read.
+     */
+    auto get_column_value_filter(int32_t schema_id, int32_t node_id) -> ColumnValueFilter const*;
+
+    /**
      * Writes decoded messages to a file.
      * @param writer
      */
@@ -249,6 +260,8 @@ private:
         std::optional<clpp::LogShapeStatArray> log_shape_stats;
         std::optional<clpp::ParentRuleShapesArray> parent_rule_shapes;
         std::optional<clpp::RuleValueIndex> rule_value_index;
+        // Keyed by `column_value_filter_key`; populated on first use.
+        std::optional<std::unordered_map<uint64_t, ColumnValueFilter>> column_value_filters;
     };
 
     // Methods
@@ -349,6 +362,22 @@ private:
      * - Forwards `clpp::RuleValueIndex::decompress`'s return values on failure.
      */
     auto read_rule_value_index() -> ystdlib::error_handling::Result<clpp::RuleValueIndex>;
+
+    /**
+     * Reads every column value filter from the archive.
+     * @return The filters keyed by `column_value_filter_key`, or an error code indicating the
+     * failure:
+     * - filter::ErrorCodeEnum::ReadFailure if the section is truncated.
+     * - Forwards `ColumnValueFilter::decompress`'s return values on failure.
+     */
+    auto read_column_value_filters()
+            -> ystdlib::error_handling::Result<std::unordered_map<uint64_t, ColumnValueFilter>>;
+
+    [[nodiscard]] static auto column_value_filter_key(int32_t schema_id, int32_t node_id)
+            -> uint64_t {
+        return (static_cast<uint64_t>(static_cast<uint32_t>(schema_id)) << 32U)
+               | static_cast<uint64_t>(static_cast<uint32_t>(node_id));
+    }
 
     // Data members
     bool m_is_open;

@@ -291,6 +291,8 @@ set(
         archive_constants.hpp
         ArchiveWriter.cpp
         ArchiveWriter.hpp
+        ColumnValueFilter.cpp
+        ColumnValueFilter.hpp
         ColumnWriter.cpp
         ColumnWriter.hpp
         Defs.hpp
@@ -345,6 +347,7 @@ if(CLP_BUILD_CLP_S_ARCHIVEWRITER)
                 PUBLIC
                 absl::flat_hash_map
                 clp_s::clp_dependencies
+                clp_s::filter
                 clp_s::io
                 clp_s::timestamp_parser
                 clp_s::timestamp_pattern
@@ -369,6 +372,8 @@ set(
         BufferViewReader.hpp
         ColumnReader.cpp
         ColumnReader.hpp
+        ColumnValueFilter.cpp
+        ColumnValueFilter.hpp
         Defs.hpp
         DictionaryEntry.cpp
         DictionaryEntry.hpp
@@ -416,6 +421,7 @@ if(CLP_BUILD_CLP_S_ARCHIVEREADER)
                 PUBLIC
                 absl::flat_hash_map
                 clp::string_utils
+                clp_s::filter
                 clp_s::io
                 clp_s::search
                 clp_s::timestamp_parser

@@ -6,6 +6,7 @@
 #include <optional>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -18,8 +19,10 @@
 #include <clp_s/archive_constants.hpp>
 #include <clp_s/ArchiveReaderAdaptor.hpp>
 #include <clp_s/ColumnReader.hpp>
+#include <clp_s/ColumnValueFilter.hpp>
 #include <clp_s/DictionaryReader.hpp>
 #include <clp_s/ErrorCode.hpp>
+#include <clp_s/filter/ErrorCode.hpp>
 #include <clp_s/InputConfig.hpp>
 #include <clp_s/ReaderUtils.hpp>
 #include <clp_s/SchemaTree.hpp>
@@ -263,6 +266,8 @@ auto ArchiveReader::ensure_section_readable(std::string_view section) -> void {
             get_log_shape_stats();
         } else if (constants::cArchiveRuleValueIndexFile == prior) {
             std::ignore = get_rule_value_index();
+        } else if (constants::cArchiveColumnValueFiltersFile == prior) {
+            std::ignore = get_column_value_filter(0, 0);
         } else if (constants::cArchiveParsingSpecFile == prior) {
             std::ignore = read_parsing_spec();
         } else {
@@ -363,7 +368,34 @@ auto ArchiveReader::get_rule_value_index() -> clpp::RuleValueIndex const* {
     return &m_clpp->rule_value_index.value();
 }
 
+auto ArchiveReader::get_column_value_filter(int32_t schema_id, int32_t node_id)
+        -> ColumnValueFilter const* {
+    if (false == m_clpp.has_value()
+        || false
+                   == m_archive_reader_adaptor->has_section(
+                           constants::cArchiveColumnValueFiltersFile
+                   ))
+    {
+        return nullptr;
+    }
+    if (false == m_clpp->column_value_filters.has_value()) {
+        ensure_section_readable(constants::cArchiveColumnValueFiltersFile);
+        m_read_sections.emplace(constants::cArchiveColumnValueFiltersFile);
+        auto result{read_column_value_filters()};
+        if (result.has_error()) {
+            throw OperationFailed(ErrorCodeFailure, __FILENAME__, __LINE__);
+        }
+        m_clpp->column_value_filters = std::move(result.value());
+    }
+    auto const& filters{m_clpp->column_value_filters.value()};
+    auto const it{filters.find(column_value_filter_key(schema_id, node_id))};
+    return filters.end() == it ? nullptr : &it->second;
+}
+
 void ArchiveReader::open_packed_streams() {
+    // The stream reader holds the tables section open for the rest of the scan, so any section
+    // consulted per table must already be in memory.
+    std::ignore = get_column_value_filter(0, 0);
     ensure_section_readable(constants::cArchiveTablesFile);
     m_stream_reader.open_packed_streams(m_archive_reader_adaptor);
 }
@@ -664,6 +696,7 @@ void ArchiveReader::close() {
             m_clpp->parent_rule_shapes->clear();
         }
         m_clpp->rule_value_index.reset();
+        m_clpp->column_value_filters.reset();
     } else {
         m_log_dict->close();
     }
@@ -753,5 +786,51 @@ auto ArchiveReader::read_rule_value_index()
     decompressor.close();
     m_archive_reader_adaptor->checkin_reader_for_section(constants::cArchiveRuleValueIndexFile);
     return index;
+}
+
+auto ArchiveReader::read_column_value_filters()
+        -> ystdlib::error_handling::Result<std::unordered_map<uint64_t, ColumnValueFilter>> {
+    constexpr size_t cDecompressorFileReadBufferCapacity{64UL * 1024};
+    auto reader{m_archive_reader_adaptor->checkout_reader_for_section(
+            constants::cArchiveColumnValueFiltersFile
+    )};
+    ZstdDecompressor decompressor{};
+    decompressor.open(*reader, cDecompressorFileReadBufferCapacity);
+
+    // See `ArchiveWriter::store_column_value_filters` for the layout.
+    std::unordered_map<uint64_t, ColumnValueFilter> filters;
+    uint64_t num_schemas{};
+    if (ErrorCodeSuccess != decompressor.try_read_numeric_value(num_schemas)) {
+        return filter::ErrorCode{filter::ErrorCodeEnum::ReadFailure};
+    }
+    for (uint64_t i{0}; i < num_schemas; ++i) {
+        int32_t schema_id{};
+        uint64_t num_columns{};
+        if (ErrorCodeSuccess != decompressor.try_read_numeric_value(schema_id)
+            || ErrorCodeSuccess != decompressor.try_read_numeric_value(num_columns))
+        {
+            return filter::ErrorCode{filter::ErrorCodeEnum::ReadFailure};
+        }
+        for (uint64_t j{0}; j < num_columns; ++j) {
+            int32_t node_id{};
+            if (ErrorCodeSuccess != decompressor.try_read_numeric_value(node_id)) {
+                return filter::ErrorCode{filter::ErrorCodeEnum::ReadFailure};
+            }
+            auto filter{YSTDLIB_ERROR_HANDLING_TRYX(ColumnValueFilter::decompress(decompressor))};
+            if (false
+                == filters.emplace(column_value_filter_key(schema_id, node_id), std::move(filter))
+                           .second)
+            {
+                // A filter that covers only some of a node's columns could wrongly prune the table.
+                return filter::ErrorCode{filter::ErrorCodeEnum::CorruptFilterPayload};
+            }
+        }
+    }
+
+    decompressor.close();
+    m_archive_reader_adaptor->checkin_reader_for_section(
+            constants::cArchiveColumnValueFiltersFile
+    );
+    return filters;
 }
 }  // namespace clp_s

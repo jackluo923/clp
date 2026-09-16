@@ -1,10 +1,14 @@
 #include "QueryRunner.hpp"
 
+#include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -12,6 +16,7 @@
 #include <fmt/format.h>
 #include <string_utils/string_utils.hpp>
 
+#include <clp_s/ColumnValueFilter.hpp>
 #include <clp_s/Schema.hpp>
 
 #include "../../clp/Defs.h"
@@ -94,6 +99,48 @@ auto evaluate_numeric_wildcard_filter(
         }
     }
     return false;
+}
+
+/**
+ * Checks an integer column's value filter against a wildcard pattern of the form `<digits>*`: the
+ * non-negative integers whose decimal form starts with the digits, i.e. the union of the ranges
+ * `[D * 10^k, (D + 1) * 10^k - 1]` over `k >= 0`.
+ * @param pattern
+ * @param value_filter
+ * @return false if the column definitely holds no integer matching `pattern`, true if it may (or
+ * `pattern` is not of the supported form).
+ */
+[[nodiscard]] auto integer_prefix_pattern_may_match(
+        std::string_view pattern,
+        ColumnValueFilter const& value_filter
+) -> bool {
+    if (pattern.size() < 2 || '*' != pattern.back()) {
+        return true;
+    }
+    auto const digits{pattern.substr(0, pattern.size() - 1)};
+    if (false == std::ranges::all_of(digits, [](char c) -> bool { return c >= '0' && c <= '9'; })) {
+        return true;
+    }
+    int64_t prefix{};
+    if (auto const [ptr, ec]{std::from_chars(digits.data(), digits.data() + digits.size(), prefix)};
+        std::errc{} != ec || ptr != digits.data() + digits.size())
+    {
+        return true;
+    }
+    constexpr int64_t cBase{10};
+    constexpr int64_t cMax{std::numeric_limits<int64_t>::max()};
+    for (int64_t low{prefix}, width{1};;) {
+        // `[low, low + width - 1]` holds the integers with `width - 1` digits after the prefix.
+        int64_t const high{low > cMax - (width - 1) ? cMax : low + width - 1};
+        if (value_filter.may_contain_in_range(low, high)) {
+            return true;
+        }
+        if (low > cMax / cBase || width > cMax / cBase) {
+            return false;
+        }
+        low *= cBase;
+        width *= cBase;
+    }
 }
 }  // namespace
 
@@ -1159,10 +1206,14 @@ EvaluatedValue QueryRunner::constant_propagate(std::shared_ptr<Expression> const
             // trivially matching
             // FIXME: have an edgecase to handle with NEXISTS on pure wildcard columns
             return EvaluatedValue::True;
-        } else if (filter->get_column()->is_pure_wildcard()
-                   && filter->get_column()->matches_any(
-                           LiteralType::ClpStringT | LiteralType::VarStringT
-                   ))
+        }
+        if (auto const value{evaluate_with_column_value_filter(filter.get())};
+            EvaluatedValue::Unknown != value)
+        {
+            return value;
+        }
+        if (filter->get_column()->is_pure_wildcard()
+            && filter->get_column()->matches_any(LiteralType::ClpStringT | LiteralType::VarStringT))
         {
             auto wildcard = filter->get_column().get();
             bool has_var_string = false;
@@ -1286,6 +1337,64 @@ EvaluatedValue QueryRunner::constant_propagate(std::shared_ptr<Expression> const
     }
 
     return EvaluatedValue::Unknown;
+}
+
+auto QueryRunner::evaluate_with_column_value_filter(FilterExpr* filter) -> EvaluatedValue {
+    auto const op{filter->get_operation()};
+    if (FilterOperation::EQ != op && FilterOperation::NEQ != op) {
+        return EvaluatedValue::Unknown;
+    }
+    auto const& column{filter->get_column()};
+    if (column->is_pure_wildcard() || column->is_unresolved_descriptor()
+        || column->has_unresolved_tokens())
+    {
+        return EvaluatedValue::Unknown;
+    }
+    auto const* value_filter{
+            m_archive_reader->get_column_value_filter(m_schema, column->get_column_id())
+    };
+    if (nullptr == value_filter) {
+        return EvaluatedValue::Unknown;
+    }
+
+    bool may_match{true};
+    auto const& operand{filter->get_operand()};
+    switch (column->get_literal_type()) {
+        case LiteralType::IntegerT: {
+            int64_t value{};
+            std::string pattern;
+            if (operand->as_int(value, op)) {
+                may_match = value_filter->may_contain(value);
+            } else if (operand->as_var_string(pattern, op)) {
+                may_match = integer_prefix_pattern_may_match(pattern, *value_filter);
+            }
+            break;
+        }
+        case LiteralType::VarStringT: {
+            std::string query_string;
+            if (false == operand->as_var_string(query_string, op)) {
+                break;
+            }
+            auto const matching_vars{m_string_var_match_map.find(query_string)};
+            if (m_string_var_match_map.end() == matching_vars
+                || matching_vars->second.size() > cMaxColumnValueFilterProbes)
+            {
+                break;
+            }
+            may_match = std::ranges::any_of(matching_vars->second, [&](int64_t var_id) -> bool {
+                return value_filter->may_contain(var_id);
+            });
+            break;
+        }
+        default:
+            break;
+    }
+    if (may_match) {
+        return EvaluatedValue::Unknown;
+    }
+    // No stored value equals the operand: EQ is false and NEQ is true, before inversion.
+    bool const result{FilterOperation::NEQ == op};
+    return (result != filter->is_inverted()) ? EvaluatedValue::True : EvaluatedValue::False;
 }
 
 bool QueryRunner::evaluate_epoch_date_filter(

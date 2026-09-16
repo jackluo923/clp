@@ -681,6 +681,7 @@ set(SOURCE_FILES_unitTest
         tests/test-ClppRuleValueIndex.cpp
         tests/test-ClppShapeDecomposer.cpp
         tests/test-ClppShapeQueryMatcher.cpp
+        tests/test-ColumnValueFilter.cpp
         tests/test-EncodedVariableInterpreter.cpp
         tests/test-encoding_methods.cpp
         tests/test-ffi_IrUnitHandlerReq.cpp

@@ -93,6 +93,7 @@ bool is_multi_file_archive(std::string_view const path) {
             || constants::cArchiveParentRuleShapesFile == formatted_name
             || constants::cArchiveLogShapeStatsFile == formatted_name
             || constants::cArchiveRuleValueIndexFile == formatted_name
+            || constants::cArchiveColumnValueFiltersFile == formatted_name
             || constants::cArchiveParsingSpecFile == formatted_name)
         {
             continue;

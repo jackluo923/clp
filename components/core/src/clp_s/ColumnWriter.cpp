@@ -30,6 +30,11 @@ void Int64ColumnWriter::store(ZstdCompressor& compressor) {
     compressor.write(reinterpret_cast<char const*>(m_values.data()), size);
 }
 
+auto Int64ColumnWriter::append_value_filter_keys(std::vector<int64_t>& keys) const -> bool {
+    keys.insert(keys.end(), m_values.begin(), m_values.end());
+    return true;
+}
+
 auto DeltaEncodedInt64ColumnWriter::add_value(int64_t value) -> size_t {
     m_values.emplace_back(value - m_cur);
     m_cur = value;
@@ -174,6 +179,12 @@ size_t VariableStringColumnWriter::add_value(ParsedMessage::variable_t& value) {
 void VariableStringColumnWriter::store(ZstdCompressor& compressor) {
     auto size{m_var_dict_ids.size() * sizeof(clp::variable_dictionary_id_t)};
     compressor.write(reinterpret_cast<char const*>(m_var_dict_ids.data()), size);
+}
+
+auto VariableStringColumnWriter::append_value_filter_keys(std::vector<int64_t>& keys) const
+        -> bool {
+    keys.insert(keys.end(), m_var_dict_ids.begin(), m_var_dict_ids.end());
+    return true;
 }
 
 auto TimestampColumnWriter::add_value(ParsedMessage::variable_t& value) -> size_t {

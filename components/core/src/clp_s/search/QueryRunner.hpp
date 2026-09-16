@@ -46,6 +46,12 @@ namespace clp_s::search {
  */
 class QueryRunner : public FilterClass {
 public:
+    // Constants
+    // A variable string filter matching more dictionary entries than this is not checked against
+    // column value filters: probing costs one hash per entry per schema, and such broad filters
+    // rarely rule a table out.
+    static constexpr size_t cMaxColumnValueFilterProbes{256};
+
     // Constructors
     QueryRunner(
             std::shared_ptr<SchemaMatch> const& match,
@@ -433,6 +439,15 @@ private:
      * if the expression evaluates to false, EvaluatedValue::Unknown otherwise
      */
     auto constant_propagate(std::shared_ptr<ast::Expression> const& expr) -> EvaluatedValue;
+
+    /**
+     * Decides an equality filter ahead of the scan using the current schema table's column value
+     * filter, when the archive has one for the filter's column.
+     * @param filter
+     * @return EvaluatedValue::False (EvaluatedValue::True for an inverted filter) if no value
+     * stored in the column can satisfy the filter; EvaluatedValue::Unknown otherwise.
+     */
+    auto evaluate_with_column_value_filter(ast::FilterExpr* filter) -> EvaluatedValue;
 
     /**
      * Populates searched wildcard columns

@@ -261,6 +261,7 @@ function(validate_clp_s_archivereader_dependencies)
     validate_clp_dependencies_for_target(CLP_BUILD_CLP_S_ARCHIVEREADER
         CLP_BUILD_CLP_STRING_UTILS
         CLP_BUILD_CLP_S_CLP_DEPENDENCIES
+        CLP_BUILD_CLP_S_FILTER
         CLP_BUILD_CLP_S_IO
         CLP_BUILD_CLP_S_TIMESTAMP_PARSER
         CLP_BUILD_CLP_S_TIMESTAMPPATTERN
@@ -282,6 +283,7 @@ endfunction()
 function(validate_clp_s_archivewriter_dependencies)
     validate_clp_dependencies_for_target(CLP_BUILD_CLP_S_ARCHIVEWRITER
         CLP_BUILD_CLP_S_CLP_DEPENDENCIES
+        CLP_BUILD_CLP_S_FILTER
         CLP_BUILD_CLP_S_IO
         CLP_BUILD_CLP_S_TIMESTAMP_PARSER
         CLP_BUILD_CLP_S_TIMESTAMPPATTERN

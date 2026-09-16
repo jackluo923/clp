@@ -389,6 +389,13 @@ private:
     [[nodiscard]] auto close_rule_value_index() -> ystdlib::error_handling::Result<size_t>;
 
     /**
+     * Builds a value filter for every column of every schema table and stores them.
+     * @return The compressed size in bytes.
+     * @throw Propagates `SchemaWriter::build_value_filters`'s exceptions.
+     */
+    [[nodiscard]] auto store_column_value_filters() -> size_t;
+
+    /**
      * Compresses and stores the parsing specification to the archive.
      * @param parsing_spec_str
      * @return The compressed size in bytes.
