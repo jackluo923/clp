@@ -217,10 +217,25 @@ search  (message: <wildcard>)
   ColumnScan               numeric wildcard leaves (5667*, *5667*) on the vectorised path
 ```
 
+The two indexes have different scopes, which is why both exist:
+
+| | rule value index (§2.1) | column value filters (§2.3) |
+|---|---|---|
+| keyed by | fully-qualified rule name (`blockID.blockNum`; 124 on hive) | (schema table, node id) — every int / var-string column of every table |
+| granularity | **one signature per rule for the whole archive**, regardless of which log shape, field or table the value landed in | per table, per column |
+| answers | "could *any* value this rule ever matched contain / start with / end with this text?" | "does *this table's* column hold this exact value?" |
+| used for | deciding which placeholder may swallow which piece of a `message: *…*` query, per shape | skipping schema tables before decompression |
+| size | 147 KB | 1.37 MB |
+
+A rule that appears in many shapes and fields (`prefix.class`, `key_value.value`) accumulates a
+wide signature and prunes less; and the rule index can say nothing table-specific, so after
+decomposition the block-ID query still touched 367 tables until the column filters cut that to 12.
+
 ### 2.1 Rule value index — `components/core/src/clpp/RuleValueIndex.{hpp,cpp}`
 
 At ingest `JsonParser` sees every `(rule_name, lexeme)` it parses, numeric or not, and feeds it to a
-per-rule `RuleSignature`: a 128-bit ASCII byte set (+ non-ASCII flag) of all bytes, first bytes and
+per-rule `RuleSignature` (`ArchiveWriter::add_rule_value(qualified_name, lexeme)`, one entry per
+rule name archive-wide): a 128-bit ASCII byte set (+ non-ASCII flag) of all bytes, first bytes and
 last bytes; exact 2^16-bit bigram sets (all, first, last); a 2^21-bit folded trigram set; and a
 64-bit length mask (exact lengths 0–62, one bit for ≥ 63). Bitsets are allocated lazily. Queries:
 `may_contain`, `may_start_with`, `may_end_with`, `may_equal`, `may_have_length`. A rule can be
