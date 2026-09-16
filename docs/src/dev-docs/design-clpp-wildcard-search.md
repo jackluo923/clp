@@ -138,7 +138,8 @@ Every count agrees between oss clpp and the optimized build in all three tables 
 log agree too (§6).
 
 Costs: the archive grows 3.6 % (42.59 → 44.10 MB, still 20 % smaller than clp-s's
-55.38 MB) and single-threaded ingest goes from 31 s to 34–36 s (three runs). Both sections are
+55.38 MB) and single-threaded ingest goes from 31.2 s to 34.7 s (+11 % against shipped oss clpp;
++30 % against the oss code on the same no-jit engine, 26.7 s — §3.3). Both sections are
 written only for `--experimental` archives; a clpp archive without them still searches through the
 old engine path.
 
@@ -423,14 +424,18 @@ dictionaries, 6 ms matcher ctor, and 13 ms of `Output::filter` over 45 schemas. 
 |---|---|---|---|---|
 | archive bytes | 55,379,378 | 42,589,517 | 42,736,318 (+0.34 %) | 44,102,522 (+3.55 %) |
 | compression ratio (2,353,623,901 B input) | 42.5× | 55.3× | 55.1× | 53.4× |
-| single-threaded ingest | 10 s | 31 s | 38 s | 34–36 s |
+| single-threaded ingest | 10 s | 31.2 s (26.7 s with the no-jit engine) | 38 s | 34.7 s |
 
 Every other section is byte-identical across the three clpp archives except `header`, which grows by
 23 B and 25 B as the new section names are listed; the two new sections are otherwise pure additions.
-Ingest times are single measurements of the 2.35 GB input (`ingest-hive.sh`): clp-s 10 s in
-`hive-plain-compress.log`, oss 31 s in `hive-cached.log`, final format 36 s in `verify-misc.log`
-(the other two final-format runs, 34 and 35 s, and the 38 s index-only run are in the session
-transcript only). If 1.37 MB of Bloom filters
+Ingest of the 2.35 GB input: the oss and final columns are 3 interleaved runs each
+(`ingest-ab.log`: oss 31.2/31.2/31.3 s, final 34.9/34.7/34.5 s), i.e. the shipped optimized
+build compresses **11 % slower** than shipped oss clpp. That understates the cost of the two new
+sections, because the optimized build also dropped the engine JIT, which is worth 4.5 s at ingest:
+the oss code linked against the same no-jit engine takes 26.7 s (`ingest-oss-nojit.log`,
+26.7/26.6/26.7 s), so the rule value index plus the column value filters add **8.0 s (+30 %)** on
+their own. The clp-s (10 s, `hive-plain-compress.log`) and index-only (38 s) columns are single
+runs. If 1.37 MB of Bloom filters
 matters, `ColumnValueFilter::cMaxBloomBits` (2^22) and `cTargetFalsePositiveRate` (1 %) are the
 knobs — the schema skip only needs to be usually right, and the range check alone already prunes
 most tables for numeric leaves.
@@ -546,7 +551,9 @@ the same with the full KQL on each line and the flags (`--experimental`) passed 
 (categories 1–2 and the clp-s substitutes);
 `bench-reg.sh` is the clp-s (non-CLP+) variant; `diff-run.sh <clp-s> <archive-a> <archive-b>
 <queries-file>` flags count mismatches between two archives; `telemetry-final.sh` captures the
-§3.2 profile; `ingest-hive.sh <out>` times an ingest. The `final-queries.txt` / `diff-queries.txt`
+§3.2 profile; `ingest-hive.sh <out>` times an ingest, `ingest-ab.sh <runs>` interleaves oss and
+optimized ingests and `ingest-one.sh <clp-s> <tag> <runs>` times one binary (`clp-s-oss-nojit` is
+`772db1bb` linked against the fork engine). The `final-queries.txt` / `diff-queries.txt`
 lists are the 17-query set (the 14 category-3 rows plus `*IOException*`, `*PacketResponder*`,
 `*ERROR*`) and the 43-query differential set; `cat1-final.txt` / `cat2-final.txt` are the
 category-1/2 rows and `cat-nearest.txt`, `nearest2.txt`, `cat2-new-nearest.txt` their clp-s
