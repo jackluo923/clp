@@ -1,14 +1,20 @@
 #include "ColumnScan.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <type_traits>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
+#include <fmt/compile.h>
+#include <fmt/format.h>
 #include <string_utils/string_utils.hpp>
 
 #include <clp/Query.hpp>
@@ -68,6 +74,48 @@ template <typename T>
         int32_t column_id,
         FilterOperation operation,
         T operand
+) -> ColumnScan::Bitmap;
+
+/**
+ * Matches the decimal rendering of numeric values against a wildcard pattern.
+ *
+ * A pattern made of literal runs of digits, `-` and `.` separated by `*` is matched with anchored
+ * prefix/suffix comparisons and ordered substring searches; any other pattern (`?`, escapes,
+ * letters) falls back to the general wildcard matcher.
+ */
+class NumericPatternMatcher {
+public:
+    explicit NumericPatternMatcher(std::string pattern);
+
+    [[nodiscard]] auto matches(std::string_view value) const -> bool;
+
+private:
+    std::string m_pattern;
+    bool m_fast{false};
+    bool m_anchored_start{false};
+    bool m_anchored_end{false};
+    // The literal runs as (offset, length) into `m_pattern`, in order.
+    std::vector<std::pair<size_t, size_t>> m_pieces;
+};
+
+/**
+ * Builds a bitmap for a wildcard filter over a numeric column, by rendering each value in decimal
+ * and matching it against the pattern. Doubles are rendered with 17 significant digits so that
+ * distinct values never render alike.
+ * @param num_messages Number of messages represented by the bitmap.
+ * @param reader_map Column readers keyed by column ID.
+ * @param column_id ID of the column to scan.
+ * @param operation Equality operation to apply.
+ * @param pattern Wildcard pattern from the filter expression.
+ * @return A bitmap indexed by message number, with nonzero entries for matching messages.
+ */
+template <typename T>
+[[nodiscard]] auto build_numeric_wildcard_filter(
+        uint64_t num_messages,
+        ColumnScan::BasicReaderMap const& reader_map,
+        int32_t column_id,
+        FilterOperation operation,
+        std::string pattern
 ) -> ColumnScan::Bitmap;
 
 /**
@@ -196,6 +244,98 @@ template <typename T>
         for (uint64_t message_index{0}; message_index < num_messages; ++message_index) {
             auto const value = std::get<T>(reader->extract_value(message_index));
             bitmap[message_index] |= compare(operation, value, operand) ? 1 : 0;
+        }
+    }
+    return bitmap;
+}
+
+NumericPatternMatcher::NumericPatternMatcher(std::string pattern) : m_pattern{std::move(pattern)} {
+    auto const is_fast_char{[](char c) -> bool {
+        return (c >= '0' && c <= '9') || '-' == c || '.' == c || '*' == c;
+    }};
+    if (false == std::ranges::all_of(m_pattern, is_fast_char)) {
+        return;
+    }
+    m_fast = true;
+    m_anchored_start = false == m_pattern.starts_with('*');
+    m_anchored_end = false == m_pattern.ends_with('*');
+    for (size_t begin{0}; begin < m_pattern.size();) {
+        auto const end{std::min(m_pattern.find('*', begin), m_pattern.size())};
+        if (end > begin) {
+            m_pieces.emplace_back(begin, end - begin);
+        }
+        begin = end + 1;
+    }
+}
+
+auto NumericPatternMatcher::matches(std::string_view value) const -> bool {
+    if (false == m_fast) {
+        return clp::string_utils::wildcard_match_unsafe(value, m_pattern, false);
+    }
+    std::string_view const pattern{m_pattern};
+    size_t pos{0};
+    size_t first{0};
+    size_t last{m_pieces.size()};
+    if (m_anchored_start && false == m_pieces.empty()) {
+        auto const piece{pattern.substr(m_pieces.front().first, m_pieces.front().second)};
+        if (false == value.starts_with(piece)) {
+            return false;
+        }
+        pos = piece.size();
+        first = 1;
+    }
+    if (m_anchored_end && last > first) {
+        auto const piece{pattern.substr(m_pieces.back().first, m_pieces.back().second)};
+        if (value.size() < pos + piece.size() || false == value.ends_with(piece)) {
+            return false;
+        }
+        value = value.substr(0, value.size() - piece.size());
+        --last;
+    } else if (m_anchored_end) {
+        // A single piece anchored at both ends must consume the whole value.
+        return pos == value.size();
+    }
+    for (size_t i{first}; i < last; ++i) {
+        auto const piece{pattern.substr(m_pieces[i].first, m_pieces[i].second)};
+        auto const found{value.find(piece, pos)};
+        if (std::string_view::npos == found) {
+            return false;
+        }
+        pos = found + piece.size();
+    }
+    return true;
+}
+
+template <typename T>
+[[nodiscard]] auto build_numeric_wildcard_filter(
+        uint64_t num_messages,
+        ColumnScan::BasicReaderMap const& reader_map,
+        int32_t column_id,
+        FilterOperation operation,
+        std::string pattern
+) -> ColumnScan::Bitmap {
+    ColumnScan::Bitmap bitmap(num_messages, 0);
+    auto const readers = reader_map.find(column_id);
+    if (reader_map.end() == readers) {
+        return bitmap;
+    }
+    NumericPatternMatcher const matcher{std::move(pattern)};
+    constexpr size_t cNumericConversionBufferSize{64};
+    std::array<char, cNumericConversionBufferSize> buf{};
+    for (auto* reader : readers->second) {
+        for (uint64_t message_index{0}; message_index < num_messages; ++message_index) {
+            auto const value = std::get<T>(reader->extract_value(message_index));
+            auto const result = [&]() -> auto {
+                if constexpr (std::is_floating_point_v<T>) {
+                    return fmt::format_to_n(buf.begin(), buf.size(), FMT_COMPILE("{:.17g}"), value);
+                }
+                return fmt::format_to_n(buf.begin(), buf.size(), FMT_COMPILE("{}"), value);
+            }();
+            if (result.size > buf.size()) {
+                continue;
+            }
+            bool const matched{matcher.matches(std::string_view{buf.data(), result.size})};
+            bitmap[message_index] |= ((FilterOperation::EQ == operation) == matched) ? 1 : 0;
         }
     }
     return bitmap;
@@ -434,7 +574,10 @@ auto ColumnScan::can_build_filter(
     switch (column->get_literal_type()) {
         case LiteralType::IntegerT:
         case LiteralType::FloatT:
-            return false == filter->get_operand()->has_wildcards();
+            // A wildcard operand is matched against each value's decimal rendering, which only
+            // makes sense for equality.
+            return false == filter->get_operand()->has_wildcards()
+                   || is_equality_operation(operation);
         case LiteralType::TimestampT:
             return true;
         case LiteralType::BooleanT:
@@ -564,29 +707,49 @@ auto ColumnScan::build_filter(
     switch (column->get_literal_type()) {
         case LiteralType::IntegerT: {
             int64_t operand_value{};
-            if (false == operand->as_int(operand_value, operation)) {
-                return bitmap;
+            std::string pattern;
+            if (operand->as_int(operand_value, operation)) {
+                return build_basic_filter(
+                        m_num_messages,
+                        basic_readers,
+                        column_id,
+                        operation,
+                        operand_value
+                );
             }
-            return build_basic_filter(
-                    m_num_messages,
-                    basic_readers,
-                    column_id,
-                    operation,
-                    operand_value
-            );
+            if (operand->as_var_string(pattern, operation)) {
+                return build_numeric_wildcard_filter<int64_t>(
+                        m_num_messages,
+                        basic_readers,
+                        column_id,
+                        operation,
+                        std::move(pattern)
+                );
+            }
+            return bitmap;
         }
         case LiteralType::FloatT: {
             double operand_value{};
-            if (false == operand->as_float(operand_value, operation)) {
-                return bitmap;
+            std::string pattern;
+            if (operand->as_float(operand_value, operation)) {
+                return build_basic_filter(
+                        m_num_messages,
+                        basic_readers,
+                        column_id,
+                        operation,
+                        operand_value
+                );
             }
-            return build_basic_filter(
-                    m_num_messages,
-                    basic_readers,
-                    column_id,
-                    operation,
-                    operand_value
-            );
+            if (operand->as_var_string(pattern, operation)) {
+                return build_numeric_wildcard_filter<double>(
+                        m_num_messages,
+                        basic_readers,
+                        column_id,
+                        operation,
+                        std::move(pattern)
+                );
+            }
+            return bitmap;
         }
         case LiteralType::BooleanT: {
             bool operand_value{};
