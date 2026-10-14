@@ -10,6 +10,7 @@ use clp_s_ffi::*;
 
 const MINIMAL_ARCHIVE: &str = "sfa-v0.5.0-minimal-cpp.bin";
 const MINIMAL_JSONL: &str = "sfa-v0.5.0-minimal-cpp-input.jsonl";
+const AGGREGATIONS_ARCHIVE: &str = "sfa-v0.5.0-aggregations-cpp.bin";
 const LOG_ORDER_ARCHIVE: &str = "sfa-v0.5.0-log-order-cpp.bin";
 const ARRAY_DIRECTORY: &str = "sfa-v0.5.0-unstructured-arrays-cpp-dir";
 const FOUR_BYTE_KV_IR_ORACLE_HEX: &str =
@@ -671,6 +672,7 @@ fn reports_frozen_abi_and_library_versions() {
     assert_eq!(120, std::mem::size_of::<ClpSKvIrEventView>());
     assert_eq!(16, std::mem::size_of::<ClpSV2ProjectedField>());
     assert_eq!(40, std::mem::size_of::<ClpSV2Value>());
+    assert_eq!(24, std::mem::size_of::<ClpSV2ArchiveFieldType>());
 
     let mut required = 0;
     // SAFETY: Null with zero capacity is a documented size probe; `required` is writable.
@@ -901,6 +903,162 @@ fn kv_ir_v2_scanner_reports_the_whole_streams_field_types() {
         clp_s_v2_kv_ir_scanner_field_types(scanner.0, ptr::null_mut(), &raw mut count, &raw mut error)
     };
     assert_ne!(CLP_S_STATUS_OK, status);
+}
+
+struct ArchiveFieldTypesHandle(*mut ClpSV2ArchiveFieldTypeList);
+
+impl Drop for ArchiveFieldTypesHandle {
+    fn drop(&mut self) {
+        // SAFETY: The wrapper owns exactly one live listing.
+        unsafe {
+            clp_s_v2_archive_field_type_list_free(self.0);
+        }
+    }
+}
+
+/// Lists an archive's field types as owned `(escaped path, node code)` pairs.
+fn archive_field_types(archive: &ArchiveHandle) -> Vec<(Vec<u8>, u8)> {
+    let mut types = ptr::dangling_mut::<ClpSV2ArchiveFieldTypeList>();
+    let mut entries = ptr::dangling::<ClpSV2ArchiveFieldType>();
+    let mut count = usize::MAX;
+    let mut text = [0_u8; 512];
+    let mut error = error_buffer(&mut text);
+    // SAFETY: The archive is live and every output is writable and disjoint.
+    let status = unsafe {
+        clp_s_v2_archive_field_types(
+            archive.0,
+            &raw mut types,
+            &raw mut entries,
+            &raw mut count,
+            &raw mut error,
+        )
+    };
+    assert_eq!(CLP_S_STATUS_OK, status, "{}", error_text(&text));
+    assert!(!types.is_null());
+    let owner = ArchiveFieldTypesHandle(types);
+    // SAFETY: The listing owns `count` entries and their paths until `owner` is dropped.
+    let entries = unsafe { slice::from_raw_parts(entries, count) };
+    let listed = entries
+        .iter()
+        .map(|entry| {
+            // SAFETY: Each path is `path_length` bytes owned by the listing.
+            let path = unsafe { slice::from_raw_parts(entry.path, entry.path_length) };
+            (path.to_vec(), entry.node_type)
+        })
+        .collect();
+    drop(owner);
+    listed
+}
+
+#[test]
+fn archive_field_types_list_each_addressable_node_once_per_type() {
+    let archive = open_archive(&fixture(AGGREGATIONS_ARCHIVE));
+    let types = archive_field_types(&archive);
+    let type_of = |name: &[u8]| -> Vec<u8> {
+        let mut codes: Vec<u8> = types
+            .iter()
+            .filter(|(path, _)| path.as_slice() == name)
+            .map(|(_, node_type)| *node_type)
+            .collect();
+        codes.sort_unstable();
+        codes
+    };
+
+    // A nested path is dot-joined, and a key holding a literal dot is escaped, so `outer` ->
+    // `a.b` -> `value` cannot be confused with `outer` -> `a` -> `b` -> `value`.
+    assert_eq!(vec![archive_node::OBJECT], type_of(b"outer"), "{types:?}");
+    assert_eq!(vec![archive_node::OBJECT], type_of(br"outer.a\.b"), "{types:?}");
+    assert_eq!(vec![archive_node::INTEGER], type_of(br"outer.a\.b.value"), "{types:?}");
+    assert!(type_of(b"outer.a.b.value").is_empty(), "{types:?}");
+
+    // A key stored as an integer in one record and a float in another is listed under both, which
+    // is how a caller learns the path is mixed.
+    let mixed = type_of(b"mixed");
+    assert_eq!(2, mixed.len(), "{types:?}");
+    assert!(mixed.contains(&archive_node::INTEGER), "{types:?}");
+    assert!(!mixed.iter().all(|code| *code == archive_node::INTEGER), "{types:?}");
+
+    // `unique` holds an integer, a float, strings, both Booleans, null, an object and an array.
+    let unique = type_of(b"unique");
+    for expected in [
+        archive_node::INTEGER,
+        archive_node::BOOLEAN,
+        archive_node::NULL,
+        archive_node::OBJECT,
+    ] {
+        assert!(unique.contains(&expected), "{expected} missing from {types:?}");
+    }
+    assert!(
+        unique.contains(&archive_node::VAR_STRING) || unique.contains(&archive_node::CLP_STRING),
+        "{types:?}"
+    );
+    // An object's members are listed under its path, whichever other types the key also takes.
+    assert_eq!(vec![archive_node::INTEGER], type_of(b"unique.nested"), "{types:?}");
+
+    assert_eq!(1, type_of(b"ts").len(), "{types:?}");
+    assert!(type_of(b"no-such-key").is_empty(), "{types:?}");
+    assert!(types.iter().all(|(path, _)| !path.is_empty()), "{types:?}");
+}
+
+#[test]
+fn archive_field_types_reject_null_arguments_after_resetting_outputs() {
+    let archive = open_archive(&fixture(MINIMAL_ARCHIVE));
+    let mut text = [0_u8; 512];
+    let mut error = error_buffer(&mut text);
+
+    let mut types = ptr::dangling_mut::<ClpSV2ArchiveFieldTypeList>();
+    let mut entries = ptr::dangling::<ClpSV2ArchiveFieldType>();
+    let mut count = usize::MAX;
+    // SAFETY: The outputs are writable; the archive handle is deliberately null.
+    let status = unsafe {
+        clp_s_v2_archive_field_types(
+            ptr::null(),
+            &raw mut types,
+            &raw mut entries,
+            &raw mut count,
+            &raw mut error,
+        )
+    };
+    assert_eq!(CLP_S_STATUS_INVALID_ARGUMENT, status);
+    assert!(types.is_null());
+    assert!(entries.is_null());
+    assert_eq!(0, count);
+
+    // SAFETY: The archive is live; the entry output is deliberately null.
+    let status = unsafe {
+        clp_s_v2_archive_field_types(
+            archive.0,
+            &raw mut types,
+            ptr::null_mut(),
+            &raw mut count,
+            &raw mut error,
+        )
+    };
+    assert_eq!(CLP_S_STATUS_INVALID_ARGUMENT, status);
+    assert!(types.is_null());
+
+    // SAFETY: Freeing null is a documented no-op.
+    unsafe {
+        clp_s_v2_archive_field_type_list_free(ptr::null_mut());
+    }
+
+    // The minimal fixture's flat record lists each key exactly once.
+    let listed = archive_field_types(&archive);
+    let mut paths: Vec<&[u8]> = listed.iter().map(|(path, _)| path.as_slice()).collect();
+    paths.sort_unstable();
+    assert_eq!(
+        vec![&b"active"[..], b"level", b"message", b"ts", b"value"],
+        paths,
+        "{listed:?}"
+    );
+    assert!(
+        listed.contains(&(b"value".to_vec(), archive_node::INTEGER)),
+        "{listed:?}"
+    );
+    assert!(
+        listed.contains(&(b"active".to_vec(), archive_node::BOOLEAN)),
+        "{listed:?}"
+    );
 }
 
 #[test]

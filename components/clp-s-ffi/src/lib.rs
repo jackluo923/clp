@@ -70,6 +70,7 @@ use clp_s::archive::FsDirectoryArchiveSource;
 use clp_s::archive::MetadataLimits;
 use clp_s::archive::SingleFileArchiveReader;
 use clp_s::extract_jsonl_records;
+use clp_s::archive::ArchiveCatalogLimits;
 use clp_s::ingest::KvIrEncodedTextError;
 use clp_s::ingest::KvIrEncoding;
 use clp_s::ingest::KvIrError;
@@ -2202,6 +2203,151 @@ pub unsafe extern "C" fn clp_s_v2_kv_ir_scanner_free(scanner: *mut ClpSV2KvIrSca
     // SAFETY: Forwarded from the function contract.
     unsafe {
         drop(Box::from_raw(scanner));
+    }
+}
+
+/// `CLP_S_V2_ARCHIVE_NODE_*` codes of the C header: the archive format's own node types.
+pub mod archive_node {
+    pub const INTEGER: u8 = 0;
+    pub const FLOAT: u8 = 1;
+    pub const CLP_STRING: u8 = 2;
+    pub const VAR_STRING: u8 = 3;
+    pub const BOOLEAN: u8 = 4;
+    pub const OBJECT: u8 = 5;
+    pub const UNSTRUCTURED_ARRAY: u8 = 6;
+    pub const NULL: u8 = 7;
+    pub const DEPRECATED_DATE_STRING: u8 = 8;
+    pub const STRUCTURED_ARRAY: u8 = 9;
+    pub const METADATA: u8 = 10;
+    pub const DELTA_INTEGER: u8 = 11;
+    pub const FORMATTED_FLOAT: u8 = 12;
+    pub const DICTIONARY_FLOAT: u8 = 13;
+    pub const TIMESTAMP: u8 = 14;
+}
+
+// The header promises these codes are the format's wire discriminants, so pin each one to it.
+const _: () = {
+    use clp_s::archive::NodeType;
+    assert!(archive_node::INTEGER == NodeType::Integer as u8);
+    assert!(archive_node::FLOAT == NodeType::Float as u8);
+    assert!(archive_node::CLP_STRING == NodeType::ClpString as u8);
+    assert!(archive_node::VAR_STRING == NodeType::VarString as u8);
+    assert!(archive_node::BOOLEAN == NodeType::Boolean as u8);
+    assert!(archive_node::OBJECT == NodeType::Object as u8);
+    assert!(archive_node::UNSTRUCTURED_ARRAY == NodeType::UnstructuredArray as u8);
+    assert!(archive_node::NULL == NodeType::Null as u8);
+    assert!(archive_node::DEPRECATED_DATE_STRING == NodeType::DeprecatedDateString as u8);
+    assert!(archive_node::STRUCTURED_ARRAY == NodeType::StructuredArray as u8);
+    assert!(archive_node::METADATA == NodeType::Metadata as u8);
+    assert!(archive_node::DELTA_INTEGER == NodeType::DeltaInteger as u8);
+    assert!(archive_node::FORMATTED_FLOAT == NodeType::FormattedFloat as u8);
+    assert!(archive_node::DICTIONARY_FLOAT == NodeType::DictionaryFloat as u8);
+    assert!(archive_node::TIMESTAMP == NodeType::Timestamp as u8);
+};
+
+/// One user-namespace schema node of an archive. Layout-identical to
+/// `clp_s_v2_archive_field_type`: an escaped dot path and the archive's own node-type
+/// discriminant, one of the `CLP_S_V2_ARCHIVE_NODE_*` codes.
+#[repr(C)]
+pub struct ClpSV2ArchiveFieldType {
+    pub path: *const u8,
+    pub path_length: usize,
+    pub node_type: u8,
+}
+
+/// Opaque owner of an archive's field-type listing.
+pub struct ClpSV2ArchiveFieldTypeList {
+    /// Owns the paths `entries` point into; a path's bytes do not move when the handle does.
+    _fields: Vec<columnar::ArchiveFieldType>,
+    entries: Vec<ClpSV2ArchiveFieldType>,
+}
+
+/// Lists the user-namespace schema nodes of an archive, with escaped dot paths and types.
+///
+/// Reads the archive's schema tree and nothing else a scan would need: no dictionary and no table
+/// is decoded. A path stored under several node types appears once per type, so a caller can
+/// certify a filter on a path only when every entry for it agrees. The entries and their paths
+/// are owned by `*out_list` and stay valid until it is freed with
+/// [`clp_s_v2_archive_field_type_list_free`]. All three outputs are reset before validation.
+///
+/// # Safety
+///
+/// `archive` must be a live handle from [`clp_s_v1_archive_open`]. `out_list`, `out_entries`,
+/// and `out_count` must be writable. `error` follows [`ClpSErrorBuffer`]'s contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clp_s_v2_archive_field_types(
+    archive: *const ClpSArchive,
+    out_list: *mut *mut ClpSV2ArchiveFieldTypeList,
+    out_entries: *mut *const ClpSV2ArchiveFieldType,
+    out_count: *mut usize,
+    error: *mut ClpSErrorBuffer,
+) -> ClpSStatus {
+    // SAFETY: The caller provides writable output storage. This happens before fallible work.
+    unsafe {
+        if !out_list.is_null() {
+            out_list.write(ptr::null_mut());
+        }
+        if !out_entries.is_null() {
+            out_entries.write(ptr::null());
+        }
+        if !out_count.is_null() {
+            out_count.write(0);
+        }
+    }
+    // SAFETY: All raw arguments are governed by this function's contract.
+    unsafe {
+        ffi_entry(error, || {
+            let archive = archive.as_ref().ok_or_else(|| {
+                ApiError::InvalidArgument("archive handle must not be null".to_owned())
+            })?;
+            if out_list.is_null() || out_entries.is_null() || out_count.is_null() {
+                return Err(ApiError::InvalidArgument(
+                    "out_list, out_entries and out_count must not be null".to_owned(),
+                ));
+            }
+            let catalog = archive
+                .open_reader()?
+                .read_catalog(ArchiveCatalogLimits::default().with_skip_dictionaries(true))
+                .map_err(|source| {
+                    ApiError::Archive(format!("failed to read archive catalog: {source}"))
+                })?;
+            let fields = columnar::archive_field_types(catalog.schema_tree());
+            let entries = fields
+                .iter()
+                .map(|field| ClpSV2ArchiveFieldType {
+                    path: field.path.as_ptr(),
+                    path_length: field.path.len(),
+                    node_type: field.node_type as u8,
+                })
+                .collect::<Vec<_>>();
+            let handle = Box::new(ClpSV2ArchiveFieldTypeList {
+                _fields: fields,
+                entries,
+            });
+            out_entries.write(handle.entries.as_ptr());
+            out_count.write(handle.entries.len());
+            out_list.write(Box::into_raw(handle));
+            Ok(())
+        })
+    }
+}
+
+/// Frees a field-type listing. A null handle is a no-op.
+///
+/// # Safety
+///
+/// A non-null pointer must have been returned by [`clp_s_v2_archive_field_types`] and must not have
+/// been freed already.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clp_s_v2_archive_field_type_list_free(
+    list: *mut ClpSV2ArchiveFieldTypeList,
+) {
+    if list.is_null() {
+        return;
+    }
+    // SAFETY: Forwarded from the function contract.
+    unsafe {
+        drop(Box::from_raw(list));
     }
 }
 

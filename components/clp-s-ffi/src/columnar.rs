@@ -119,11 +119,7 @@ impl std::fmt::Display for ScanError {
 fn resolve_path(tree: &SchemaTree, components: &[&str]) -> Vec<u32> {
     let mut resolved = Vec::new();
     let nodes = tree.nodes();
-    let Some(mut current) = nodes.iter().position(|node| {
-        node.parent_id().is_none()
-            && NodeType::Metadata != node.node_type()
-            && node.key_bytes().is_empty()
-    }) else {
+    let Some(mut current) = user_root(tree) else {
         return resolved;
     };
     for (index, component) in components.iter().enumerate() {
@@ -155,6 +151,67 @@ fn resolve_path(tree: &SchemaTree, components: &[&str]) -> Vec<u32> {
         current = next;
     }
     resolved
+}
+
+/// Returns the default namespace's object root, the parent of every top-level user key.
+fn user_root(tree: &SchemaTree) -> Option<usize> {
+    tree.nodes().iter().position(|node| {
+        node.parent_id().is_none()
+            && NodeType::Metadata != node.node_type()
+            && node.key_bytes().is_empty()
+    })
+}
+
+/// One schema node a dot path can address: the path, escaped the way a projection descriptor is,
+/// and the archive's node type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveFieldType {
+    pub path: Vec<u8>,
+    pub node_type: NodeType,
+}
+
+/// Lists every schema node a dot path can address, with its escaped path and type.
+///
+/// A node is addressable when every ancestor below the user root is an object with a non-empty
+/// key: an array's children describe its elements rather than further dot paths, and an empty key
+/// has no dot spelling. A key stored under several node types yields one entry per type, which is
+/// what lets a caller tell a homogeneous path from a mixed one. A validated tree lists every
+/// parent before its children, so one forward pass suffices.
+#[must_use]
+pub fn archive_field_types(tree: &SchemaTree) -> Vec<ArchiveFieldType> {
+    let nodes = tree.nodes();
+    let Some(root) = user_root(tree) else {
+        return Vec::new();
+    };
+    // The dot path of every object a later node may hang off, by node ID.
+    let mut object_paths: Vec<Option<Vec<u8>>> = vec![None; nodes.len()];
+    object_paths[root] = Some(Vec::new());
+    let mut types = Vec::new();
+    for (node_id, node) in nodes.iter().enumerate() {
+        if node.key_bytes().is_empty() {
+            continue;
+        }
+        let Some(parent_path) = node
+            .parent_id()
+            .and_then(|parent| object_paths.get(parent))
+            .and_then(Option::as_ref)
+        else {
+            continue;
+        };
+        let mut path = parent_path.clone();
+        if !path.is_empty() {
+            path.push(b'.');
+        }
+        crate::kv_ir_columnar::push_escaped_component(&mut path, node.key_bytes());
+        if NodeType::Object == node.node_type() {
+            object_paths[node_id] = Some(path.clone());
+        }
+        types.push(ArchiveFieldType {
+            path,
+            node_type: node.node_type(),
+        });
+    }
+    types
 }
 
 /// Splits an escaped dot descriptor into its components.

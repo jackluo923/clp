@@ -253,7 +253,7 @@ pub struct FieldType {
 }
 
 /// Appends `key` to `path` with `.` and `\` escaped.
-fn push_escaped_component(path: &mut Vec<u8>, key: &[u8]) {
+pub(crate) fn push_escaped_component(path: &mut Vec<u8>, key: &[u8]) {
     for &byte in key {
         if byte == b'\\' || byte == b'.' {
             path.push(b'\\');

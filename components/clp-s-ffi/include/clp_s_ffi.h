@@ -589,6 +589,55 @@ clp_s_status clp_s_v2_kv_ir_scanner_field_types(
         clp_s_error_buffer *error
 );
 
+/* The archive format's own schema-tree node types. These are stable wire discriminants: values are
+ * never renumbered, and new ones are only appended. */
+#define CLP_S_V2_ARCHIVE_NODE_INTEGER 0u
+#define CLP_S_V2_ARCHIVE_NODE_FLOAT 1u
+#define CLP_S_V2_ARCHIVE_NODE_CLP_STRING 2u
+#define CLP_S_V2_ARCHIVE_NODE_VAR_STRING 3u
+#define CLP_S_V2_ARCHIVE_NODE_BOOLEAN 4u
+#define CLP_S_V2_ARCHIVE_NODE_OBJECT 5u
+#define CLP_S_V2_ARCHIVE_NODE_UNSTRUCTURED_ARRAY 6u
+#define CLP_S_V2_ARCHIVE_NODE_NULL 7u
+#define CLP_S_V2_ARCHIVE_NODE_DEPRECATED_DATE_STRING 8u
+#define CLP_S_V2_ARCHIVE_NODE_STRUCTURED_ARRAY 9u
+#define CLP_S_V2_ARCHIVE_NODE_METADATA 10u
+#define CLP_S_V2_ARCHIVE_NODE_DELTA_INTEGER 11u
+#define CLP_S_V2_ARCHIVE_NODE_FORMATTED_FLOAT 12u
+#define CLP_S_V2_ARCHIVE_NODE_DICTIONARY_FLOAT 13u
+#define CLP_S_V2_ARCHIVE_NODE_TIMESTAMP 14u
+
+typedef struct clp_s_v2_archive_field_type_list clp_s_v2_archive_field_type_list;
+
+/**
+ * One user-namespace schema node of an archive: its dot path, escaped the way a projection
+ * descriptor is (a backslash before `.` and `\`), and its `CLP_S_V2_ARCHIVE_NODE_*` type.
+ */
+typedef struct clp_s_v2_archive_field_type {
+    const uint8_t *path;
+    size_t path_length;
+    uint8_t node_type;
+} clp_s_v2_archive_field_type;
+
+/**
+ * Lists the user-namespace schema nodes of an archive. Only the schema tree and the sections a
+ * catalog needs are read; no dictionary or table is decoded. A node is listed when every ancestor
+ * below the user root is an object with a non-empty key, and a path stored under several node types
+ * appears once per type, so a filter on a path is safe to push only when every entry for it agrees.
+ * The entries and their paths are owned by `*out_list` and stay valid until it is freed. All
+ * three outputs are reset before validation.
+ */
+clp_s_status clp_s_v2_archive_field_types(
+        const clp_s_archive *archive,
+        clp_s_v2_archive_field_type_list **out_list,
+        const clp_s_v2_archive_field_type **out_entries,
+        size_t *out_count,
+        clp_s_error_buffer *error
+);
+
+/** Frees a field-type listing. A null handle is a no-op. */
+void clp_s_v2_archive_field_type_list_free(clp_s_v2_archive_field_type_list *list);
+
 #if defined(__cplusplus)
 #define CLP_S_ABI_STATIC_ASSERT(condition, message) static_assert((condition), message)
 #elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
@@ -621,6 +670,14 @@ CLP_S_ABI_STATIC_ASSERT(
 CLP_S_ABI_STATIC_ASSERT(
         sizeof(clp_s_v2_projected_field) == sizeof(void *) + sizeof(size_t),
         "v2 field size"
+);
+CLP_S_ABI_STATIC_ASSERT(
+        offsetof(clp_s_v2_archive_field_type, path_length) == sizeof(void *),
+        "v2 archive field type length offset"
+);
+CLP_S_ABI_STATIC_ASSERT(
+        offsetof(clp_s_v2_archive_field_type, node_type) == sizeof(void *) + sizeof(size_t),
+        "v2 archive field type node type offset"
 );
 CLP_S_ABI_STATIC_ASSERT(offsetof(clp_s_v2_value, kind) == 0, "v2 value kind offset");
 CLP_S_ABI_STATIC_ASSERT(
