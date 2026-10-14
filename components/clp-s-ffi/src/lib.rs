@@ -95,13 +95,24 @@ use clp_s::ingest::KvIrSerializerOptions;
 use clp_s::json::JsonBytePolicy;
 use clp_s::search::ArchiveSearchOptions;
 use clp_s::search::KqlLimits;
+use clp_s::search::KvIrJsonlMatchSink;
+use clp_s::search::KvIrJsonlOptions;
+use clp_s::search::KvIrMatchSink;
+use clp_s::search::KvIrMatchedEvent;
+use clp_s::search::KvIrSearchLimits;
+use clp_s::search::KvIrSearchOptions;
+use clp_s::search::KvIrSearchSink;
 use clp_s::search::ParsedQuery;
 use clp_s::search::SearchJsonlAdapter;
 use clp_s::search::SearchJsonlOptions;
 use clp_s::search::SearchLimits;
 use clp_s::search::SearchOptions;
+use clp_s::search::is_cpp_tolerated_kv_ir_truncation;
 use clp_s::search::parse_kql;
 use clp_s::search::search_archive;
+use clp_s::search::search_first_kv_ir_stream;
+
+use crate::columnar::ScanError;
 
 /// Numeric version of the `clp_s_v1_*` ABI.
 pub const CLP_S_ABI_VERSION: u32 = 1;
@@ -1440,6 +1451,87 @@ fn callback_result(stop: Option<CallbackStop>, archive_error: impl std::fmt::Dis
         }
         Some(CallbackStop::Error(message)) => ApiError::Callback(message),
         None => ApiError::Archive(archive_error.to_string()),
+    }
+}
+
+/// Formats matching KV-IR events and forwards each one to a foreign callback.
+///
+/// This is the KV-IR twin of [`CallbackSink`]. It renders the user namespace alone, because a
+/// caller asking for a whole record wants the user object, not [`KvIrJsonlMatchSink`]'s
+/// two-namespace JSONL envelope. The wrapped sink owns a writer that is never written to: only
+/// its record buffer is used, through the borrowed render.
+struct KvIrCallbackSink {
+    callback: ClpSRecordCallback,
+    user_data: *mut c_void,
+    jsonl: KvIrJsonlMatchSink<Vec<u8>>,
+    delivered: u64,
+    stop: Option<CallbackStop>,
+}
+
+impl KvIrCallbackSink {
+    fn new(callback: ClpSRecordCallback, user_data: *mut c_void) -> Self {
+        Self {
+            callback,
+            user_data,
+            jsonl: KvIrJsonlMatchSink::new(
+                Vec::new(),
+                KvIrJsonlOptions::new().with_byte_policy(JsonBytePolicy::PreserveInvalidUtf8),
+            ),
+            delivered: 0,
+            stop: None,
+        }
+    }
+}
+
+impl KvIrMatchSink for KvIrCallbackSink {
+    type Error = ScanError;
+
+    fn write_match(&mut self, event: KvIrMatchedEvent<'_>) -> Result<(), Self::Error> {
+        let (json, json_length) = {
+            let rendered = self
+                .jsonl
+                .format_user_record(event)
+                .map_err(|source| ScanError::Projection(source.to_string()))?;
+            (rendered.as_ptr(), rendered.len())
+        };
+        // A KV-IR event has no physical table or row, so the archive identities stay absent.
+        let abi_record = ClpSRecord {
+            json,
+            json_length,
+            table_index: 0,
+            row_index: 0,
+            log_event_idx: 0,
+            has_log_event_idx: 0,
+            reserved: 0,
+        };
+        self.delivered = self
+            .delivered
+            .checked_add(1)
+            .ok_or_else(|| ScanError::Archive("callback record count overflow".to_owned()))?;
+        // SAFETY: The callback pointer was checked when the operation began. The JSON bytes
+        // borrow `self.jsonl`, which is not mutated again before this synchronous foreign call
+        // returns, and `abi_record` stays live for its duration. The C ABI contract forbids a
+        // foreign unwind.
+        let disposition = unsafe { (self.callback)(self.user_data, &raw const abi_record) };
+        match disposition {
+            CLP_S_CALLBACK_CONTINUE => Ok(()),
+            CLP_S_CALLBACK_CANCEL => {
+                self.stop = Some(CallbackStop::Cancelled);
+                Err(ScanError::Archive(
+                    "record callback requested cancellation".to_owned(),
+                ))
+            }
+            CLP_S_CALLBACK_ERROR => {
+                let message = "record callback reported failure".to_owned();
+                self.stop = Some(CallbackStop::Error(message.clone()));
+                Err(ScanError::Archive(message))
+            }
+            actual => {
+                let message = format!("record callback returned unknown disposition {actual}");
+                self.stop = Some(CallbackStop::Error(message.clone()));
+                Err(ScanError::Archive(message))
+            }
+        }
     }
 }
 
@@ -3029,6 +3121,94 @@ pub unsafe extern "C" fn clp_s_v1_search(
             result
                 .map(|_stats| ())
                 .map_err(|source| callback_result(callback_sink.stop, source))
+        })
+    }
+}
+
+/// Searches a zstd-framed KV-IR stream and delivers the user namespace of each matching event as
+/// a complete JSON document.
+///
+/// This is the KV-IR counterpart of [`clp_s_v1_search`]. The bytes are the user-generated
+/// namespace alone: a bare JSON object, carrying neither the engine's two-namespace JSONL
+/// envelope nor a trailing newline, which is the shape a whole-record `_source` document takes.
+/// The stream must carry zstd framing; an uncompressed KV-IR stream is not accepted, matching
+/// [`clp_s_v2_kv_ir_scanner_open`].
+///
+/// A stream still being appended to has no end marker. A truncation the engine's KV-IR reader
+/// tolerates ends the search successfully with the complete events already delivered; any other
+/// read failure is reported. `records_delivered` is optional, initialized to zero, and updated on
+/// every ordinary return, including callback cancellation or failure.
+///
+/// # Safety
+///
+/// `stream_path` must be readable for `stream_path_length` bytes. `query` must be a live handle
+/// from [`clp_s_v1_query_compile`]. `callback` must not unwind and must obey the callback
+/// contract. Optional output/error pointers must remain writable and must not overlap the handles,
+/// callback state, or each other. No handle may be freed during this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clp_s_v1_kv_ir_search(
+    stream_path: *const u8,
+    stream_path_length: usize,
+    query: *const ClpSQuery,
+    callback: Option<ClpSRecordCallback>,
+    user_data: *mut c_void,
+    records_delivered: *mut u64,
+    error: *mut ClpSErrorBuffer,
+) -> ClpSStatus {
+    if !records_delivered.is_null() {
+        // SAFETY: The caller supplies writable optional counter storage.
+        unsafe {
+            records_delivered.write(0);
+        }
+    }
+    // SAFETY: All raw arguments are governed by this function's contract.
+    unsafe {
+        ffi_entry(error, || {
+            let query = query.as_ref().ok_or_else(|| {
+                ApiError::InvalidArgument("query handle must not be null".to_owned())
+            })?;
+            let callback = callback.ok_or_else(|| {
+                ApiError::InvalidArgument("record callback must not be null".to_owned())
+            })?;
+            let path_bytes = borrowed_bytes(stream_path, stream_path_length, "stream_path")?;
+            let path_text = str::from_utf8(path_bytes).map_err(|source| {
+                ApiError::InvalidArgument(format!("stream path is not valid UTF-8: {source}"))
+            })?;
+
+            let file = File::open(path_text)
+                .map_err(|source| ApiError::Io(format!("failed to open {path_text}: {source}")))?;
+            let decoder = zstd::stream::read::Decoder::new(file)
+                .map_err(|source| ApiError::Io(format!("failed to open {path_text}: {source}")))?;
+
+            let sink = KvIrCallbackSink::new(callback, user_data);
+            let mut searcher = KvIrSearchSink::new(
+                &query.parsed,
+                sink,
+                KvIrSearchOptions::new(
+                    query.options.search().ignore_case(),
+                    KvIrSearchLimits::default(),
+                ),
+            )
+            .map_err(|source| {
+                ApiError::Query(format!("failed to compile the KV-IR query: {source}"))
+            })?;
+            let mut reader = KvIrReader::new(decoder, KvIrOptions::default());
+            let result = search_first_kv_ir_stream(&mut reader, &mut searcher);
+
+            let sink = searcher.match_sink_mut();
+            let delivered = sink.delivered;
+            if !records_delivered.is_null() {
+                // SAFETY: The caller supplies writable optional counter storage.
+                records_delivered.write(delivered);
+            }
+            let stop = sink.stop.take();
+            match result {
+                Ok(_) => Ok(()),
+                // A live segment ends without an explicit end marker. The events before that
+                // narrow truncation are complete and already delivered.
+                Err(source) if is_cpp_tolerated_kv_ir_truncation(&source) => Ok(()),
+                Err(source) => Err(callback_result(stop, source)),
+            }
         })
     }
 }

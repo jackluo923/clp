@@ -16,6 +16,8 @@ const FOUR_BYTE_KV_IR_ORACLE_HEX: &str =
     include_str!("../../clp-s/tests/fixtures/kv-ir-v0.1.0-four-byte-cpp.hex");
 const EIGHT_BYTE_KV_IR_ORACLE_HEX: &str =
     include_str!("../../clp-s/tests/fixtures/kv-ir-v0.1.0-eight-byte-cpp.hex");
+const NESTED_KV_IR_SEARCH_HEX: &str =
+    include_str!("../../clp-s/tests/fixtures/kv-ir-search-v0.1.0-nested-cpp.hex");
 const KV_IR_FIXTURE_METADATA: &[u8] = concat!(
     r#"{"USER_DEFINED_METADATA":{"fixture":"rust-kv-ir-reader-v1"}"#,
     r#","VARIABLES_SCHEMA_ID":"com.yscope.clp.VariablesSchemaV2""#,
@@ -1994,6 +1996,59 @@ fn kv_ir_deserializer_enforces_owned_event_limits_and_becomes_terminal() {
         clp_s_v1_kv_ir_deserializer_free(ptr::null_mut());
         clp_s_v1_kv_ir_event_free(ptr::null_mut());
     }
+}
+
+/// The KV-IR search filters a stream by the compiled query and delivers each matching event's
+/// user namespace alone, so a caller asking for a whole record receives a bare document rather
+/// than the two-namespace JSONL envelope `clp_s_v1_search`'s KV-IR twin would otherwise carry.
+#[test]
+fn kv_ir_search_delivers_bare_user_documents() {
+    let stream = TemporaryKvIrFile::from_raw_stream(&decode_hex(NESTED_KV_IR_SEARCH_HEX));
+    let query = compile_query("*: *", 0);
+    let path = stream.path.to_str().expect("temporary path is UTF-8");
+    let mut state = CallbackState::default();
+    let mut delivered = u64::MAX;
+    let mut text = [0_u8; 512];
+    let mut error = error_buffer(&mut text);
+    // SAFETY: The path bytes and both handles stay live for this synchronous call, and the
+    // callback state is a live local that the ABI only borrows during the call.
+    let status = unsafe {
+        clp_s_v1_kv_ir_search(
+            path.as_ptr(),
+            path.len(),
+            query.0,
+            Some(collect_record),
+            (&raw mut state).cast(),
+            &raw mut delivered,
+            &raw mut error,
+        )
+    };
+    assert_eq!(CLP_S_STATUS_OK, status, "{}", error_text(&text));
+    assert_eq!(0, error.required);
+    assert_eq!(
+        u64::try_from(state.records.len()).expect("the delivered count fits"),
+        delivered
+    );
+    assert!(
+        !state.records.is_empty(),
+        "a match-all query delivers the fixture's events"
+    );
+    for record in &state.records {
+        assert!(
+            !record.json.starts_with(b"{\"auto_generated_kv_pairs\""),
+            "a whole-record search must not carry the JSONL envelope: {}",
+            String::from_utf8_lossy(&record.json)
+        );
+        assert!(
+            record.json.starts_with(b"{") && record.json.ends_with(b"}"),
+            "the document is one bare object: {}",
+            String::from_utf8_lossy(&record.json)
+        );
+    }
+    assert_eq!(
+        br#"{"a":1,"empty":{},"none":null,"obj":{"a":true,"b":"bee"},"z":9}"#,
+        state.records[0].json.as_slice()
+    );
 }
 
 fn auto_map() -> Vec<u8> {

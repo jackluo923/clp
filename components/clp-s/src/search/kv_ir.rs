@@ -2344,6 +2344,26 @@ impl<W: Write> KvIrJsonlMatchSink<W> {
         self.append_literal(b"}\n")
     }
 
+    /// Renders one matched event as its user namespace alone.
+    ///
+    /// The bytes are a bare JSON object with no envelope and no trailing newline, which is the
+    /// shape a whole-record `_source` document takes, as opposed to [`Self::format_record`]'s
+    /// two-namespace JSONL envelope. The borrow is valid until the next call that formats
+    /// through this sink.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KvIrJsonlError`] if the event's user namespace cannot be rendered within the
+    /// sink's configured limits.
+    pub fn format_user_record(
+        &mut self,
+        event: KvIrMatchedEvent<'_>,
+    ) -> Result<&[u8], KvIrJsonlError> {
+        self.record.clear();
+        self.append_namespace(event, KvIrNamespace::UserGenerated)?;
+        Ok(&self.record)
+    }
+
     fn append_namespace(
         &mut self,
         event: KvIrMatchedEvent<'_>,

@@ -406,6 +406,28 @@ clp_s_status clp_s_v1_search(
 );
 
 /**
+ * Searches a zstd-framed KV-IR stream and delivers the user namespace of each matching event as a
+ * complete JSON document.
+ *
+ * The KV-IR counterpart of `clp_s_v1_search`. Each document is a bare JSON object holding the
+ * user-generated namespace alone: it carries neither the engine's two-namespace JSONL envelope nor
+ * a trailing newline. The stream must carry zstd framing; an uncompressed KV-IR stream is not
+ * accepted. A stream still being appended to has no end marker, so a truncation the KV-IR reader
+ * tolerates ends the search successfully with the events already delivered, while any other read
+ * failure is reported. `records_delivered` may be NULL and includes a callback invocation that
+ * returns CANCEL or ERROR.
+ */
+clp_s_status clp_s_v1_kv_ir_search(
+        const uint8_t *stream_path,
+        size_t stream_path_length,
+        const clp_s_query *query,
+        clp_s_record_callback callback,
+        void *user_data,
+        uint64_t *records_delivered,
+        clp_s_error_buffer *error
+);
+
+/**
  * ABI v2: projected columnar scanning.
  *
  * `clp_s_v1_search` delivers one complete JSON document per match, so a caller wanting a few
