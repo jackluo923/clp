@@ -7,6 +7,7 @@ use std::fmt::Formatter;
 use std::io;
 use std::iter::FusedIterator;
 
+use super::CompiledQuery;
 use super::MatchBitmap;
 use super::MatchingRows;
 use super::ParsedQuery;
@@ -99,7 +100,8 @@ pub struct ArchiveSearchStats {
 }
 
 impl ArchiveSearchStats {
-    /// Returns the number of packed streams read and decoded.
+    /// Returns the number of packed streams read and decoded. A stream none of whose tables can
+    /// match is skipped unread.
     #[must_use]
     pub const fn streams_scanned(self) -> u64 {
         self.streams_scanned
@@ -111,13 +113,14 @@ impl ArchiveSearchStats {
         self.decoded_stream_bytes
     }
 
-    /// Returns the number of schema tables evaluated.
+    /// Returns the number of schema tables evaluated. A table whose schema cannot match is not.
     #[must_use]
     pub const fn tables_scanned(self) -> u64 {
         self.tables_scanned
     }
 
-    /// Returns the number of physical rows evaluated.
+    /// Returns the number of physical rows covered: evaluated, or ruled out with their table
+    /// because its schema cannot match.
     #[must_use]
     pub const fn rows_scanned(self) -> u64 {
         self.rows_scanned
@@ -139,6 +142,16 @@ impl ArchiveSearchStats {
             .checked_add(
                 u64::try_from(decoded_bytes).map_err(|_| ArchiveSearchError::SizeOverflow)?,
             )
+            .ok_or(ArchiveSearchError::SizeOverflow)?;
+        Ok(())
+    }
+
+    /// Counts a table whose schema the query cannot match: its rows are covered without being
+    /// evaluated, so record positions after it stay correct.
+    fn add_skipped_table(&mut self, rows: u64) -> Result<(), ArchiveSearchError> {
+        self.rows_scanned = self
+            .rows_scanned
+            .checked_add(rows)
             .ok_or(ArchiveSearchError::SizeOverflow)?;
         Ok(())
     }
@@ -357,85 +370,66 @@ pub fn search_archive<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
     sink: &mut S,
     options: &ArchiveSearchOptions,
 ) -> Result<ArchiveSearchStats, ArchiveSearchError> {
-    let catalog = reader
-        .read_catalog(options.catalog)
+    // The dictionaries are usually most of an archive, and a query rarely needs all of them: the
+    // filter needs only those its compared columns are read through, and the rest matter only
+    // once a row matches and must be written out. So the catalog is read without them, the
+    // filter's are loaded before compiling, and the others when the first match appears.
+    let mut catalog = reader
+        .read_catalog(options.catalog.with_skip_dictionaries(true))
         .map_err(ArchiveSearchError::Catalog)?;
-    let compiled = query
-        .compile_for_archive(&catalog, options.search)
-        .map_err(ArchiveSearchError::Compile)?;
-    if !compiled
-        .reaches_match_sink()
-        .map_err(ArchiveSearchError::Compile)?
-    {
-        return Ok(ArchiveSearchStats::default());
-    }
-    sink.begin_archive()
-        .map_err(ArchiveSearchError::BeginSink)?;
-    if !compiled.may_match_archive() {
-        return Ok(ArchiveSearchStats::default());
-    }
-    let mut stats = ArchiveSearchStats::default();
-    let mut expected_table_index = 0_usize;
+    let mut loaded = Dictionaries::NONE;
+    let filter = filter_dictionaries(query, catalog.schema_tree());
+    load_dictionaries(reader, &mut catalog, &options.catalog, filter, &mut loaded)?;
 
-    for stream_index in 0..catalog.table_metadata().packed_streams().len() {
-        let stream_id =
-            u64::try_from(stream_index).map_err(|_| ArchiveSearchError::SizeOverflow)?;
-        let stream = reader
-            .read_packed_stream(
-                catalog.metadata(),
-                catalog.table_metadata(),
-                stream_index,
-                options.packed_stream,
-            )
-            .map_err(|source| ArchiveSearchError::PackedStream { stream_id, source })?;
-        stats.add_stream(stream.len())?;
-        let stream = catalog
-            .materialize_adaptive_numerics(stream_id, stream, options.columns)
-            .map_err(|source| ArchiveSearchError::TableStream { stream_id, source })?;
-        let tables = catalog
-            .schema_tables(stream_id, &stream, options.columns)
-            .map_err(|source| ArchiveSearchError::TableStream { stream_id, source })?;
-        for decoded in tables {
-            let decoded =
-                decoded.map_err(|source| ArchiveSearchError::TableStream { stream_id, source })?;
-            if decoded.table_index() != expected_table_index {
-                return Err(ArchiveSearchError::PhysicalTableOrder {
-                    expected: expected_table_index,
-                    actual: decoded.table_index(),
-                });
+    let mut scan = ScanPosition::default();
+    let mut sink_begun = false;
+    loop {
+        let compiled = query
+            .compile_for_archive(&catalog, options.search)
+            .map_err(ArchiveSearchError::Compile)?;
+        if !sink_begun {
+            if !compiled
+                .reaches_match_sink()
+                .map_err(ArchiveSearchError::Compile)?
+            {
+                return Ok(ArchiveSearchStats::default());
             }
-            let table_index = decoded.table_index();
-            let schema_id = decoded.schema().id();
-            let bitmap = compiled.match_table(&decoded).map_err(|source| {
-                ArchiveSearchError::TableMatch {
-                    stream_id,
-                    table_index,
-                    schema_id,
-                    source,
-                }
-            })?;
-            if 0 != bitmap.match_count() {
-                sink.write_matches(ArchiveTableMatches {
-                    catalog: &catalog,
-                    table: &decoded,
-                    bitmap: &bitmap,
-                    stream_id,
-                    archive_record_start: stats.rows_scanned,
-                })
-                .map_err(|source| ArchiveSearchError::Sink {
-                    stream_id,
-                    table_index,
-                    schema_id,
-                    source,
-                })?;
+            sink.begin_archive()
+                .map_err(ArchiveSearchError::BeginSink)?;
+            sink_begun = true;
+            if !compiled.may_match_archive() {
+                return Ok(ArchiveSearchStats::default());
             }
-            stats.add_table(bitmap.len(), bitmap.match_count())?;
-            expected_table_index = expected_table_index
-                .checked_add(1)
-                .ok_or(ArchiveSearchError::SizeOverflow)?;
+        }
+        let outcome = scan_streams(
+            reader,
+            &catalog,
+            &compiled,
+            sink,
+            options,
+            Dictionaries::ALL == loaded,
+            &mut scan,
+        )?;
+        drop(compiled);
+        match outcome {
+            ScanOutcome::Finished => break,
+            // A match needs every dictionary to be written out. Load the rest and resume at the
+            // stream holding the match, which wrote nothing before stopping.
+            ScanOutcome::NeedsDictionaries => load_dictionaries(
+                reader,
+                &mut catalog,
+                &options.catalog,
+                Dictionaries::ALL,
+                &mut loaded,
+            )?,
         }
     }
 
+    let ScanPosition {
+        stats,
+        expected_table_index,
+        ..
+    } = scan;
     let expected_tables = catalog.table_metadata().schema_tables().len();
     if expected_table_index != expected_tables {
         return Err(ArchiveSearchError::TableCountMismatch {
@@ -451,6 +445,335 @@ pub fn search_archive<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
         });
     }
     Ok(stats)
+}
+
+/// Where a scan has reached, kept across a restart so finished streams are not read again.
+#[derive(Clone, Copy, Default)]
+struct ScanPosition {
+    stream_index: usize,
+    stats: ArchiveSearchStats,
+    expected_table_index: usize,
+}
+
+enum ScanOutcome {
+    Finished,
+    /// A table in the stream at the saved position matched while dictionaries were missing. The
+    /// position is that stream's start, and nothing from it has reached the sink.
+    NeedsDictionaries,
+}
+
+fn scan_streams<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
+    reader: &mut A,
+    catalog: &ArchiveCatalog,
+    compiled: &CompiledQuery<'_, '_>,
+    sink: &mut S,
+    options: &ArchiveSearchOptions,
+    all_dictionaries_loaded: bool,
+    position: &mut ScanPosition,
+) -> Result<ScanOutcome, ArchiveSearchError> {
+    let table_metadata = catalog.table_metadata();
+    let stream_count = table_metadata.packed_streams().len();
+    while position.stream_index < stream_count {
+        let stream_index = position.stream_index;
+        let stream_id =
+            u64::try_from(stream_index).map_err(|_| ArchiveSearchError::SizeOverflow)?;
+        let stream_start = *position;
+
+        // A stream whose every table has a schema the query cannot match is never decompressed.
+        let tables = stream_tables(table_metadata.schema_tables(), stream_id);
+        let mut any_may_match = false;
+        for table in tables {
+            if schema_may_match(catalog, compiled, table.schema_id())? {
+                any_may_match = true;
+                break;
+            }
+        }
+        if !any_may_match {
+            for table in tables {
+                position.stats.add_skipped_table(table.message_count())?;
+                position.expected_table_index = position
+                    .expected_table_index
+                    .checked_add(1)
+                    .ok_or(ArchiveSearchError::SizeOverflow)?;
+            }
+            position.stream_index += 1;
+            continue;
+        }
+
+        let stream = reader
+            .read_packed_stream(
+                catalog.metadata(),
+                table_metadata,
+                stream_index,
+                options.packed_stream,
+            )
+            .map_err(|source| ArchiveSearchError::PackedStream { stream_id, source })?;
+        position.stats.add_stream(stream.len())?;
+        let stream = catalog
+            .materialize_adaptive_numerics(stream_id, stream, options.columns)
+            .map_err(|source| ArchiveSearchError::TableStream { stream_id, source })?;
+        let decoded_tables = catalog
+            .schema_tables(stream_id, &stream, options.columns)
+            .map_err(|source| ArchiveSearchError::TableStream { stream_id, source })?;
+        for decoded in decoded_tables {
+            let decoded =
+                decoded.map_err(|source| ArchiveSearchError::TableStream { stream_id, source })?;
+            if decoded.table_index() != position.expected_table_index {
+                return Err(ArchiveSearchError::PhysicalTableOrder {
+                    expected: position.expected_table_index,
+                    actual: decoded.table_index(),
+                });
+            }
+            let table_index = decoded.table_index();
+            let schema_id = decoded.schema().id();
+            if schema_may_match(catalog, compiled, schema_id)? {
+                let bitmap = compiled.match_table(&decoded).map_err(|source| {
+                    ArchiveSearchError::TableMatch {
+                        stream_id,
+                        table_index,
+                        schema_id,
+                        source,
+                    }
+                })?;
+                if 0 != bitmap.match_count() {
+                    if !all_dictionaries_loaded {
+                        *position = stream_start;
+                        return Ok(ScanOutcome::NeedsDictionaries);
+                    }
+                    sink.write_matches(ArchiveTableMatches {
+                        catalog,
+                        table: &decoded,
+                        bitmap: &bitmap,
+                        stream_id,
+                        archive_record_start: position.stats.rows_scanned,
+                    })
+                    .map_err(|source| ArchiveSearchError::Sink {
+                        stream_id,
+                        table_index,
+                        schema_id,
+                        source,
+                    })?;
+                }
+                position
+                    .stats
+                    .add_table(bitmap.len(), bitmap.match_count())?;
+            } else {
+                position
+                    .stats
+                    .add_skipped_table(decoded.metadata().message_count())?;
+            }
+            position.expected_table_index = position
+                .expected_table_index
+                .checked_add(1)
+                .ok_or(ArchiveSearchError::SizeOverflow)?;
+        }
+        position.stream_index += 1;
+    }
+    Ok(ScanOutcome::Finished)
+}
+
+/// The tables stored in one packed stream, which table metadata keeps grouped by stream.
+fn stream_tables(
+    tables: &[crate::archive::SchemaTableMetadata],
+    stream_id: u64,
+) -> &[crate::archive::SchemaTableMetadata] {
+    let first = tables.partition_point(|table| table.stream_id() < stream_id);
+    let end = first + tables[first..].partition_point(|table| table.stream_id() == stream_id);
+    &tables[first..end]
+}
+
+fn schema_may_match(
+    catalog: &ArchiveCatalog,
+    compiled: &CompiledQuery<'_, '_>,
+    schema_id: i32,
+) -> Result<bool, ArchiveSearchError> {
+    // A schema the map lacks is left to the table decoder to report.
+    let Some(schema) = catalog.schema_map().get(schema_id) else {
+        return Ok(true);
+    };
+    compiled
+        .may_match_schema(schema)
+        .map_err(ArchiveSearchError::Compile)
+}
+
+/// A set of the three archive dictionaries.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Dictionaries {
+    variable: bool,
+    log_type: bool,
+    array: bool,
+}
+
+impl Dictionaries {
+    const NONE: Self = Self {
+        variable: false,
+        log_type: false,
+        array: false,
+    };
+    const ALL: Self = Self {
+        variable: true,
+        log_type: true,
+        array: true,
+    };
+
+    /// The dictionaries a column of this type is read through.
+    const fn add_node_type(&mut self, node_type: crate::archive::NodeType) {
+        use crate::archive::NodeType;
+        match node_type {
+            NodeType::VarString | NodeType::DictionaryFloat => self.variable = true,
+            NodeType::ClpString => {
+                self.variable = true;
+                self.log_type = true;
+            }
+            NodeType::UnstructuredArray => {
+                self.variable = true;
+                self.array = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Loads the dictionaries in `wanted` that `loaded` lacks, recording them in `loaded`.
+fn load_dictionaries<A: ArchiveReader + ?Sized>(
+    reader: &mut A,
+    catalog: &mut ArchiveCatalog,
+    limits: &ArchiveCatalogLimits,
+    wanted: Dictionaries,
+    loaded: &mut Dictionaries,
+) -> Result<(), ArchiveSearchError> {
+    if wanted.variable && !loaded.variable {
+        let dictionary = reader
+            .read_variable_dictionary(catalog.metadata(), limits.variable_dictionary())
+            .map_err(|source| {
+                ArchiveSearchError::Catalog(ArchiveCatalogError::VariableDictionary(source))
+            })?;
+        catalog.set_variable_dictionary(dictionary);
+        loaded.variable = true;
+    }
+    if wanted.log_type && !loaded.log_type {
+        let dictionary = reader
+            .read_log_type_dictionary(catalog.metadata(), limits.log_type_dictionary())
+            .map_err(|source| {
+                ArchiveSearchError::Catalog(ArchiveCatalogError::LogTypeDictionary(source))
+            })?;
+        catalog.set_log_type_dictionary(dictionary);
+        loaded.log_type = true;
+    }
+    if wanted.array && !loaded.array {
+        let dictionary = reader
+            .read_array_dictionary(catalog.metadata(), limits.array_dictionary())
+            .map_err(|source| {
+                ArchiveSearchError::Catalog(ArchiveCatalogError::ArrayDictionary(source))
+            })?;
+        catalog.set_array_dictionary(dictionary);
+        loaded.array = true;
+    }
+    Ok(())
+}
+
+/// The dictionaries the query's filter compares against.
+///
+/// Conservative: anything this cannot pin down to schema nodes, such as a wildcard path, the
+/// auto-generated namespace, or an expression kind it does not know, asks for all three. Getting
+/// this wrong would be silent, since a filter compiled against a missing dictionary matches
+/// nothing, so it errs toward loading.
+fn filter_dictionaries(query: &ParsedQuery, tree: &crate::archive::SchemaTree) -> Dictionaries {
+    use super::ColumnNamespace;
+    use super::ExpressionKind;
+    let mut wanted = Dictionaries::NONE;
+    for node in query.nodes() {
+        let path = match node.kind() {
+            ExpressionKind::Predicate(predicate) => predicate.path(),
+            ExpressionKind::List(list) => list.path(),
+            ExpressionKind::Not { .. } | ExpressionKind::Boolean { .. } => continue,
+        };
+        match path.namespace() {
+            ColumnNamespace::Default => {}
+            ColumnNamespace::RangeIndex => continue,
+            _ => return Dictionaries::ALL,
+        }
+        if path.components().is_empty()
+            || path
+                .components()
+                .iter()
+                .any(super::PathComponent::is_wildcard)
+        {
+            return Dictionaries::ALL;
+        }
+        add_path_dictionaries(tree, path.components(), &mut wanted);
+        if Dictionaries::ALL == wanted {
+            break;
+        }
+    }
+    wanted
+}
+
+/// Adds the dictionaries read by every column a path can reach: the columns at its end, any
+/// column beneath an object or structured array it ends on, and an unstructured array it passes
+/// through, whose elements are matched inside the array's text.
+fn add_path_dictionaries(
+    tree: &crate::archive::SchemaTree,
+    components: &[super::PathComponent],
+    wanted: &mut Dictionaries,
+) {
+    use crate::archive::NodeType;
+    let nodes = tree.nodes();
+    let mut current: Vec<usize> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            node.parent_id().is_none()
+                && NodeType::Metadata != node.node_type()
+                && node.key_bytes().is_empty()
+        })
+        .map(|(id, _)| id)
+        .collect();
+    for (index, component) in components.iter().enumerate() {
+        let last = index + 1 == components.len();
+        let mut next = Vec::new();
+        for (child_id, child) in nodes.iter().enumerate() {
+            if !child
+                .parent_id()
+                .is_some_and(|parent| current.contains(&parent))
+                || child.key_bytes() != component.value().as_bytes()
+            {
+                continue;
+            }
+            match child.node_type() {
+                NodeType::Object if last => add_descendant_dictionaries(tree, child_id, wanted),
+                NodeType::Object => next.push(child_id),
+                NodeType::StructuredArray => add_descendant_dictionaries(tree, child_id, wanted),
+                NodeType::UnstructuredArray => wanted.add_node_type(NodeType::UnstructuredArray),
+                node_type if last => wanted.add_node_type(node_type),
+                _ => {}
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        current = next;
+    }
+}
+
+/// Adds the dictionaries read by every column beneath `ancestor`. A node always follows its
+/// parent, so one forward pass sees each parent first.
+fn add_descendant_dictionaries(
+    tree: &crate::archive::SchemaTree,
+    ancestor: usize,
+    wanted: &mut Dictionaries,
+) {
+    let nodes = tree.nodes();
+    let mut inside = vec![false; nodes.len()];
+    for (node_id, node) in nodes.iter().enumerate() {
+        let Some(parent) = node.parent_id() else {
+            continue;
+        };
+        if parent == ancestor || inside.get(parent).copied().unwrap_or(false) {
+            inside[node_id] = true;
+            wanted.add_node_type(node.node_type());
+        }
+    }
 }
 
 /// Failure while orchestrating one archive-wide search.
@@ -756,7 +1079,10 @@ mod tests {
         )
         .expect("negation must retain ordinary three-valued evaluation");
         assert_eq!(1, negated.matching_rows());
-        assert_eq!(3, negated.tables_scanned());
+        // Only the table holding `c` is evaluated; the other two schemas lack the column, so their
+        // tables are ruled out unread, but their rows still count toward the archive's total.
+        assert_eq!(1, negated.tables_scanned());
+        assert_eq!(6, negated.rows_scanned());
         assert_eq!(2, sink.begin_calls);
         assert_eq!(1, sink.batches.len());
 

@@ -215,6 +215,23 @@ impl ArchiveCatalog {
         self.dictionaries_loaded = true;
     }
 
+    /// Installs `/var.dict` alone, for a caller that loads dictionaries as it finds it needs them.
+    ///
+    /// [`Self::dictionaries_loaded`] stays as it was; [`Self::set_dictionaries`] sets it.
+    pub fn set_variable_dictionary(&mut self, dictionary: VariableDictionary) {
+        self.variable_dictionary = dictionary;
+    }
+
+    /// Installs `/log.dict` alone; see [`Self::set_variable_dictionary`].
+    pub fn set_log_type_dictionary(&mut self, dictionary: LogTypeDictionary) {
+        self.log_type_dictionary = dictionary;
+    }
+
+    /// Installs `/array.dict` alone; see [`Self::set_variable_dictionary`].
+    pub fn set_array_dictionary(&mut self, dictionary: ArrayDictionary) {
+        self.array_dictionary = dictionary;
+    }
+
     /// Returns the archive metadata and validated physical section directory.
     #[must_use]
     pub const fn metadata(&self) -> &ArchiveMetadata {

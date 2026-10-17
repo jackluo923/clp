@@ -1238,6 +1238,21 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
         Ok(list)
     }
 
+    /// Returns whether a row of this schema could match, judged from its columns alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the compiled query is internally inconsistent.
+    ///
+    /// `false` is a proof: no row stored under the schema can satisfy the query, so its table need
+    /// not be decompressed. This is the per-schema form of the archive-wide schema preflight.
+    pub fn may_match_schema(
+        &self,
+        schema: &crate::archive::SchemaDefinition,
+    ) -> Result<bool, SearchError> {
+        Ok(Tri::False != self.evaluate_schema_program(schema)?)
+    }
+
     /// Returns whether the compiled root might match at least one physical archive row.
     ///
     /// This deliberately recognizes only roots that can be proven empty without table data. A
