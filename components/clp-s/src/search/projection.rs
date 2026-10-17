@@ -188,9 +188,30 @@ impl Projection {
         self.limits
     }
 
+    /// Resolves each path to the nodes holding its value. An object or structured-array path
+    /// resolves to nothing, as in the C++ reader, which suits an aggregation over scalar leaves.
     pub(super) fn resolve(
         &self,
         schema_tree: &SchemaTree,
+    ) -> Result<ResolvedProjection, ProjectionError> {
+        self.resolve_with(schema_tree, false)
+    }
+
+    /// Resolves each path for writing records out: as [`Self::resolve`], except that an object or
+    /// structured-array path selects everything beneath it, so the record carries that value as
+    /// stored. With arrays structured, as the writer does by default, a projection could otherwise
+    /// never return an array-valued field.
+    pub(super) fn resolve_records(
+        &self,
+        schema_tree: &SchemaTree,
+    ) -> Result<ResolvedProjection, ProjectionError> {
+        self.resolve_with(schema_tree, true)
+    }
+
+    fn resolve_with(
+        &self,
+        schema_tree: &SchemaTree,
+        subtrees: bool,
     ) -> Result<ResolvedProjection, ProjectionError> {
         let Some(columns) = &self.columns else {
             return Ok(ResolvedProjection::All);
@@ -226,13 +247,25 @@ impl Projection {
                         continue;
                     }
                     if last {
-                        // Plain objects and structured-array roots are structural only and do not
-                        // occur in the C++ ordered-column projection map. Projecting either is a
-                        // characterized no-op; unstructured arrays are physical leaf values.
-                        if !matches!(
+                        // An object or structured-array root holds no value of its own: its value
+                        // is everything beneath it. The C++ reader's ordered-column map has no
+                        // entry for such a root, so `resolve` projects nothing for it, while
+                        // `resolve_records` selects the subtree.
+                        let structural = matches!(
                             child.node_type(),
                             NodeType::Object | NodeType::StructuredArray
-                        ) {
+                        );
+                        if structural && !subtrees {
+                            // Characterized no-op.
+                        } else if structural {
+                            push_descendants(
+                                &index,
+                                schema_tree,
+                                child_id,
+                                &mut nodes,
+                                self.limits,
+                            )?;
+                        } else {
                             let retained = nodes
                                 .len()
                                 .checked_add(1)
@@ -274,6 +307,37 @@ impl Default for Projection {
     fn default() -> Self {
         Self::all()
     }
+}
+
+/// Selects `root` and every node beneath it.
+fn push_descendants(
+    index: &ChildIndex,
+    schema_tree: &SchemaTree,
+    root: usize,
+    nodes: &mut Vec<u32>,
+    limits: ProjectionLimits,
+) -> Result<(), ProjectionError> {
+    let mut pending = vec![root];
+    while let Some(node_id) = pending.pop() {
+        schema_tree
+            .get(node_id)
+            .ok_or(ProjectionError::SizeOverflow)?;
+        let retained = nodes
+            .len()
+            .checked_add(1)
+            .ok_or(ProjectionError::SizeOverflow)?;
+        check_limit(
+            ProjectionResource::ResolvedNodes,
+            retained,
+            limits.max_resolved_nodes(),
+        )?;
+        nodes
+            .try_reserve(1)
+            .map_err(|_| allocation(ProjectionResource::ResolvedNodes, 1))?;
+        nodes.push(u32::try_from(node_id).map_err(|_| ProjectionError::SizeOverflow)?);
+        pending.extend_from_slice(index.children_of(node_id)?);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

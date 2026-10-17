@@ -141,7 +141,7 @@ impl<'sink, 'options, S: JsonlRecordSink + ?Sized> SearchJsonlAdapter<'sink, 'op
             self.projection = Some(
                 self.options
                     .projection()
-                    .resolve(matches.catalog().schema_tree())
+                    .resolve_records(matches.catalog().schema_tree())
                     .map_err(SearchJsonlAdapterError::Projection)?,
             );
         }
@@ -553,20 +553,28 @@ mod tests {
     }
 
     #[test]
-    fn structured_array_matches_emit_exact_cpp_records_and_projection_no_ops() {
+    fn structured_array_matches_emit_exact_cpp_records_and_project_whole_subtrees() {
         let fixture = decode_hex(STRUCTURED_ARRAY_FIXTURE_HEX);
         let (stats, output) = search_fixture(&fixture, "*:*", &SearchJsonlOptions::default());
         assert_eq!(9, stats.matching_rows());
         assert_eq!(STRUCTURED_ARRAY_EXPECTED, output);
 
+        // Projecting an array or object root writes the whole value, empty members included, so
+        // every record reads exactly as it does unprojected. `items.x` reaches into an array and
+        // so adds nothing beyond `items`. (The C++ reader projects nothing for such a root.)
         let columns = ["id", "items", "items.x", "obj", "obj.items.x"];
         let projection =
             Projection::selected(&columns, ProjectionLimits::default()).expect("projection");
         let (_, projected) = search_fixture(&fixture, "*:*", &SearchJsonlOptions::new(projection));
+        assert_eq!(STRUCTURED_ARRAY_EXPECTED, projected.as_slice());
+
+        let projection =
+            Projection::selected(&["id"], ProjectionLimits::default()).expect("projection");
+        let (_, ids) = search_fixture(&fixture, "*:*", &SearchJsonlOptions::new(projection));
         assert_eq!(
             b"{\"id\":0}\n{\"id\":1}\n{\"id\":2}\n{\"id\":7}\n{\"id\":6}\n\
               {\"id\":8}\n{\"id\":3}\n{\"id\":4}\n{\"id\":5}\n",
-            projected.as_slice()
+            ids.as_slice()
         );
     }
 

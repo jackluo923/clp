@@ -132,7 +132,9 @@ impl ExtractionPlan {
     }
 
     /// Retains only values whose schema-tree node IDs are selected, together with the enclosing
-    /// object/array operations required to produce valid JSON.
+    /// object/array operations required to produce valid JSON. An object or array whose own node is
+    /// selected is retained even when it ends up empty, so a projected subtree keeps its `{}` and
+    /// `[]` members.
     ///
     /// `selected_node_ids` must be sorted and deduplicated. The method is crate-private because
     /// public callers should use the higher-level search projection API, which resolves paths and
@@ -152,7 +154,8 @@ impl ExtractionPlan {
 
         for operation in &self.operations {
             match *operation {
-                ExtractionOp::BeginObject { .. } | ExtractionOp::BeginArray { .. } => {
+                ExtractionOp::BeginObject { node_id, .. }
+                | ExtractionOp::BeginArray { node_id, .. } => {
                     frames
                         .try_reserve(1)
                         .map_err(|_| ExtractionPlanError::AllocationFailed {
@@ -161,7 +164,7 @@ impl ExtractionPlan {
                         })?;
                     frames.push(Frame {
                         output_start: operations.len(),
-                        retained_child: false,
+                        retained_child: selected_node_ids.binary_search(&node_id).is_ok(),
                     });
                     push_projected_operation(&mut operations, *operation)?;
                 }

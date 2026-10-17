@@ -437,7 +437,7 @@ impl<'sink, 'text, 'options, S: SearchResultsCacheBatchSink + ?Sized>
             self.projection = Some(
                 self.options
                     .projection()
-                    .resolve(matches.catalog().schema_tree())
+                    .resolve_records(matches.catalog().schema_tree())
                     .map_err(SearchResultsCacheAdapterError::Projection)?,
             );
         }

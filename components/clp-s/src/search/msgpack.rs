@@ -199,7 +199,7 @@ impl<'sink, 'id, 'options, W: Write + ?Sized> SearchMsgpackAdapter<'sink, 'id, '
             self.projection = Some(
                 self.options
                     .projection()
-                    .resolve(matches.catalog().schema_tree())
+                    .resolve_records(matches.catalog().schema_tree())
                     .map_err(SearchMsgpackAdapterError::Projection)?,
             );
         }
