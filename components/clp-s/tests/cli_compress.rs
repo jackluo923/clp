@@ -1572,6 +1572,104 @@ fn structurize_arrays_matches_the_exact_cpp_single_file_archive() {
 }
 
 #[test]
+fn searches_through_structured_arrays_read_only_what_they_need_and_answer_exactly() {
+    // Three record shapes, each its own table stored one frame per column. A filter that passes
+    // through the structured array reaches a Boolean inside it, a lookup matches one table of
+    // many, and an object projection is written only from the tables a filter can match.
+    let mut input = String::new();
+    for index in 0..60 {
+        let record = match index % 3 {
+            0 => format!(
+                "{{\"id\":{index},\"uuid\":\"u-{index}\",\"result\":\"failed {index}\",\
+                 \"content\":[{{\"type\":\"tool_result\",\"is_error\":{},\
+                 \"content\":\"result text {index}\"}}]}}",
+                0 == index % 4
+            ),
+            1 => format!(
+                "{{\"id\":{index},\"uuid\":\"u-{index}\",\
+                 \"content\":[{{\"type\":\"text\",\"text\":\"assistant says {index}\"}}]}}"
+            ),
+            _ => format!(
+                "{{\"id\":{index},\"uuid\":\"u-{index}\",\"isApiError\":true,\
+                 \"content\":[{{\"type\":\"text\",\"text\":\"API Error {}\"}}]}}",
+                index % 4
+            ),
+        };
+        input.push_str(&record);
+        input.push('\n');
+    }
+    let temporary = TestDirectory::new("structured-array-search");
+    let input_path = temporary.path().join("input.jsonl");
+    fs::write(&input_path, &input).expect("write structured-array fixture");
+    let archives_path = temporary.path().join("archives");
+    let result = clp_s(&[
+        "c".as_ref(),
+        "--single-file-archive".as_ref(),
+        archives_path.as_os_str(),
+        input_path.as_os_str(),
+    ]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let archive = only_entry(&archives_path);
+    let records: Vec<serde_json::Value> = input
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("fixture is JSONL"))
+        .collect();
+    let expected = |keep: &dyn Fn(&serde_json::Value) -> bool, fields: &[&str]| {
+        let mut lines = Vec::new();
+        for record in records.iter().filter(|record| keep(record)) {
+            let value = if fields.is_empty() {
+                record.clone()
+            } else {
+                let mut projected = serde_json::Map::new();
+                for field in fields {
+                    projected.insert((*field).to_owned(), record[*field].clone());
+                }
+                serde_json::Value::Object(projected)
+            };
+            lines.extend_from_slice(value.to_string().as_bytes());
+            lines.push(b'\n');
+        }
+        semantic_json_records(&lines)
+    };
+    let search = |query: &str, projection: &[&str]| {
+        let mut arguments: Vec<&OsStr> = vec!["s".as_ref(), archive.as_os_str(), query.as_ref()];
+        if !projection.is_empty() {
+            arguments.push("--projection".as_ref());
+            arguments.extend(projection.iter().map(|path| OsStr::new(*path)));
+        }
+        let result = clp_s(&arguments);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        semantic_json_records(&result.stdout)
+    };
+    let is_error = |record: &serde_json::Value| record["content"][0]["is_error"] == true;
+    let is_api_error = |record: &serde_json::Value| record["isApiError"] == true;
+    let lookup = |record: &serde_json::Value| record["uuid"] == "u-7";
+    for (query, keep, projection) in [
+        (
+            "content.is_error:true",
+            &is_error as &dyn Fn(&serde_json::Value) -> bool,
+            &["result"][..],
+        ),
+        ("content.is_error:true", &is_error, &[][..]),
+        ("isApiError:true", &is_api_error, &["content"][..]),
+        ("uuid:\"u-7\"", &lookup, &["id"][..]),
+        ("uuid:\"u-7\"", &lookup, &[][..]),
+    ] {
+        let wanted = expected(keep, projection);
+        assert!(!wanted.is_empty(), "{query} matches the fixture");
+        assert_eq!(wanted, search(query, projection), "{query} {projection:?}");
+    }
+}
+
+#[test]
 fn field_logtype_dictionaries_read_back_exactly_and_answer_searches_the_same() {
     // Several text fields, some sharing a message, so their sections overlap and a field's search
     // must load only its own entries.

@@ -387,34 +387,40 @@ pub fn search_archive<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
         .read_catalog(options.catalog.with_skip_dictionaries(true))
         .map_err(ArchiveSearchError::Catalog)?;
     let mut loaded = Dictionaries::NONE;
-    let filter = filter_dictionaries(query, catalog.schema_tree());
-    let output = sink
-        .output_nodes(catalog.schema_tree())
-        .map_or(Dictionaries::ALL, |nodes| {
-            let mut output = Dictionaries::NONE;
-            for node in nodes {
-                if let Some(schema_node) = catalog.schema_tree().get(node as usize) {
-                    output.add_node(node, schema_node.node_type());
-                }
-            }
-            output
-        });
-    // A projected output is narrow, so its dictionaries load with the filter's: one load of the
-    // log-type dictionary, which a per-field archive reads only a prefix of, rather than two.
-    // Whole records may need every dictionary, so those wait until a row matches.
-    let first = if Dictionaries::ALL == output {
-        filter
-    } else {
-        filter.union(&output)
+    let filter = filter_nodes(query, catalog.schema_tree());
+    let output_nodes = sink.output_nodes(catalog.schema_tree());
+    let columns = StreamColumns {
+        filter: filter.columns(options.search),
     };
-    load_dictionaries(reader, &mut catalog, &options.catalog, &first, &mut loaded)?;
+    let filter_dictionaries = filter.dictionaries(catalog.schema_tree());
+    load_dictionaries(
+        reader,
+        &mut catalog,
+        &options.catalog,
+        &filter_dictionaries,
+        &mut loaded,
+    )?;
 
+    // The output's dictionaries are worked out once the filter is compiled, from the tables it
+    // can match. A projected output is narrow, so they load before the scan; whole records may
+    // need many more, so those wait until a row matches.
+    let mut output = None;
     let mut scan = ScanPosition::default();
     let mut sink_begun = false;
     loop {
         let compiled = query
             .compile_for_archive(&catalog, options.search)
             .map_err(ArchiveSearchError::Compile)?;
+        let wanted = match output {
+            Some(ref wanted) => Dictionaries::clone(wanted),
+            None => output
+                .insert(output_dictionaries(
+                    &catalog,
+                    &compiled,
+                    output_nodes.as_deref(),
+                )?)
+                .clone(),
+        };
         if !sink_begun {
             if !compiled
                 .reaches_match_sink()
@@ -429,13 +435,21 @@ pub fn search_archive<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
                 return Ok(ArchiveSearchStats::default());
             }
         }
+        if output_nodes.is_some() && !loaded.covers(&wanted) {
+            drop(compiled);
+            load_dictionaries(reader, &mut catalog, &options.catalog, &wanted, &mut loaded)?;
+            continue;
+        }
         let outcome = scan_streams(
             reader,
             &catalog,
             &compiled,
             sink,
             options,
-            loaded.covers(&output),
+            ScanSettings {
+                columns,
+                all_dictionaries_loaded: loaded.covers(&wanted),
+            },
             &mut scan,
         )?;
         drop(compiled);
@@ -444,7 +458,7 @@ pub fn search_archive<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
             // A match needs the dictionaries its output is read through. Load them and resume at
             // the stream holding the match, which wrote nothing before stopping.
             ScanOutcome::NeedsDictionaries => {
-                load_dictionaries(reader, &mut catalog, &options.catalog, &output, &mut loaded)?;
+                load_dictionaries(reader, &mut catalog, &options.catalog, &wanted, &mut loaded)?;
             }
         }
     }
@@ -486,13 +500,106 @@ enum ScanOutcome {
     NeedsDictionaries,
 }
 
+/// The columns a table can be matched from alone, or `None` when matching may read any.
+#[derive(Clone, Copy)]
+struct StreamColumns<'a> {
+    filter: Option<&'a std::collections::BTreeSet<u32>>,
+}
+
+impl StreamColumns<'_> {
+    /// For a separate-column stream, which stores one column per frame, the mask of the columns
+    /// matching reads, in the stream's column order. `None` for a stream sharing one frame, or
+    /// when the filter's columns are unknown.
+    fn matching_mask(
+        self,
+        catalog: &ArchiveCatalog,
+        table: &crate::archive::SchemaTableMetadata,
+    ) -> Option<Vec<bool>> {
+        use crate::archive::SchemaEntry;
+        let filter = self.filter?;
+        let frames = catalog
+            .table_metadata()
+            .separate_columns_for(table.stream_id())?
+            .columns()
+            .len();
+        let schema = catalog.schema_map().get(table.schema_id())?;
+        let tree = catalog.schema_tree();
+        let mut mask = Vec::with_capacity(frames);
+        for entry in schema.entries() {
+            let SchemaEntry::Node(node) = *entry else {
+                continue;
+            };
+            if crate::archive::is_value_bearing(tree.get(node as usize)?.node_type()) {
+                mask.push(filter.contains(&node));
+            }
+        }
+        (mask.len() == frames).then_some(mask)
+    }
+}
+
+/// How one pass of a scan reads its streams.
+#[derive(Clone, Copy)]
+struct ScanSettings<'a> {
+    columns: StreamColumns<'a>,
+    /// Whether every dictionary a match is written through is loaded.
+    all_dictionaries_loaded: bool,
+}
+
+/// Matches the one table of the stream at `position` from the columns `mask` selects, and when
+/// no row matches, records the stream as scanned and moves past it. Returns whether it did; on
+/// `false` the stream is left for a whole read.
+fn unmatched_by_columns<A: ArchiveReader + ?Sized>(
+    reader: &mut A,
+    catalog: &ArchiveCatalog,
+    compiled: &CompiledQuery<'_, '_>,
+    options: &ArchiveSearchOptions,
+    mask: &[bool],
+    position: &mut ScanPosition,
+) -> Result<bool, ArchiveSearchError> {
+    let stream_index = position.stream_index;
+    let stream_id = u64::try_from(stream_index).map_err(|_| ArchiveSearchError::SizeOverflow)?;
+    let stream = read_stream(reader, catalog, stream_index, Some(mask), options)?;
+    let decoded = catalog
+        .schema_tables(stream_id, &stream, options.columns)
+        .map_err(|source| ArchiveSearchError::TableStream { stream_id, source })?
+        .next()
+        .transpose()
+        .map_err(|source| ArchiveSearchError::TableStream { stream_id, source })?;
+    // A table out of place is left for the whole read to report.
+    let Some(decoded) =
+        decoded.filter(|decoded| decoded.table_index() == position.expected_table_index)
+    else {
+        return Ok(false);
+    };
+    let bitmap =
+        compiled
+            .match_table(&decoded)
+            .map_err(|source| ArchiveSearchError::TableMatch {
+                stream_id,
+                table_index: decoded.table_index(),
+                schema_id: decoded.schema().id(),
+                source,
+            })?;
+    if 0 != bitmap.match_count() {
+        return Ok(false);
+    }
+    position.stats.add_stream(stream.len())?;
+    position.stats.add_table(bitmap.len(), 0)?;
+    position.expected_table_index = position
+        .expected_table_index
+        .checked_add(1)
+        .ok_or(ArchiveSearchError::SizeOverflow)?;
+    position.stream_index += 1;
+    Ok(true)
+}
+
 fn scan_streams<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
     reader: &mut A,
     catalog: &ArchiveCatalog,
     compiled: &CompiledQuery<'_, '_>,
     sink: &mut S,
     options: &ArchiveSearchOptions,
-    all_dictionaries_loaded: bool,
+    scan: ScanSettings<'_>,
     position: &mut ScanPosition,
 ) -> Result<ScanOutcome, ArchiveSearchError> {
     let table_metadata = catalog.table_metadata();
@@ -524,18 +631,17 @@ fn scan_streams<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
             continue;
         }
 
-        let stream = reader
-            .read_packed_stream(
-                catalog.metadata(),
-                table_metadata,
-                stream_index,
-                options.packed_stream,
-            )
-            .map_err(|source| ArchiveSearchError::PackedStream { stream_id, source })?;
+        // A separate-column stream holds one table. The columns its filter reads are read alone
+        // first, so a stream without a match costs only those; one with a match is read whole.
+        if let [table] = tables
+            && let Some(mask) = scan.columns.matching_mask(catalog, table)
+            && unmatched_by_columns(reader, catalog, compiled, options, &mask, position)?
+        {
+            continue;
+        }
+
+        let stream = read_stream(reader, catalog, stream_index, None, options)?;
         position.stats.add_stream(stream.len())?;
-        let stream = catalog
-            .materialize_adaptive_numerics(stream_id, stream, options.columns)
-            .map_err(|source| ArchiveSearchError::TableStream { stream_id, source })?;
         let decoded_tables = catalog
             .schema_tables(stream_id, &stream, options.columns)
             .map_err(|source| ArchiveSearchError::TableStream { stream_id, source })?;
@@ -560,7 +666,7 @@ fn scan_streams<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
                     }
                 })?;
                 if 0 != bitmap.match_count() {
-                    if !all_dictionaries_loaded {
+                    if !scan.all_dictionaries_loaded {
                         *position = stream_start;
                         return Ok(ScanOutcome::NeedsDictionaries);
                     }
@@ -594,6 +700,38 @@ fn scan_streams<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
         position.stream_index += 1;
     }
     Ok(ScanOutcome::Finished)
+}
+
+/// Reads a packed stream, only the columns `mask` selects when given, with its adaptive numeric
+/// columns materialized.
+fn read_stream<A: ArchiveReader + ?Sized>(
+    reader: &mut A,
+    catalog: &ArchiveCatalog,
+    stream_index: usize,
+    mask: Option<&[bool]>,
+    options: &ArchiveSearchOptions,
+) -> Result<crate::archive::DecodedPackedStream, ArchiveSearchError> {
+    let stream_id = u64::try_from(stream_index).map_err(|_| ArchiveSearchError::SizeOverflow)?;
+    let stream = match mask {
+        Some(mask) => reader.read_packed_stream_projected(
+            catalog.metadata(),
+            catalog.table_metadata(),
+            stream_index,
+            mask,
+            None,
+            options.packed_stream,
+        ),
+        None => reader.read_packed_stream(
+            catalog.metadata(),
+            catalog.table_metadata(),
+            stream_index,
+            options.packed_stream,
+        ),
+    }
+    .map_err(|source| ArchiveSearchError::PackedStream { stream_id, source })?;
+    catalog
+        .materialize_adaptive_numerics(stream_id, stream, options.columns)
+        .map_err(|source| ArchiveSearchError::TableStream { stream_id, source })
 }
 
 /// The tables stored in one packed stream, which table metadata keeps grouped by stream.
@@ -697,14 +835,6 @@ impl Dictionaries {
         }
     }
 
-    fn union(&self, other: &Self) -> Self {
-        Self {
-            variable: self.variable || other.variable,
-            log_type: self.log_type.union(&other.log_type),
-            array: self.array || other.array,
-        }
-    }
-
     fn covers(&self, other: &Self) -> bool {
         (self.variable || !other.variable)
             && (self.array || !other.array)
@@ -767,26 +897,69 @@ fn load_dictionaries<A: ArchiveReader + ?Sized>(
     Ok(())
 }
 
-/// The dictionaries the query's filter compares against.
-///
-/// Conservative: anything this cannot pin down to schema nodes, such as a wildcard path, the
-/// auto-generated namespace, or an expression kind it does not know, asks for all three. Getting
-/// this wrong would be silent, since a filter compiled against a missing dictionary matches
-/// nothing, so it errs toward loading.
-fn filter_dictionaries(query: &ParsedQuery, tree: &crate::archive::SchemaTree) -> Dictionaries {
+/// The schema nodes the query's filter reads.
+struct FilterNodes {
+    /// Every node the filter's paths reach, or `None` when they cannot be pinned down: a wildcard
+    /// path, the auto-generated namespace, or an expression kind this does not know.
+    nodes: Option<std::collections::BTreeSet<u32>>,
+    /// Whether a predicate selects by range index, which reads the log-order column.
+    range_index: bool,
+}
+
+impl FilterNodes {
+    /// The dictionaries the filter compares against. Conservative: when the nodes are unknown,
+    /// all three. Getting this wrong would be silent, since a filter compiled against a missing
+    /// dictionary matches nothing, so it errs toward loading.
+    fn dictionaries(&self, tree: &crate::archive::SchemaTree) -> Dictionaries {
+        let Some(nodes) = &self.nodes else {
+            return Dictionaries::ALL;
+        };
+        let mut wanted = Dictionaries::NONE;
+        for node in nodes {
+            if let Some(schema_node) = tree.get(*node as usize) {
+                wanted.add_node(*node, schema_node.node_type());
+            }
+        }
+        wanted
+    }
+
+    /// The columns a table can be matched from alone, or `None` when matching may read others:
+    /// besides unknown nodes, a range-index selector or a timestamp bound reads columns the
+    /// filter's paths do not name.
+    const fn columns(&self, options: SearchOptions) -> Option<&std::collections::BTreeSet<u32>> {
+        let range = options.authoritative_timestamp_range();
+        if self.range_index
+            || range.begin_milliseconds().is_some()
+            || range.end_milliseconds().is_some()
+        {
+            return None;
+        }
+        self.nodes.as_ref()
+    }
+}
+
+fn filter_nodes(query: &ParsedQuery, tree: &crate::archive::SchemaTree) -> FilterNodes {
     use super::ColumnNamespace;
     use super::ExpressionKind;
-    let mut wanted = Dictionaries::NONE;
+    let mut nodes = std::collections::BTreeSet::new();
+    let mut range_index = false;
     for node in query.nodes() {
         let path = match node.kind() {
             ExpressionKind::Predicate(predicate) => predicate.path(),
             ExpressionKind::List(list) => list.path(),
             ExpressionKind::Not { .. } | ExpressionKind::Boolean { .. } => continue,
         };
+        let unknown = FilterNodes {
+            nodes: None,
+            range_index,
+        };
         match path.namespace() {
             ColumnNamespace::Default => {}
-            ColumnNamespace::RangeIndex => continue,
-            _ => return Dictionaries::ALL,
+            ColumnNamespace::RangeIndex => {
+                range_index = true;
+                continue;
+            }
+            _ => return unknown,
         }
         if path.components().is_empty()
             || path
@@ -794,24 +967,78 @@ fn filter_dictionaries(query: &ParsedQuery, tree: &crate::archive::SchemaTree) -
                 .iter()
                 .any(super::PathComponent::is_wildcard)
         {
-            return Dictionaries::ALL;
+            return unknown;
         }
-        add_path_dictionaries(tree, path.components(), &mut wanted);
+        add_path_nodes(tree, path.components(), &mut nodes);
     }
-    wanted
+    FilterNodes {
+        nodes: Some(nodes),
+        range_index,
+    }
 }
 
-/// Adds the dictionaries read by every column a path can reach: the columns at its end, any
-/// column beneath an object or structured array it ends on, and an unstructured array it passes
-/// through, whose elements are matched inside the array's text.
-fn add_path_dictionaries(
+/// The dictionaries a matched row's output is read through: those of the output's columns, or of
+/// every column for whole records, held by a table whose schema the filter can match. A column
+/// only other tables hold is never written.
+fn output_dictionaries(
+    catalog: &ArchiveCatalog,
+    compiled: &CompiledQuery<'_, '_>,
+    nodes: Option<&[u32]>,
+) -> Result<Dictionaries, ArchiveSearchError> {
+    use crate::archive::SchemaEntry;
+    let tree = catalog.schema_tree();
+    let mut held = vec![false; tree.len()];
+    for table in catalog.table_metadata().schema_tables() {
+        if !schema_may_match(catalog, compiled, table.schema_id())? {
+            continue;
+        }
+        // A schema the map lacks is left to the table decoder to report; until then, any column
+        // may be written.
+        let Some(schema) = catalog.schema_map().get(table.schema_id()) else {
+            held.fill(true);
+            break;
+        };
+        for entry in schema.entries() {
+            if let SchemaEntry::Node(node) = *entry
+                && let Some(slot) = held.get_mut(node as usize)
+            {
+                *slot = true;
+            }
+        }
+    }
+    let mut output = Dictionaries::NONE;
+    let mut add = |node: usize| {
+        if held.get(node).copied().unwrap_or(false)
+            && let (Some(schema_node), Ok(id)) = (tree.get(node), u32::try_from(node))
+        {
+            output.add_node(id, schema_node.node_type());
+        }
+    };
+    match nodes {
+        Some(nodes) => nodes.iter().for_each(|node| add(*node as usize)),
+        None => (0..tree.len()).for_each(add),
+    }
+    Ok(output)
+}
+
+/// Adds every column a path can reach, resolving it as the compiler does: a node with an empty key, such as a structured array's element, consumes no component.
+/// That covers the columns at the path's end, any column beneath an object or structured array
+/// it ends on, and an unstructured array it reaches, whose elements are matched inside the
+/// array's text.
+fn add_path_nodes(
     tree: &crate::archive::SchemaTree,
     components: &[super::PathComponent],
-    wanted: &mut Dictionaries,
+    wanted: &mut std::collections::BTreeSet<u32>,
 ) {
     use crate::archive::NodeType;
     let nodes = tree.nodes();
-    let mut current: Vec<usize> = nodes
+    let mut children = vec![Vec::new(); nodes.len()];
+    for (node_id, node) in nodes.iter().enumerate() {
+        if let Some(slot) = node.parent_id().and_then(|parent| children.get_mut(parent)) {
+            slot.push(node_id);
+        }
+    }
+    let mut pending: Vec<(usize, usize)> = nodes
         .iter()
         .enumerate()
         .filter(|(_, node)| {
@@ -819,49 +1046,53 @@ fn add_path_dictionaries(
                 && NodeType::Metadata != node.node_type()
                 && node.key_bytes().is_empty()
         })
-        .map(|(id, _)| id)
+        .flat_map(|(id, _)| children[id].iter().map(|child| (*child, 0)))
         .collect();
-    for (index, component) in components.iter().enumerate() {
-        let last = index + 1 == components.len();
-        let mut next = Vec::new();
-        for (child_id, child) in nodes.iter().enumerate() {
-            if !child
-                .parent_id()
-                .is_some_and(|parent| current.contains(&parent))
-                || child.key_bytes() != component.value().as_bytes()
-            {
-                continue;
-            }
-            match child.node_type() {
-                NodeType::Object if last => add_descendant_dictionaries(tree, child_id, wanted),
-                NodeType::Object => next.push(child_id),
-                NodeType::StructuredArray => add_descendant_dictionaries(tree, child_id, wanted),
-                NodeType::UnstructuredArray => {
-                    if let Ok(node) = u32::try_from(child_id) {
-                        wanted.add_node(node, NodeType::UnstructuredArray);
-                    }
-                }
-                node_type if last => {
-                    if let Ok(node) = u32::try_from(child_id) {
-                        wanted.add_node(node, node_type);
-                    }
-                }
-                _ => {}
-            }
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some((node_id, component)) = pending.pop() {
+        if !visited.insert((node_id, component)) {
+            continue;
         }
-        if next.is_empty() {
-            break;
+        let node = &nodes[node_id];
+        let key = node.key_bytes();
+        let matches_component = components
+            .get(component)
+            .is_some_and(|expected| key == expected.value().as_bytes());
+        if NodeType::UnstructuredArray == node.node_type() {
+            if matches_component && let Ok(id) = u32::try_from(node_id) {
+                wanted.insert(id);
+            }
+            continue;
         }
-        current = next;
+        let next = if key.is_empty() {
+            component
+        } else if matches_component {
+            component + 1
+        } else {
+            continue;
+        };
+        if next == components.len() {
+            if let Ok(id) = u32::try_from(node_id) {
+                wanted.insert(id);
+            }
+            if matches!(
+                node.node_type(),
+                NodeType::Object | NodeType::StructuredArray
+            ) {
+                add_descendant_nodes(tree, node_id, wanted);
+            }
+            continue;
+        }
+        pending.extend(children[node_id].iter().map(|child| (*child, next)));
     }
 }
 
-/// Adds the dictionaries read by every column beneath `ancestor`. A node always follows its
+/// Adds every column beneath `ancestor`. A node always follows its
 /// parent, so one forward pass sees each parent first.
-fn add_descendant_dictionaries(
+fn add_descendant_nodes(
     tree: &crate::archive::SchemaTree,
     ancestor: usize,
-    wanted: &mut Dictionaries,
+    wanted: &mut std::collections::BTreeSet<u32>,
 ) {
     let nodes = tree.nodes();
     let mut inside = vec![false; nodes.len()];
@@ -872,7 +1103,7 @@ fn add_descendant_dictionaries(
         if parent == ancestor || inside.get(parent).copied().unwrap_or(false) {
             inside[node_id] = true;
             if let Ok(node_id) = u32::try_from(node_id) {
-                wanted.add_node(node_id, node.node_type());
+                wanted.insert(node_id);
             }
         }
     }
