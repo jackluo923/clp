@@ -492,7 +492,7 @@ impl WriterOptions {
             dictionary_compression: DictionaryCompression {
                 level: Self::DEFAULT_DICTIONARY_COMPRESSION_LEVEL,
                 long_distance_matching: true,
-                per_field: false,
+                per_field: true,
                 per_field_frame_size: 0,
             },
             limits: WriterLimits::DEFAULT,
@@ -653,7 +653,7 @@ impl WriterOptions {
     /// only the start of a frame; see
     /// [`with_field_dictionary_frame_size`](Self::with_field_dictionary_frame_size). Takes effect
     /// only with adaptive numeric columns, and stamps archive version 0.7.0, which earlier readers
-    /// refuse. Off by default.
+    /// refuse. On by default.
     #[must_use]
     pub const fn with_field_logtype_dictionaries(mut self, enabled: bool) -> Self {
         self.dictionary_compression.per_field = enabled;
@@ -1735,8 +1735,8 @@ mod tests {
             let (version, decoded) = adaptive_column_values(bytes);
             assert_eq!(
                 version,
-                crate::archive::ArchiveVersion::ADAPTIVE_NUMERIC,
-                "an adaptive archive is stamped 0.6.0"
+                crate::archive::ArchiveVersion::FIELD_DICTIONARIES,
+                "an adaptive archive, with per-field log-type dictionaries by default, is stamped 0.7.0"
             );
             assert_eq!(decoded, values, "the column round-trips through the adaptive pipeline");
         }
@@ -1840,8 +1840,8 @@ mod tests {
             let (version, bits) = adaptive_float_column_bits(adaptive_float_archive(&values));
             assert_eq!(
                 version,
-                crate::archive::ArchiveVersion::ADAPTIVE_NUMERIC,
-                "an adaptive archive is stamped 0.6.0"
+                crate::archive::ArchiveVersion::FIELD_DICTIONARIES,
+                "an adaptive archive, with per-field log-type dictionaries by default, is stamped 0.7.0"
             );
             assert_eq!(bits, expected, "float column round-trips bit-exact");
         }

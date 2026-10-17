@@ -1604,8 +1604,13 @@ fn field_logtype_dictionaries_read_back_exactly_and_answer_searches_the_same() {
         );
         only_entry(&archives_path)
     };
-    let plain = compress("plain", &[]);
-    let fields = compress("fields", &["--field-logtype-dictionaries"]);
+    // Per-field dictionaries are the default; the plain archive opts out.
+    let plain = compress("plain", &["--no-field-logtype-dictionaries"]);
+    let fields = compress("fields", &[]);
+    assert_ne!(
+        fs::read(&plain).expect("read plain archive"),
+        fs::read(&fields).expect("read per-field archive")
+    );
     assert_eq!(
         extract_original(&plain, &temporary.path().join("plain-extracted")),
         extract_original(&fields, &temporary.path().join("fields-extracted"))
@@ -1639,15 +1644,14 @@ fn field_logtype_dictionaries_read_back_exactly_and_answer_searches_the_same() {
             "{query} {projection:?}"
         );
     }
-    let conflicting_path = temporary.path().join("conflicting");
-    let conflicting = clp_s(&[
-        "c".as_ref(),
-        "--field-logtype-dictionaries".as_ref(),
-        "--no-adaptive-numeric-columns".as_ref(),
-        conflicting_path.as_os_str(),
-        input_path.as_os_str(),
-    ]);
-    assert!(!conflicting.status.success());
+    // The default stamps 0.7.0. Without adaptive numeric columns the layout is not used, so such
+    // an archive stays at the 0.5.0 every reader accepts. The header's version is bytes 4 to 8.
+    let version = |archive: &Path| fs::read(archive).expect("read archive")[4..8].to_vec();
+    assert_eq!(vec![0, 0, 7, 0], version(&fields));
+    assert_eq!(
+        vec![0, 0, 5, 0],
+        version(&compress("no-adaptive", &["--no-adaptive-numeric-columns"]))
+    );
 }
 
 #[test]
