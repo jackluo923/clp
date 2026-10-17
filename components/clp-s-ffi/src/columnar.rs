@@ -25,12 +25,15 @@ use clp_s::archive::SchemaTree;
 use clp_s::archive::is_value_bearing;
 use clp_s::LogOrderLocator;
 use clp_s::archive::append_clp_message_bounded;
+use clp_s::archive::append_logtype_template;
 use clp_s::search::ArchiveSearchOptions;
 use clp_s::search::DictionaryMatches;
 use clp_s::search::ColumnNamespace;
 use clp_s::search::ExpressionKind;
 use clp_s::search::ParsedQuery;
 use clp_s::search::PathComponent;
+use clp_s::search::resolve_filter_path;
+use clp_s::timestamp_catalog::TimestampPatternCatalog;
 
 /// Rows materialized before a batch is handed back.
 ///
@@ -153,74 +156,6 @@ fn resolve_path(tree: &SchemaTree, components: &[&str]) -> Vec<u32> {
     resolved
 }
 
-/// Resolves a predicate's path to every schema node its comparison can read.
-///
-/// A predicate, unlike a projected field, can name a path inside an array, such as `items.x` when
-/// `items` holds objects. The schema tree has no node for that path: an unstructured array is one
-/// column, and a structured array's elements hang beneath the array node. The comparison still
-/// reads those columns, so a path that reaches an array before it ends resolves to the unstructured
-/// array's node, or to every value-bearing node beneath a structured array.
-fn resolve_predicate_path(tree: &SchemaTree, components: &[&str]) -> Vec<u32> {
-    let mut resolved = resolve_path(tree, components);
-    let nodes = tree.nodes();
-    let Some(root) = user_root(tree) else {
-        return resolved;
-    };
-    let mut objects = vec![root];
-    for (index, component) in components.iter().enumerate() {
-        let last = index + 1 == components.len();
-        let mut next_objects = Vec::new();
-        for (child_id, child) in nodes.iter().enumerate() {
-            if !child
-                .parent_id()
-                .is_some_and(|parent| objects.contains(&parent))
-                || child.key_bytes() != component.as_bytes()
-            {
-                continue;
-            }
-            match child.node_type() {
-                NodeType::Object => next_objects.push(child_id),
-                NodeType::UnstructuredArray if !last => {
-                    resolved.extend(u32::try_from(child_id).ok());
-                }
-                NodeType::StructuredArray => {
-                    resolved.extend(value_bearing_descendants(tree, child_id));
-                }
-                _ => {}
-            }
-        }
-        if next_objects.is_empty() {
-            break;
-        }
-        objects = next_objects;
-    }
-    resolved
-}
-
-/// Every value-bearing node beneath `ancestor`.
-///
-/// A node is always added after its parent, so one forward pass sees each parent first.
-fn value_bearing_descendants(tree: &SchemaTree, ancestor: usize) -> Vec<u32> {
-    let nodes = tree.nodes();
-    let mut inside = vec![false; nodes.len()];
-    let mut descendants = Vec::new();
-    for (node_id, node) in nodes.iter().enumerate() {
-        let Some(parent) = node.parent_id() else {
-            continue;
-        };
-        if parent != ancestor && !inside.get(parent).copied().unwrap_or(false) {
-            continue;
-        }
-        inside[node_id] = true;
-        if is_value_bearing(node.node_type())
-            && let Ok(id) = u32::try_from(node_id)
-        {
-            descendants.push(id);
-        }
-    }
-    descendants
-}
-
 /// Returns the default namespace's object root, the parent of every top-level user key.
 fn user_root(tree: &SchemaTree) -> Option<usize> {
     tree.nodes().iter().position(|node| {
@@ -313,6 +248,10 @@ pub struct ProjectedScanner {
     options: ArchiveSearchOptions,
     /// Candidate schema nodes per requested field, in request order.
     field_nodes: Vec<Vec<u32>>,
+    /// Whether each requested field asks for its CLP strings' logtype templates.
+    field_shapes: Vec<bool>,
+    /// Sorted schema nodes the filter reads, or `None` when they cannot be pinned down.
+    filter_nodes: Option<Vec<u32>>,
     /// Sorted schema nodes the scan reads, or `None` to read every column.
     wanted_nodes: Option<Vec<u32>>,
     /// Dictionary matches this query has already resolved against this archive.
@@ -360,13 +299,133 @@ impl Dictionaries {
     const fn all(&self) -> bool {
         self.variable && self.log_type_all && self.array
     }
+
+    fn union(&self, other: &Self) -> Self {
+        let mut log_type = self.log_type.clone();
+        log_type.extend_from_slice(&other.log_type);
+        log_type.sort_unstable();
+        log_type.dedup();
+        Self {
+            variable: self.variable || other.variable,
+            log_type,
+            log_type_all: self.log_type_all || other.log_type_all,
+            array: self.array || other.array,
+        }
+    }
+
+    /// Whether everything `other` needs is already here.
+    fn covers(&self, other: &Self) -> bool {
+        (self.variable || !other.variable)
+            && (self.array || !other.array)
+            && (self.log_type_all
+                || (!other.log_type_all
+                    && other
+                        .log_type
+                        .iter()
+                        .all(|node| self.log_type.binary_search(node).is_ok())))
+    }
+}
+
+/// Loads what `wanted` adds to `loaded`, recording it in `loaded`. A log-type dictionary is
+/// reloaded for the union of the fields already loaded and those now wanted.
+fn load_dictionaries(
+    reader: &mut dyn ArchiveReader,
+    catalog: &mut ArchiveCatalog,
+    options: ArchiveSearchOptions,
+    wanted: &Dictionaries,
+    loaded: &mut Dictionaries,
+) -> Result<(), ScanError> {
+    let limits = options.catalog();
+    if wanted.variable && !loaded.variable {
+        let variable = reader
+            .read_variable_dictionary(catalog.metadata(), limits.variable_dictionary())
+            .map_err(|source| ScanError::Archive(format!("failed to read var.dict: {source}")))?;
+        catalog.set_variable_dictionary(variable);
+        loaded.variable = true;
+    }
+    let log_type_loaded = Dictionaries {
+        variable: true,
+        array: true,
+        ..loaded.clone()
+    };
+    let log_type_wanted = Dictionaries {
+        variable: false,
+        array: false,
+        ..wanted.clone()
+    };
+    if !log_type_loaded.covers(&log_type_wanted) {
+        let fields = loaded.union(&log_type_wanted);
+        let log_type = if fields.log_type_all {
+            reader.read_log_type_dictionary(catalog.metadata(), limits.log_type_dictionary())
+        } else {
+            reader.read_log_type_dictionary_fields(
+                catalog.metadata(),
+                limits.log_type_dictionary(),
+                &fields.log_type,
+            )
+        }
+        .map_err(|source| ScanError::Archive(format!("failed to read log.dict: {source}")))?;
+        // A dictionary stored as one sequence loads whole whatever was asked for.
+        loaded.log_type_all = fields.log_type_all || log_type.is_complete();
+        loaded.log_type = fields.log_type;
+        catalog.set_log_type_dictionary(log_type);
+    }
+    if wanted.array && !loaded.array {
+        let array = reader
+            .read_array_dictionary(catalog.metadata(), limits.array_dictionary())
+            .map_err(|source| ScanError::Archive(format!("failed to read array.dict: {source}")))?;
+        catalog.set_array_dictionary(array);
+        loaded.array = true;
+    }
+    Ok(())
+}
+
+/// For each schema node, whether a table whose schema the filter can match holds it.
+fn nodes_of_matchable_tables(
+    catalog: &ArchiveCatalog,
+    compiled: &clp_s::search::CompiledQuery<'_, '_>,
+) -> Result<Vec<bool>, ScanError> {
+    let mut held = vec![false; catalog.schema_tree().len()];
+    for table in catalog.table_metadata().schema_tables() {
+        // A schema the map lacks is left to the table decoder to report; until then, any column
+        // may be written.
+        let Some(schema) = catalog.schema_map().get(table.schema_id()) else {
+            held.fill(true);
+            break;
+        };
+        if !compiled
+            .may_match_schema(schema)
+            .map_err(|source| ScanError::Archive(format!("failed to compile query: {source}")))?
+        {
+            continue;
+        }
+        for entry in schema.entries() {
+            if let SchemaEntry::Node(node) = *entry
+                && let Some(slot) = held.get_mut(node as usize)
+            {
+                *slot = true;
+            }
+        }
+    }
+    Ok(held)
 }
 
 /// The dictionaries the columns behind `nodes` are read through. A string is a variable ID, a CLP
 /// string a logtype whose variables may be IDs, and an unstructured array an array-dictionary
-/// logtype whose variables may be IDs; numbers, Booleans and timestamps need none.
-fn dictionaries_read_by(tree: &SchemaTree, nodes: &[u32]) -> Dictionaries {
+/// logtype whose variables may be IDs; numbers, Booleans and timestamps need none. A CLP string
+/// among `shaped` is written as its logtype template, which reads no variable.
+fn dictionaries_read_by(tree: &SchemaTree, nodes: &[u32], shaped: &[u32]) -> Dictionaries {
     let mut needed = Dictionaries::default();
+    for (node_id, node) in shaped
+        .iter()
+        .filter_map(|node_id| Some((*node_id, tree.get(*node_id as usize)?)))
+    {
+        if NodeType::ClpString == node.node_type() {
+            needed.log_type.push(node_id);
+        } else {
+            needed = needed.union(&dictionaries_read_by(tree, &[node_id], &[]));
+        }
+    }
     for (node_id, node) in nodes
         .iter()
         .filter_map(|node_id| Some((*node_id, tree.get(*node_id as usize)?)))
@@ -387,13 +446,13 @@ fn dictionaries_read_by(tree: &SchemaTree, nodes: &[u32]) -> Dictionaries {
     needed
 }
 
-/// Every schema node the scan reads: the projected fields plus each node a predicate compares.
+/// Every schema node the query's filter reads, sorted: each node a predicate compares, and the
+/// log-order column when a range-index selector places rows by walking it.
 ///
 /// `None` means the set cannot be pinned down (a wildcard, an unfamiliar namespace or expression
-/// kind), so the scan must load every column and every dictionary. A range-index selector reads
-/// the log-order column, so that node joins the set when one is present.
-fn wanted_nodes(parsed: &ParsedQuery, tree: &SchemaTree, field_nodes: &[Vec<u32>]) -> Option<Vec<u32>> {
-    let mut nodes: Vec<u32> = field_nodes.iter().flatten().copied().collect();
+/// kind), so the scan must load every column and every dictionary.
+fn filter_nodes(parsed: &ParsedQuery, tree: &SchemaTree) -> Option<Vec<u32>> {
+    let mut nodes: Vec<u32> = Vec::new();
     let mut needs_log_order = false;
     for node in parsed.nodes() {
         let path = match node.kind() {
@@ -416,7 +475,7 @@ fn wanted_nodes(parsed: &ParsedQuery, tree: &SchemaTree, field_nodes: &[Vec<u32>
             return None;
         }
         let components: Vec<&str> = path.components().iter().map(PathComponent::value).collect();
-        nodes.extend(resolve_predicate_path(tree, &components));
+        nodes.extend(resolve_filter_path(tree, &components));
     }
     if needs_log_order {
         match LogOrderLocator::discover(tree) {
@@ -435,6 +494,15 @@ fn wanted_nodes(parsed: &ParsedQuery, tree: &SchemaTree, field_nodes: &[Vec<u32>
     Some(nodes)
 }
 
+/// Splits a requested field into its descriptor and whether it asks for the logtype template,
+/// which a field spelled `shape(<descriptor>)` does.
+fn field_descriptor(field: &str) -> (&str, bool) {
+    field
+        .strip_prefix("shape(")
+        .and_then(|inner| inner.strip_suffix(')'))
+        .map_or((field, false), |inner| (inner, true))
+}
+
 impl ProjectedScanner {
     pub fn open(
         reader: Box<dyn ArchiveReader>,
@@ -449,10 +517,14 @@ impl ProjectedScanner {
         let mut catalog = reader
             .read_catalog(catalog_limits)
             .map_err(|source| ScanError::Archive(format!("failed to read catalog: {source}")))?;
+        let field_shapes: Vec<bool> = fields
+            .iter()
+            .map(|field| field_descriptor(field).1)
+            .collect();
         let field_nodes = fields
             .iter()
             .map(|field| {
-                let components = split_descriptor(field);
+                let components = split_descriptor(field_descriptor(field).0);
                 let borrowed: Vec<&str> = components.iter().map(String::as_str).collect();
                 resolve_path(catalog.schema_tree(), &borrowed)
             })
@@ -464,62 +536,82 @@ impl ProjectedScanner {
         // it knows passes the unset ones as empty strings.
         let force_eager = std::env::var("CLP_RUST_EAGER_DICTIONARIES")
             .is_ok_and(|value| !value.is_empty() && value != "0");
-        let wanted_nodes = wanted_nodes(&parsed, catalog.schema_tree(), &field_nodes);
+        let filter_nodes = filter_nodes(&parsed, catalog.schema_tree());
+        let wanted_nodes = filter_nodes.as_ref().map(|filter| {
+            let mut nodes: Vec<u32> = field_nodes.iter().flatten().copied().collect();
+            nodes.extend_from_slice(filter);
+            nodes.sort_unstable();
+            nodes.dedup();
+            nodes
+        });
         // The dictionaries are usually most of an archive, and on a string-heavy one decoding them
         // costs more than reading the tables. Only those the read columns go through are loaded:
         // a scan of numbers, Booleans and timestamps loads none, and one of plain strings only the
-        // variable dictionary.
-        let mut needed = match wanted_nodes.as_deref() {
+        // variable dictionary. The filter's load first; the fields' then only for the tables the
+        // filter can match, since a column no such table holds is never written.
+        let mut loaded = Dictionaries::default();
+        let filter_needed = match filter_nodes.as_deref() {
             _ if force_eager => Dictionaries::ALL,
             None => Dictionaries::ALL,
-            Some(nodes) => dictionaries_read_by(catalog.schema_tree(), nodes),
+            Some(nodes) => dictionaries_read_by(catalog.schema_tree(), nodes, &[]),
         };
-        let limits = options.catalog();
-        if needed.variable {
-            let variable = reader
-                .read_variable_dictionary(catalog.metadata(), limits.variable_dictionary())
+        load_dictionaries(
+            &mut *reader,
+            &mut catalog,
+            options,
+            &filter_needed,
+            &mut loaded,
+        )?;
+        // Compiling here answers which source files the selector accepts once, rather than once
+        // per stream, and the answer outlives the compiled query it came from.
+        let (accepted_ranges, held) = {
+            let compiled = parsed
+                .compile_for_archive(&catalog, options.search())
                 .map_err(|source| {
-                    ScanError::Archive(format!("failed to read var.dict: {source}"))
+                    ScanError::Archive(format!("failed to compile query: {source}"))
                 })?;
-            catalog.set_variable_dictionary(variable);
-        }
-        if needed.log_type_all || !needed.log_type.is_empty() {
-            let log_type = if needed.log_type_all {
-                reader.read_log_type_dictionary(catalog.metadata(), limits.log_type_dictionary())
-            } else {
-                needed.log_type.sort_unstable();
-                needed.log_type.dedup();
-                reader.read_log_type_dictionary_fields(
-                    catalog.metadata(),
-                    limits.log_type_dictionary(),
-                    &needed.log_type,
-                )
-            }
-            .map_err(|source| ScanError::Archive(format!("failed to read log.dict: {source}")))?;
-            catalog.set_log_type_dictionary(log_type);
-        }
-        if needed.array {
-            let array = reader
-                .read_array_dictionary(catalog.metadata(), limits.array_dictionary())
-                .map_err(|source| {
-                    ScanError::Archive(format!("failed to read array.dict: {source}"))
-                })?;
-            catalog.set_array_dictionary(array);
-        }
-        if !needed.all() {
+            let accepted_ranges = compiled.accepted_log_event_ranges().map_err(|source| {
+                ScanError::Archive(format!("failed to read the range index: {source}"))
+            })?;
+            (
+                accepted_ranges,
+                nodes_of_matchable_tables(&catalog, &compiled)?,
+            )
+        };
+        let shaped: Vec<u32> = field_nodes
+            .iter()
+            .zip(&field_shapes)
+            .filter(|(_, shape)| **shape)
+            .flat_map(|(nodes, _)| nodes.iter().copied())
+            .collect();
+        let plain: Vec<u32> = field_nodes
+            .iter()
+            .zip(&field_shapes)
+            .filter(|(_, shape)| !**shape)
+            .flat_map(|(nodes, _)| nodes.iter().copied())
+            .filter(|node| held.get(*node as usize).copied().unwrap_or(false))
+            .collect();
+        let shaped: Vec<u32> = shaped
+            .into_iter()
+            .filter(|node| held.get(*node as usize).copied().unwrap_or(false))
+            .collect();
+        let field_needed = if force_eager {
+            Dictionaries::ALL
+        } else {
+            dictionaries_read_by(catalog.schema_tree(), &plain, &shaped)
+        };
+        load_dictionaries(
+            &mut *reader,
+            &mut catalog,
+            options,
+            &field_needed,
+            &mut loaded,
+        )?;
+        if !loaded.all() {
             // A column whose dictionary was left unloaded is never read, so decoding must not
             // check its IDs against the empty one.
             options = options.with_columns(options.columns().with_dictionary_validation(false));
         }
-        // Compiling here answers which source files the selector accepts once, rather than once
-        // per stream, and the answer outlives the compiled query it came from.
-        let accepted_ranges = parsed
-            .compile_for_archive(&catalog, options.search())
-            .map_err(|source| ScanError::Archive(format!("failed to compile query: {source}")))?
-            .accepted_log_event_ranges()
-            .map_err(|source| {
-                ScanError::Archive(format!("failed to read the range index: {source}"))
-            })?;
         let stream_count = catalog.table_metadata().packed_streams().len();
         Ok(Self {
             reader,
@@ -528,6 +620,8 @@ impl ProjectedScanner {
             options,
             field_count: fields.len(),
             field_nodes,
+            field_shapes,
+            filter_nodes,
             wanted_nodes,
             dictionary_matches: DictionaryMatches::new(),
             accepted_ranges,
@@ -627,6 +721,18 @@ impl ProjectedScanner {
             Some(wanted) => self.plan_truncation(stream_id, wanted),
             None => None,
         };
+        // The columns the filter reads are read alone first when the fields add others, so a
+        // stream without a match costs only those.
+        if truncate.is_none()
+            && let Some(wanted) = mask.as_deref()
+            && let Some(matching) = self.filter_mask(stream_id)
+            && matching != wanted
+            && !self.matches_from_columns(stream_id, first_table, &matching)?
+        {
+            self.table_cursor = end_table;
+            self.stream_index += 1;
+            return Ok(false);
+        }
         let total_rows = self
             .stream_table(stream_id)
             .and_then(|table| usize::try_from(table.message_count()).ok())
@@ -724,6 +830,77 @@ impl ProjectedScanner {
             .iter()
             .any(|value| *value)
             .then_some((log_order_column, limit, truncatable))
+    }
+
+    /// Which columns of a separate-column stream the filter reads, in column order, or `None`
+    /// when its columns are unknown or the stream shares one frame across its tables.
+    fn filter_mask(&self, stream_id: u64) -> Option<Vec<bool>> {
+        let filter = self.filter_nodes.as_deref()?;
+        self.column_nodes(stream_id).map(|nodes| {
+            nodes
+                .iter()
+                .map(|id| filter.binary_search(id).is_ok())
+                .collect()
+        })
+    }
+
+    /// Whether any row of the one table in a separate-column stream matches, judged from the
+    /// columns `mask` selects. A table out of place answers `true`, leaving the whole read to
+    /// report it.
+    fn matches_from_columns(
+        &mut self,
+        stream_id: u64,
+        table_index: usize,
+        mask: &[bool],
+    ) -> Result<bool, ScanError> {
+        let stream = self
+            .reader
+            .read_packed_stream_projected(
+                self.catalog.metadata(),
+                self.catalog.table_metadata(),
+                self.stream_index,
+                mask,
+                None,
+                self.options.packed_stream(),
+            )
+            .map_err(|source| {
+                ScanError::Archive(format!(
+                    "failed to read packed stream {stream_id}: {source}"
+                ))
+            })?;
+        let stream = self
+            .catalog
+            .materialize_adaptive_numerics(stream_id, stream, self.options.columns())
+            .map_err(|source| {
+                ScanError::Archive(format!(
+                    "failed to materialize adaptive columns in stream {stream_id}: {source}"
+                ))
+            })?;
+        let compiled = self
+            .parsed
+            .compile_for_archive_reusing(
+                &self.catalog,
+                self.options.search(),
+                &mut self.dictionary_matches,
+            )
+            .map_err(|source| ScanError::Archive(format!("failed to compile query: {source}")))?;
+        let Some(decoded) = self
+            .catalog
+            .schema_tables(stream_id, &stream, self.options.columns())
+            .map_err(|source| {
+                ScanError::Archive(format!("failed to open stream {stream_id}: {source}"))
+            })?
+            .next()
+            .transpose()
+            .map_err(|source| ScanError::Archive(format!("failed to decode table: {source}")))?
+            .filter(|decoded| decoded.table_index() == table_index)
+        else {
+            return Ok(true);
+        };
+        let bitmap = compiled
+            .match_table(&decoded)
+            .map_err(|source| ScanError::Archive(format!("failed to match table: {source}")))?;
+        Ok(0 != bitmap.match_count())
     }
 
     fn projection_mask(&self, stream_id: u64) -> Option<Vec<bool>> {
@@ -866,7 +1043,15 @@ impl ProjectedScanner {
             }
             let columns = self.column_slots(&decoded);
             for row in bitmap.matching_rows() {
-                project_row(&decoded, &columns, row, &mut cells, &mut text)?;
+                project_row(
+                    &decoded,
+                    &columns,
+                    &self.field_shapes,
+                    self.catalog.timestamp_patterns(),
+                    row,
+                    &mut cells,
+                    &mut text,
+                )?;
                 buffered += 1;
             }
             table_cursor = decoded.table_index() + 1;
@@ -898,16 +1083,20 @@ impl ProjectedScanner {
     }
 }
 
-/// Reads one row's projected values out of the decoded columns.
+/// Reads one row's projected values out of the decoded columns. A field among `shapes` writes a
+/// CLP string as its logtype template rather than its value, and a timestamp as the text it was
+/// stored from, as a whole record would show it, since such a field has no record to read it from.
 fn project_row(
     decoded: &DecodedSchemaTable<'_, '_>,
     columns: &[Option<usize>],
+    shapes: &[bool],
+    timestamps: &TimestampPatternCatalog,
     row: usize,
     cells: &mut Vec<Cell>,
     text: &mut Vec<u8>,
 ) -> Result<(), ScanError> {
     let table = decoded.table();
-    for slot in columns {
+    for (field, slot) in columns.iter().enumerate() {
         let Some(column_index) = *slot else {
             cells.push(Cell::absent());
             continue;
@@ -936,12 +1125,60 @@ fn project_row(
             ColumnData::Boolean(values) => values.get(row).map_or_else(Cell::absent, |value| {
                 Cell::scalar(kind::BOOLEAN, i64::from(value), 0.0)
             }),
+            ColumnData::Timestamp(values) if shapes.get(field).copied().unwrap_or(false) => {
+                match values.get(row) {
+                    Some(value) => {
+                        let mut formatted = String::new();
+                        if timestamps
+                            .append_epoch_nanoseconds(
+                                value.pattern_id(),
+                                value.epoch_nanoseconds(),
+                                &mut formatted,
+                            )
+                            .is_ok()
+                        {
+                            // The text is a JSON literal: a quoted string, or a bare number.
+                            if let Some(inner) = formatted
+                                .strip_prefix('"')
+                                .and_then(|rest| rest.strip_suffix('"'))
+                            {
+                                push_text(kind::STRING, inner.as_bytes(), text)
+                            } else if let Ok(integer) = formatted.parse::<i64>() {
+                                Cell::scalar(kind::INTEGER, integer, 0.0)
+                            } else if let Ok(real) = formatted.parse::<f64>() {
+                                Cell::scalar(kind::FLOAT, 0, real)
+                            } else {
+                                Cell::scalar(kind::TIMESTAMP, value.epoch_nanoseconds(), 0.0)
+                            }
+                        } else {
+                            Cell::scalar(kind::TIMESTAMP, value.epoch_nanoseconds(), 0.0)
+                        }
+                    }
+                    None => Cell::absent(),
+                }
+            }
             ColumnData::Timestamp(values) => values.get(row).map_or_else(Cell::absent, |value| {
                 Cell::scalar(kind::TIMESTAMP, value.epoch_nanoseconds(), 0.0)
             }),
             ColumnData::VarString(values) | ColumnData::DictionaryFloat(values) => values
                 .value(row)
                 .map_or_else(Cell::absent, |bytes| push_text(kind::STRING, bytes, text)),
+            ColumnData::ClpString(values) if shapes.get(field).copied().unwrap_or(false) => {
+                match values.record(row) {
+                    Some(record) => {
+                        let start = text.len();
+                        append_logtype_template(record.logtype(), text);
+                        Cell {
+                            kind: kind::STRING,
+                            integer: 0,
+                            real: 0.0,
+                            text_offset: start,
+                            text_length: text.len() - start,
+                        }
+                    }
+                    None => Cell::absent(),
+                }
+            }
             ColumnData::ClpString(values) | ColumnData::UnstructuredArray(values) => {
                 match values.record(row) {
                     Some(record) => {

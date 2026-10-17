@@ -1021,16 +1021,26 @@ fn output_dictionaries(
     Ok(output)
 }
 
-/// Adds every column a path can reach, resolving it as the compiler does: a node with an empty key, such as a structured array's element, consumes no component.
-/// That covers the columns at the path's end, any column beneath an object or structured array
-/// it ends on, and an unstructured array it reaches, whose elements are matched inside the
-/// array's text.
+/// Adds every column a filter path can reach; see [`resolve_filter_path`].
 fn add_path_nodes(
     tree: &crate::archive::SchemaTree,
     components: &[super::PathComponent],
     wanted: &mut std::collections::BTreeSet<u32>,
 ) {
+    let components: Vec<&str> = components.iter().map(super::PathComponent::value).collect();
+    wanted.extend(resolve_filter_path(tree, &components));
+}
+
+/// Returns every schema node a filter's comparison on a path, given as unescaped keys, can read.
+///
+/// The path resolves as the query compiler resolves it: a node with an empty key, such as a
+/// structured array's element, consumes no component. That covers the nodes at the path's end,
+/// every node beneath an object or structured array it ends on, and an unstructured array it
+/// reaches, whose elements are matched inside the array's text. The result is sorted.
+#[must_use]
+pub fn resolve_filter_path(tree: &crate::archive::SchemaTree, components: &[&str]) -> Vec<u32> {
     use crate::archive::NodeType;
+    let mut wanted = std::collections::BTreeSet::new();
     let nodes = tree.nodes();
     let mut children = vec![Vec::new(); nodes.len()];
     for (node_id, node) in nodes.iter().enumerate() {
@@ -1057,7 +1067,7 @@ fn add_path_nodes(
         let key = node.key_bytes();
         let matches_component = components
             .get(component)
-            .is_some_and(|expected| key == expected.value().as_bytes());
+            .is_some_and(|expected| key == expected.as_bytes());
         if NodeType::UnstructuredArray == node.node_type() {
             if matches_component && let Ok(id) = u32::try_from(node_id) {
                 wanted.insert(id);
@@ -1079,12 +1089,13 @@ fn add_path_nodes(
                 node.node_type(),
                 NodeType::Object | NodeType::StructuredArray
             ) {
-                add_descendant_nodes(tree, node_id, wanted);
+                add_descendant_nodes(tree, node_id, &mut wanted);
             }
             continue;
         }
         pending.extend(children[node_id].iter().map(|child| (*child, next)));
     }
+    wanted.into_iter().collect()
 }
 
 /// Adds every column beneath `ancestor`. A node always follows its

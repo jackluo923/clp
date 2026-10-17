@@ -1419,6 +1419,109 @@ fn projected_scan_integers(archive: &Path, query: &str, field: &str) -> Vec<i64>
     values
 }
 
+/// The strings a projected scan returns for one field, in scan order, `None` for any other kind.
+fn projected_scan_strings(archive: &Path, query: &str, field: &str) -> Vec<Option<String>> {
+    let query = compile_query(query, 0);
+    let path = archive.to_str().expect("archive path is UTF-8").as_bytes();
+    let fields = [ClpSV2ProjectedField {
+        path: field.as_ptr(),
+        path_length: field.len(),
+    }];
+    let mut scanner = ptr::null_mut();
+    let mut text = [0_u8; 512];
+    let mut error = error_buffer(&mut text);
+    // SAFETY: Every pointer names live storage for the duration of the call.
+    let status = unsafe {
+        clp_s_v2_scanner_open(
+            path.as_ptr(),
+            path.len(),
+            query.0,
+            fields.as_ptr(),
+            fields.len(),
+            &raw mut scanner,
+            &raw mut error,
+        )
+    };
+    assert_eq!(CLP_S_STATUS_OK, status, "{}", error_text(&text));
+    let mut values = Vec::new();
+    loop {
+        let mut value = ClpSV2Value {
+            kind: 0,
+            reserved: 0,
+            integer: 0,
+            real: 0.0,
+            text: ptr::null(),
+            text_length: 0,
+        };
+        let mut has_row = 0_u32;
+        let mut text = [0_u8; 512];
+        let mut error = error_buffer(&mut text);
+        // SAFETY: The scanner is live and `value` holds one cell per projected field.
+        let status = unsafe {
+            clp_s_v2_scanner_next_row(scanner, &raw mut value, &raw mut has_row, &raw mut error)
+        };
+        assert_eq!(CLP_S_STATUS_OK, status, "{}", error_text(&text));
+        if 0 == has_row {
+            break;
+        }
+        values.push((CLP_S_V2_VALUE_STRING == value.kind).then(|| {
+            // SAFETY: A string cell's span stays valid until the scanner's next call.
+            let bytes = unsafe { std::slice::from_raw_parts(value.text, value.text_length) };
+            String::from_utf8(bytes.to_vec()).expect("projected text is UTF-8")
+        }));
+    }
+    // SAFETY: The scanner is live and freed exactly once.
+    unsafe { clp_s_v2_scanner_free(scanner) };
+    values
+}
+
+#[test]
+fn projected_scan_writes_shape_fields_as_logtype_templates() {
+    let source = concat!(
+        r#"{"n":1,"msg":"took 15 ms for user alice42","content":[{"is_error":true,"text":"a 1"}]}"#,
+        "\n",
+        r#"{"n":2,"msg":"ratio 0.5 at 100% of 10.0.0.1","content":[{"is_error":false,"text":"b 2"}]}"#,
+        "\n",
+        r#"{"n":3,"msg":"no variables here at all","content":[{"is_error":true,"text":"c 3"}]}"#,
+        "\n",
+    );
+    let path = std::env::temp_dir().join(format!("clp-s-ffi-shape-{}.clps", std::process::id()));
+    std::fs::write(&path, adaptive_archive(source.as_bytes(), true)).expect("write shape archive");
+    let strings = |values: &[&str]| -> Vec<Option<String>> {
+        values
+            .iter()
+            .map(|value| Some((*value).to_owned()))
+            .collect()
+    };
+    assert_eq!(
+        strings(&[
+            "took %int% ms for user %str%",
+            "ratio %float% at %int%%% of %str%",
+            "no variables here at all",
+        ]),
+        projected_scan_strings(&path, "*", "shape(msg)")
+    );
+    assert_eq!(
+        strings(&[
+            "took 15 ms for user alice42",
+            "ratio 0.5 at 100% of 10.0.0.1",
+            "no variables here at all",
+        ]),
+        projected_scan_strings(&path, "*", "msg")
+    );
+    // A filter through the structured array reads its Boolean column alone before the
+    // projected field; the rows must be exactly those a whole read matches.
+    assert_eq!(
+        strings(&["took 15 ms for user alice42", "no variables here at all"]),
+        projected_scan_strings(&path, "content.is_error: true", "msg")
+    );
+    assert_eq!(
+        strings(&["took %int% ms for user %str%", "no variables here at all"]),
+        projected_scan_strings(&path, "content.is_error: true", "shape(msg)")
+    );
+    std::fs::remove_file(path).expect("remove shape archive");
+}
+
 #[test]
 fn projected_scan_skips_streams_no_schema_can_match_and_resumes_after_them() {
     // Adaptive numeric columns give each table holding a number its own stream, so the nine

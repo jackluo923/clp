@@ -47,6 +47,7 @@ pub use archive::ArchiveSearchError;
 pub use archive::ArchiveSearchOptions;
 pub use archive::ArchiveSearchStats;
 pub use archive::ArchiveTableMatches;
+pub use archive::resolve_filter_path;
 pub use archive::search_archive;
 pub use array::ArraySearchError;
 pub use array::ArraySyntaxErrorKind;
