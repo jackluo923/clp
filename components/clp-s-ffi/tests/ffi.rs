@@ -13,6 +13,11 @@ const MINIMAL_JSONL: &str = "sfa-v0.5.0-minimal-cpp-input.jsonl";
 const AGGREGATIONS_ARCHIVE: &str = "sfa-v0.5.0-aggregations-cpp.bin";
 const LOG_ORDER_ARCHIVE: &str = "sfa-v0.5.0-log-order-cpp.bin";
 const ARRAY_DIRECTORY: &str = "sfa-v0.5.0-unstructured-arrays-cpp-dir";
+const UNSTRUCTURED_ARRAY_ARCHIVE: &str = "sfa-v0.5.0-unstructured-arrays-cpp.bin";
+const UNSTRUCTURED_ARRAY_JSONL: &str = "sfa-v0.5.0-unstructured-arrays-cpp-input.jsonl";
+const STRUCTURED_ARRAY_JSONL: &str = "sfa-v0.5.0-structured-arrays-cpp-input.jsonl";
+const STRUCTURED_ARRAY_ARCHIVE_HEX: &str =
+    include_str!("../../clp-s/tests/fixtures/sfa-v0.5.0-structured-arrays-cpp.hex");
 const FOUR_BYTE_KV_IR_ORACLE_HEX: &str =
     include_str!("../../clp-s/tests/fixtures/kv-ir-v0.1.0-four-byte-cpp.hex");
 const EIGHT_BYTE_KV_IR_ORACLE_HEX: &str =
@@ -1239,6 +1244,126 @@ fn sfa_search_reuses_query_and_archive_handles() {
     assert_eq!(CLP_S_STATUS_OK, status, "{error}");
     assert_eq!(0, delivered);
     assert_eq!(state.records, [] as [OwnedRecord; 0]);
+}
+
+/// Counts the rows a projected scan matches when it projects no fields.
+fn projected_scan_count(archive: &Path, query: &str) -> Result<u64, String> {
+    let query = compile_query(query, 0);
+    let path = archive.to_str().expect("archive path is UTF-8").as_bytes();
+    let mut scanner = ptr::null_mut();
+    let mut text = [0_u8; 512];
+    let mut error = error_buffer(&mut text);
+    // SAFETY: Every pointer names live storage for the duration of the call.
+    let status = unsafe {
+        clp_s_v2_scanner_open(
+            path.as_ptr(),
+            path.len(),
+            query.0,
+            ptr::null(),
+            0,
+            &raw mut scanner,
+            &raw mut error,
+        )
+    };
+    if CLP_S_STATUS_OK != status {
+        return Err(error_text(&text).to_owned());
+    }
+    let mut rows = 0;
+    let result = loop {
+        let mut has_row = 0_u32;
+        let mut text = [0_u8; 512];
+        let mut error = error_buffer(&mut text);
+        // SAFETY: The scanner is live, and with no projected fields it writes no values.
+        let status = unsafe {
+            clp_s_v2_scanner_next_row(scanner, ptr::null_mut(), &raw mut has_row, &raw mut error)
+        };
+        if CLP_S_STATUS_OK != status {
+            break Err(error_text(&text).to_owned());
+        }
+        if 0 == has_row {
+            break Ok(rows);
+        }
+        rows += 1;
+    };
+    // SAFETY: The scanner is live and freed exactly once.
+    unsafe { clp_s_v2_scanner_free(scanner) };
+    result
+}
+
+/// Writes `source` into a single-file archive with the Rust writer's adaptive numeric columns, so
+/// every table holding a number is stored one zstd frame per column and a scan inflates only the
+/// columns it reads.
+fn adaptive_archive(source: &[u8], structurize_arrays: bool) -> Vec<u8> {
+    let mut archive = clp_s::writer::OpenArchive::new(
+        std::io::Cursor::new(Vec::new()),
+        clp_s::writer::WriterOptions::default().with_adaptive_numeric_columns(true),
+    );
+    {
+        let mut reader =
+            clp_s::ingest::ParseManyReader::new(source, clp_s::ingest::ParseManyOptions::default());
+        let mut sink = clp_s::ingest::JsonArchiveSink::new(
+            &mut archive,
+            clp_s::ingest::JsonArchiveOptions::new().with_structurize_arrays(structurize_arrays),
+        );
+        reader.read_to_end(&mut sink).expect("ingest array fixture");
+    }
+    archive
+        .finish()
+        .expect("finish array archive")
+        .into_inner()
+        .into_inner()
+}
+
+#[test]
+fn projected_scan_matches_predicates_inside_arrays() {
+    let temporary = |name: &str, bytes: Vec<u8>| {
+        let path =
+            std::env::temp_dir().join(format!("clp-s-ffi-{name}-{}.clps", std::process::id()));
+        std::fs::write(&path, bytes).expect("write array archive");
+        path
+    };
+    let unstructured_source =
+        std::fs::read(fixture(UNSTRUCTURED_ARRAY_JSONL)).expect("read unstructured-array source");
+    let structured_source =
+        std::fs::read(fixture(STRUCTURED_ARRAY_JSONL)).expect("read structured-array source");
+    let cpp_structured = temporary("cpp-structured", decode_hex(STRUCTURED_ARRAY_ARCHIVE_HEX));
+    let rust_unstructured = temporary(
+        "rust-unstructured",
+        adaptive_archive(&unstructured_source, false),
+    );
+    let rust_structured = temporary(
+        "rust-structured",
+        adaptive_archive(&structured_source, true),
+    );
+    let cases = [
+        (fixture(UNSTRUCTURED_ARRAY_ARCHIVE), "array.k: \"v\""),
+        (fixture(UNSTRUCTURED_ARRAY_ARCHIVE), "array.n: 9"),
+        (cpp_structured.clone(), "items.x: 3"),
+        (cpp_structured.clone(), "items.nested.z: \"yes\""),
+        (rust_unstructured.clone(), "array.k: \"v\""),
+        (rust_unstructured.clone(), "array.n: 9"),
+        (rust_structured.clone(), "items.x: 3"),
+        (rust_structured.clone(), "items.nested.z: \"yes\""),
+    ];
+    for (archive, query) in &cases {
+        // A predicate on an array element names a path the schema tree has no node for, so the
+        // scan must still read the array's columns and dictionaries. The full search reads
+        // everything, so it is the reference.
+        let mut state = CallbackState::default();
+        let (status, expected, error) =
+            search(&open_archive(archive), &compile_query(query, 0), &mut state);
+        assert_eq!(CLP_S_STATUS_OK, status, "{query}: {error}");
+        assert!(0 < expected, "{query} matches a fixture record");
+        assert_eq!(
+            Ok(expected),
+            projected_scan_count(archive, query),
+            "{query} on {}",
+            archive.display()
+        );
+    }
+    for path in [cpp_structured, rust_unstructured, rust_structured] {
+        std::fs::remove_file(path).expect("remove array archive");
+    }
 }
 
 #[test]

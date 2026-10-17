@@ -153,6 +153,74 @@ fn resolve_path(tree: &SchemaTree, components: &[&str]) -> Vec<u32> {
     resolved
 }
 
+/// Resolves a predicate's path to every schema node its comparison can read.
+///
+/// A predicate, unlike a projected field, can name a path inside an array, such as `items.x` when
+/// `items` holds objects. The schema tree has no node for that path: an unstructured array is one
+/// column, and a structured array's elements hang beneath the array node. The comparison still
+/// reads those columns, so a path that reaches an array before it ends resolves to the unstructured
+/// array's node, or to every value-bearing node beneath a structured array.
+fn resolve_predicate_path(tree: &SchemaTree, components: &[&str]) -> Vec<u32> {
+    let mut resolved = resolve_path(tree, components);
+    let nodes = tree.nodes();
+    let Some(root) = user_root(tree) else {
+        return resolved;
+    };
+    let mut objects = vec![root];
+    for (index, component) in components.iter().enumerate() {
+        let last = index + 1 == components.len();
+        let mut next_objects = Vec::new();
+        for (child_id, child) in nodes.iter().enumerate() {
+            if !child
+                .parent_id()
+                .is_some_and(|parent| objects.contains(&parent))
+                || child.key_bytes() != component.as_bytes()
+            {
+                continue;
+            }
+            match child.node_type() {
+                NodeType::Object => next_objects.push(child_id),
+                NodeType::UnstructuredArray if !last => {
+                    resolved.extend(u32::try_from(child_id).ok());
+                }
+                NodeType::StructuredArray => {
+                    resolved.extend(value_bearing_descendants(tree, child_id));
+                }
+                _ => {}
+            }
+        }
+        if next_objects.is_empty() {
+            break;
+        }
+        objects = next_objects;
+    }
+    resolved
+}
+
+/// Every value-bearing node beneath `ancestor`.
+///
+/// A node is always added after its parent, so one forward pass sees each parent first.
+fn value_bearing_descendants(tree: &SchemaTree, ancestor: usize) -> Vec<u32> {
+    let nodes = tree.nodes();
+    let mut inside = vec![false; nodes.len()];
+    let mut descendants = Vec::new();
+    for (node_id, node) in nodes.iter().enumerate() {
+        let Some(parent) = node.parent_id() else {
+            continue;
+        };
+        if parent != ancestor && !inside.get(parent).copied().unwrap_or(false) {
+            continue;
+        }
+        inside[node_id] = true;
+        if is_value_bearing(node.node_type())
+            && let Ok(id) = u32::try_from(node_id)
+        {
+            descendants.push(id);
+        }
+    }
+    descendants
+}
+
 /// Returns the default namespace's object root, the parent of every top-level user key.
 fn user_root(tree: &SchemaTree) -> Option<usize> {
     tree.nodes().iter().position(|node| {
@@ -315,7 +383,7 @@ fn wanted_nodes(parsed: &ParsedQuery, tree: &SchemaTree, field_nodes: &[Vec<u32>
             return None;
         }
         let components: Vec<&str> = path.components().iter().map(PathComponent::value).collect();
-        nodes.extend(resolve_path(tree, &components));
+        nodes.extend(resolve_predicate_path(tree, &components));
     }
     if needs_log_order {
         match LogOrderLocator::discover(tree) {
