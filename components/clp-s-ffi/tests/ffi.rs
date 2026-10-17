@@ -1366,6 +1366,82 @@ fn projected_scan_matches_predicates_inside_arrays() {
     }
 }
 
+/// The integers a projected scan returns for one field, in scan order.
+fn projected_scan_integers(archive: &Path, query: &str, field: &str) -> Vec<i64> {
+    let query = compile_query(query, 0);
+    let path = archive.to_str().expect("archive path is UTF-8").as_bytes();
+    let fields = [ClpSV2ProjectedField {
+        path: field.as_ptr(),
+        path_length: field.len(),
+    }];
+    let mut scanner = ptr::null_mut();
+    let mut text = [0_u8; 512];
+    let mut error = error_buffer(&mut text);
+    // SAFETY: Every pointer names live storage for the duration of the call.
+    let status = unsafe {
+        clp_s_v2_scanner_open(
+            path.as_ptr(),
+            path.len(),
+            query.0,
+            fields.as_ptr(),
+            fields.len(),
+            &raw mut scanner,
+            &raw mut error,
+        )
+    };
+    assert_eq!(CLP_S_STATUS_OK, status, "{}", error_text(&text));
+    let mut values = Vec::new();
+    loop {
+        let mut value = ClpSV2Value {
+            kind: 0,
+            reserved: 0,
+            integer: 0,
+            real: 0.0,
+            text: ptr::null(),
+            text_length: 0,
+        };
+        let mut has_row = 0_u32;
+        let mut text = [0_u8; 512];
+        let mut error = error_buffer(&mut text);
+        // SAFETY: The scanner is live and `value` holds one cell per projected field.
+        let status = unsafe {
+            clp_s_v2_scanner_next_row(scanner, &raw mut value, &raw mut has_row, &raw mut error)
+        };
+        assert_eq!(CLP_S_STATUS_OK, status, "{}", error_text(&text));
+        if 0 == has_row {
+            break;
+        }
+        assert_eq!(CLP_S_V2_VALUE_INTEGER, value.kind);
+        values.push(value.integer);
+    }
+    // SAFETY: The scanner is live and freed exactly once.
+    unsafe { clp_s_v2_scanner_free(scanner) };
+    values
+}
+
+#[test]
+fn projected_scan_skips_streams_no_schema_can_match_and_resumes_after_them() {
+    // Adaptive numeric columns give each table holding a number its own stream, so the nine
+    // records of this fixture spread over several streams with different schemas. A query on a
+    // column only some schemas hold skips the others' streams unread; the rows of every stream
+    // after a skipped one must still be found.
+    let source =
+        std::fs::read(fixture(STRUCTURED_ARRAY_JSONL)).expect("read structured-array source");
+    let archive =
+        std::env::temp_dir().join(format!("clp-s-ffi-stream-skip-{}.clps", std::process::id()));
+    std::fs::write(&archive, adaptive_archive(&source, true)).expect("write archive");
+    for (query, expected) in [
+        ("obj.items.x: 5", vec![6]),
+        ("items.nested.z: *", vec![7, 8]),
+        ("id >= 0", vec![0, 1, 2, 3, 4, 5, 6, 7, 8]),
+    ] {
+        let mut ids = projected_scan_integers(&archive, query, "id");
+        ids.sort_unstable();
+        assert_eq!(expected, ids, "{query}");
+    }
+    std::fs::remove_file(&archive).expect("remove archive");
+}
+
 #[test]
 fn directory_archive_search_and_extraction_use_the_same_handles() {
     let archive = open_archive(&fixture(ARRAY_DIRECTORY));

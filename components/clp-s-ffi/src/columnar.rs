@@ -339,19 +339,45 @@ pub struct ProjectedScanner {
     finished: bool,
 }
 
-/// Whether any node in `nodes` is read through a dictionary.
-fn any_dictionary_backed(tree: &SchemaTree, nodes: &[u32]) -> bool {
-    nodes.iter().any(|node_id| {
-        tree.get(*node_id as usize).is_some_and(|node| {
-            matches!(
-                node.node_type(),
-                NodeType::VarString
-                    | NodeType::DictionaryFloat
-                    | NodeType::ClpString
-                    | NodeType::UnstructuredArray
-            )
-        })
-    })
+/// Which of the three dictionaries a scan reads through: variable, log-type, array.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+struct Dictionaries {
+    variable: bool,
+    log_type: bool,
+    array: bool,
+}
+
+impl Dictionaries {
+    const ALL: Self = Self {
+        variable: true,
+        log_type: true,
+        array: true,
+    };
+}
+
+/// The dictionaries the columns behind `nodes` are read through. A string is a variable ID, a CLP
+/// string a logtype whose variables may be IDs, and an unstructured array an array-dictionary
+/// logtype whose variables may be IDs; numbers, Booleans and timestamps need none.
+fn dictionaries_read_by(tree: &SchemaTree, nodes: &[u32]) -> Dictionaries {
+    let mut needed = Dictionaries::default();
+    for node in nodes
+        .iter()
+        .filter_map(|node_id| tree.get(*node_id as usize))
+    {
+        match node.node_type() {
+            NodeType::VarString | NodeType::DictionaryFloat => needed.variable = true,
+            NodeType::ClpString => {
+                needed.variable = true;
+                needed.log_type = true;
+            }
+            NodeType::UnstructuredArray => {
+                needed.variable = true;
+                needed.array = true;
+            }
+            _ => {}
+        }
+    }
+    needed
 }
 
 /// Every schema node the scan reads: the projected fields plus each node a predicate compares.
@@ -432,26 +458,43 @@ impl ProjectedScanner {
         let force_eager = std::env::var("CLP_RUST_EAGER_DICTIONARIES")
             .is_ok_and(|value| !value.is_empty() && value != "0");
         let wanted_nodes = wanted_nodes(&parsed, catalog.schema_tree(), &field_nodes);
-        // The dictionaries are decoded eagerly by default, and on a string-heavy archive that
-        // costs more than reading the tables. A scan that only touches integers, floats,
-        // booleans and timestamps never looks anything up, so it can leave them unloaded.
-        let needs_dictionaries = wanted_nodes
-            .as_deref()
-            .is_none_or(|nodes| any_dictionary_backed(catalog.schema_tree(), nodes));
-        if force_eager || needs_dictionaries {
-            let limits = options.catalog();
+        // The dictionaries are usually most of an archive, and on a string-heavy one decoding them
+        // costs more than reading the tables. Only those the read columns go through are loaded:
+        // a scan of numbers, Booleans and timestamps loads none, and one of plain strings only the
+        // variable dictionary.
+        let needed = match wanted_nodes.as_deref() {
+            _ if force_eager => Dictionaries::ALL,
+            None => Dictionaries::ALL,
+            Some(nodes) => dictionaries_read_by(catalog.schema_tree(), nodes),
+        };
+        let limits = options.catalog();
+        if needed.variable {
             let variable = reader
                 .read_variable_dictionary(catalog.metadata(), limits.variable_dictionary())
-                .map_err(|source| ScanError::Archive(format!("failed to read var.dict: {source}")))?;
+                .map_err(|source| {
+                    ScanError::Archive(format!("failed to read var.dict: {source}"))
+                })?;
+            catalog.set_variable_dictionary(variable);
+        }
+        if needed.log_type {
             let log_type = reader
                 .read_log_type_dictionary(catalog.metadata(), limits.log_type_dictionary())
-                .map_err(|source| ScanError::Archive(format!("failed to read log.dict: {source}")))?;
+                .map_err(|source| {
+                    ScanError::Archive(format!("failed to read log.dict: {source}"))
+                })?;
+            catalog.set_log_type_dictionary(log_type);
+        }
+        if needed.array {
             let array = reader
                 .read_array_dictionary(catalog.metadata(), limits.array_dictionary())
-                .map_err(|source| ScanError::Archive(format!("failed to read array.dict: {source}")))?;
-            catalog.set_dictionaries(variable, log_type, array);
-        } else {
-            // Nothing will look an ID up, so decoding need not check them either.
+                .map_err(|source| {
+                    ScanError::Archive(format!("failed to read array.dict: {source}"))
+                })?;
+            catalog.set_array_dictionary(array);
+        }
+        if Dictionaries::ALL != needed {
+            // A column whose dictionary was left unloaded is never read, so decoding must not
+            // check its IDs against the empty one.
             options = options.with_columns(options.columns().with_dictionary_validation(false));
         }
         // Compiling here answers which source files the selector accepts once, rather than once
@@ -556,6 +599,15 @@ impl ProjectedScanner {
     /// would need each row's `log_event_idx`, which is inside the stream being skipped.
     fn load_next_stream(&mut self) -> Result<bool, ScanError> {
         let stream_id = self.stream_index as u64;
+        // A stream none of whose tables has a schema the query can match holds no result row, so it
+        // is skipped unread. The cursor moves past its tables, since resuming before a stream's
+        // first table would read that stream as finished.
+        let (first_table, end_table) = self.stream_table_range(stream_id);
+        if !self.any_schema_may_match(first_table..end_table)? {
+            self.table_cursor = end_table;
+            self.stream_index += 1;
+            return Ok(false);
+        }
         let mask = self.projection_mask(stream_id);
         let truncate = match mask.as_deref() {
             Some(wanted) => self.plan_truncation(stream_id, wanted),
@@ -687,6 +739,40 @@ impl ProjectedScanner {
         Some(nodes)
     }
 
+    /// The archive-wide indexes of the tables stored in one packed stream, which table metadata
+    /// keeps grouped by stream.
+    fn stream_table_range(&self, stream_id: u64) -> (usize, usize) {
+        let tables = self.catalog.table_metadata().schema_tables();
+        let first = tables.partition_point(|table| table.stream_id() < stream_id);
+        let end = first + tables[first..].partition_point(|table| table.stream_id() == stream_id);
+        (first, end)
+    }
+
+    /// Whether the query could match a row of any table in `tables`, judged from schemas alone.
+    fn any_schema_may_match(&mut self, tables: std::ops::Range<usize>) -> Result<bool, ScanError> {
+        let compiled = self
+            .parsed
+            .compile_for_archive_reusing(
+                &self.catalog,
+                self.options.search(),
+                &mut self.dictionary_matches,
+            )
+            .map_err(|source| ScanError::Archive(format!("failed to compile query: {source}")))?;
+        let metadata = self.catalog.table_metadata().schema_tables();
+        for table in &metadata[tables] {
+            // A schema the map lacks is left to the table decoder to report.
+            let Some(schema) = self.catalog.schema_map().get(table.schema_id()) else {
+                return Ok(true);
+            };
+            if compiled.may_match_schema(schema).map_err(|source| {
+                ScanError::Archive(format!("failed to compile query: {source}"))
+            })? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn stream_table(&self, stream_id: u64) -> Option<&SchemaTableMetadata> {
         let tables = self.catalog.table_metadata().schema_tables();
         let first = tables.partition_point(|table| table.stream_id() < stream_id);
@@ -749,6 +835,14 @@ impl ProjectedScanner {
             let decoded = decoded.map_err(|source| {
                 ScanError::Archive(format!("failed to decode table: {source}"))
             })?;
+            // A table whose schema the query cannot match is passed over without evaluating it.
+            if !compiled
+                .may_match_schema(decoded.schema())
+                .map_err(|source| ScanError::Archive(format!("failed to match table: {source}")))?
+            {
+                table_cursor = decoded.table_index() + 1;
+                continue;
+            }
             let bitmap = compiled
                 .match_table(&decoded)
                 .map_err(|source| ScanError::Archive(format!("failed to match table: {source}")))?;
