@@ -1572,6 +1572,53 @@ fn structurize_arrays_matches_the_exact_cpp_single_file_archive() {
 }
 
 #[test]
+fn arrays_are_structured_unless_disabled() {
+    let temporary = TestDirectory::new("array-default");
+    let input_path = temporary.path().join("input.jsonl");
+    fs::write(&input_path, STRUCTURED_ARRAY_INPUT).expect("write structured-array fixture");
+    let compress = |name: &str, array_flag: Option<&str>| {
+        let archives_path = temporary.path().join(name);
+        let mut arguments = vec![
+            "c".as_ref(),
+            "--single-file-archive".as_ref(),
+            "--disable-log-order".as_ref(),
+        ];
+        if let Some(flag) = array_flag {
+            arguments.push(flag.as_ref());
+        }
+        arguments.extend([archives_path.as_os_str(), input_path.as_os_str()]);
+        let result = clp_s(&arguments);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        fs::read(only_entry(&archives_path)).expect("read array-default SFA")
+    };
+
+    let default = compress("default", None);
+    assert_eq!(
+        compress("structured", Some("--structurize-arrays")),
+        default,
+        "arrays are structured by default, and the C++ flag still names that behaviour"
+    );
+    assert_ne!(
+        compress("unstructured", Some("--no-structurize-arrays")),
+        default
+    );
+
+    let conflicting_path = temporary.path().join("conflicting");
+    let conflicting = clp_s(&[
+        "c".as_ref(),
+        "--structurize-arrays".as_ref(),
+        "--no-structurize-arrays".as_ref(),
+        conflicting_path.as_os_str(),
+        input_path.as_os_str(),
+    ]);
+    assert!(!conflicting.status.success());
+}
+
+#[test]
 fn kv_ir_magic_legacy_and_truncation_routes_preserve_typed_errors_and_committed_prefixes() {
     let temporary = TestDirectory::new("kv-ir-errors");
     let fixture = decode_hex(FOUR_BYTE_KV_IR_HEX);

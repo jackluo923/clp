@@ -218,8 +218,12 @@ struct CompressionRepresentationArgs {
     /// Decode floating-point values without retaining their exact source spelling.
     #[arg(long)]
     no_retain_float_format: bool,
-    /// Encode arrays as structured schema nodes.
+    /// Store each array whole, as a string in the array dictionary, instead of encoding its
+    /// elements as structured schema nodes (the default).
     #[arg(long)]
+    no_structurize_arrays: bool,
+    /// Arrays are structured by default; accepted so C++ command lines keep working.
+    #[arg(long, hide = true, conflicts_with = "no_structurize_arrays")]
     structurize_arrays: bool,
     /// Omit archive-global log-order and range-index metadata.
     #[arg(long)]
@@ -511,7 +515,7 @@ fn run_compress(arguments: &CompressArgs) -> CliResult<()> {
     );
     let json_options = JsonArchiveOptions::new()
         .with_retain_float_format(!arguments.representation.no_retain_float_format)
-        .with_structurize_arrays(arguments.representation.structurize_arrays)
+        .with_structurize_arrays(!arguments.representation.no_structurize_arrays)
         .with_structured_array_limits(JsonStructuredArrayLimits::new(u64::MAX, u64::MAX));
     let stream_options = StructuredStreamOptions::new()
         .with_parse_many(
