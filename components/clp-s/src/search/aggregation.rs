@@ -337,6 +337,9 @@ impl AggregationField {
     fn compile(source: &str, limits: ProjectionLimits) -> Result<Self, AggregationPlanError> {
         let projection =
             Projection::selected(&[source], limits).map_err(AggregationPlanError::InvalidField)?;
+        if projection.has_shapes() {
+            return Err(AggregationPlanError::ShapeField);
+        }
         let column = projection
             .selected_columns()
             .and_then(|columns| columns.first())
@@ -378,6 +381,8 @@ pub enum AggregationPlanError {
     },
     /// A parsed field unexpectedly contained no descriptor.
     MissingField,
+    /// The aggregation field was wrapped in `shape(...)`, which only selects output columns.
+    ShapeField,
     /// A bounded plan allocation failed.
     AllocationFailed {
         /// Requested byte count.
@@ -400,6 +405,9 @@ impl Display for AggregationPlanError {
                 "aggregation fields must use the default namespace, not {namespace:?}"
             ),
             Self::MissingField => formatter.write_str("aggregation field is empty"),
+            Self::ShapeField => {
+                formatter.write_str("aggregation fields cannot use shape(...); project it instead")
+            }
             Self::AllocationFailed { requested } => write!(
                 formatter,
                 "failed to allocate {requested} byte(s) for the aggregation plan"
@@ -415,6 +423,7 @@ impl Error for AggregationPlanError {
             Self::InvalidBucketSize { .. }
             | Self::UnsupportedNamespace { .. }
             | Self::MissingField
+            | Self::ShapeField
             | Self::AllocationFailed { .. } => None,
         }
     }
@@ -2221,6 +2230,14 @@ mod tests {
         for (expected, actual) in expected.iter().zip(actual) {
             assert_eq!(*expected, actual);
         }
+    }
+
+    #[test]
+    fn shape_fields_are_rejected() {
+        assert!(matches!(
+            AggregationPlan::unique("shape(message)"),
+            Err(AggregationPlanError::ShapeField)
+        ));
     }
 
     #[test]

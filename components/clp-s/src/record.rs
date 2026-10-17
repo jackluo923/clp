@@ -36,6 +36,7 @@ use crate::archive::TimestampColumn;
 use crate::archive::U64Column;
 use crate::archive::append_clp_message_bounded;
 use crate::archive::append_formatted_float;
+use crate::archive::append_logtype_template;
 use crate::json::JsonBytePolicy;
 use crate::json::JsonEscapeError;
 use crate::json::JsonEscapeLimits;
@@ -175,6 +176,8 @@ pub struct RecordProgram {
     literals: Vec<u8>,
     values: Vec<ValueStep>,
     expected_columns: Vec<Option<ExpectedColumn>>,
+    /// Sorted schema nodes whose CLP strings are written as their logtype templates.
+    shape_nodes: Vec<u32>,
     byte_policy: JsonBytePolicy,
     limits: RecordLimits,
 }
@@ -220,6 +223,17 @@ impl RecordProgram {
             byte_policy,
             limits,
         )
+    }
+
+    /// Writes the CLP-string columns of `nodes` as their logtype templates rather than their
+    /// values, as the C++ `shape(...)` projection does: each variable becomes `%int%`, `%float%`
+    /// or `%str%`. A node of any other type is written as usual.
+    #[must_use]
+    pub fn with_shape_nodes(mut self, nodes: &[u32]) -> Self {
+        self.shape_nodes = nodes.to_vec();
+        self.shape_nodes.sort_unstable();
+        self.shape_nodes.dedup();
+        self
     }
 
     /// Returns the opaque schema ID represented by this program.
@@ -500,6 +514,8 @@ enum ColumnCursor<'table, 'archive> {
     Boolean(BooleanColumn<'table>),
     VarString(DictionaryIdColumn<'table, 'archive>),
     ClpString(ClpStringColumn<'table, 'archive>),
+    /// A CLP string written as its logtype template.
+    ClpShape(ClpStringColumn<'table, 'archive>),
     UnstructuredArray(ClpStringColumn<'table, 'archive>),
     Timestamp {
         epochs: DeltaI64Values<'table>,
@@ -686,6 +702,15 @@ fn append_dynamic_value(
             scratch,
             output,
         ),
+        ColumnCursor::ClpShape(column) => append_clp_shape(
+            *column,
+            step,
+            row_index,
+            byte_policy,
+            scratch_limit,
+            scratch,
+            output,
+        ),
         ColumnCursor::UnstructuredArray(column) => append_clp_value(
             *column,
             step,
@@ -798,6 +823,30 @@ fn append_clp_value(
     }
 }
 
+fn append_clp_shape(
+    column: ClpStringColumn<'_, '_>,
+    step: ValueStep,
+    row_index: usize,
+    byte_policy: JsonBytePolicy,
+    scratch_limit: usize,
+    scratch: &mut RecordScratch,
+    output: &mut BoundedRecordOutput<'_>,
+) -> Result<(), RecordError> {
+    let record = column
+        .record(row_index)
+        .ok_or_else(|| missing(step, row_index))?;
+    scratch.bytes.clear();
+    append_logtype_template(record.logtype(), &mut scratch.bytes);
+    if scratch.bytes.len() > scratch_limit {
+        return Err(RecordError::LimitExceeded {
+            resource: RecordResource::ScratchBytes,
+            required: scratch.bytes.len(),
+            limit: scratch_limit,
+        });
+    }
+    output.append_json_string(&scratch.bytes, byte_policy, step)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn append_timestamp(
     epochs: &mut DeltaI64Values<'_>,
@@ -904,6 +953,14 @@ fn bind_writer<'program, 'table, 'archive, 'catalog>(
                 program.limits.scratch_bytes,
             )?,
             None => ColumnCursor::Unused,
+        };
+        let cursor = match cursor {
+            ColumnCursor::ClpString(data)
+                if program.shape_nodes.binary_search(&column.node_id()).is_ok() =>
+            {
+                ColumnCursor::ClpShape(data)
+            }
+            cursor => cursor,
         };
         trial.push(cursor.clone());
         current.push(cursor);
@@ -1404,6 +1461,7 @@ impl<'a> ProgramCompiler<'a> {
             literals: self.literals,
             values: self.values,
             expected_columns: self.expected_columns,
+            shape_nodes: Vec::new(),
             byte_policy: self.byte_policy,
             limits: self.limits,
         }

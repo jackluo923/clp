@@ -1572,6 +1572,83 @@ fn structurize_arrays_matches_the_exact_cpp_single_file_archive() {
 }
 
 #[test]
+fn shape_projection_writes_clp_strings_as_logtype_templates() {
+    // As the C++ `shape(...)` projection: each variable becomes `%int%`, `%float%` or `%str%`, a
+    // literal `%` is doubled, and a field that is not a CLP string keeps its value.
+    let input = concat!(
+        r#"{"id":1,"msg":"took 15 ms for user alice42","kind":"plain"}"#,
+        "\n",
+        r#"{"id":2,"msg":"ratio 0.5 at 100% of 10.0.0.1","kind":"plain"}"#,
+        "\n",
+        r#"{"id":3,"msg":"no variables here at all","kind":"plain"}"#,
+        "\n",
+        r#"{"id":4,"msg":"escaped \\ backslash 7","kind":"x"}"#,
+        "\n",
+    );
+    let temporary = TestDirectory::new("shape-projection");
+    let input_path = temporary.path().join("input.jsonl");
+    fs::write(&input_path, input).expect("write shape fixture");
+    let archives_path = temporary.path().join("archives");
+    let result = clp_s(&[
+        "c".as_ref(),
+        "--single-file-archive".as_ref(),
+        archives_path.as_os_str(),
+        input_path.as_os_str(),
+    ]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let archive = only_entry(&archives_path);
+    let search = |projection: &[&str]| {
+        let mut arguments: Vec<&OsStr> = vec![
+            "s".as_ref(),
+            archive.as_os_str(),
+            "id > 0".as_ref(),
+            "--projection".as_ref(),
+        ];
+        arguments.extend(projection.iter().map(|path| OsStr::new(*path)));
+        clp_s(&arguments)
+    };
+    let templates = concat!(
+        r#"{"msg":"took %int% ms for user %str%"}"#,
+        "\n",
+        r#"{"msg":"ratio %float% at %int%%% of %str%"}"#,
+        "\n",
+        r#"{"msg":"no variables here at all"}"#,
+        "\n",
+        r#"{"msg":"escaped \\ backslash %int%"}"#,
+        "\n",
+    );
+    let result = search(&["shape(msg)"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(templates, String::from_utf8_lossy(&result.stdout));
+    // Selected both ways, the template wins, as in C++.
+    assert_eq!(templates.as_bytes(), search(&["shape(msg)", "msg"]).stdout);
+    // A field that is not a CLP string is written as its value.
+    let result = search(&["shape(kind)"]);
+    assert_eq!(
+        concat!(
+            r#"{"kind":"plain"}"#,
+            "\n",
+            r#"{"kind":"plain"}"#,
+            "\n",
+            r#"{"kind":"plain"}"#,
+            "\n",
+            r#"{"kind":"x"}"#,
+            "\n",
+        ),
+        String::from_utf8_lossy(&result.stdout)
+    );
+    assert!(!search(&["shape(msg)", "shape(msg)"]).status.success());
+}
+
+#[test]
 fn searches_through_structured_arrays_read_only_what_they_need_and_answer_exactly() {
     // Three record shapes, each its own table stored one frame per column. A filter that passes
     // through the structured array reaches a Boolean inside it, a lookup matches one table of

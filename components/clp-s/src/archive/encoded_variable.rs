@@ -93,6 +93,29 @@ pub fn append_clp_message<V: EncodedVariableSource + ?Sized>(
     )
 }
 
+/// Appends a CLP logtype's template: the message with each variable replaced by a placeholder.
+///
+/// A variable becomes `%int%`, `%float%` or `%str%` (a variable-dictionary value). An escaped
+/// byte is written as itself, and a literal `%` is doubled so it cannot be mistaken for a
+/// placeholder. This is the rendering the C++ `shape(...)` projection emits.
+pub fn append_logtype_template(logtype: LogTypeDictionaryEntry<'_>, output: &mut Vec<u8>) {
+    let mut bytes = logtype.escaped_value().iter();
+    while let Some(&byte) = bytes.next() {
+        match byte {
+            ESCAPE_MARKER => {
+                if let Some(&escaped) = bytes.next() {
+                    output.push(escaped);
+                }
+            }
+            INTEGER_PLACEHOLDER => output.extend_from_slice(b"%int%"),
+            FLOAT_PLACEHOLDER => output.extend_from_slice(b"%float%"),
+            DICTIONARY_PLACEHOLDER => output.extend_from_slice(b"%str%"),
+            b'%' => output.extend_from_slice(b"%%"),
+            literal => output.push(literal),
+        }
+    }
+}
+
 /// Reconstructs one CLP message with an explicit bound on bytes appended.
 ///
 /// Validation and exact-size analysis finish before the limit is checked, and the limit is checked

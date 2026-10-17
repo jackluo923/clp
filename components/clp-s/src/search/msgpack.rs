@@ -242,12 +242,18 @@ impl<'sink, 'id, 'options, W: Write + ?Sized> SearchMsgpackAdapter<'sink, 'id, '
                 .map_err(|source| SearchMsgpackAdapterError::Plan { schema_id, source })?,
             None => plan,
         };
+        let shape_nodes = self
+            .options
+            .projection()
+            .resolve_shapes(matches.catalog().schema_tree())
+            .map_err(SearchMsgpackAdapterError::Projection)?;
         RecordProgram::compile_with_byte_policy(
             &plan,
             matches.catalog().schema_tree(),
             self.options.byte_policy(),
             self.options.record_limits(),
         )
+        .map(|program| program.with_shape_nodes(&shape_nodes))
         .map_err(|source| SearchMsgpackAdapterError::Program { schema_id, source })
     }
 

@@ -96,10 +96,14 @@ impl Default for ProjectionLimits {
 /// Search-result projection resolved independently of any archive.
 ///
 /// [`Self::all`] returns every ordinary event field. [`Self::selected`] parses the same escaped
-/// dot descriptors as the C++ `--projection` option and rejects wildcard or duplicate columns.
+/// dot descriptors as the C++ `--projection` option and rejects wildcard or duplicate columns. A
+/// descriptor wrapped as `shape(...)` selects its field as the C++ projection function does: a
+/// CLP-encoded string is written as its logtype template, each variable a placeholder.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Projection {
     columns: Option<Vec<ColumnPath>>,
+    /// Whether each selected column was wrapped in `shape(...)`.
+    shapes: Vec<bool>,
     limits: ProjectionLimits,
 }
 
@@ -109,6 +113,7 @@ impl Projection {
     pub const fn all() -> Self {
         Self {
             columns: None,
+            shapes: Vec::new(),
             limits: ProjectionLimits::new(0, 0, 0, 0, 0, 0),
         }
     }
@@ -134,6 +139,10 @@ impl Projection {
         parsed
             .try_reserve_exact(columns.len())
             .map_err(|_| allocation(ProjectionResource::Columns, columns.len()))?;
+        let mut shapes = Vec::new();
+        shapes
+            .try_reserve_exact(columns.len())
+            .map_err(|_| allocation(ProjectionResource::Columns, columns.len()))?;
         let mut total_source_bytes = 0_usize;
         let mut total_string_bytes = 0_usize;
         for (column_index, source) in columns.iter().enumerate() {
@@ -145,29 +154,73 @@ impl Projection {
                 total_source_bytes,
                 limits.max_owned_string_bytes(),
             )?;
-            let column = parse_descriptor(
-                source.as_ref(),
-                column_index,
-                limits,
-                &mut total_string_bytes,
-            )?;
+            let (descriptor, shape) = source
+                .as_ref()
+                .strip_prefix("shape(")
+                .and_then(|inner| inner.strip_suffix(')'))
+                .map_or_else(|| (source.as_ref(), false), |inner| (inner, true));
+            let column =
+                parse_descriptor(descriptor, column_index, limits, &mut total_string_bytes)?;
             // The pinned C++ `ColumnDescriptor::operator==` deliberately/observably compares the
-            // descriptor tokens and type flags but not the namespace.
-            if let Some(first_column) = parsed
-                .iter()
-                .position(|existing| existing.components() == column.components())
-            {
+            // descriptor tokens and type flags but not the namespace. As in C++, a column may be
+            // selected both plainly and as `shape(...)`.
+            if let Some(first_column) = parsed.iter().zip(&shapes).position(|(existing, &mode)| {
+                existing.components() == column.components() && mode == shape
+            }) {
                 return Err(ProjectionError::DuplicateColumn {
                     first_column,
                     duplicate_column: column_index,
                 });
             }
             parsed.push(column);
+            shapes.push(shape);
         }
         Ok(Self {
             columns: Some(parsed),
+            shapes,
             limits,
         })
+    }
+
+    /// Returns whether any selected column is wrapped in `shape(...)`.
+    #[must_use]
+    pub fn has_shapes(&self) -> bool {
+        self.shapes.contains(&true)
+    }
+
+    /// Resolves the `shape(...)` columns to the CLP-encoded string nodes written as their logtype
+    /// templates. A node of another type at such a path is written as its value, as in C++, and
+    /// so is a CLP string inside a structured array, which no descriptor addresses.
+    pub(super) fn resolve_shapes(
+        &self,
+        schema_tree: &SchemaTree,
+    ) -> Result<Vec<u32>, ProjectionError> {
+        let Some(columns) = &self.columns else {
+            return Ok(Vec::new());
+        };
+        let shaped: Vec<ColumnPath> = columns
+            .iter()
+            .zip(&self.shapes)
+            .filter(|(_, shape)| **shape)
+            .map(|(column, _)| column.clone())
+            .collect();
+        if shaped.is_empty() {
+            return Ok(Vec::new());
+        }
+        let plain = vec![false; shaped.len()];
+        let resolved = Self {
+            columns: Some(shaped),
+            shapes: plain,
+            limits: self.limits,
+        }
+        .resolve_with(schema_tree, false)?;
+        let mut nodes = resolved.selected_node_ids().unwrap_or_default().to_vec();
+        nodes.retain(|node| {
+            schema_tree
+                .get(*node as usize)
+                .is_some_and(|node| NodeType::ClpString == node.node_type())
+        });
+        Ok(nodes)
     }
 
     /// Returns whether every ordinary event field is selected.
@@ -919,6 +972,38 @@ mod tests {
         assert!(matches!(
             Projection::selected(&["a..b"], ProjectionLimits::default()),
             Err(ProjectionError::EmptyPathComponent { .. })
+        ));
+    }
+
+    #[test]
+    fn shape_descriptors_select_their_column_in_their_own_mode() {
+        let projection = Projection::selected(
+            &["shape(a.b)", "a.b", "shape(c)"],
+            ProjectionLimits::default(),
+        )
+        .expect("parse");
+        assert!(projection.has_shapes());
+        let parsed = projection.selected_columns().expect("selected mode");
+        assert_eq!(
+            ["a", "b"],
+            [
+                parsed[0].components()[0].value(),
+                parsed[0].components()[1].value()
+            ]
+        );
+        assert_eq!("c", parsed[2].components()[0].value());
+        assert!(
+            !Projection::selected(&["a"], ProjectionLimits::default())
+                .expect("parse")
+                .has_shapes()
+        );
+        assert!(matches!(
+            Projection::selected(&["shape(id)", "shape(id)"], ProjectionLimits::default()),
+            Err(ProjectionError::DuplicateColumn { .. })
+        ));
+        assert!(matches!(
+            Projection::selected(&["shape(a.*)"], ProjectionLimits::default()),
+            Err(ProjectionError::WildcardColumn { .. })
         ));
     }
 

@@ -71,6 +71,7 @@ pub use encoded_variable::EncodedVariableError;
 pub use encoded_variable::EncodedVariableSource;
 pub use encoded_variable::append_clp_message;
 pub use encoded_variable::append_clp_message_bounded;
+pub use encoded_variable::append_logtype_template;
 pub use format::ArchiveCompression;
 pub use format::ArchiveHeader;
 pub use format::ArchiveVersion;
