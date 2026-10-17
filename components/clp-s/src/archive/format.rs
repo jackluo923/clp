@@ -37,6 +37,10 @@ impl ArchiveVersion {
     /// misreading the variable-width columns as fixed 8-byte values.
     pub const ADAPTIVE_NUMERIC: Self = Self::new(0, 6, 0);
 
+    /// First version whose `/log.dict` may be stored as per-field sections (0.6 plus that layout).
+    /// Stamped only when the writer's per-field log-type dictionaries are enabled.
+    pub const FIELD_DICTIONARIES: Self = Self::new(0, 7, 0);
+
     /// Creates a version from its semantic components.
     #[must_use]
     pub const fn new(major: u8, minor: u8, patch: u16) -> Self {
@@ -71,13 +75,16 @@ impl ArchiveVersion {
     /// writer change rather than a layout change: 0.5.1 added RFC 2822 timestamp parsing and left
     /// every section byte-identical, so rejecting it would refuse archives this crate decodes
     /// correctly. The 0.6 line is also accepted: it is 0.5 plus optional adaptive-integer column
-    /// encodings this crate's reader understands ([`Self::supports_adaptive_numeric`]). A differing
-    /// major, or a minor outside {5, 6}, is still refused, because that is where unknown layout
+    /// encodings this crate's reader understands ([`Self::supports_adaptive_numeric`]), and 0.7 is
+    /// 0.6 plus a per-field `/log.dict` layout it also reads. A differing major, or a minor outside
+    /// {5, 6, 7}, is still refused, because that is where unknown layout
     /// changes land, and reading one as if it were 0.5 would misparse rather than fail.
     #[must_use]
     pub const fn is_readable(self) -> bool {
         self.major == Self::CURRENT.major
-            && (self.minor == Self::CURRENT.minor || self.minor == Self::ADAPTIVE_NUMERIC.minor)
+            && (self.minor == Self::CURRENT.minor
+                || self.minor == Self::ADAPTIVE_NUMERIC.minor
+                || self.minor == Self::FIELD_DICTIONARIES.minor)
     }
 
     /// Whether a separate-column integer stream in an archive at this version may carry an adaptive
@@ -421,10 +428,13 @@ mod tests {
         // 0.6 adds opt-in adaptive integer columns this crate's reader understands.
         assert!(ArchiveVersion::ADAPTIVE_NUMERIC.is_readable());
         assert!(ArchiveVersion::new(0, 6, 7).is_readable());
+        // 0.7 adds the opt-in per-field log-type dictionary layout.
+        assert!(ArchiveVersion::FIELD_DICTIONARIES.is_readable());
+        assert!(ArchiveVersion::FIELD_DICTIONARIES.supports_adaptive_numeric());
         // A minor outside the supported set, or a different major, changes the layout unknowably,
         // so it stays refused.
         assert!(!ArchiveVersion::new(0, 4, 0).is_readable());
-        assert!(!ArchiveVersion::new(0, 7, 0).is_readable());
+        assert!(!ArchiveVersion::new(0, 8, 0).is_readable());
         assert!(!ArchiveVersion::new(1, 5, 0).is_readable());
     }
 

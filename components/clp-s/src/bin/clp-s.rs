@@ -166,6 +166,19 @@ struct CompressArgs {
     /// memory while an archive is finalized. The output is standard zstd either way.
     #[arg(long, default_value_t = false)]
     no_dictionary_long_distance_matching: bool,
+    /// Store the log-type dictionary as one dictionary per CLP-string field, so a query reads only
+    /// the dictionaries of the fields it touches. Experimental: stamps archive version 0.7.0,
+    /// which earlier readers refuse. Requires adaptive numeric columns.
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with = "no_adaptive_numeric_columns"
+    )]
+    field_logtype_dictionaries: bool,
+    /// With per-field dictionaries, give each one of at least this many uncompressed bytes its own
+    /// zstd frame, which a reader can skip or jump to. Zero keeps them all in one frame.
+    #[arg(long, default_value_t = 0)]
+    field_dictionary_frame_size: u64,
     /// Rotate after the dictionaries and encoded messages reach this many bytes.
     #[arg(long, default_value_t = 8_u64 * 1024 * 1024 * 1024)]
     target_encoded_size: u64,
@@ -496,6 +509,8 @@ fn run_compress(arguments: &CompressArgs) -> CliResult<()> {
     let writer_options = WriterOptions::new(arguments.compression_level)
         .with_dictionary_compression_level(arguments.dictionary_compression_level)
         .with_dictionary_long_distance_matching(!arguments.no_dictionary_long_distance_matching)
+        .with_field_logtype_dictionaries(arguments.field_logtype_dictionaries)
+        .with_field_dictionary_frame_size(arguments.field_dictionary_frame_size)
         .with_limits(WriterLimits::new(u64::MAX, u64::MAX, u64::MAX, u64::MAX))
         .with_minimum_packed_stream_size(arguments.min_table_size)
         .with_separate_columns_min_size(arguments.separate_columns_min_size)

@@ -56,6 +56,7 @@ pub use dictionary::ArrayDictionary;
 pub use dictionary::DictionaryError;
 pub use dictionary::DictionaryLimits;
 pub use dictionary::DictionarySection;
+pub(crate) use dictionary::FIELD_DICTIONARIES_MARKER;
 pub use dictionary::LogTypeDictionary;
 pub use dictionary::LogTypeDictionaryEntry;
 pub use dictionary::LogTypePlaceholderCounts;

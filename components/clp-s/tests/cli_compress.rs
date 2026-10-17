@@ -1572,6 +1572,85 @@ fn structurize_arrays_matches_the_exact_cpp_single_file_archive() {
 }
 
 #[test]
+fn field_logtype_dictionaries_read_back_exactly_and_answer_searches_the_same() {
+    // Several text fields, some sharing a message, so their sections overlap and a field's search
+    // must load only its own entries.
+    let mut input = Vec::new();
+    for index in 0..40 {
+        let shared = format!("shared message {} for every field", index % 7);
+        input.extend_from_slice(
+            format!(
+                "{{\"id\":{index},\"small\":\"small {} value\",\"note\":\"{shared}\",\
+                 \"body\":\"long body text number {index} that only the body holds\",\
+                 \"copy\":\"{shared}\"}}\n",
+                index % 3
+            )
+            .as_bytes(),
+        );
+    }
+    let temporary = TestDirectory::new("field-dictionaries");
+    let input_path = temporary.path().join("input.jsonl");
+    fs::write(&input_path, &input).expect("write field-dictionary fixture");
+    let compress = |name: &str, extra: &[&str]| {
+        let archives_path = temporary.path().join(name);
+        let mut arguments: Vec<&OsStr> = vec!["c".as_ref(), "--single-file-archive".as_ref()];
+        arguments.extend(extra.iter().map(|argument| OsStr::new(*argument)));
+        arguments.extend([archives_path.as_os_str(), input_path.as_os_str()]);
+        let result = clp_s(&arguments);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        only_entry(&archives_path)
+    };
+    let plain = compress("plain", &[]);
+    let fields = compress("fields", &["--field-logtype-dictionaries"]);
+    assert_eq!(
+        extract_original(&plain, &temporary.path().join("plain-extracted")),
+        extract_original(&fields, &temporary.path().join("fields-extracted"))
+    );
+    let search = |archive: &Path, query: &str, projection: &[&str]| {
+        let mut arguments: Vec<&OsStr> = vec!["s".as_ref(), archive.as_os_str(), query.as_ref()];
+        if !projection.is_empty() {
+            arguments.push("--projection".as_ref());
+            arguments.extend(projection.iter().map(|path| OsStr::new(*path)));
+        }
+        let result = clp_s(&arguments);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        result.stdout
+    };
+    for (query, projection) in [
+        ("small:\"small 1 value\"", &["id"][..]),
+        ("note:\"*message 3*\"", &["copy"][..]),
+        ("body:\"*number 2*\"", &["small", "note"][..]),
+        ("copy:\"*message 5*\" AND id > 10", &[][..]),
+        ("*", &["body"][..]),
+    ] {
+        let expected = search(&plain, query, projection);
+        assert!(!expected.is_empty(), "{query} matches the fixture");
+        assert_eq!(
+            expected,
+            search(&fields, query, projection),
+            "{query} {projection:?}"
+        );
+    }
+    let conflicting_path = temporary.path().join("conflicting");
+    let conflicting = clp_s(&[
+        "c".as_ref(),
+        "--field-logtype-dictionaries".as_ref(),
+        "--no-adaptive-numeric-columns".as_ref(),
+        conflicting_path.as_os_str(),
+        input_path.as_os_str(),
+    ]);
+    assert!(!conflicting.status.success());
+}
+
+#[test]
 fn arrays_are_structured_unless_disabled() {
     let temporary = TestDirectory::new("array-default");
     let input_path = temporary.path().join("input.jsonl");

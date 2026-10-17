@@ -455,6 +455,8 @@ impl Default for WriterLimits {
 struct DictionaryCompression {
     level: i32,
     long_distance_matching: bool,
+    per_field: bool,
+    per_field_frame_size: u64,
 }
 
 /// Configuration for one archive finalization.
@@ -490,6 +492,8 @@ impl WriterOptions {
             dictionary_compression: DictionaryCompression {
                 level: Self::DEFAULT_DICTIONARY_COMPRESSION_LEVEL,
                 long_distance_matching: true,
+                per_field: false,
+                per_field_frame_size: 0,
             },
             limits: WriterLimits::DEFAULT,
             minimum_packed_stream_size: Self::DEFAULT_MINIMUM_PACKED_STREAM_SIZE,
@@ -638,6 +642,45 @@ impl WriterOptions {
     #[must_use]
     pub const fn dictionary_long_distance_matching(self) -> bool {
         self.dictionary_compression.long_distance_matching
+    }
+
+    /// Stores `/log.dict` as one dictionary per CLP-string field, so a query reads only the
+    /// dictionaries of the fields it touches.
+    ///
+    /// Each field's dictionary holds every logtype its column uses, numbered from zero, so a
+    /// logtype shared by several fields is stored once per field. The dictionaries share zstd
+    /// frames, where a repeat costs little, smallest first, so reading narrow fields decompresses
+    /// only the start of a frame; see
+    /// [`with_field_dictionary_frame_size`](Self::with_field_dictionary_frame_size). Takes effect
+    /// only with adaptive numeric columns, and stamps archive version 0.7.0, which earlier readers
+    /// refuse. Off by default.
+    #[must_use]
+    pub const fn with_field_logtype_dictionaries(mut self, enabled: bool) -> Self {
+        self.dictionary_compression.per_field = enabled;
+        self
+    }
+
+    /// Gives every per-field log-type dictionary of at least this many uncompressed bytes its own
+    /// zstd frame, so a reader can skip it, or jump straight to it, without decompressing the
+    /// dictionaries before it. Zero, the default, keeps them all in one frame, which compresses
+    /// best: a separate frame loses the context of the others.
+    #[must_use]
+    pub const fn with_field_dictionary_frame_size(mut self, size: u64) -> Self {
+        self.dictionary_compression.per_field_frame_size = size;
+        self
+    }
+
+    /// The per-field log-type dictionary frame threshold; zero keeps one frame.
+    #[must_use]
+    pub const fn field_dictionary_frame_size(self) -> u64 {
+        self.dictionary_compression.per_field_frame_size
+    }
+
+    /// Whether `/log.dict` is stored per field; see
+    /// [`with_field_logtype_dictionaries`](Self::with_field_logtype_dictionaries).
+    #[must_use]
+    pub const fn field_logtype_dictionaries(self) -> bool {
+        self.dictionary_compression.per_field && self.adaptive_numeric_columns
     }
 
     /// Resource limits applied during finalization.
@@ -988,7 +1031,9 @@ impl EncodedEmptyArchive {
 
         // Stamp the adaptive-integer format version only when the opt-in flag is set, so default
         // writes remain byte-identical 0.5.0 archives that 0.5.x readers still accept.
-        let version = if options.adaptive_numeric_columns() {
+        let version = if options.field_logtype_dictionaries() {
+            crate::archive::ArchiveVersion::FIELD_DICTIONARIES
+        } else if options.adaptive_numeric_columns() {
             crate::archive::ArchiveVersion::ADAPTIVE_NUMERIC
         } else {
             crate::archive::ArchiveVersion::CURRENT

@@ -1254,7 +1254,8 @@ fn decode_column<'table, 'archive>(
             context,
             message_count,
             variable_dictionary,
-            LogTypeDictionaryRef::Log(logtype_dictionary),
+            // A per-field archive gives every CLP-string field its own dictionary and IDs.
+            LogTypeDictionaryRef::Log(logtype_dictionary.for_field(context.node_id)),
             limits,
             total_encoded_variables,
         )?)),

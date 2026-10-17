@@ -836,19 +836,153 @@ impl PrimitiveArchive {
         self.encoded_data_size = plan.resulting_encoded_data_size;
     }
 
+    /// Encodes `/log.dict` as one dictionary per CLP-string field, each with its own IDs, and
+    /// returns the remapping its columns' descriptors need; see
+    /// [`WriterOptions::with_field_logtype_dictionaries`] and the reader's
+    /// `decode_field_dictionaries` for the layout.
+    fn encode_field_logtype_dictionaries(
+        &self,
+        options: WriterOptions,
+    ) -> Result<(Vec<u8>, LogTypeRemap), WriterError> {
+        use crate::archive::FIELD_DICTIONARIES_MARKER;
+
+        let dictionary = &self.log_type_dictionary;
+        let entry_count = dictionary.entry_count();
+        let fields = self.field_logtype_ids()?;
+        // A field's local ID is the rank of its archive-wide ID among those its column uses.
+        let mut dictionaries: Vec<(u32, Vec<u32>, usize)> = Vec::new();
+        for (node, mut ids) in fields {
+            ids.sort_unstable();
+            ids.dedup();
+            let mut size = 0_usize;
+            for id in &ids {
+                let value = usize::try_from(*id)
+                    .ok()
+                    .filter(|id| *id < entry_count)
+                    .and_then(|id| dictionary_entry(&dictionary.values, &dictionary.entry_ends, id))
+                    .ok_or(WriterError::SizeOverflow)?;
+                if u32::try_from(value.len()).is_err() {
+                    return Err(WriterError::SizeOverflow);
+                }
+                size = size
+                    .checked_add(size_of::<u32>() + value.len())
+                    .ok_or(WriterError::SizeOverflow)?;
+            }
+            dictionaries.push((node, ids, size));
+        }
+        // Smallest first, so narrow fields lie at the start of their frame. A dictionary at least
+        // the frame threshold starts its own frame, which a reader can then skip or jump to.
+        dictionaries.sort_unstable_by_key(|(node, _, size)| (*size, *node));
+        let threshold = options.field_dictionary_frame_size();
+        let mut frames: Vec<Vec<usize>> = Vec::new();
+        for (position, (_, _, size)) in dictionaries.iter().enumerate() {
+            let alone = 0 != threshold && usize_u64(*size)? >= threshold;
+            if frames.is_empty() || alone {
+                frames.push(Vec::new());
+            }
+            frames
+                .last_mut()
+                .expect("a frame was just pushed")
+                .push(position);
+        }
+
+        let mut index = Vec::new();
+        let mut frame_index = Vec::new();
+        let mut payload = Vec::new();
+        for (frame, members) in frames.iter().enumerate() {
+            let mut raw = Vec::new();
+            for position in members {
+                let (node, ids, _) = &dictionaries[*position];
+                let start = raw.len();
+                let values: Vec<&[u8]> = ids
+                    .iter()
+                    .map(|id| {
+                        dictionary_entry(&dictionary.values, &dictionary.entry_ends, *id as usize)
+                            .expect("checked above")
+                    })
+                    .collect();
+                for value in &values {
+                    let length =
+                        u32::try_from(value.len()).map_err(|_| WriterError::SizeOverflow)?;
+                    raw.extend_from_slice(&length.to_le_bytes());
+                }
+                for value in &values {
+                    raw.extend_from_slice(value);
+                }
+                index.push([
+                    u64::from(*node),
+                    usize_u64(ids.len())?,
+                    usize_u64(frame)?,
+                    usize_u64(start)?,
+                    usize_u64(raw.len())?,
+                ]);
+            }
+            let compressed = compress_dictionary_frame(&raw, options)?;
+            frame_index.push([usize_u64(compressed.len())?, usize_u64(raw.len())?]);
+            payload.extend_from_slice(&compressed);
+        }
+
+        let mut section = Vec::new();
+        append_u64(&mut section, FIELD_DICTIONARIES_MARKER);
+        append_u64(&mut section, usize_u64(index.len())?);
+        append_u64(&mut section, usize_u64(frame_index.len())?);
+        for word in index.iter().flatten().chain(frame_index.iter().flatten()) {
+            append_u64(&mut section, *word);
+        }
+        section.extend_from_slice(&payload);
+        let remap = LogTypeRemap {
+            fields: dictionaries
+                .into_iter()
+                .map(|(node, ids, _)| (node, ids))
+                .collect(),
+        };
+        Ok((section, remap))
+    }
+
+    /// The archive-wide logtype IDs each CLP-string field's column uses, unsorted.
+    fn field_logtype_ids(&self) -> Result<HashMap<u32, Vec<u32>>, WriterError> {
+        let mut fields: HashMap<u32, Vec<u32>> = HashMap::new();
+        for table in &self.tables.tables {
+            for column in &table.columns {
+                let (NodeType::ClpString, TableColumnData::ClpString { descriptors, .. }) =
+                    (column.node_type, &column.data)
+                else {
+                    continue;
+                };
+                let ids = fields.entry(column.node_id).or_default();
+                for chunk in descriptors.as_chunks::<8>().0 {
+                    let id = u32::try_from(u64::from_le_bytes(*chunk) & MAX_LOG_TYPE_ID)
+                        .map_err(|_| WriterError::SizeOverflow)?;
+                    ids.push(id);
+                }
+            }
+        }
+        Ok(fields)
+    }
+
     pub(super) fn encode_sections(
         &self,
         options: WriterOptions,
     ) -> Result<([Vec<u8>; 7], Vec<u8>), WriterError> {
         let schema_tree = self.tree.encode(options.compression_level())?;
         let schema_map = self.tables.encode_schema_map(options.compression_level())?;
-        let (table_metadata, tables) = self.tables.encode_tables(options)?;
+        // Per-field log-type dictionaries renumber each field's logtypes, so they are built first
+        // and the tables written with their descriptors remapped.
+        let (log_type_dictionary, remap) = if options.field_logtype_dictionaries()
+            && 0 != self.log_type_dictionary.entry_count()
+        {
+            let (section, remap) = self.encode_field_logtype_dictionaries(options)?;
+            (section, Some(remap))
+        } else {
+            (self.log_type_dictionary.encode(options)?, None)
+        };
+        let (table_metadata, tables) = self.tables.encode_tables(options, remap.as_ref())?;
         let sections = [
             schema_tree,
             schema_map,
             table_metadata,
             self.variable_dictionary.encode(options)?,
-            self.log_type_dictionary.encode(options)?,
+            log_type_dictionary,
             self.array_dictionary.encode(options)?,
             tables,
         ];
@@ -3712,7 +3846,29 @@ impl TableColumn {
         }
     }
 
-    fn write_to<W: Write>(&self, output: &mut W) -> Result<(), WriterError> {
+    /// Writes the column, with a CLP-string column's descriptors renumbered when the log-type
+    /// dictionary is stored per field.
+    fn write_remapped<W: Write>(
+        &self,
+        output: &mut W,
+        remap: Option<&LogTypeRemap>,
+    ) -> Result<(), WriterError> {
+        if let (
+            Some(remap),
+            NodeType::ClpString,
+            TableColumnData::ClpString {
+                descriptors,
+                encoded_variables,
+                encoded_variable_count,
+            },
+        ) = (remap, self.node_type, &self.data)
+        {
+            output
+                .write_all(&remap.remap_descriptors(self.node_id, descriptors)?)
+                .map_err(WriterError::Io)?;
+            write_u64(output, *encoded_variable_count)?;
+            return output.write_all(encoded_variables).map_err(WriterError::Io);
+        }
         match &self.data {
             TableColumnData::Fixed(bytes) => output.write_all(bytes).map_err(WriterError::Io),
             TableColumnData::DeltaI64 { deltas, .. } => {
@@ -3743,6 +3899,56 @@ impl TableColumn {
                 output.write_all(encoded_variables).map_err(WriterError::Io)
             }
         }
+    }
+}
+
+/// Compresses one frame of per-field log-type dictionaries the way every dictionary is compressed.
+fn compress_dictionary_frame(raw: &[u8], options: WriterOptions) -> Result<Vec<u8>, WriterError> {
+    let mut encoder =
+        zstd::stream::write::Encoder::new(Vec::new(), options.dictionary_compression_level())
+            .map_err(WriterError::Io)?;
+    encoder
+        .set_pledged_src_size(Some(usize_u64(raw.len())?))
+        .map_err(WriterError::Io)?;
+    if options.dictionary_long_distance_matching() {
+        encoder
+            .long_distance_matching(true)
+            .map_err(WriterError::Io)?;
+        encoder
+            .window_log(DICTIONARY_LONG_DISTANCE_WINDOW_LOG)
+            .map_err(WriterError::Io)?;
+    }
+    encoder.write_all(raw).map_err(WriterError::Io)?;
+    encoder.finish().map_err(WriterError::Io)
+}
+
+/// Each CLP-string field's archive-wide logtype IDs, sorted: a field's local ID for a logtype is
+/// the position of its archive-wide ID here.
+struct LogTypeRemap {
+    fields: HashMap<u32, Vec<u32>>,
+}
+
+impl LogTypeRemap {
+    /// Rewrites a field's descriptors from archive-wide to its own logtype IDs.
+    fn remap_descriptors(&self, node: u32, descriptors: &[u8]) -> Result<Vec<u8>, WriterError> {
+        let ids = self.fields.get(&node).ok_or(WriterError::SizeOverflow)?;
+        let mut remapped = Vec::new();
+        remapped.try_reserve_exact(descriptors.len()).map_err(|_| {
+            WriterError::AllocationFailed {
+                requested: descriptors.len(),
+            }
+        })?;
+        for chunk in descriptors.as_chunks::<8>().0 {
+            let raw = u64::from_le_bytes(*chunk);
+            let global =
+                u32::try_from(raw & MAX_LOG_TYPE_ID).map_err(|_| WriterError::SizeOverflow)?;
+            let local = ids
+                .binary_search(&global)
+                .map_err(|_| WriterError::SizeOverflow)?;
+            remapped
+                .extend_from_slice(&((raw & !MAX_LOG_TYPE_ID) | usize_u64(local)?).to_le_bytes());
+        }
+        Ok(remapped)
     }
 }
 
@@ -4034,7 +4240,11 @@ impl TableSet {
         encoder.finish().map_err(WriterError::Io)
     }
 
-    fn encode_tables(&self, options: WriterOptions) -> Result<(Vec<u8>, Vec<u8>), WriterError> {
+    fn encode_tables(
+        &self,
+        options: WriterOptions,
+        remap: Option<&LogTypeRemap>,
+    ) -> Result<(Vec<u8>, Vec<u8>), WriterError> {
         let mut order = Vec::new();
         order
             .try_reserve_exact(self.tables.len())
@@ -4052,7 +4262,7 @@ impl TableSet {
                         .cmp(&self.tables[*right].schema_id)
                 })
         });
-        let packed = pack_tables(&self.tables, &order, options)?;
+        let packed = pack_tables(&self.tables, &order, options, remap)?;
         let metadata = encode_table_metadata(&packed, options.compression_level())?;
         Ok((metadata, packed.compressed))
     }
@@ -4425,6 +4635,7 @@ fn pack_tables(
     tables: &[TableBuilder],
     order: &[usize],
     options: WriterOptions,
+    remap: Option<&LogTypeRemap>,
 ) -> Result<PackedTables, WriterError> {
     let mut packed = PackedTables {
         compressed: Vec::new(),
@@ -4467,7 +4678,7 @@ fn pack_tables(
             && table.columns.len() > 1)
             || (adaptive && table_has_numeric_column(table));
         if separate {
-            encode_separate_table(table, options, &mut column_compressor, &mut packed)?;
+            encode_separate_table(table, options, &mut column_compressor, remap, &mut packed)?;
         } else {
             grouped.push(table_index);
         }
@@ -4490,6 +4701,7 @@ fn pack_tables(
                 &order[stream_start..=position],
                 stream_size,
                 options,
+                remap,
                 &mut packed,
             )?;
             stream_start = position + 1;
@@ -4539,6 +4751,7 @@ fn write_best_candidate(
 fn encode_plain_column(
     column: &TableColumn,
     compressor: &mut zstd::bulk::Compressor<'_>,
+    remap: Option<&LogTypeRemap>,
     out: &mut Vec<u8>,
 ) -> Result<u64, WriterError> {
     let length = column.encoded_len();
@@ -4546,7 +4759,7 @@ fn encode_plain_column(
         let mut raw = Vec::new();
         raw.try_reserve_exact(length)
             .map_err(|_| WriterError::AllocationFailed { requested: length })?;
-        column.write_to(&mut raw)?;
+        column.write_remapped(&mut raw, remap)?;
         out.extend_from_slice(&compressor.compress(&raw).map_err(WriterError::Io)?);
     }
     usize_u64(length)
@@ -4561,7 +4774,7 @@ fn encode_adaptive_integer_column(
 ) -> Result<u64, WriterError> {
     // Integer columns are always `Fixed`; keep a defensive fallback to the standard path.
     let TableColumnData::Fixed(bytes) = &column.data else {
-        return encode_plain_column(column, compressor, out);
+        return encode_plain_column(column, compressor, None, out);
     };
     if bytes.is_empty() {
         return Ok(0);
@@ -4583,7 +4796,7 @@ fn encode_adaptive_float_column(
 ) -> Result<u64, WriterError> {
     // Float columns are always `Fixed`; keep a defensive fallback to the standard path.
     let TableColumnData::Fixed(bytes) = &column.data else {
-        return encode_plain_column(column, compressor, out);
+        return encode_plain_column(column, compressor, None, out);
     };
     if bytes.is_empty() {
         return Ok(0);
@@ -4608,6 +4821,7 @@ fn encode_separate_table(
     table: &TableBuilder,
     options: WriterOptions,
     compressor: &mut zstd::bulk::Compressor<'_>,
+    remap: Option<&LogTypeRemap>,
     packed: &mut PackedTables,
 ) -> Result<(), WriterError> {
     let file_offset = len_u64(&packed.compressed)?;
@@ -4628,7 +4842,7 @@ fn encode_separate_table(
             (true, NodeType::Float) => {
                 encode_adaptive_float_column(column, compressor, &mut packed.compressed)?
             }
-            _ => encode_plain_column(column, compressor, &mut packed.compressed)?,
+            _ => encode_plain_column(column, compressor, remap, &mut packed.compressed)?,
         };
         let compressed = usize_u64(packed.compressed.len() - start)?;
         columns.push((uncompressed, compressed));
@@ -4655,6 +4869,7 @@ fn encode_table_stream(
     indexes: &[usize],
     uncompressed_size: u64,
     options: WriterOptions,
+    remap: Option<&LogTypeRemap>,
     packed: &mut PackedTables,
 ) -> Result<(), WriterError> {
     let file_offset = len_u64(&packed.compressed)?;
@@ -4683,7 +4898,7 @@ fn encode_table_stream(
                 message_count: table.message_count,
             });
             for column in &table.columns {
-                column.write_to(&mut encoder)?;
+                column.write_remapped(&mut encoder, remap)?;
             }
             stream_offset = stream_offset
                 .checked_add(usize_u64(table.uncompressed_size)?)

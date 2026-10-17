@@ -506,6 +506,23 @@ pub trait ArchiveReader {
         limits: DictionaryLimits,
     ) -> Result<LogTypeDictionary, DictionaryError>;
 
+    /// Decodes `/log.dict` with only the entries the columns of `fields` (sorted schema node IDs)
+    /// use, where the dictionary is stored per field; an entry left out reads as absent. A
+    /// dictionary stored as one sequence loads whole, which is also this default.
+    ///
+    /// # Errors
+    ///
+    /// Returns a section decode error.
+    fn read_log_type_dictionary_fields(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        limits: DictionaryLimits,
+        fields: &[u32],
+    ) -> Result<LogTypeDictionary, DictionaryError> {
+        let _ = fields;
+        self.read_log_type_dictionary(metadata, limits)
+    }
+
     /// Decodes `/array.dict` on its own; see [`Self::read_variable_dictionary`].
     ///
     /// # Errors
@@ -605,6 +622,14 @@ impl<R: Read + Seek> ArchiveReader for SingleFileArchiveReader<R> {
     ) -> Result<LogTypeDictionary, DictionaryError> {
         Self::read_log_type_dictionary(self, metadata, limits)
     }
+    fn read_log_type_dictionary_fields(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        limits: DictionaryLimits,
+        fields: &[u32],
+    ) -> Result<LogTypeDictionary, DictionaryError> {
+        Self::read_log_type_dictionary_fields(self, metadata, limits, fields)
+    }
     fn read_array_dictionary(
         &mut self,
         metadata: &ArchiveMetadata,
@@ -663,6 +688,14 @@ impl<S: DirectoryArchiveSource> ArchiveReader for DirectoryArchiveReader<S> {
         limits: DictionaryLimits,
     ) -> Result<LogTypeDictionary, DictionaryError> {
         Self::read_log_type_dictionary(self, metadata, limits)
+    }
+    fn read_log_type_dictionary_fields(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        limits: DictionaryLimits,
+        fields: &[u32],
+    ) -> Result<LogTypeDictionary, DictionaryError> {
+        Self::read_log_type_dictionary_fields(self, metadata, limits, fields)
     }
     fn read_array_dictionary(
         &mut self,

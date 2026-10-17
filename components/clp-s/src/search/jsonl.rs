@@ -306,6 +306,17 @@ impl<S: JsonlRecordSink + ?Sized> ArchiveMatchSink for SearchJsonlAdapter<'_, '_
     fn write_matches(&mut self, matches: ArchiveTableMatches<'_, '_, '_>) -> io::Result<()> {
         self.write_jsonl(matches).map_err(io::Error::other)
     }
+
+    fn output_nodes(&self, schema_tree: &crate::archive::SchemaTree) -> Option<Vec<u32>> {
+        // A projection writes only its resolved nodes; without one, or if resolving fails (it is
+        // retried, and reported, when the first match is written), any node may be written.
+        self.options
+            .projection()
+            .resolve_records(schema_tree)
+            .ok()?
+            .selected_node_ids()
+            .map(<[u32]>::to_vec)
+    }
 }
 
 /// Failure while projecting or formatting an accepted search batch as JSONL.

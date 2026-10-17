@@ -28,6 +28,7 @@ use super::dictionary::LogTypeDictionary;
 use super::dictionary::VariableDictionary;
 use super::dictionary::decode_array_dictionary;
 use super::dictionary::decode_logtype_dictionary;
+use super::dictionary::decode_logtype_dictionary_fields;
 use super::dictionary::decode_variable_dictionary;
 use super::format::ArchiveHeader;
 use super::format::ArchiveVersion;
@@ -605,6 +606,23 @@ impl<S: DirectoryArchiveSource> DirectoryArchiveReader<S> {
     ) -> Result<LogTypeDictionary, DictionaryError> {
         let compressed = self.dictionary_reader(metadata, DictionarySection::LogType)?;
         decode_logtype_dictionary(compressed, limits)
+    }
+
+    /// Decompresses `/log.dict`, loading only the entries the columns of `fields` (sorted schema
+    /// node IDs) use when the dictionary is stored per field; see
+    /// [`crate::ArchiveReader::read_log_type_dictionary_fields`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as `read_log_type_dictionary`.
+    pub fn read_log_type_dictionary_fields(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        limits: DictionaryLimits,
+        fields: &[u32],
+    ) -> Result<LogTypeDictionary, DictionaryError> {
+        let compressed = self.dictionary_reader(metadata, DictionarySection::LogType)?;
+        decode_logtype_dictionary_fields(compressed, limits, Some(fields))
     }
 
     /// Decompresses and validates `/array.dict`.

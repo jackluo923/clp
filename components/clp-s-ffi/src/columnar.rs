@@ -339,20 +339,27 @@ pub struct ProjectedScanner {
     finished: bool,
 }
 
-/// Which of the three dictionaries a scan reads through: variable, log-type, array.
-#[derive(Clone, Copy, Default, Eq, PartialEq)]
+/// Which of the three dictionaries a scan reads through: variable, log-type, array. `log_type`
+/// lists the CLP-string fields read, which an archive storing the dictionary per field loads alone.
+#[derive(Clone, Default, Eq, PartialEq)]
 struct Dictionaries {
     variable: bool,
-    log_type: bool,
+    log_type: Vec<u32>,
+    log_type_all: bool,
     array: bool,
 }
 
 impl Dictionaries {
     const ALL: Self = Self {
         variable: true,
-        log_type: true,
+        log_type: Vec::new(),
+        log_type_all: true,
         array: true,
     };
+
+    const fn all(&self) -> bool {
+        self.variable && self.log_type_all && self.array
+    }
 }
 
 /// The dictionaries the columns behind `nodes` are read through. A string is a variable ID, a CLP
@@ -360,15 +367,15 @@ impl Dictionaries {
 /// logtype whose variables may be IDs; numbers, Booleans and timestamps need none.
 fn dictionaries_read_by(tree: &SchemaTree, nodes: &[u32]) -> Dictionaries {
     let mut needed = Dictionaries::default();
-    for node in nodes
+    for (node_id, node) in nodes
         .iter()
-        .filter_map(|node_id| tree.get(*node_id as usize))
+        .filter_map(|node_id| Some((*node_id, tree.get(*node_id as usize)?)))
     {
         match node.node_type() {
             NodeType::VarString | NodeType::DictionaryFloat => needed.variable = true,
             NodeType::ClpString => {
                 needed.variable = true;
-                needed.log_type = true;
+                needed.log_type.push(node_id);
             }
             NodeType::UnstructuredArray => {
                 needed.variable = true;
@@ -462,7 +469,7 @@ impl ProjectedScanner {
         // costs more than reading the tables. Only those the read columns go through are loaded:
         // a scan of numbers, Booleans and timestamps loads none, and one of plain strings only the
         // variable dictionary.
-        let needed = match wanted_nodes.as_deref() {
+        let mut needed = match wanted_nodes.as_deref() {
             _ if force_eager => Dictionaries::ALL,
             None => Dictionaries::ALL,
             Some(nodes) => dictionaries_read_by(catalog.schema_tree(), nodes),
@@ -476,12 +483,19 @@ impl ProjectedScanner {
                 })?;
             catalog.set_variable_dictionary(variable);
         }
-        if needed.log_type {
-            let log_type = reader
-                .read_log_type_dictionary(catalog.metadata(), limits.log_type_dictionary())
-                .map_err(|source| {
-                    ScanError::Archive(format!("failed to read log.dict: {source}"))
-                })?;
+        if needed.log_type_all || !needed.log_type.is_empty() {
+            let log_type = if needed.log_type_all {
+                reader.read_log_type_dictionary(catalog.metadata(), limits.log_type_dictionary())
+            } else {
+                needed.log_type.sort_unstable();
+                needed.log_type.dedup();
+                reader.read_log_type_dictionary_fields(
+                    catalog.metadata(),
+                    limits.log_type_dictionary(),
+                    &needed.log_type,
+                )
+            }
+            .map_err(|source| ScanError::Archive(format!("failed to read log.dict: {source}")))?;
             catalog.set_log_type_dictionary(log_type);
         }
         if needed.array {
@@ -492,7 +506,7 @@ impl ProjectedScanner {
                 })?;
             catalog.set_array_dictionary(array);
         }
-        if Dictionaries::ALL != needed {
+        if !needed.all() {
             // A column whose dictionary was left unloaded is never read, so decoding must not
             // check its IDs against the empty one.
             options = options.with_columns(options.columns().with_dictionary_validation(false));

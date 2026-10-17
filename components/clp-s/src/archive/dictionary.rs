@@ -139,8 +139,25 @@ impl Display for DictionarySection {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DictionaryStorage {
-    bytes: Vec<u8>,
+    bytes: StorageBytes,
     ranges: Vec<Range<usize>>,
+}
+
+/// The bytes a dictionary's entries lie in: its own, or a decompressed frame its field shares with
+/// the other fields loaded from that frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StorageBytes {
+    Owned(Vec<u8>),
+    Shared(std::sync::Arc<Vec<u8>>),
+}
+
+impl StorageBytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Shared(bytes) => bytes,
+        }
+    }
 }
 
 impl DictionaryStorage {
@@ -151,7 +168,7 @@ impl DictionaryStorage {
     fn value(&self, id: u64) -> Option<&[u8]> {
         let index = usize::try_from(id).ok()?;
         let range = self.ranges.get(index)?;
-        Some(&self.bytes[range.clone()])
+        Some(&self.bytes.as_slice()[range.clone()])
     }
 }
 
@@ -173,7 +190,7 @@ impl VariableDictionary {
     pub const fn empty() -> Self {
         Self {
             storage: DictionaryStorage {
-                bytes: Vec::new(),
+                bytes: StorageBytes::Owned(Vec::new()),
                 ranges: Vec::new(),
             },
         }
@@ -205,7 +222,7 @@ impl VariableDictionary {
             .zip(&self.storage.ranges)
             .map(|(id, range)| VariableDictionaryEntry {
                 id,
-                value: &self.storage.bytes[range.clone()],
+                value: &self.storage.bytes.as_slice()[range.clone()],
             })
     }
 }
@@ -285,10 +302,21 @@ impl LogTypePlaceholderCounts {
 ///
 /// Decoding records only where each entry lies. An entry's escape structure and placeholders are
 /// read when it is used, so opening an archive does not scan every logtype it holds.
+///
+/// An archive may store one dictionary per CLP-string field instead, each with its own IDs; then
+/// this holds the fields' dictionaries, of which a query may have loaded only some, and a column
+/// resolves its logtypes through [`Self::for_field`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogTypeDictionary {
     storage: DictionaryStorage,
+    /// The loaded fields' dictionaries, by schema node, when stored per field.
+    fields: Vec<(u32, Self)>,
+    per_field: bool,
+    complete: bool,
 }
+
+/// What a field whose dictionary was not loaded resolves to: no entries.
+static NO_LOG_TYPES: LogTypeDictionary = LogTypeDictionary::empty();
 
 impl LogTypeDictionary {
     /// A dictionary with no entries; see [`VariableDictionary::empty`].
@@ -296,16 +324,44 @@ impl LogTypeDictionary {
     pub const fn empty() -> Self {
         Self {
             storage: DictionaryStorage {
-                bytes: Vec::new(),
+                bytes: StorageBytes::Owned(Vec::new()),
                 ranges: Vec::new(),
             },
+            fields: Vec::new(),
+            per_field: false,
+            complete: true,
         }
+    }
+
+    /// The dictionary the column of `node` reads its logtypes through: this one, or the field's
+    /// own when stored per field. A field that was not loaded has no entries.
+    #[must_use]
+    pub fn for_field(&self, node: u32) -> &Self {
+        if !self.per_field {
+            return self;
+        }
+        self.fields
+            .binary_search_by_key(&node, |(field, _)| *field)
+            .map_or(&NO_LOG_TYPES, |index| &self.fields[index].1)
+    }
+
+    /// Whether the dictionary is stored per field.
+    #[must_use]
+    pub const fn is_per_field(&self) -> bool {
+        self.per_field
     }
 
     /// Returns the number of logtype dictionary entries.
     #[must_use]
     pub const fn len(&self) -> usize {
         self.storage.entry_count()
+    }
+
+    /// Whether every entry is loaded, as it is unless a per-field dictionary was loaded for only
+    /// some fields.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.complete
     }
 
     /// Returns whether the logtype dictionary has no entries.
@@ -338,7 +394,7 @@ impl ArrayDictionary {
     pub const fn empty() -> Self {
         Self {
             storage: DictionaryStorage {
-                bytes: Vec::new(),
+                bytes: StorageBytes::Owned(Vec::new()),
                 ranges: Vec::new(),
             },
         }
@@ -430,7 +486,7 @@ fn logtype_entries(
         .zip(storage.ranges.iter())
         .map(|(id, range)| LogTypeDictionaryEntry {
             id,
-            escaped_value: &storage.bytes[range.clone()],
+            escaped_value: &storage.bytes.as_slice()[range.clone()],
         })
 }
 
@@ -447,9 +503,320 @@ pub(super) fn decode_logtype_dictionary<R: Read>(
     section: Take<R>,
     limits: DictionaryLimits,
 ) -> Result<LogTypeDictionary, DictionaryError> {
+    decode_logtype_dictionary_fields(section, limits, None)
+}
+
+/// Decodes `/log.dict`, loading only the dictionaries of `fields` when it is stored per field.
+/// `None`, or a dictionary stored as one sequence, loads everything.
+pub(super) fn decode_logtype_dictionary_fields<R: Read>(
+    mut section: Take<R>,
+    limits: DictionaryLimits,
+    fields: Option<&[u32]>,
+) -> Result<LogTypeDictionary, DictionaryError> {
+    let compressed_size = section.limit();
+    if compressed_size > limits.compressed {
+        return Err(DictionaryError::CompressedSectionTooLarge {
+            actual: compressed_size,
+            limit: limits.compressed,
+        });
+    }
+    let first = read_u64(&mut section)?;
+    if FIELD_DICTIONARIES_MARKER == first {
+        return decode_field_dictionaries(section, limits, fields);
+    }
     Ok(LogTypeDictionary {
-        storage: decode_dictionary(section, limits)?,
+        storage: decode_entry_sequence(section, limits, first)?,
+        fields: Vec::new(),
+        per_field: false,
+        complete: true,
     })
+}
+
+/// Marks a `/log.dict` stored as one dictionary per field. It is read where a plain dictionary
+/// stores its entry count, and exceeds any count a reader accepts, so a reader that does not know
+/// the layout refuses the dictionary rather than misreading it.
+pub const FIELD_DICTIONARIES_MARKER: u64 = 0xC1F5_F1E1_DD1C_7002;
+
+/// One field's dictionary as the index describes it: its schema node, entry count, the frame
+/// holding it, and where it lies in that frame's decompressed bytes.
+struct FieldDictionaryIndex {
+    node: u64,
+    entries: u64,
+    frame: usize,
+    start: u64,
+    end: u64,
+}
+
+/// Decodes a `/log.dict` stored as one dictionary per CLP-string field.
+///
+/// After the marker, an uncompressed index: the dictionary count and frame count, then for each
+/// dictionary its field (a schema node ID), entry count, frame, and start and end within the
+/// frame's decompressed bytes, then each frame's compressed and decompressed size. Then the frames.
+/// A dictionary is its entries' 4-byte lengths followed by their bytes, and an entry's ID is its
+/// position in its field's dictionary. Dictionaries sharing a frame lie back to back, so reading
+/// one decompresses its frame only up to its end, and a reader skips a frame it needs nothing from.
+fn decode_field_dictionaries<R: Read>(
+    mut section: Take<R>,
+    limits: DictionaryLimits,
+    fields: Option<&[u32]>,
+) -> Result<LogTypeDictionary, DictionaryError> {
+    let count_limit = limits.entries.saturating_add(1);
+    let dictionary_count = read_u64(&mut section)?;
+    let frame_count = read_u64(&mut section)?;
+    for count in [dictionary_count, frame_count] {
+        if count > count_limit {
+            return Err(DictionaryError::EntryCountTooLarge {
+                actual: count,
+                limit: limits.entries,
+            });
+        }
+    }
+    let index = read_field_index(&mut section, dictionary_count, frame_count, limits)?;
+    let frames = read_frame_index(&mut section, frame_count, limits)?;
+    // The dictionaries of each frame must tile it from the start, in order.
+    for (frame, (_, decompressed)) in frames.iter().enumerate() {
+        let mut expected = 0_u64;
+        for entry in index.iter().filter(|entry| entry.frame == frame) {
+            if entry.start != expected {
+                return Err(DictionaryError::TrailingDecompressedData);
+            }
+            expected = entry.end;
+        }
+        if expected != *decompressed {
+            return Err(DictionaryError::TrailingDecompressedData);
+        }
+    }
+
+    let mut compressed = Vec::new();
+    section
+        .read_to_end(&mut compressed)
+        .map_err(DictionaryError::Io)?;
+    let mut frame_ranges = Vec::with_capacity(frames.len());
+    let mut offset = 0_usize;
+    for (size, _) in &frames {
+        let end = usize::try_from(*size)
+            .ok()
+            .and_then(|size| offset.checked_add(size))
+            .ok_or(DictionaryError::SizeOverflow)?;
+        frame_ranges.push(offset..end);
+        offset = end;
+    }
+    if offset != compressed.len() {
+        return Err(DictionaryError::TrailingCompressedData {
+            remaining: u64::try_from(compressed.len().abs_diff(offset)).unwrap_or(u64::MAX),
+        });
+    }
+
+    let wanted = |entry: &FieldDictionaryIndex| {
+        fields.is_none_or(|fields| {
+            u32::try_from(entry.node).is_ok_and(|node| fields.binary_search(&node).is_ok())
+        })
+    };
+    let mut loaded = Vec::new();
+    let mut total_value_bytes = 0_u64;
+    for (frame, range) in frame_ranges.into_iter().enumerate() {
+        let in_frame: Vec<&FieldDictionaryIndex> =
+            index.iter().filter(|entry| entry.frame == frame).collect();
+        let Some(last) = in_frame.iter().rposition(|entry| wanted(entry)) else {
+            continue;
+        };
+        // The frame is decompressed once, up to the end of the last dictionary wanted from it,
+        // into one buffer the wanted fields share.
+        let prefix =
+            usize::try_from(in_frame[last].end).map_err(|_| DictionaryError::SizeOverflow)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(prefix)
+            .map_err(|_| DictionaryError::AllocationFailed { requested: prefix })?;
+        decompress_prefix(&compressed[range], &mut bytes, prefix)?;
+        let bytes = std::sync::Arc::new(bytes);
+        for entry in in_frame[..=last].iter().filter(|entry| wanted(entry)) {
+            let ranges = field_ranges(&bytes, entry, limits, &mut total_value_bytes)?;
+            let node = u32::try_from(entry.node).map_err(|_| DictionaryError::SizeOverflow)?;
+            loaded.push((
+                node,
+                LogTypeDictionary {
+                    storage: DictionaryStorage {
+                        bytes: StorageBytes::Shared(std::sync::Arc::clone(&bytes)),
+                        ranges,
+                    },
+                    fields: Vec::new(),
+                    per_field: false,
+                    complete: true,
+                },
+            ));
+        }
+    }
+    loaded.sort_unstable_by_key(|(node, _)| *node);
+    let complete = loaded.len() == index.len();
+    Ok(LogTypeDictionary {
+        storage: DictionaryStorage {
+            bytes: StorageBytes::Owned(Vec::new()),
+            ranges: Vec::new(),
+        },
+        fields: loaded,
+        per_field: true,
+        complete,
+    })
+}
+
+/// Reads the per-dictionary part of the index.
+fn read_field_index<R: Read>(
+    section: &mut Take<R>,
+    dictionary_count: u64,
+    frame_count: u64,
+    limits: DictionaryLimits,
+) -> Result<Vec<FieldDictionaryIndex>, DictionaryError> {
+    let mut index = Vec::new();
+    let mut total_entries = 0_u64;
+    for _ in 0..dictionary_count {
+        let node = read_u64(section)?;
+        let entries = read_u64(section)?;
+        let frame = read_u64(section)?;
+        if frame >= frame_count {
+            return Err(DictionaryError::SizeOverflow);
+        }
+        let frame = usize::try_from(frame).map_err(|_| DictionaryError::SizeOverflow)?;
+        let start = read_u64(section)?;
+        let end = read_u64(section)?;
+        let lengths = entries
+            .checked_mul(4)
+            .ok_or(DictionaryError::SizeOverflow)?;
+        if end < start || end - start < lengths {
+            return Err(DictionaryError::SizeOverflow);
+        }
+        total_entries = total_entries
+            .checked_add(entries)
+            .ok_or(DictionaryError::SizeOverflow)?;
+        index.push(FieldDictionaryIndex {
+            node,
+            entries,
+            frame,
+            start,
+            end,
+        });
+    }
+    if total_entries > limits.entries {
+        return Err(DictionaryError::EntryCountTooLarge {
+            actual: total_entries,
+            limit: limits.entries,
+        });
+    }
+    Ok(index)
+}
+
+/// Reads each frame's compressed and decompressed size.
+fn read_frame_index<R: Read>(
+    section: &mut Take<R>,
+    frame_count: u64,
+    limits: DictionaryLimits,
+) -> Result<Vec<(u64, u64)>, DictionaryError> {
+    let mut frames = Vec::new();
+    let mut decompressed_total = 0_u64;
+    for _ in 0..frame_count {
+        let compressed = read_u64(section)?;
+        let decompressed = read_u64(section)?;
+        decompressed_total = decompressed_total
+            .checked_add(decompressed)
+            .ok_or(DictionaryError::SizeOverflow)?;
+        frames.push((compressed, decompressed));
+    }
+    if decompressed_total > limits.decompressed {
+        return Err(DictionaryError::DecompressedSectionTooLarge {
+            actual: decompressed_total,
+            limit: limits.decompressed,
+        });
+    }
+    Ok(frames)
+}
+
+/// Decompresses one frame into `output` until it holds at least `prefix` bytes. Writing into the
+/// vector's spare capacity needs no zero-filling; it may run past `prefix` to the capacity, which
+/// is harmless.
+fn decompress_prefix(
+    frame: &[u8],
+    output: &mut Vec<u8>,
+    prefix: usize,
+) -> Result<(), DictionaryError> {
+    let mut context = zstd::zstd_safe::DCtx::create();
+    let mut input = zstd::zstd_safe::InBuffer::around(frame);
+    let mut out = zstd::zstd_safe::OutBuffer::around(output);
+    while out.pos() < prefix {
+        let before = (input.pos(), out.pos());
+        context
+            .decompress_stream(&mut out, &mut input)
+            .map_err(|code| {
+                DictionaryError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    zstd::zstd_safe::get_error_name(code),
+                ))
+            })?;
+        if (input.pos(), out.pos()) == before {
+            return Err(DictionaryError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "dictionary frame ends before its dictionaries do",
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Locates the entries of one field's dictionary in its decompressed frame: `entries` 4-byte
+/// lengths, then the bytes, between the index's start and end.
+fn field_ranges(
+    frame: &[u8],
+    entry: &FieldDictionaryIndex,
+    limits: DictionaryLimits,
+    total_value_bytes: &mut u64,
+) -> Result<Vec<Range<usize>>, DictionaryError> {
+    let start = usize::try_from(entry.start).map_err(|_| DictionaryError::SizeOverflow)?;
+    let end = usize::try_from(entry.end).map_err(|_| DictionaryError::SizeOverflow)?;
+    let entries = usize::try_from(entry.entries).map_err(|_| DictionaryError::SizeOverflow)?;
+    let lengths_end = entries
+        .checked_mul(4)
+        .and_then(|lengths| start.checked_add(lengths))
+        .filter(|lengths_end| *lengths_end <= end && end <= frame.len())
+        .ok_or(DictionaryError::SizeOverflow)?;
+    let mut ranges = Vec::new();
+    ranges
+        .try_reserve_exact(entries)
+        .map_err(|_| DictionaryError::AllocationFailed { requested: entries })?;
+    let mut offset = lengths_end;
+    for (entry_id, length) in frame[start..lengths_end]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .enumerate()
+    {
+        let length = u32::from_le_bytes(*length);
+        if u64::from(length) > limits.entry_bytes {
+            return Err(DictionaryError::EntryTooLarge {
+                entry_id: wire_id(entry_id)?,
+                actual: u64::from(length),
+                limit: limits.entry_bytes,
+            });
+        }
+        *total_value_bytes = total_value_bytes
+            .checked_add(u64::from(length))
+            .ok_or(DictionaryError::SizeOverflow)?;
+        if *total_value_bytes > limits.total_value_bytes {
+            return Err(DictionaryError::TotalValueBytesTooLarge {
+                actual: *total_value_bytes,
+                limit: limits.total_value_bytes,
+            });
+        }
+        let value_end = usize::try_from(length)
+            .ok()
+            .and_then(|length| offset.checked_add(length))
+            .filter(|value_end| *value_end <= end)
+            .ok_or(DictionaryError::TrailingDecompressedData)?;
+        ranges.push(offset..value_end);
+        offset = value_end;
+    }
+    if offset != end {
+        return Err(DictionaryError::TrailingDecompressedData);
+    }
+    Ok(ranges)
 }
 
 pub(super) fn decode_array_dictionary<R: Read>(
@@ -472,8 +839,16 @@ fn decode_dictionary<R: Read>(
             limit: limits.compressed,
         });
     }
-
     let entry_count = read_u64(&mut section)?;
+    decode_entry_sequence(section, limits, entry_count)
+}
+
+/// Decodes a dictionary stored as one sequence of entries, once its entry count has been read.
+fn decode_entry_sequence<R: Read>(
+    mut section: Take<R>,
+    limits: DictionaryLimits,
+    entry_count: u64,
+) -> Result<DictionaryStorage, DictionaryError> {
     if entry_count > limits.entries {
         return Err(DictionaryError::EntryCountTooLarge {
             actual: entry_count,
@@ -487,7 +862,7 @@ fn decode_dictionary<R: Read>(
             return Err(DictionaryError::TrailingCompressedData { remaining });
         }
         return Ok(DictionaryStorage {
-            bytes: Vec::new(),
+            bytes: StorageBytes::Owned(Vec::new()),
             ranges: Vec::new(),
         });
     }
@@ -512,11 +887,11 @@ fn decode_dictionary<R: Read>(
     let mut compressed = Vec::new();
     let compressed_len =
         usize::try_from(section.limit()).map_err(|_| DictionaryError::SizeOverflow)?;
-    compressed
-        .try_reserve_exact(compressed_len)
-        .map_err(|_| DictionaryError::AllocationFailed {
+    compressed.try_reserve_exact(compressed_len).map_err(|_| {
+        DictionaryError::AllocationFailed {
             requested: compressed_len,
-        })?;
+        }
+    })?;
     section
         .read_to_end(&mut compressed)
         .map_err(DictionaryError::Io)?;
@@ -529,9 +904,10 @@ fn decode_dictionary<R: Read>(
     let remaining_compressed =
         u64::try_from(compressed.len() - frame_len).map_err(|_| DictionaryError::SizeOverflow)?;
     let frame = &compressed[..frame_len];
-    let decompressed = match zstd::zstd_safe::get_frame_content_size(frame) {
-        Ok(Some(size)) => decode_sized_frame(frame, size, limits.decompressed)?,
-        _ => {
+    let decompressed = if let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(frame) {
+        decode_sized_frame(frame, size, limits.decompressed)?
+    } else {
+        {
             let mut decoder = zstd::stream::read::Decoder::with_buffer(frame)
                 .map_err(DictionaryError::Io)?
                 .single_frame();
@@ -649,7 +1025,7 @@ fn reserve_dictionary(entry_count: usize) -> Result<DictionaryStorage, Dictionar
             requested: entry_count,
         })?;
     Ok(DictionaryStorage {
-        bytes: Vec::new(),
+        bytes: StorageBytes::Owned(Vec::new()),
         ranges,
     })
 }
@@ -712,7 +1088,7 @@ fn decode_entries(
     if offset != decompressed.len() {
         return Err(DictionaryError::TrailingDecompressedData);
     }
-    decoded.bytes = decompressed;
+    decoded.bytes = StorageBytes::Owned(decompressed);
     Ok(())
 }
 
@@ -990,6 +1366,98 @@ mod tests {
             decode_array_dictionary(take(&noncanonical), DictionaryLimits::default()),
             Err(DictionaryError::TrailingCompressedData { .. })
         ));
+    }
+
+    /// Each frame's dictionaries, as (field, entries).
+    type Frames<'a> = &'a [&'a [(u64, &'a [&'a [u8]])]];
+
+    /// A per-field `/log.dict` holding `frames`.
+    fn field_dictionaries(frames: Frames<'_>) -> Vec<u8> {
+        let mut index = Vec::new();
+        let mut frame_index = Vec::new();
+        let mut payloads = Vec::new();
+        for (frame, dictionaries) in frames.iter().enumerate() {
+            let mut payload = Vec::new();
+            for (field, entries) in *dictionaries {
+                let start = payload.len() as u64;
+                for entry in *entries {
+                    let length = u32::try_from(entry.len()).expect("test entry fits u32");
+                    payload.extend_from_slice(&length.to_le_bytes());
+                }
+                for entry in *entries {
+                    payload.extend_from_slice(entry);
+                }
+                index.push([
+                    *field,
+                    entries.len() as u64,
+                    frame as u64,
+                    start,
+                    payload.len() as u64,
+                ]);
+            }
+            let compressed = zstd::stream::encode_all(payload.as_slice(), 3).expect("zstd");
+            frame_index.push([compressed.len() as u64, payload.len() as u64]);
+            payloads.extend_from_slice(&compressed);
+        }
+        let mut encoded = Vec::new();
+        for word in [
+            FIELD_DICTIONARIES_MARKER,
+            index.len() as u64,
+            frame_index.len() as u64,
+        ] {
+            encoded.extend_from_slice(&word.to_le_bytes());
+        }
+        for word in index.iter().flatten().chain(frame_index.iter().flatten()) {
+            encoded.extend_from_slice(&word.to_le_bytes());
+        }
+        encoded.extend_from_slice(&payloads);
+        encoded
+    }
+
+    #[test]
+    fn per_field_dictionary_loads_only_the_requested_fields() {
+        fn value(dictionary: &LogTypeDictionary, field: u32, id: u64) -> Option<&[u8]> {
+            dictionary
+                .for_field(field)
+                .entry(id)
+                .map(LogTypeDictionaryEntry::escaped_value)
+        }
+
+        // Fields 5 and 9 share a frame, 12 has its own; IDs restart in every field.
+        let bytes = field_dictionaries(&[
+            &[(5, &[b"shared"]), (9, &[b"shared", b"", b"wide only"])],
+            &[(12, &[b"big field"])],
+        ]);
+        let load = |fields: Option<&[u32]>| {
+            decode_logtype_dictionary_fields(take(&bytes), DictionaryLimits::default(), fields)
+                .expect("per-field dictionary")
+        };
+
+        let narrow = load(Some(&[5]));
+        assert!(narrow.is_per_field());
+        assert!(!narrow.is_complete());
+        assert_eq!(Some(&b"shared"[..]), value(&narrow, 5, 0));
+        assert_eq!(None, value(&narrow, 5, 1));
+        assert_eq!(
+            None,
+            value(&narrow, 9, 0),
+            "a field not asked for resolves to nothing"
+        );
+
+        let wide = load(Some(&[9, 12]));
+        assert_eq!(
+            Some(&b""[..]),
+            value(&wide, 9, 1),
+            "an empty entry is loaded, not absent"
+        );
+        assert_eq!(Some(&b"wide only"[..]), value(&wide, 9, 2));
+        assert_eq!(Some(&b"big field"[..]), value(&wide, 12, 0));
+
+        let whole = load(None);
+        assert!(whole.is_complete());
+        assert_eq!(Some(&b"shared"[..]), value(&whole, 5, 0));
+        assert_eq!(3, whole.for_field(9).entries().count());
+        assert_eq!(0, whole.for_field(42).entries().count());
     }
 
     #[test]

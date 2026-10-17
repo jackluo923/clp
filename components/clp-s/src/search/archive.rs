@@ -346,6 +346,15 @@ pub trait ArchiveMatchSink {
     /// Returns an I/O error when the destination cannot accept the batch. The sink may already
     /// have accepted matches from earlier tables.
     fn write_matches(&mut self, matches: ArchiveTableMatches<'_, '_, '_>) -> io::Result<()>;
+
+    /// The schema nodes this sink writes for a matched row, or `None` when it may write any.
+    ///
+    /// The search loads only the dictionaries these nodes are read through before handing over
+    /// matches. The default, `None`, loads them all.
+    fn output_nodes(&self, schema_tree: &crate::archive::SchemaTree) -> Option<Vec<u32>> {
+        let _ = schema_tree;
+        None
+    }
 }
 
 /// Searches every physical schema table in one archive without materializing decoded JSON.
@@ -379,7 +388,26 @@ pub fn search_archive<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
         .map_err(ArchiveSearchError::Catalog)?;
     let mut loaded = Dictionaries::NONE;
     let filter = filter_dictionaries(query, catalog.schema_tree());
-    load_dictionaries(reader, &mut catalog, &options.catalog, filter, &mut loaded)?;
+    let output = sink
+        .output_nodes(catalog.schema_tree())
+        .map_or(Dictionaries::ALL, |nodes| {
+            let mut output = Dictionaries::NONE;
+            for node in nodes {
+                if let Some(schema_node) = catalog.schema_tree().get(node as usize) {
+                    output.add_node(node, schema_node.node_type());
+                }
+            }
+            output
+        });
+    // A projected output is narrow, so its dictionaries load with the filter's: one load of the
+    // log-type dictionary, which a per-field archive reads only a prefix of, rather than two.
+    // Whole records may need every dictionary, so those wait until a row matches.
+    let first = if Dictionaries::ALL == output {
+        filter
+    } else {
+        filter.union(&output)
+    };
+    load_dictionaries(reader, &mut catalog, &options.catalog, &first, &mut loaded)?;
 
     let mut scan = ScanPosition::default();
     let mut sink_begun = false;
@@ -407,21 +435,17 @@ pub fn search_archive<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
             &compiled,
             sink,
             options,
-            Dictionaries::ALL == loaded,
+            loaded.covers(&output),
             &mut scan,
         )?;
         drop(compiled);
         match outcome {
             ScanOutcome::Finished => break,
-            // A match needs every dictionary to be written out. Load the rest and resume at the
-            // stream holding the match, which wrote nothing before stopping.
-            ScanOutcome::NeedsDictionaries => load_dictionaries(
-                reader,
-                &mut catalog,
-                &options.catalog,
-                Dictionaries::ALL,
-                &mut loaded,
-            )?,
+            // A match needs the dictionaries its output is read through. Load them and resume at
+            // the stream holding the match, which wrote nothing before stopping.
+            ScanOutcome::NeedsDictionaries => {
+                load_dictionaries(reader, &mut catalog, &options.catalog, &output, &mut loaded)?;
+            }
         }
     }
 
@@ -596,34 +620,74 @@ fn schema_may_match(
         .map_err(ArchiveSearchError::Compile)
 }
 
-/// A set of the three archive dictionaries.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Which log-type dictionary entries a search needs: none, those of some CLP-string fields, or all.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum LogTypeFields {
+    #[default]
+    None,
+    Fields(std::collections::BTreeSet<u32>),
+    All,
+}
+
+impl LogTypeFields {
+    fn add(&mut self, node: u32) {
+        match self {
+            Self::None => *self = Self::Fields(std::iter::once(node).collect()),
+            Self::Fields(fields) => {
+                fields.insert(node);
+            }
+            Self::All => {}
+        }
+    }
+
+    fn union(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::All, _) | (_, Self::All) => Self::All,
+            (Self::None, other) | (other, Self::None) => other.clone(),
+            (Self::Fields(left), Self::Fields(right)) => {
+                Self::Fields(left.union(right).copied().collect())
+            }
+        }
+    }
+
+    fn covers(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::All, _) | (_, Self::None) => true,
+            (Self::Fields(left), Self::Fields(right)) => right.is_subset(left),
+            _ => false,
+        }
+    }
+}
+
+/// The dictionaries a search needs: the variable and array dictionaries whole, and the log-type
+/// dictionary whole or for some fields, which an archive storing it per field loads alone.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct Dictionaries {
     variable: bool,
-    log_type: bool,
+    log_type: LogTypeFields,
     array: bool,
 }
 
 impl Dictionaries {
     const NONE: Self = Self {
         variable: false,
-        log_type: false,
+        log_type: LogTypeFields::None,
         array: false,
     };
     const ALL: Self = Self {
         variable: true,
-        log_type: true,
+        log_type: LogTypeFields::All,
         array: true,
     };
 
-    /// The dictionaries a column of this type is read through.
-    const fn add_node_type(&mut self, node_type: crate::archive::NodeType) {
+    /// Adds the dictionaries the column of `node` is read through.
+    fn add_node(&mut self, node: u32, node_type: crate::archive::NodeType) {
         use crate::archive::NodeType;
         match node_type {
             NodeType::VarString | NodeType::DictionaryFloat => self.variable = true,
             NodeType::ClpString => {
                 self.variable = true;
-                self.log_type = true;
+                self.log_type.add(node);
             }
             NodeType::UnstructuredArray => {
                 self.variable = true;
@@ -632,14 +696,29 @@ impl Dictionaries {
             _ => {}
         }
     }
+
+    fn union(&self, other: &Self) -> Self {
+        Self {
+            variable: self.variable || other.variable,
+            log_type: self.log_type.union(&other.log_type),
+            array: self.array || other.array,
+        }
+    }
+
+    fn covers(&self, other: &Self) -> bool {
+        (self.variable || !other.variable)
+            && (self.array || !other.array)
+            && self.log_type.covers(&other.log_type)
+    }
 }
 
-/// Loads the dictionaries in `wanted` that `loaded` lacks, recording them in `loaded`.
+/// Loads what `wanted` adds to `loaded`, recording it in `loaded`. A log-type dictionary is
+/// reloaded for the union of the fields already loaded and those now wanted.
 fn load_dictionaries<A: ArchiveReader + ?Sized>(
     reader: &mut A,
     catalog: &mut ArchiveCatalog,
     limits: &ArchiveCatalogLimits,
-    wanted: Dictionaries,
+    wanted: &Dictionaries,
     loaded: &mut Dictionaries,
 ) -> Result<(), ArchiveSearchError> {
     if wanted.variable && !loaded.variable {
@@ -651,14 +730,30 @@ fn load_dictionaries<A: ArchiveReader + ?Sized>(
         catalog.set_variable_dictionary(dictionary);
         loaded.variable = true;
     }
-    if wanted.log_type && !loaded.log_type {
-        let dictionary = reader
-            .read_log_type_dictionary(catalog.metadata(), limits.log_type_dictionary())
-            .map_err(|source| {
-                ArchiveSearchError::Catalog(ArchiveCatalogError::LogTypeDictionary(source))
-            })?;
+    if !loaded.log_type.covers(&wanted.log_type) {
+        let fields = loaded.log_type.union(&wanted.log_type);
+        let dictionary = match &fields {
+            LogTypeFields::Fields(nodes) => {
+                let nodes: Vec<u32> = nodes.iter().copied().collect();
+                reader.read_log_type_dictionary_fields(
+                    catalog.metadata(),
+                    limits.log_type_dictionary(),
+                    &nodes,
+                )
+            }
+            _ => reader.read_log_type_dictionary(catalog.metadata(), limits.log_type_dictionary()),
+        }
+        .map_err(|source| {
+            ArchiveSearchError::Catalog(ArchiveCatalogError::LogTypeDictionary(source))
+        })?;
+        // A dictionary stored as one sequence loads whole whatever was asked for, so it is
+        // recorded as such and never reloaded.
+        loaded.log_type = if dictionary.is_complete() {
+            LogTypeFields::All
+        } else {
+            fields
+        };
         catalog.set_log_type_dictionary(dictionary);
-        loaded.log_type = true;
     }
     if wanted.array && !loaded.array {
         let dictionary = reader
@@ -702,9 +797,6 @@ fn filter_dictionaries(query: &ParsedQuery, tree: &crate::archive::SchemaTree) -
             return Dictionaries::ALL;
         }
         add_path_dictionaries(tree, path.components(), &mut wanted);
-        if Dictionaries::ALL == wanted {
-            break;
-        }
     }
     wanted
 }
@@ -744,8 +836,16 @@ fn add_path_dictionaries(
                 NodeType::Object if last => add_descendant_dictionaries(tree, child_id, wanted),
                 NodeType::Object => next.push(child_id),
                 NodeType::StructuredArray => add_descendant_dictionaries(tree, child_id, wanted),
-                NodeType::UnstructuredArray => wanted.add_node_type(NodeType::UnstructuredArray),
-                node_type if last => wanted.add_node_type(node_type),
+                NodeType::UnstructuredArray => {
+                    if let Ok(node) = u32::try_from(child_id) {
+                        wanted.add_node(node, NodeType::UnstructuredArray);
+                    }
+                }
+                node_type if last => {
+                    if let Ok(node) = u32::try_from(child_id) {
+                        wanted.add_node(node, node_type);
+                    }
+                }
                 _ => {}
             }
         }
@@ -771,7 +871,9 @@ fn add_descendant_dictionaries(
         };
         if parent == ancestor || inside.get(parent).copied().unwrap_or(false) {
             inside[node_id] = true;
-            wanted.add_node_type(node.node_type());
+            if let Ok(node_id) = u32::try_from(node_id) {
+                wanted.add_node(node_id, node.node_type());
+            }
         }
     }
 }
