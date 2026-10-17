@@ -54,17 +54,17 @@ impl ColumnLimits {
             columns: max_columns,
             encoded_variables_per_column: max_encoded_variables_per_column,
             total_encoded_variables: max_total_encoded_variables,
-            validate_dictionary_references: true,
+            validate_dictionary_references: false,
         }
     }
 
     /// Controls whether decoding checks every dictionary ID and logtype a table references.
     ///
-    /// The check reads each ID of every dictionary-backed column against the dictionary, whether
-    /// or not the column is ever read. A caller that loaded no dictionaries, having established
-    /// that it reads and filters only other columns, turns it off; the column views it never
-    /// touches then hold unchecked IDs, and a view it does touch resolves each ID on access and
-    /// reports a miss as absent.
+    /// Off by default. The check reads each ID of every dictionary-backed column against the
+    /// dictionary, whether or not the column is ever read, and scans every logtype those columns
+    /// use, which costs a query far more than the rows it returns. Unchecked, a column view resolves
+    /// each ID on access and reports a miss as absent, so a damaged archive still cannot read out of
+    /// bounds. Turn it on to have decoding reject such an archive up front.
     #[must_use]
     pub const fn with_dictionary_validation(mut self, validate: bool) -> Self {
         self.validate_dictionary_references = validate;
@@ -881,7 +881,11 @@ impl<'table, 'archive> ClpStringColumn<'table, 'archive> {
         self.variable_dictionary
     }
 
-    /// Returns one validated logtype and encoded-variable span.
+    /// Returns one record's logtype and encoded-variable span.
+    ///
+    /// Records store their variables back to back, so a record's span runs from its own offset to
+    /// the next record's, or to the end of the column for the last record. Reading the count this
+    /// way needs no scan of the logtype.
     #[must_use]
     pub fn record(self, index: usize) -> Option<ClpStringRecord<'table, 'archive>> {
         let descriptor = self.descriptor(index)?;
@@ -889,7 +893,11 @@ impl<'table, 'archive> ClpStringColumn<'table, 'archive> {
             .logtype_dictionary
             .entry(u64::from(descriptor.logtype_id()))?;
         let start = usize::try_from(descriptor.encoded_variable_offset()).ok()?;
-        let count = usize::try_from(logtype.placeholder_counts().encoded_variables()).ok()?;
+        let end = match self.descriptor(index + 1) {
+            Some(next) => usize::try_from(next.encoded_variable_offset()).ok()?,
+            None => self.encoded_variables.len(),
+        };
+        let count = end.checked_sub(start)?;
         Some(ClpStringRecord {
             descriptor,
             logtype,
@@ -1584,7 +1592,7 @@ fn validate_clp_descriptors(
     // `LogTypeDictionaryEntry` through every iteration of a same-logtype run.
     let mut cached_logtype_id = u64::MAX;
     let mut cached_encoded_variable_count = 0_u64;
-    let mut cached_variable_kinds = &[][..];
+    let mut cached_variable_kinds = Vec::new();
     let mut cached_needs_variable_validation = false;
     for (message_index, raw) in descriptors.iter().enumerate() {
         let descriptor = ClpDescriptor { raw };
@@ -1600,10 +1608,22 @@ fn validate_clp_descriptors(
                     },
                 )
             })?;
+            cached_variable_kinds.clear();
+            entry
+                .variable_kinds_into(&mut cached_variable_kinds)
+                .map_err(|_| {
+                    corrupt(
+                        context,
+                        Some(message_index),
+                        ColumnCorruption::DanglingLogTypeEscape {
+                            section: logtype_dictionary.section(),
+                            id: logtype_id,
+                        },
+                    )
+                })?;
             let counts = entry.placeholder_counts();
             cached_logtype_id = logtype_id;
             cached_encoded_variable_count = counts.encoded_variables();
-            cached_variable_kinds = entry.variable_kinds();
             cached_needs_variable_validation = 0 != counts.dictionary() || 0 != counts.float();
         }
         let offset = descriptor.encoded_variable_offset();
@@ -1636,7 +1656,7 @@ fn validate_clp_descriptors(
             .slice(offset, count)
             .ok_or(ColumnError::SizeOverflow)?;
         validate_clp_variables(
-            cached_variable_kinds,
+            &cached_variable_kinds,
             cached_needs_variable_validation,
             variables,
             context,
@@ -1856,6 +1876,13 @@ pub enum ColumnCorruption {
         /// Missing logtype ID.
         id: u64,
     },
+    /// A referenced logtype ends in an escape marker that escapes nothing.
+    DanglingLogTypeEscape {
+        /// Dictionary ID space.
+        section: LogTypeSection,
+        /// Logtype ID.
+        id: u64,
+    },
     /// A descriptor offset differs from the canonical contiguous record layout.
     NonCanonicalEncodedVariableOffset {
         /// Required offset.
@@ -1927,6 +1954,9 @@ impl Display for ColumnCorruption {
             ),
             Self::UnknownLogType { section, id } => {
                 write!(formatter, "{section} has no entry {id}")
+            }
+            Self::DanglingLogTypeEscape { section, id } => {
+                write!(formatter, "{section} entry {id} ends in a dangling escape")
             }
             Self::NonCanonicalEncodedVariableOffset { expected, actual } => write!(
                 formatter,
@@ -2404,13 +2434,14 @@ mod tests {
         message_count: u64,
         resources: &'archive Resources,
     ) -> Result<SchemaTable<'table, 'archive>, ColumnError> {
+        // These tests exercise decoding's checks, which a query leaves off by default.
         decode_with_limits(
             bytes,
             tree,
             schema,
             message_count,
             resources,
-            ColumnLimits::default(),
+            ColumnLimits::default().with_dictionary_validation(true),
         )
     }
 

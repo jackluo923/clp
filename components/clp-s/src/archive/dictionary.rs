@@ -281,13 +281,13 @@ impl LogTypePlaceholderCounts {
     }
 }
 
-/// A decoded `/log.dict` with validated escape structure and placeholder counts.
+/// A decoded `/log.dict`.
+///
+/// Decoding records only where each entry lies. An entry's escape structure and placeholders are
+/// read when it is used, so opening an archive does not scan every logtype it holds.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogTypeDictionary {
     storage: DictionaryStorage,
-    placeholder_counts: Vec<LogTypePlaceholderCounts>,
-    variable_kinds: Vec<LogTypeVariableKind>,
-    variable_kind_ranges: Vec<Range<usize>>,
 }
 
 impl LogTypeDictionary {
@@ -299,9 +299,6 @@ impl LogTypeDictionary {
                 bytes: Vec::new(),
                 ranges: Vec::new(),
             },
-            placeholder_counts: Vec::new(),
-            variable_kinds: Vec::new(),
-            variable_kind_ranges: Vec::new(),
         }
     }
 
@@ -320,33 +317,19 @@ impl LogTypeDictionary {
     /// Returns an entry by its implicit zero-based wire ID.
     #[must_use]
     pub fn entry(&self, id: u64) -> Option<LogTypeDictionaryEntry<'_>> {
-        logtype_entry(
-            &self.storage,
-            &self.placeholder_counts,
-            &self.variable_kinds,
-            &self.variable_kind_ranges,
-            id,
-        )
+        logtype_entry(&self.storage, id)
     }
 
     /// Iterates entries in implicit wire-ID order.
     pub fn entries(&self) -> impl Iterator<Item = LogTypeDictionaryEntry<'_>> {
-        logtype_entries(
-            &self.storage,
-            &self.placeholder_counts,
-            &self.variable_kinds,
-            &self.variable_kind_ranges,
-        )
+        logtype_entries(&self.storage)
     }
 }
 
-/// A decoded `/array.dict` with validated escape structure and placeholder counts.
+/// A decoded `/array.dict`, recorded the same way as [`LogTypeDictionary`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArrayDictionary {
     storage: DictionaryStorage,
-    placeholder_counts: Vec<LogTypePlaceholderCounts>,
-    variable_kinds: Vec<LogTypeVariableKind>,
-    variable_kind_ranges: Vec<Range<usize>>,
 }
 
 impl ArrayDictionary {
@@ -358,9 +341,6 @@ impl ArrayDictionary {
                 bytes: Vec::new(),
                 ranges: Vec::new(),
             },
-            placeholder_counts: Vec::new(),
-            variable_kinds: Vec::new(),
-            variable_kind_ranges: Vec::new(),
         }
     }
 
@@ -379,23 +359,12 @@ impl ArrayDictionary {
     /// Returns an entry by its implicit zero-based wire ID.
     #[must_use]
     pub fn entry(&self, id: u64) -> Option<LogTypeDictionaryEntry<'_>> {
-        logtype_entry(
-            &self.storage,
-            &self.placeholder_counts,
-            &self.variable_kinds,
-            &self.variable_kind_ranges,
-            id,
-        )
+        logtype_entry(&self.storage, id)
     }
 
     /// Iterates entries in implicit wire-ID order.
     pub fn entries(&self) -> impl Iterator<Item = LogTypeDictionaryEntry<'_>> {
-        logtype_entries(
-            &self.storage,
-            &self.placeholder_counts,
-            &self.variable_kinds,
-            &self.variable_kind_ranges,
-        )
+        logtype_entries(&self.storage)
     }
 }
 
@@ -404,8 +373,6 @@ impl ArrayDictionary {
 pub struct LogTypeDictionaryEntry<'a> {
     id: u64,
     escaped_value: &'a [u8],
-    placeholder_counts: LogTypePlaceholderCounts,
-    variable_kinds: &'a [LogTypeVariableKind],
 }
 
 impl<'a> LogTypeDictionaryEntry<'a> {
@@ -421,59 +388,58 @@ impl<'a> LogTypeDictionaryEntry<'a> {
         self.escaped_value
     }
 
-    /// Returns validated placeholder and escape-sequence counts.
+    /// Counts the placeholders and escape sequences, scanning the entry on each call.
+    ///
+    /// A trailing escape marker with nothing after it is counted as an escape sequence; use
+    /// [`Self::variable_kinds_into`] to reject it.
     #[must_use]
-    pub const fn placeholder_counts(self) -> LogTypePlaceholderCounts {
-        self.placeholder_counts
+    pub fn placeholder_counts(self) -> LogTypePlaceholderCounts {
+        let mut counts = LogTypePlaceholderCounts::default();
+        let _ = scan_logtype(self.escaped_value, &mut counts, &mut |_| {});
+        counts
     }
 
-    /// Returns the encoded-variable kinds in their validated logtype order.
-    pub(super) const fn variable_kinds(self) -> &'a [LogTypeVariableKind] {
-        self.variable_kinds
+    /// Appends the encoded-variable kinds in logtype order to `kinds`, after checking that every
+    /// escape marker escapes a byte.
+    pub(super) fn variable_kinds_into(
+        self,
+        kinds: &mut Vec<LogTypeVariableKind>,
+    ) -> Result<(), DictionaryError> {
+        let mut counts = LogTypePlaceholderCounts::default();
+        scan_logtype(self.escaped_value, &mut counts, &mut |kind| {
+            kinds.push(kind);
+        })
+        .map_err(|offset| DictionaryError::DanglingEscape {
+            entry_id: self.id,
+            offset,
+        })
     }
 }
 
-fn logtype_entry<'a>(
-    storage: &'a DictionaryStorage,
-    counts: &[LogTypePlaceholderCounts],
-    variable_kinds: &'a [LogTypeVariableKind],
-    variable_kind_ranges: &[Range<usize>],
-    id: u64,
-) -> Option<LogTypeDictionaryEntry<'a>> {
-    let index = usize::try_from(id).ok()?;
+fn logtype_entry(storage: &DictionaryStorage, id: u64) -> Option<LogTypeDictionaryEntry<'_>> {
     Some(LogTypeDictionaryEntry {
         id,
         escaped_value: storage.value(id)?,
-        placeholder_counts: *counts.get(index)?,
-        variable_kinds: variable_kinds.get(variable_kind_ranges.get(index)?.clone())?,
     })
 }
 
-fn logtype_entries<'a>(
-    storage: &'a DictionaryStorage,
-    counts: &'a [LogTypePlaceholderCounts],
-    variable_kinds: &'a [LogTypeVariableKind],
-    variable_kind_ranges: &'a [Range<usize>],
-) -> impl Iterator<Item = LogTypeDictionaryEntry<'a>> {
+fn logtype_entries(
+    storage: &DictionaryStorage,
+) -> impl Iterator<Item = LogTypeDictionaryEntry<'_>> {
     (0_u64..)
-        .zip(storage.ranges.iter().zip(counts).zip(variable_kind_ranges))
-        .map(
-            |(id, ((range, placeholder_counts), variable_kind_range))| LogTypeDictionaryEntry {
-                id,
-                escaped_value: &storage.bytes[range.clone()],
-                placeholder_counts: *placeholder_counts,
-                variable_kinds: &variable_kinds[variable_kind_range.clone()],
-            },
-        )
+        .zip(storage.ranges.iter())
+        .map(|(id, range)| LogTypeDictionaryEntry {
+            id,
+            escaped_value: &storage.bytes[range.clone()],
+        })
 }
 
 pub(super) fn decode_variable_dictionary<R: Read>(
     section: Take<R>,
     limits: DictionaryLimits,
 ) -> Result<VariableDictionary, DictionaryError> {
-    let decoded = decode_dictionary(section, limits, false)?;
     Ok(VariableDictionary {
-        storage: decoded.storage,
+        storage: decode_dictionary(section, limits)?,
     })
 }
 
@@ -481,12 +447,8 @@ pub(super) fn decode_logtype_dictionary<R: Read>(
     section: Take<R>,
     limits: DictionaryLimits,
 ) -> Result<LogTypeDictionary, DictionaryError> {
-    let decoded = decode_dictionary(section, limits, true)?;
     Ok(LogTypeDictionary {
-        storage: decoded.storage,
-        placeholder_counts: decoded.placeholder_counts,
-        variable_kinds: decoded.variable_kinds,
-        variable_kind_ranges: decoded.variable_kind_ranges,
+        storage: decode_dictionary(section, limits)?,
     })
 }
 
@@ -494,27 +456,15 @@ pub(super) fn decode_array_dictionary<R: Read>(
     section: Take<R>,
     limits: DictionaryLimits,
 ) -> Result<ArrayDictionary, DictionaryError> {
-    let decoded = decode_dictionary(section, limits, true)?;
     Ok(ArrayDictionary {
-        storage: decoded.storage,
-        placeholder_counts: decoded.placeholder_counts,
-        variable_kinds: decoded.variable_kinds,
-        variable_kind_ranges: decoded.variable_kind_ranges,
+        storage: decode_dictionary(section, limits)?,
     })
-}
-
-struct DecodedDictionary {
-    storage: DictionaryStorage,
-    placeholder_counts: Vec<LogTypePlaceholderCounts>,
-    variable_kinds: Vec<LogTypeVariableKind>,
-    variable_kind_ranges: Vec<Range<usize>>,
 }
 
 fn decode_dictionary<R: Read>(
     mut section: Take<R>,
     limits: DictionaryLimits,
-    validate_logtypes: bool,
-) -> Result<DecodedDictionary, DictionaryError> {
+) -> Result<DictionaryStorage, DictionaryError> {
     let compressed_size = section.limit();
     if compressed_size > limits.compressed {
         return Err(DictionaryError::CompressedSectionTooLarge {
@@ -536,14 +486,9 @@ fn decode_dictionary<R: Read>(
         if 0 != remaining {
             return Err(DictionaryError::TrailingCompressedData { remaining });
         }
-        return Ok(DecodedDictionary {
-            storage: DictionaryStorage {
-                bytes: Vec::new(),
-                ranges: Vec::new(),
-            },
-            placeholder_counts: Vec::new(),
-            variable_kinds: Vec::new(),
-            variable_kind_ranges: Vec::new(),
+        return Ok(DictionaryStorage {
+            bytes: Vec::new(),
+            ranges: Vec::new(),
         });
     }
 
@@ -558,26 +503,43 @@ fn decode_dictionary<R: Read>(
     }
 
     let entry_count = usize::try_from(entry_count).map_err(|_| DictionaryError::SizeOverflow)?;
-    let mut dictionary = reserve_dictionary(entry_count, validate_logtypes)?;
+    let mut dictionary = reserve_dictionary(entry_count)?;
 
-    let mut decoder = zstd::stream::read::Decoder::new(section)
-        .map_err(DictionaryError::Io)?
-        .single_frame();
-    let decompressed = decode_frame(&mut decoder, minimum_decompressed_size, limits.decompressed)?;
+    // The section is read whole and checked to hold exactly one frame. A frame that records its
+    // decompressed size, as every dictionary compressed with a pledged size does, is then
+    // decompressed in one call into a buffer of exactly that size; streaming it through a staging
+    // buffer into a growing one copied every byte about three times.
+    let mut compressed = Vec::new();
+    let compressed_len =
+        usize::try_from(section.limit()).map_err(|_| DictionaryError::SizeOverflow)?;
+    compressed
+        .try_reserve_exact(compressed_len)
+        .map_err(|_| DictionaryError::AllocationFailed {
+            requested: compressed_len,
+        })?;
+    section
+        .read_to_end(&mut compressed)
+        .map_err(DictionaryError::Io)?;
+    let frame_len = zstd::zstd_safe::find_frame_compressed_size(&compressed).map_err(|_| {
+        DictionaryError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "dictionary is not one complete zstd frame",
+        ))
+    })?;
+    let remaining_compressed =
+        u64::try_from(compressed.len() - frame_len).map_err(|_| DictionaryError::SizeOverflow)?;
+    let frame = &compressed[..frame_len];
+    let decompressed = match zstd::zstd_safe::get_frame_content_size(frame) {
+        Ok(Some(size)) => decode_sized_frame(frame, size, limits.decompressed)?,
+        _ => {
+            let mut decoder = zstd::stream::read::Decoder::with_buffer(frame)
+                .map_err(DictionaryError::Io)?
+                .single_frame();
+            decode_frame(&mut decoder, minimum_decompressed_size, limits.decompressed)?
+        }
+    };
 
-    let section = decoder.finish();
-    let remaining_compressed = u64::try_from(section.buffer().len())
-        .map_err(|_| DictionaryError::SizeOverflow)?
-        .checked_add(section.get_ref().limit())
-        .ok_or(DictionaryError::SizeOverflow)?;
-
-    decode_entries(
-        decompressed,
-        entry_count,
-        limits,
-        validate_logtypes,
-        &mut dictionary,
-    )?;
+    decode_entries(decompressed, entry_count, limits, &mut dictionary)?;
     if 0 != remaining_compressed {
         return Err(DictionaryError::TrailingCompressedData {
             remaining: remaining_compressed,
@@ -585,6 +547,36 @@ fn decode_dictionary<R: Read>(
     }
 
     Ok(dictionary)
+}
+
+/// Decompresses one frame whose header records its decompressed size, in one call, into a buffer
+/// of exactly that size.
+fn decode_sized_frame(
+    frame: &[u8],
+    size: u64,
+    maximum_size: u64,
+) -> Result<Vec<u8>, DictionaryError> {
+    if size > maximum_size {
+        return Err(DictionaryError::DecompressedSectionTooLarge {
+            actual: size,
+            limit: maximum_size,
+        });
+    }
+    let size = usize::try_from(size).map_err(|_| DictionaryError::SizeOverflow)?;
+    let mut decompressed = Vec::new();
+    decompressed
+        .try_reserve_exact(size)
+        .map_err(|_| DictionaryError::AllocationFailed { requested: size })?;
+    let written = zstd::bulk::Decompressor::new()
+        .and_then(|mut decompressor| decompressor.decompress_to_buffer(frame, &mut decompressed))
+        .map_err(DictionaryError::Io)?;
+    if written != size {
+        return Err(DictionaryError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "dictionary frame decompressed to a size other than its header records",
+        )));
+    }
+    Ok(decompressed)
 }
 
 fn decode_frame<R: Read>(
@@ -649,38 +641,16 @@ fn reserve_decompressed(
         })
 }
 
-fn reserve_dictionary(
-    entry_count: usize,
-    validate_logtypes: bool,
-) -> Result<DecodedDictionary, DictionaryError> {
+fn reserve_dictionary(entry_count: usize) -> Result<DictionaryStorage, DictionaryError> {
     let mut ranges = Vec::new();
     ranges
         .try_reserve_exact(entry_count)
         .map_err(|_| DictionaryError::AllocationFailed {
             requested: entry_count,
         })?;
-    let mut placeholder_counts = Vec::new();
-    let mut variable_kind_ranges = Vec::new();
-    if validate_logtypes {
-        placeholder_counts
-            .try_reserve_exact(entry_count)
-            .map_err(|_| DictionaryError::AllocationFailed {
-                requested: entry_count,
-            })?;
-        variable_kind_ranges
-            .try_reserve_exact(entry_count)
-            .map_err(|_| DictionaryError::AllocationFailed {
-                requested: entry_count,
-            })?;
-    }
-    Ok(DecodedDictionary {
-        storage: DictionaryStorage {
-            bytes: Vec::new(),
-            ranges,
-        },
-        placeholder_counts,
-        variable_kinds: Vec::new(),
-        variable_kind_ranges,
+    Ok(DictionaryStorage {
+        bytes: Vec::new(),
+        ranges,
     })
 }
 
@@ -688,8 +658,7 @@ fn decode_entries(
     decompressed: Vec<u8>,
     entry_count: usize,
     limits: DictionaryLimits,
-    validate_logtypes: bool,
-    decoded: &mut DecodedDictionary,
+    decoded: &mut DictionaryStorage,
 ) -> Result<(), DictionaryError> {
     let mut total_value_bytes = 0_u64;
     let mut offset = 0_usize;
@@ -731,78 +700,59 @@ fn decode_entries(
         let entry_end = entry_start
             .checked_add(entry_size)
             .ok_or(DictionaryError::SizeOverflow)?;
-        let value = decompressed.get(entry_start..entry_end).ok_or_else(|| {
-            DictionaryError::Io(io::Error::new(
+        if entry_end > decompressed.len() {
+            return Err(DictionaryError::Io(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "dictionary entry is truncated",
-            ))
-        })?;
-        decoded.storage.ranges.push(entry_start..entry_end);
-
-        if validate_logtypes {
-            decoded
-                .variable_kinds
-                .try_reserve(entry_size)
-                .map_err(|_| DictionaryError::AllocationFailed {
-                    requested: entry_size,
-                })?;
-            let variable_kind_start = decoded.variable_kinds.len();
-            decoded.placeholder_counts.push(validate_logtype(
-                value,
-                wire_id(entry_id)?,
-                &mut decoded.variable_kinds,
-            )?);
-            decoded
-                .variable_kind_ranges
-                .push(variable_kind_start..decoded.variable_kinds.len());
+            )));
         }
+        decoded.ranges.push(entry_start..entry_end);
         offset = entry_end;
     }
     if offset != decompressed.len() {
         return Err(DictionaryError::TrailingDecompressedData);
     }
-    decoded.storage.bytes = decompressed;
+    decoded.bytes = decompressed;
     Ok(())
 }
 
-fn validate_logtype(
+/// Walks one escaped logtype, counting into `counts` and reporting each encoded variable's kind in
+/// order. Returns the offset of a trailing escape marker that escapes nothing, after counting it as
+/// an escape sequence.
+fn scan_logtype(
     escaped_value: &[u8],
-    entry_id: u64,
-    variable_kinds: &mut Vec<LogTypeVariableKind>,
-) -> Result<LogTypePlaceholderCounts, DictionaryError> {
-    let mut counts = LogTypePlaceholderCounts::default();
+    counts: &mut LogTypePlaceholderCounts,
+    on_variable: &mut dyn FnMut(LogTypeVariableKind),
+) -> Result<(), u64> {
     let mut offset = 0_usize;
     while offset < escaped_value.len() {
         match escaped_value[offset] {
             ESCAPE_MARKER => {
-                if offset + 1 == escaped_value.len() {
-                    return Err(DictionaryError::DanglingEscape {
-                        entry_id,
-                        offset: wire_id(offset)?,
-                    });
-                }
                 counts.escape_sequences += 1;
+                if offset + 1 == escaped_value.len() {
+                    return Err(u64::try_from(offset).unwrap_or(u64::MAX));
+                }
                 offset += 2;
             }
             INTEGER_PLACEHOLDER => {
                 counts.integers += 1;
-                variable_kinds.push(LogTypeVariableKind::Integer);
+                on_variable(LogTypeVariableKind::Integer);
                 offset += 1;
             }
             DICTIONARY_PLACEHOLDER => {
                 counts.dictionaries += 1;
-                variable_kinds.push(LogTypeVariableKind::Dictionary);
+                on_variable(LogTypeVariableKind::Dictionary);
                 offset += 1;
             }
             FLOAT_PLACEHOLDER => {
                 counts.floats += 1;
-                variable_kinds.push(LogTypeVariableKind::Float);
+                on_variable(LogTypeVariableKind::Float);
                 offset += 1;
             }
             _ => offset += 1,
         }
     }
-    Ok(counts)
+    Ok(())
 }
 
 fn wire_id(value: usize) -> Result<u64, DictionaryError> {
@@ -1059,18 +1009,27 @@ mod tests {
         assert_eq!(2, counts.encoded_variables());
         assert_eq!(2, counts.escape_sequences());
         assert_eq!(4, counts.placeholders());
+        let mut kinds = Vec::new();
+        entry
+            .variable_kinds_into(&mut kinds)
+            .expect("escapes are complete");
         assert_eq!(
-            [LogTypeVariableKind::Integer, LogTypeVariableKind::Float],
-            entry.variable_kinds()
+            vec![LogTypeVariableKind::Integer, LogTypeVariableKind::Float],
+            kinds
         );
         assert_eq!(1, dictionary.entries().count());
     }
 
     #[test]
-    fn rejects_a_dangling_logtype_escape() {
+    fn reports_a_dangling_logtype_escape_on_use_not_on_decode() {
+        // Opening an archive does not scan its logtypes; the dangling escape surfaces only when the
+        // entry's variables are asked for.
         let bytes = section(&[b"constant\\"]);
+        let dictionary = decode_logtype_dictionary(take(&bytes), DictionaryLimits::default())
+            .expect("decoding records ranges only");
+        let entry = dictionary.entry(0).expect("entry zero");
         assert!(matches!(
-            decode_logtype_dictionary(take(&bytes), DictionaryLimits::default()),
+            entry.variable_kinds_into(&mut Vec::new()),
             Err(DictionaryError::DanglingEscape {
                 entry_id: 0,
                 offset: 8
