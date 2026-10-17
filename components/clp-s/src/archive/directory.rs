@@ -44,6 +44,7 @@ use super::packed_stream::DecodedPackedStream;
 use super::table_metadata::PackedStreamMetadata;
 use super::packed_stream::PackedStreamError;
 use super::packed_stream::PackedStreamLimits;
+use super::packed_stream::decode_column_frames;
 use super::packed_stream::decode_log_order_prefix;
 use super::packed_stream::decode_packed_stream;
 use super::packed_stream::decode_packed_stream_prefix;
@@ -524,6 +525,16 @@ impl<S: DirectoryArchiveSource> DirectoryArchiveReader<S> {
                     .map_err(|_| PackedStreamError::SizeOverflow)?,
             );
             cursor = end;
+        }
+        if truncate.is_none() {
+            return decode_column_frames(&offsets, &sizes, wanted, limits, |range, buffer| {
+                let length = usize::try_from(range.end - range.start)
+                    .map_err(|_| io::Error::other("compressed column run exceeds memory"))?;
+                buffer.clear();
+                buffer.resize(length, 0);
+                self.reader_for_member_range(DirectoryArchiveMember::PackedStreams, range)?
+                    .read_exact(buffer)
+            });
         }
         let mut columns: Vec<Option<Vec<u8>>> = vec![None; frames.len()];
         let mut read = vec![false; frames.len()];

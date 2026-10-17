@@ -395,6 +395,126 @@ fn decode_frame<R: Read>(
     })
 }
 
+/// Decompresses the wanted column frames of a separate-column stream into one buffer.
+///
+/// `offsets` holds each frame's compressed byte range and `sizes` its decompressed size;
+/// `read_run` fills a buffer with the compressed bytes of a range. Consecutive wanted frames are
+/// read with one call, and each frame decompresses straight into its place in the output through
+/// one reused context, so a stream of many small columns costs a few reads rather than a reader,
+/// a decoder and a copy per column. A column `wanted` excludes is left unloaded.
+pub(super) fn decode_column_frames(
+    offsets: &[(u64, u64)],
+    sizes: &[usize],
+    wanted: Option<&[bool]>,
+    limits: PackedStreamLimits,
+    mut read_run: impl FnMut(Range<u64>, &mut Vec<u8>) -> io::Result<()>,
+) -> Result<DecodedPackedStream, PackedStreamError> {
+    let loaded: Vec<bool> = (0..sizes.len())
+        .map(|index| wanted.is_none_or(|mask| mask.get(index).copied().unwrap_or(true)))
+        .collect();
+    let mut total = 0_usize;
+    let mut layout = Vec::with_capacity(sizes.len());
+    for (&size, &loaded) in sizes.iter().zip(&loaded) {
+        let stored = if loaded { size } else { 0 };
+        total = total
+            .checked_add(stored)
+            .ok_or(PackedStreamError::SizeOverflow)?;
+        layout.push(ColumnSlot {
+            size,
+            stored,
+            loaded,
+        });
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(total)
+        .map_err(|_| PackedStreamError::AllocationFailed { requested: total })?;
+    bytes.resize(total, 0);
+
+    let mut context = zstd::zstd_safe::DCtx::create();
+    let mut compressed = Vec::new();
+    let mut output_start = 0_usize;
+    let mut index = 0;
+    while index < sizes.len() {
+        if !loaded[index] {
+            index += 1;
+            continue;
+        }
+        let mut end = index + 1;
+        while end < sizes.len() && loaded[end] {
+            end += 1;
+        }
+        let run_start = offsets[index].0;
+        read_run(run_start..offsets[end - 1].1, &mut compressed).map_err(PackedStreamError::Io)?;
+        for frame in index..end {
+            let (start, stop) = offsets[frame];
+            let input = usize::try_from(start - run_start)
+                .ok()
+                .zip(usize::try_from(stop - run_start).ok())
+                .and_then(|(start, stop)| compressed.get(start..stop))
+                .ok_or(PackedStreamError::SizeOverflow)?;
+            let output_end = output_start + sizes[frame];
+            decode_frame_into(
+                &mut context,
+                input,
+                &mut bytes[output_start..output_end],
+                limits,
+            )?;
+            output_start = output_end;
+        }
+        index = end;
+    }
+    Ok(DecodedPackedStream {
+        bytes,
+        column_layout: Some(layout),
+    })
+}
+
+/// Decompresses one whole zstd frame into `output`, which must come out exactly full.
+fn decode_frame_into(
+    context: &mut zstd::zstd_safe::DCtx<'_>,
+    compressed: &[u8],
+    output: &mut [u8],
+    limits: PackedStreamLimits,
+) -> Result<(), PackedStreamError> {
+    let compressed_size = usize_to_u64(compressed.len())?;
+    let advertised = usize_to_u64(output.len())?;
+    if validate_frame_sizes(compressed_size, compressed_size, advertised, limits)? {
+        return Ok(());
+    }
+    let zstd_error = |code| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            zstd::zstd_safe::get_error_name(code),
+        )
+    };
+    let frame_size = zstd::zstd_safe::find_frame_compressed_size(compressed).map_err(|code| {
+        PackedStreamError::TruncatedFrame {
+            advertised,
+            actual: 0,
+            source: io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                zstd::zstd_safe::get_error_name(code),
+            ),
+        }
+    })?;
+    if frame_size < compressed.len() {
+        return Err(PackedStreamError::TrailingCompressedData {
+            remaining: usize_to_u64(compressed.len() - frame_size)?,
+        });
+    }
+    let written = context
+        .decompress(output, compressed)
+        .map_err(|code| PackedStreamError::Io(zstd_error(code)))?;
+    if written != output.len() {
+        return Err(PackedStreamError::DecompressedSizeMismatch {
+            advertised,
+            actual: usize_to_u64(written)?,
+        });
+    }
+    Ok(())
+}
+
 impl DecodedPackedStream {
     /// Assembles a stream from per-column pieces: `None` for a column left unloaded.
     ///
