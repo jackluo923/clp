@@ -166,9 +166,12 @@ fn write_cpp_oracle_records(options: WriterOptions) -> Vec<u8> {
 
 #[test]
 fn rust_writer_is_byte_exact_with_cpp_and_reconstructs_every_record() {
+    // C++ compresses dictionaries at the archive's level, without long-distance matching.
     let options = WriterOptions::default()
         .with_log_order(false)
-        .with_uncompressed_size(u64::try_from(SOURCE_JSONL.len()).expect("source size fits u64"));
+        .with_uncompressed_size(u64::try_from(SOURCE_JSONL.len()).expect("source size fits u64"))
+        .with_dictionary_compression_level(3)
+        .with_dictionary_long_distance_matching(false);
     let actual = write_cpp_oracle_records(options);
     let mut reader = SingleFileArchiveReader::open(Cursor::new(actual.clone()))
         .expect("open Rust structured-array SFA");

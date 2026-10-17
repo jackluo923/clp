@@ -505,10 +505,14 @@ fn both_layouts_match_the_deterministic_cpp_archive_and_extract() {
         fs::write(&input_path, INPUT).expect("write parse-many fixture");
 
         // Byte-exactness is validated against the C++ 0.5.0 reference, so opt out of the CLI's
-        // default adaptive numeric encoding (which would produce a 0.6.0 archive).
+        // default adaptive numeric encoding (which would produce a 0.6.0 archive), and compress the
+        // dictionaries the way C++ does: at the archive's level, without long-distance matching.
         let mut arguments = vec![
             "c".as_ref(),
             "--no-adaptive-numeric-columns".as_ref(),
+            "--dictionary-compression-level".as_ref(),
+            "3".as_ref(),
+            "--no-dictionary-long-distance-matching".as_ref(),
             "--disable-log-order".as_ref(),
         ];
         if single_file {
@@ -1543,6 +1547,9 @@ fn structurize_arrays_matches_the_exact_cpp_single_file_archive() {
     let result = clp_s(&[
         "c".as_ref(),
         "--no-adaptive-numeric-columns".as_ref(),
+        "--dictionary-compression-level".as_ref(),
+        "3".as_ref(),
+        "--no-dictionary-long-distance-matching".as_ref(),
         "--single-file-archive".as_ref(),
         "--disable-log-order".as_ref(),
         "--structurize-arrays".as_ref(),

@@ -1848,11 +1848,14 @@ mod tests {
         const CPP_ORACLE: &[u8] =
             include_bytes!("../../tests/fixtures/sfa-v0.5.0-unstructured-arrays-cpp.bin");
         let source_size = u64::try_from(SOURCE.len()).expect("fixture size fits u64");
+        // C++ compresses dictionaries at the archive's level, without long-distance matching.
         let mut archive = OpenArchive::new(
             Cursor::new(Vec::new()),
             WriterOptions::default()
                 .with_log_order(false)
-                .with_uncompressed_size(source_size),
+                .with_uncompressed_size(source_size)
+                .with_dictionary_compression_level(3)
+                .with_dictionary_long_distance_matching(false),
         );
         let mut reader = ParseManyReader::new(SOURCE, ParseManyOptions::default());
         {
@@ -1872,8 +1875,14 @@ mod tests {
         const CPP_ORACLE_HEX: &[u8] =
             include_bytes!("../../tests/fixtures/sfa-v0.5.0-structured-arrays-cpp.hex");
 
-        let options =
-            ArchiveSetOptions::new(WriterOptions::default().with_log_order(false), u64::MAX);
+        // C++ compresses dictionaries at the archive's level, without long-distance matching.
+        let options = ArchiveSetOptions::new(
+            WriterOptions::default()
+                .with_log_order(false)
+                .with_dictionary_compression_level(3)
+                .with_dictionary_long_distance_matching(false),
+            u64::MAX,
+        );
         let mut archive_set =
             ArchiveSetWriter::new(CapturedSfas::default(), CapturedStats::default(), options);
         let mut reader = NdjsonReader::new(SOURCE, NdjsonOptions::default());
@@ -1983,7 +1992,13 @@ mod tests {
             "components/clp-s/tests/fixtures/sfa-v0.5.0-log-order-cpp-input.jsonl";
         const CREATOR: &str = "a2217fe8-aef3-4efe-93dc-625977a1d35a";
 
-        let options = ArchiveSetOptions::new(WriterOptions::default(), u64::MAX);
+        // C++ compresses dictionaries at the archive's level, without long-distance matching.
+        let options = ArchiveSetOptions::new(
+            WriterOptions::default()
+                .with_dictionary_compression_level(3)
+                .with_dictionary_long_distance_matching(false),
+            u64::MAX,
+        );
         let mut archive_set =
             ArchiveSetWriter::new(CapturedSfas::default(), CapturedStats::default(), options);
         let mut reader = ParseManyReader::new(SOURCE, ParseManyOptions::default());

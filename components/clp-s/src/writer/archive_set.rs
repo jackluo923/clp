@@ -1717,10 +1717,17 @@ mod tests {
         const FILENAME: &str =
             "components/clp-s/tests/fixtures/sfa-v0.5.0-log-order-cpp-input.jsonl";
         const CREATOR: &str = "a2217fe8-aef3-4efe-93dc-625977a1d35a";
+        // C++ compresses dictionaries at the archive's level, without long-distance matching.
         let mut writer = ArchiveSetWriter::new(
             MemorySink::default(),
             StatsCollector::default(),
-            options(u64::MAX, true),
+            ArchiveSetOptions::new(
+                WriterOptions::default()
+                    .with_log_order(true)
+                    .with_dictionary_compression_level(3)
+                    .with_dictionary_long_distance_matching(false),
+                u64::MAX,
+            ),
         );
         writer
             .begin_source(ArchiveSourceContext::new(FILENAME, CREATOR))

@@ -63,6 +63,10 @@ const OLDER_FIXED_DICTIONARY_HINT_LIMIT: usize = 2;
 const LINEAR_DUPLICATE_FIELD_LIMIT: usize = 16;
 const COMMON_OBJECT_NESTING_CAPACITY: usize = 4;
 const COMMON_RECORD_FIELD_CAPACITY: usize = 16;
+/// Bytes of the length that precedes each dictionary value on the wire.
+const DICTIONARY_ENTRY_LENGTH_SIZE: u64 = 8;
+/// The 128 MiB window zstd's own `--long` uses. Pledging the source size caps it at the dictionary.
+const DICTIONARY_LONG_DISTANCE_WINDOW_LOG: u32 = 27;
 const COMMON_DICTIONARY_PLAN_ENTRY_CAPACITY: usize = 4;
 const COMMON_DICTIONARY_PLAN_VALUE_CAPACITY: usize = 128;
 const DICTIONARY_ENCODE_BUFFER_CAPACITY: usize = 128 * 1024;
@@ -843,11 +847,9 @@ impl PrimitiveArchive {
             schema_tree,
             schema_map,
             table_metadata,
-            self.variable_dictionary
-                .encode(options.compression_level())?,
-            self.log_type_dictionary
-                .encode(options.compression_level())?,
-            self.array_dictionary.encode(options.compression_level())?,
+            self.variable_dictionary.encode(options)?,
+            self.log_type_dictionary.encode(options)?,
+            self.array_dictionary.encode(options)?,
             tables,
         ];
         check_section_limits(&sections, options.limits())?;
@@ -1077,7 +1079,7 @@ impl DictionaryBuilder {
         debug_assert_eq!(reservations.resulting_entry_count, self.entry_count());
     }
 
-    fn encode(&self, compression_level: i32) -> Result<Vec<u8>, WriterError> {
+    fn encode(&self, options: WriterOptions) -> Result<Vec<u8>, WriterError> {
         if 0 == self.entry_count() {
             return encode_empty_dictionary();
         }
@@ -1094,8 +1096,30 @@ impl DictionaryBuilder {
             .map_err(|_| WriterError::AllocationFailed {
                 requested: DICTIONARY_ENCODE_BUFFER_CAPACITY,
             })?;
-        let mut encoder = zstd::stream::write::Encoder::new(&mut section, compression_level)
-            .map_err(WriterError::Io)?;
+        let mut encoder =
+            zstd::stream::write::Encoder::new(&mut section, options.dictionary_compression_level())
+                .map_err(WriterError::Io)?;
+        if options.dictionary_long_distance_matching() {
+            // The pledged size lets zstd shrink the window to the dictionary, so a small archive
+            // does not pay for a 128 MiB one. It is the exact count of bytes written below: one
+            // eight-byte length per entry plus every value.
+            let pledged = usize_u64(self.values.len())?
+                .checked_add(
+                    usize_u64(self.entry_count())?
+                        .checked_mul(DICTIONARY_ENTRY_LENGTH_SIZE)
+                        .ok_or(WriterError::SizeOverflow)?,
+                )
+                .ok_or(WriterError::SizeOverflow)?;
+            encoder
+                .set_pledged_src_size(Some(pledged))
+                .map_err(WriterError::Io)?;
+            encoder
+                .long_distance_matching(true)
+                .map_err(WriterError::Io)?;
+            encoder
+                .window_log(DICTIONARY_LONG_DISTANCE_WINDOW_LOG)
+                .map_err(WriterError::Io)?;
+        }
         for index in 0..self.entry_count() {
             let entry = dictionary_entry(&self.values, &self.entry_ends, index)
                 .expect("stored dictionary offset must address an arena entry");
@@ -4978,7 +5002,9 @@ mod tests {
             dictionary.entry_ends
         );
 
-        let encoded = dictionary.encode(1).expect("encode packed dictionary");
+        let encoded = dictionary
+            .encode(WriterOptions::new(1))
+            .expect("encode packed dictionary");
         assert_eq!(
             5,
             u64::from_le_bytes(
@@ -4999,12 +5025,31 @@ mod tests {
         }
         assert_eq!(expected, decoded);
 
+        // A separate level with long-distance matching changes only how the frame is compressed:
+        // the pledged size must match the bytes written, and the frame decodes to the same entries.
+        let long_distance = dictionary
+            .encode(
+                WriterOptions::new(1)
+                    .with_dictionary_compression_level(9)
+                    .with_dictionary_long_distance_matching(true),
+            )
+            .expect("encode dictionary with long-distance matching");
+        assert_eq!(
+            encoded[..size_of::<u64>()],
+            long_distance[..size_of::<u64>()]
+        );
+        assert_eq!(
+            expected,
+            zstd::stream::decode_all(&long_distance[size_of::<u64>()..])
+                .expect("decode long-distance dictionary frame")
+        );
+
         let mut independently_hashed = DictionaryBuilder::default();
         append_dictionary_values(&mut independently_hashed, &values);
         assert_eq!(
             encoded,
             independently_hashed
-                .encode(1)
+                .encode(WriterOptions::new(1))
                 .expect("encode independently hashed dictionary")
         );
     }

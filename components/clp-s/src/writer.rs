@@ -450,6 +450,13 @@ impl Default for WriterLimits {
     }
 }
 
+/// How the variable, log-type and array dictionaries are compressed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DictionaryCompression {
+    level: i32,
+    long_distance_matching: bool,
+}
+
 /// Configuration for one archive finalization.
 ///
 /// Archive-global record-order columns are recorded by default, matching the C++ CLI. They may be
@@ -457,6 +464,7 @@ impl Default for WriterLimits {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WriterOptions {
     compression_level: i32,
+    dictionary_compression: DictionaryCompression,
     limits: WriterLimits,
     minimum_packed_stream_size: u64,
     uncompressed_size: u64,
@@ -468,12 +476,21 @@ pub struct WriterOptions {
 
 impl WriterOptions {
     const DEFAULT_MINIMUM_PACKED_STREAM_SIZE: u64 = 1024 * 1024;
+    const DEFAULT_DICTIONARY_COMPRESSION_LEVEL: i32 = 9;
 
     /// Creates options using the requested zstd compression level and default limits.
+    ///
+    /// The level applies to every frame except the variable, log-type and array dictionaries,
+    /// which default to level 9 with long-distance matching (see
+    /// [`with_dictionary_compression_level`](Self::with_dictionary_compression_level)).
     #[must_use]
     pub const fn new(compression_level: i32) -> Self {
         Self {
             compression_level,
+            dictionary_compression: DictionaryCompression {
+                level: Self::DEFAULT_DICTIONARY_COMPRESSION_LEVEL,
+                long_distance_matching: true,
+            },
             limits: WriterLimits::DEFAULT,
             minimum_packed_stream_size: Self::DEFAULT_MINIMUM_PACKED_STREAM_SIZE,
             uncompressed_size: 0,
@@ -579,10 +596,48 @@ impl WriterOptions {
         self
     }
 
-    /// Zstd compression level used for every frame.
+    /// Replaces the zstd compression level of the variable, log-type and array dictionaries.
+    ///
+    /// Those dictionaries are usually most of an archive's bytes, and each is decompressed whole
+    /// when an archive is opened, so a higher level shrinks the archive at a cost paid only at
+    /// write time. Defaults to 9. Every other frame keeps
+    /// [`compression_level`](Self::compression_level).
+    #[must_use]
+    pub const fn with_dictionary_compression_level(mut self, level: i32) -> Self {
+        self.dictionary_compression.level = level;
+        self
+    }
+
+    /// Enables or disables zstd long-distance matching for the variable, log-type and array
+    /// dictionaries. Enabled by default.
+    ///
+    /// It finds repeats too far apart for the level's own window, such as text shared by
+    /// transcripts that are compressed into one archive. The frame stays standard zstd: the window
+    /// is at most 128 MiB and never larger than the dictionary, within every zstd decoder's
+    /// default limit, so no reader change is needed.
+    #[must_use]
+    pub const fn with_dictionary_long_distance_matching(mut self, enabled: bool) -> Self {
+        self.dictionary_compression.long_distance_matching = enabled;
+        self
+    }
+
+    /// Zstd compression level used for every frame except the variable, log-type and array
+    /// dictionaries.
     #[must_use]
     pub const fn compression_level(self) -> i32 {
         self.compression_level
+    }
+
+    /// Zstd compression level used for the variable, log-type and array dictionaries.
+    #[must_use]
+    pub const fn dictionary_compression_level(self) -> i32 {
+        self.dictionary_compression.level
+    }
+
+    /// Whether the variable, log-type and array dictionaries use zstd long-distance matching.
+    #[must_use]
+    pub const fn dictionary_long_distance_matching(self) -> bool {
+        self.dictionary_compression.long_distance_matching
     }
 
     /// Resource limits applied during finalization.
@@ -1899,7 +1954,13 @@ mod tests {
     #[test]
     fn string_writer_is_byte_identical_to_the_pinned_cpp_oracle() {
         const CPP_ORACLE: &[u8] = include_bytes!("../tests/fixtures/sfa-v0.5.0-strings-cpp.bin");
-        let rust = string_archive(WriterOptions::default().with_uncompressed_size(205));
+        // C++ compresses dictionaries at the archive's level, without long-distance matching.
+        let rust = string_archive(
+            WriterOptions::default()
+                .with_uncompressed_size(205)
+                .with_dictionary_compression_level(3)
+                .with_dictionary_long_distance_matching(false),
+        );
         assert_eq!(CPP_ORACLE, rust);
     }
 
@@ -1917,8 +1978,12 @@ mod tests {
             include_bytes!("../tests/fixtures/sfa-v0.5.0-unstructured-arrays-cpp.bin");
         let source_size =
             u64::try_from(UNSTRUCTURED_ARRAY_SOURCE.len()).expect("source size fits u64");
+        // C++ compresses dictionaries at the archive's level, without long-distance matching.
         let rust = unstructured_array_archive(
-            WriterOptions::default().with_uncompressed_size(source_size),
+            WriterOptions::default()
+                .with_uncompressed_size(source_size)
+                .with_dictionary_compression_level(3)
+                .with_dictionary_long_distance_matching(false),
         );
         assert_eq!(CPP_ORACLE, rust);
     }
@@ -2257,7 +2322,13 @@ mod tests {
     fn log_order_writer_matches_every_canonical_cpp_section() {
         const CPP_ORACLE: &[u8] = include_bytes!("../tests/fixtures/sfa-v0.5.0-log-order-cpp.bin");
         let source_size = u64::try_from(LOG_ORDER_SOURCE.len()).expect("source size fits u64");
-        let rust = log_order_archive(WriterOptions::default().with_uncompressed_size(source_size));
+        // C++ compresses dictionaries at the archive's level, without long-distance matching.
+        let rust = log_order_archive(
+            WriterOptions::default()
+                .with_uncompressed_size(source_size)
+                .with_dictionary_compression_level(3)
+                .with_dictionary_long_distance_matching(false),
+        );
         assert_ne!(CPP_ORACLE, rust.as_slice());
         let cpp_sections = canonical_section_bytes(CPP_ORACLE);
         let rust_sections = canonical_section_bytes(&rust);
@@ -2623,8 +2694,13 @@ mod tests {
         const CPP_ORACLE: &[u8] =
             include_bytes!("../tests/fixtures/sfa-v0.5.0-retained-floats-cpp.bin");
         let source_size = u64::try_from(RETAINED_FLOAT_SOURCE.len()).expect("source size fits u64");
-        let rust =
-            retained_float_archive(WriterOptions::default().with_uncompressed_size(source_size));
+        // C++ compresses dictionaries at the archive's level, without long-distance matching.
+        let rust = retained_float_archive(
+            WriterOptions::default()
+                .with_uncompressed_size(source_size)
+                .with_dictionary_compression_level(3)
+                .with_dictionary_long_distance_matching(false),
+        );
         assert_eq!(CPP_ORACLE, rust);
     }
 

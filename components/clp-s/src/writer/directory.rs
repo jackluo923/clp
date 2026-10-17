@@ -572,10 +572,14 @@ mod tests {
         include_bytes!("../../tests/fixtures/sfa-v0.5.0-unstructured-arrays-cpp-dir/0"),
     ];
 
+    /// Options matching the C++ writer that made the oracle, which compresses dictionaries at the
+    /// archive's level without long-distance matching.
     fn options() -> WriterOptions {
         WriterOptions::default()
             .with_log_order(false)
             .with_uncompressed_size(u64::try_from(SOURCE.len()).expect("source size fits u64"))
+            .with_dictionary_compression_level(3)
+            .with_dictionary_long_distance_matching(false)
     }
 
     fn append_corpus(archive: &mut OpenDirectoryArchive) {

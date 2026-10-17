@@ -154,9 +154,18 @@ struct CompressArgs {
     /// Local files or directories to ingest, in command-line order.
     #[arg(required_unless_present = "files_from")]
     input_paths: Vec<PathBuf>,
-    /// Zstd compression level.
+    /// Zstd compression level for everything except the dictionaries.
     #[arg(long, default_value_t = 3, allow_hyphen_values = true)]
     compression_level: i32,
+    /// Zstd compression level for the variable, log-type and array dictionaries, which are usually
+    /// most of an archive's bytes and are decompressed once per archive opened.
+    #[arg(long, default_value_t = 9, allow_hyphen_values = true)]
+    dictionary_compression_level: i32,
+    /// Disable zstd long-distance matching for the dictionaries (enabled by default). It finds
+    /// repeats too far apart for the level's own window, at the cost of up to 128 MiB of extra
+    /// memory while an archive is finalized. The output is standard zstd either way.
+    #[arg(long, default_value_t = false)]
+    no_dictionary_long_distance_matching: bool,
     /// Rotate after the dictionaries and encoded messages reach this many bytes.
     #[arg(long, default_value_t = 8_u64 * 1024 * 1024 * 1024)]
     target_encoded_size: u64,
@@ -481,6 +490,8 @@ fn run_compress(arguments: &CompressArgs) -> CliResult<()> {
     );
     let stats = CompressionArchiveStats::new(arguments.output.print_archive_stats, published_ids);
     let writer_options = WriterOptions::new(arguments.compression_level)
+        .with_dictionary_compression_level(arguments.dictionary_compression_level)
+        .with_dictionary_long_distance_matching(!arguments.no_dictionary_long_distance_matching)
         .with_limits(WriterLimits::new(u64::MAX, u64::MAX, u64::MAX, u64::MAX))
         .with_minimum_packed_stream_size(arguments.min_table_size)
         .with_separate_columns_min_size(arguments.separate_columns_min_size)
