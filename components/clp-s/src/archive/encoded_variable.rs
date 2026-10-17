@@ -112,15 +112,10 @@ pub fn append_clp_message_bounded<V: EncodedVariableSource + ?Sized>(
     output: &mut Vec<u8>,
     max_appended_bytes: usize,
 ) -> Result<(), EncodedVariableError> {
-    let expected = logtype.placeholder_counts().encoded_variables();
-    let expected_usize =
-        usize::try_from(expected).map_err(|_| EncodedVariableError::OutputSizeOverflow)?;
-    let actual = encoded_variables.len();
-    if expected_usize != actual {
-        return Err(EncodedVariableError::VariableCountMismatch { expected, actual });
-    }
-
-    let appended_size = analyze_message(logtype, variable_dictionary, encoded_variables)?;
+    // Sizing first keeps the output untouched, capacity included, when the message is refused.
+    // Both walks hand over literal text a run at a time, so the second costs little.
+    let appended_size = analyze_message(logtype, variable_dictionary, encoded_variables)
+        .map_err(|error| count_mismatch(error, logtype, encoded_variables))?;
     if appended_size > max_appended_bytes {
         return Err(EncodedVariableError::OutputLimitExceeded {
             required: appended_size,
@@ -145,6 +140,22 @@ pub fn append_clp_message_bounded<V: EncodedVariableSource + ?Sized>(
     result
 }
 
+/// Reports a wrong number of variables as the count mismatch it is, ahead of whatever the walk
+/// tripped over first, such as a missing variable or a surplus one read as a float. The logtype
+/// is counted only on this error path.
+fn count_mismatch<V: EncodedVariableSource + ?Sized>(
+    error: EncodedVariableError,
+    logtype: LogTypeDictionaryEntry<'_>,
+    encoded_variables: &V,
+) -> EncodedVariableError {
+    let expected = logtype.placeholder_counts().encoded_variables();
+    let actual = encoded_variables.len();
+    if u64::try_from(actual).is_ok_and(|actual| actual != expected) {
+        return EncodedVariableError::VariableCountMismatch { expected, actual };
+    }
+    error
+}
+
 fn analyze_message<V: EncodedVariableSource + ?Sized>(
     logtype: LogTypeDictionaryEntry<'_>,
     variable_dictionary: &VariableDictionary,
@@ -153,7 +164,7 @@ fn analyze_message<V: EncodedVariableSource + ?Sized>(
     let mut output_size = 0_usize;
     walk_logtype(logtype, encoded_variables, |token| {
         let token_size = match token {
-            LogTypeToken::Literal(_) => 1,
+            LogTypeToken::Literal(run) => run.len(),
             LogTypeToken::Integer { value, .. } => i64_string_len(value),
             LogTypeToken::Dictionary { index, encoded } => variable_dictionary
                 .entry(bit_cast_dictionary_id(encoded))
@@ -183,7 +194,7 @@ fn append_validated_message<V: EncodedVariableSource + ?Sized>(
 ) -> Result<(), EncodedVariableError> {
     walk_logtype(logtype, encoded_variables, |token| {
         match token {
-            LogTypeToken::Literal(byte) => output.push(byte),
+            LogTypeToken::Literal(run) => output.extend_from_slice(run),
             LogTypeToken::Integer { value, .. } => append_i64(value, output),
             LogTypeToken::Dictionary { index, encoded } => {
                 let entry = variable_dictionary
@@ -206,11 +217,21 @@ fn append_validated_message<V: EncodedVariableSource + ?Sized>(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LogTypeToken {
-    Literal(u8),
-    Integer { index: usize, value: i64 },
-    Dictionary { index: usize, encoded: i64 },
-    Float { index: usize, encoded: i64 },
+enum LogTypeToken<'a> {
+    /// A run of literal bytes, copied as a whole.
+    Literal(&'a [u8]),
+    Integer {
+        index: usize,
+        value: i64,
+    },
+    Dictionary {
+        index: usize,
+        encoded: i64,
+    },
+    Float {
+        index: usize,
+        encoded: i64,
+    },
 }
 
 fn walk_logtype<V, F>(
@@ -220,19 +241,26 @@ fn walk_logtype<V, F>(
 ) -> Result<(), EncodedVariableError>
 where
     V: EncodedVariableSource + ?Sized,
-    F: FnMut(LogTypeToken) -> Result<(), EncodedVariableError>, {
+    F: FnMut(LogTypeToken<'_>) -> Result<(), EncodedVariableError>, {
     let bytes = logtype.escaped_value();
     let mut byte_offset = 0_usize;
     let mut variable_index = 0_usize;
     while byte_offset < bytes.len() {
+        // Everything up to the next marker is literal text, handed over in one piece.
+        let run_end =
+            crate::byte_scan::next_logtype_marker(bytes, byte_offset).unwrap_or(bytes.len());
+        if run_end > byte_offset {
+            visit(LogTypeToken::Literal(&bytes[byte_offset..run_end]))?;
+            byte_offset = run_end;
+            continue;
+        }
         match bytes[byte_offset] {
             ESCAPE_MARKER => {
                 let literal_offset = byte_offset
                     .checked_add(1)
                     .ok_or(EncodedVariableError::OutputSizeOverflow)?;
                 let literal = bytes
-                    .get(literal_offset)
-                    .copied()
+                    .get(literal_offset..=literal_offset)
                     .ok_or(EncodedVariableError::InvalidLogTypeEscape { byte_offset })?;
                 visit(LogTypeToken::Literal(literal))?;
                 byte_offset = literal_offset
@@ -268,12 +296,7 @@ where
                     .checked_add(1)
                     .ok_or(EncodedVariableError::OutputSizeOverflow)?;
             }
-            literal => {
-                visit(LogTypeToken::Literal(literal))?;
-                byte_offset = byte_offset
-                    .checked_add(1)
-                    .ok_or(EncodedVariableError::OutputSizeOverflow)?;
-            }
+            _ => unreachable!("a literal run ends only at a marker"),
         }
     }
     if variable_index != encoded_variables.len() {

@@ -8,6 +8,7 @@
 mod adaptive_float;
 mod adaptive_int;
 pub mod archive;
+mod byte_scan;
 mod extract;
 mod extraction_plan;
 pub mod ingest;

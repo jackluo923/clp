@@ -6,14 +6,18 @@
 //! arbitrary bytes; its output is valid JSON only when the input bytes are valid UTF-8.
 //!
 //! Prefer the `&str` APIs, or [`JsonBytePolicy::StrictUtf8`], when emitting standards-compliant
-//! JSON. All append operations validate and reserve before modifying the destination, preserve
-//! its contents on every error, reserve only the exact appended size, and copy safe byte runs in
-//! bulk. The write pass performs no temporary allocation.
+//! JSON. All append operations check their limits before modifying the destination, preserve its
+//! contents on every error, and copy safe byte runs in bulk. A fragment that fits its output limit
+//! even at the worst-case expansion is written in one pass, reserving its unescaped size and
+//! growing only if it needs escaping; any other is measured first and reserved exactly. The write
+//! pass performs no temporary allocation.
 
 use std::error::Error;
 use std::fmt;
 use std::fmt::Display;
 use std::fmt::Formatter;
+
+use crate::byte_scan::next_json_escape as next_escape;
 
 const MEBIBYTE: usize = 1024 * 1024;
 
@@ -235,6 +239,14 @@ fn append_str(
     framing: JsonFraming,
     limits: JsonEscapeLimits,
 ) -> Result<(), JsonEscapeError> {
+    check_input_size(source.len(), limits)?;
+    if fits_unsized(source.len(), framing, limits) {
+        reserve_string(destination, source.len() + framing.byte_len())?;
+        framing.append_prefix_to_string(destination);
+        append_escaped_str_validated(source, destination);
+        framing.append_suffix_to_string(destination);
+        return Ok(());
+    }
     let analysis = analyze(source.as_bytes(), framing, limits)?;
     reserve_string(destination, analysis.appended_size)?;
 
@@ -262,6 +274,13 @@ fn append_bytes(
             error_len: error.error_len(),
         })?;
     }
+    if fits_unsized(source.len(), framing, limits) {
+        reserve_bytes(destination, source.len() + framing.byte_len())?;
+        framing.append_prefix_to_bytes(destination);
+        append_escaped_bytes_validated(source, destination);
+        framing.append_suffix_to_bytes(destination);
+        return Ok(());
+    }
     let analysis = analyze_checked_input(source, framing, limits)?;
     reserve_bytes(destination, analysis.appended_size)?;
 
@@ -274,6 +293,21 @@ fn append_bytes(
     framing.append_suffix_to_bytes(destination);
     Ok(())
 }
+
+/// Whether the escaped fragment fits the output limit however many bytes need escaping.
+///
+/// An escape writes at most six bytes for one, so when six times the input fits, the fragment can
+/// be written in one pass without first measuring it. Otherwise it is measured first, so that one
+/// over the limit is refused before anything is written.
+fn fits_unsized(source_len: usize, framing: JsonFraming, limits: JsonEscapeLimits) -> bool {
+    source_len
+        .checked_mul(MAX_ESCAPE_EXPANSION)
+        .and_then(|size| size.checked_add(framing.byte_len()))
+        .is_some_and(|size| size <= limits.output_bytes)
+}
+
+/// The most bytes one source byte can become: a control byte's `\u00XX`.
+const MAX_ESCAPE_EXPANSION: usize = 6;
 
 fn analyze(
     source: &[u8],
@@ -356,14 +390,12 @@ fn reserve_bytes(destination: &mut Vec<u8>, appended_size: usize) -> Result<(), 
 }
 
 fn append_escaped_str_validated(source: &str, destination: &mut String) {
+    // Every escaped byte is ASCII, so each run boundary is a character boundary.
     let bytes = source.as_bytes();
     let mut run_start = 0;
-    for (index, &byte) in bytes.iter().enumerate() {
-        let Some(sequence) = escape_sequence(byte) else {
-            continue;
-        };
+    while let Some(index) = next_escape(bytes, run_start) {
         destination.push_str(&source[run_start..index]);
-        destination.push_str(sequence);
+        destination.push_str(escape_sequence(bytes[index]).expect("table marks an escape"));
         run_start = index + 1;
     }
     destination.push_str(&source[run_start..]);
@@ -371,12 +403,13 @@ fn append_escaped_str_validated(source: &str, destination: &mut String) {
 
 fn append_escaped_bytes_validated(source: &[u8], destination: &mut Vec<u8>) {
     let mut run_start = 0;
-    for (index, &byte) in source.iter().enumerate() {
-        let Some(sequence) = escape_sequence(byte) else {
-            continue;
-        };
+    while let Some(index) = next_escape(source, run_start) {
         destination.extend_from_slice(&source[run_start..index]);
-        destination.extend_from_slice(sequence.as_bytes());
+        destination.extend_from_slice(
+            escape_sequence(source[index])
+                .expect("table marks an escape")
+                .as_bytes(),
+        );
         run_start = index + 1;
     }
     destination.extend_from_slice(&source[run_start..]);
