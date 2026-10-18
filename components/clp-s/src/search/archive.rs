@@ -1035,8 +1035,9 @@ fn add_path_nodes(
 ///
 /// The path resolves as the query compiler resolves it: a node with an empty key, such as a
 /// structured array's element, consumes no component. That covers the nodes at the path's end,
-/// every node beneath an object or structured array it ends on, and an unstructured array it
-/// reaches, whose elements are matched inside the array's text. The result is sorted.
+/// an element one component short of it, every node beneath an object or structured array it
+/// ends on, and an unstructured array it reaches, whose elements are matched inside the array's
+/// text. The result is sorted.
 #[must_use]
 pub fn resolve_filter_path(tree: &crate::archive::SchemaTree, components: &[&str]) -> Vec<u32> {
     use crate::archive::NodeType;
@@ -1075,6 +1076,13 @@ pub fn resolve_filter_path(tree: &crate::archive::SchemaTree, components: &[&str
             continue;
         }
         let next = if key.is_empty() {
+            // The compiler also resolves an element one component short of the path's end, so
+            // `a.b` reaches a scalar element of `a`.
+            if component + 1 == components.len()
+                && let Ok(id) = u32::try_from(node_id)
+            {
+                wanted.insert(id);
+            }
             component
         } else if matches_component {
             component + 1

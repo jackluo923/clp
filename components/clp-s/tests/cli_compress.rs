@@ -1747,6 +1747,46 @@ fn searches_through_structured_arrays_read_only_what_they_need_and_answer_exactl
 }
 
 #[test]
+fn searches_read_the_scalar_elements_a_path_through_an_array_resolves_to() {
+    // The query compiler resolves `content.text` to the object element's `text` and to the bare
+    // message beside it, so a search must load both columns and their logtypes.
+    let temporary = TestDirectory::new("array-scalar-elements");
+    let input_path = temporary.path().join("input.jsonl");
+    fs::write(
+        &input_path,
+        "{\"content\":[{\"text\":\"took 7 ms\"},\"note x\"]}\n\
+         {\"content\":[{\"text\":\"took 8 ms\"},\"note y\"]}\n",
+    )
+    .expect("write array fixture");
+    for layout in [&[][..], &["--single-file-archive"][..]] {
+        let archives_path = temporary.path().join(format!("archives{}", layout.len()));
+        let mut arguments: Vec<&OsStr> = vec!["c".as_ref()];
+        arguments.extend(layout.iter().map(|argument| OsStr::new(*argument)));
+        arguments.extend([archives_path.as_os_str(), input_path.as_os_str()]);
+        let result = clp_s(&arguments);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let archive = only_entry(&archives_path);
+        for query in ["content.text:\"took 7*\"", "content.text:\"took 7 ms\""] {
+            let result = clp_s(&["s".as_ref(), archive.as_os_str(), query.as_ref()]);
+            assert!(
+                result.status.success(),
+                "{query}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(
+                "{\"content\":[{\"text\":\"took 7 ms\"},\"note x\"]}\n",
+                String::from_utf8_lossy(&result.stdout),
+                "{query}"
+            );
+        }
+    }
+}
+
+#[test]
 fn adaptive_string_columns_read_back_exactly_and_answer_searches_the_same() {
     // Tables holding a number are stored one frame per column, so their string and CLP-string
     // columns are encoded adaptively: a few repeated strings (dictionary IDs that suit the
