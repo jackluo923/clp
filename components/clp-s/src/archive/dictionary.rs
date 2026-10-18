@@ -176,9 +176,16 @@ impl DictionaryStorage {
 ///
 /// Values are retained as arbitrary bytes in one contiguous allocation to avoid one allocation
 /// per dictionary entry.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct VariableDictionary {
     storage: DictionaryStorage,
+    /// Bytes the dictionary frame decoded to. An entry stored as a binary UUID has a range of 36
+    /// bytes at or past this, which addresses its text in `rendered` rather than `storage`.
+    frame_len: usize,
+    /// The 16 bytes of each binary-UUID entry, in ID order.
+    uuids: Vec<u8>,
+    /// The text of every binary-UUID entry, built the first time one is read.
+    rendered: std::sync::OnceLock<Vec<u8>>,
 }
 
 impl VariableDictionary {
@@ -193,6 +200,9 @@ impl VariableDictionary {
                 bytes: StorageBytes::Owned(Vec::new()),
                 ranges: Vec::new(),
             },
+            frame_len: 0,
+            uuids: Vec::new(),
+            rendered: std::sync::OnceLock::new(),
         }
     }
 
@@ -211,9 +221,11 @@ impl VariableDictionary {
     /// Returns an entry by its implicit unsigned 64-bit wire ID.
     #[must_use]
     pub fn entry(&self, id: u64) -> Option<VariableDictionaryEntry<'_>> {
-        self.storage
-            .value(id)
-            .map(|value| VariableDictionaryEntry { id, value })
+        let range = self.storage.ranges.get(usize::try_from(id).ok()?)?;
+        Some(VariableDictionaryEntry {
+            id,
+            value: self.value_in(range),
+        })
     }
 
     /// Iterates entries in implicit wire-ID order.
@@ -222,10 +234,57 @@ impl VariableDictionary {
             .zip(&self.storage.ranges)
             .map(|(id, range)| VariableDictionaryEntry {
                 id,
-                value: &self.storage.bytes.as_slice()[range.clone()],
+                value: self.value_in(range),
             })
     }
+
+    /// The 16 bytes of an entry stored as a binary UUID, or `None` for any other entry. Reading
+    /// them needs no text, so a search can compare a UUID literal without rendering the UUIDs.
+    #[must_use]
+    pub fn binary_uuid(&self, id: u64) -> Option<&[u8]> {
+        let range = self.storage.ranges.get(usize::try_from(id).ok()?)?;
+        let index = self.uuid_index(range)?;
+        self.uuids.get(index * 16..index * 16 + 16)
+    }
+
+    /// Whether some entries are stored as binary UUIDs.
+    #[must_use]
+    pub const fn has_binary_uuids(&self) -> bool {
+        !self.uuids.is_empty()
+    }
+
+    fn uuid_index(&self, range: &Range<usize>) -> Option<usize> {
+        (!self.uuids.is_empty() && 36 == range.len() && range.start >= self.frame_len)
+            .then(|| (range.start - self.frame_len) / 36)
+    }
+
+    fn value_in(&self, range: &Range<usize>) -> &[u8] {
+        if self.uuid_index(range).is_none() {
+            return &self.storage.bytes.as_slice()[range.clone()];
+        }
+        let rendered = self.rendered.get_or_init(|| {
+            let mut rendered = Vec::with_capacity(self.uuids.len() / 16 * 36);
+            for uuid in self.uuids.as_chunks::<16>().0 {
+                render_uuid(uuid, &mut rendered);
+            }
+            rendered
+        });
+        &rendered[range.start - self.frame_len..range.end - self.frame_len]
+    }
 }
+
+// Two dictionaries are equal when their entries are, whether or not either has rendered its UUIDs.
+impl PartialEq for VariableDictionary {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len()
+            && self
+                .entries()
+                .zip(other.entries())
+                .all(|(left, right)| left.value() == right.value())
+    }
+}
+
+impl Eq for VariableDictionary {}
 
 /// A borrowed variable-dictionary entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -491,12 +550,113 @@ fn logtype_entries(
 }
 
 pub(super) fn decode_variable_dictionary<R: Read>(
-    section: Take<R>,
+    mut section: Take<R>,
     limits: DictionaryLimits,
 ) -> Result<VariableDictionary, DictionaryError> {
+    let compressed_size = section.limit();
+    if compressed_size > limits.compressed {
+        return Err(DictionaryError::CompressedSectionTooLarge {
+            actual: compressed_size,
+            limit: limits.compressed,
+        });
+    }
+    let first = read_u64(&mut section)?;
+    if BINARY_UUIDS_MARKER != first {
+        let storage = decode_entry_sequence(section, limits, first, None)?;
+        return Ok(VariableDictionary {
+            frame_len: storage.bytes.as_slice().len(),
+            storage,
+            uuids: Vec::new(),
+            rendered: std::sync::OnceLock::new(),
+        });
+    }
+    // Entries that are canonical UUIDs are stored as their 16 bytes, in ID order, in a zstd frame
+    // of their own ahead of the frame holding the rest; that frame marks each one's place with a
+    // length of `BINARY_UUID_LENGTH` and no bytes.
+    let entry_count = read_u64(&mut section)?;
+    let uuid_count = read_u64(&mut section)?;
+    if uuid_count > entry_count || entry_count > limits.entries {
+        return Err(DictionaryError::EntryCountTooLarge {
+            actual: uuid_count.max(entry_count),
+            limit: limits.entries.min(entry_count),
+        });
+    }
+    let uuid_bytes = uuid_count
+        .checked_mul(UUID_SIZE)
+        .filter(|bytes| *bytes <= limits.decompressed)
+        .ok_or(DictionaryError::SizeOverflow)?;
+    let frame_len = read_u64(&mut section)?;
+    if frame_len > section.limit() {
+        return Err(DictionaryError::SizeOverflow);
+    }
+    let frame_len = usize::try_from(frame_len).map_err(|_| DictionaryError::SizeOverflow)?;
+    let mut frame = Vec::new();
+    frame
+        .try_reserve_exact(frame_len)
+        .map_err(|_| DictionaryError::AllocationFailed {
+            requested: frame_len,
+        })?;
+    frame.resize(frame_len, 0);
+    section
+        .read_exact(&mut frame)
+        .map_err(DictionaryError::Io)?;
+    let uuids = decode_sized_frame(&frame, uuid_bytes, limits.decompressed)?;
+    let storage = decode_entry_sequence(section, limits, entry_count, Some(&uuids))?;
     Ok(VariableDictionary {
-        storage: decode_dictionary(section, limits)?,
+        frame_len: storage.bytes.as_slice().len(),
+        storage,
+        uuids,
+        rendered: std::sync::OnceLock::new(),
     })
+}
+
+/// Marks a `/var.dict` whose canonical-UUID entries are stored as binary. It is read where a plain
+/// dictionary stores its entry count, and exceeds any count a reader accepts, so a reader that does
+/// not know the layout refuses the dictionary rather than misreading it.
+pub const BINARY_UUIDS_MARKER: u64 = 0xC1F5_B1A5_0D1D_0008;
+
+/// The length a binary-UUID entry carries in place of its own inside the dictionary frame.
+pub const BINARY_UUID_LENGTH: u64 = u64::MAX;
+
+const UUID_SIZE: u64 = 16;
+
+/// Whether `value` is a UUID in its canonical text form, lowercase hex digits grouped 8-4-4-4-12
+/// by hyphens, which [`render_uuid`] rebuilds exactly from its 16 bytes.
+#[must_use]
+pub fn canonical_uuid(value: &[u8]) -> Option<[u8; 16]> {
+    if 36 != value.len() {
+        return None;
+    }
+    let mut bytes = [0_u8; 16];
+    let mut nibble = 0;
+    for (index, &character) in value.iter().enumerate() {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            if b'-' != character {
+                return None;
+            }
+            continue;
+        }
+        let digit = match character {
+            b'0'..=b'9' => character - b'0',
+            b'a'..=b'f' => character - b'a' + 10,
+            _ => return None,
+        };
+        bytes[nibble / 2] |= if 0 == nibble % 2 { digit << 4 } else { digit };
+        nibble += 1;
+    }
+    Some(bytes)
+}
+
+/// Appends the canonical text of a UUID's 16 bytes: lowercase hex grouped 8-4-4-4-12 by hyphens.
+pub fn render_uuid(bytes: &[u8], output: &mut Vec<u8>) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (index, byte) in bytes.iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            output.push(b'-');
+        }
+        output.push(HEX[usize::from(byte >> 4)]);
+        output.push(HEX[usize::from(byte & 0x0F)]);
+    }
 }
 
 pub(super) fn decode_logtype_dictionary<R: Read>(
@@ -525,7 +685,7 @@ pub(super) fn decode_logtype_dictionary_fields<R: Read>(
         return decode_field_dictionaries(section, limits, fields);
     }
     Ok(LogTypeDictionary {
-        storage: decode_entry_sequence(section, limits, first)?,
+        storage: decode_entry_sequence(section, limits, first, None)?,
         fields: Vec::new(),
         per_field: false,
         complete: true,
@@ -840,14 +1000,16 @@ fn decode_dictionary<R: Read>(
         });
     }
     let entry_count = read_u64(&mut section)?;
-    decode_entry_sequence(section, limits, entry_count)
+    decode_entry_sequence(section, limits, entry_count, None)
 }
 
 /// Decodes a dictionary stored as one sequence of entries, once its entry count has been read.
+/// `uuids` holds the 16 bytes of each entry stored as a binary UUID, in ID order.
 fn decode_entry_sequence<R: Read>(
     mut section: Take<R>,
     limits: DictionaryLimits,
     entry_count: u64,
+    uuids: Option<&[u8]>,
 ) -> Result<DictionaryStorage, DictionaryError> {
     if entry_count > limits.entries {
         return Err(DictionaryError::EntryCountTooLarge {
@@ -915,7 +1077,7 @@ fn decode_entry_sequence<R: Read>(
         }
     };
 
-    decode_entries(decompressed, entry_count, limits, &mut dictionary)?;
+    decode_entries(decompressed, entry_count, limits, uuids, &mut dictionary)?;
     if 0 != remaining_compressed {
         return Err(DictionaryError::TrailingCompressedData {
             remaining: remaining_compressed,
@@ -1034,10 +1196,15 @@ fn decode_entries(
     decompressed: Vec<u8>,
     entry_count: usize,
     limits: DictionaryLimits,
+    uuids: Option<&[u8]>,
     decoded: &mut DictionaryStorage,
 ) -> Result<(), DictionaryError> {
     let mut total_value_bytes = 0_u64;
     let mut offset = 0_usize;
+    // A binary UUID's range lies past the frame's bytes, where its text is rendered on demand.
+    let frame_end = decompressed.len();
+    let mut rendered = 0_usize;
+    let mut uuids = uuids.map(|bytes| bytes.as_chunks::<16>().0.iter());
 
     for entry_id in 0..entry_count {
         let length_end = offset
@@ -1054,6 +1221,32 @@ fn decode_entries(
                 .try_into()
                 .expect("validated dictionary length slice has eight bytes"),
         );
+        if BINARY_UUID_LENGTH == entry_size
+            && let Some(uuids) = uuids.as_mut()
+        {
+            uuids.next().ok_or_else(|| {
+                DictionaryError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "dictionary marks more binary UUIDs than it stores",
+                ))
+            })?;
+            let start = frame_end
+                .checked_add(rendered)
+                .ok_or(DictionaryError::SizeOverflow)?;
+            rendered += 36;
+            total_value_bytes = total_value_bytes
+                .checked_add(36)
+                .ok_or(DictionaryError::SizeOverflow)?;
+            if total_value_bytes > limits.total_value_bytes {
+                return Err(DictionaryError::TotalValueBytesTooLarge {
+                    actual: total_value_bytes,
+                    limit: limits.total_value_bytes,
+                });
+            }
+            decoded.ranges.push(start..start + 36);
+            offset = length_end;
+            continue;
+        }
         if entry_size > limits.entry_bytes {
             return Err(DictionaryError::EntryTooLarge {
                 entry_id: wire_id(entry_id)?,
@@ -1086,6 +1279,9 @@ fn decode_entries(
         offset = entry_end;
     }
     if offset != decompressed.len() {
+        return Err(DictionaryError::TrailingDecompressedData);
+    }
+    if uuids.is_some_and(|mut uuids| uuids.next().is_some()) {
         return Err(DictionaryError::TrailingDecompressedData);
     }
     decoded.bytes = StorageBytes::Owned(decompressed);
@@ -1287,6 +1483,82 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    #[test]
+    fn canonical_uuids_round_trip_through_their_bytes() {
+        let text = b"34c75dc7-30ee-42e1-9f1e-58cf1667f88e";
+        let bytes = canonical_uuid(text).expect("canonical UUID");
+        let mut rendered = Vec::new();
+        render_uuid(&bytes, &mut rendered);
+        assert_eq!(text.as_slice(), rendered.as_slice());
+        // Only the exact lowercase 8-4-4-4-12 form is stored as bytes, so text always round-trips.
+        for other in [
+            b"34C75DC7-30EE-42E1-9F1E-58CF1667F88E".as_slice(),
+            b"34c75dc730ee42e19f1e58cf1667f88e",
+            b"34c75dc7-30ee-42e1-9f1e-58cf1667f88",
+            b"34c75dc7-30ee-42e1-9f1e_58cf1667f88e",
+            b"g4c75dc7-30ee-42e1-9f1e-58cf1667f88e",
+        ] {
+            assert_eq!(
+                None,
+                canonical_uuid(other),
+                "{}",
+                String::from_utf8_lossy(other)
+            );
+        }
+    }
+
+    #[test]
+    fn binary_uuid_entries_read_back_as_their_text() {
+        let uuid = b"34c75dc7-30ee-42e1-9f1e-58cf1667f88e";
+        let other = b"0f2b6a1e-9c4d-4e8b-a3f5-7d6c5b4a3921";
+        let entries: [&[u8]; 4] = [b"plain", uuid, b"", other];
+        let mut frame = Vec::new();
+        let mut uuids = Vec::new();
+        for entry in entries {
+            if let Some(bytes) = canonical_uuid(entry) {
+                frame.extend_from_slice(&BINARY_UUID_LENGTH.to_le_bytes());
+                uuids.extend_from_slice(&bytes);
+            } else {
+                frame.extend_from_slice(&(entry.len() as u64).to_le_bytes());
+                frame.extend_from_slice(entry);
+            }
+        }
+        let mut encoded = BINARY_UUIDS_MARKER.to_le_bytes().to_vec();
+        encoded.extend_from_slice(&4_u64.to_le_bytes());
+        encoded.extend_from_slice(&2_u64.to_le_bytes());
+        let uuid_frame = zstd::bulk::compress(&uuids, 3).expect("compress UUIDs");
+        encoded.extend_from_slice(&(uuid_frame.len() as u64).to_le_bytes());
+        encoded.extend_from_slice(&uuid_frame);
+        encoded.extend_from_slice(&zstd::bulk::compress(&frame, 3).expect("compress frame"));
+        let dictionary = decode_variable_dictionary(take(&encoded), DictionaryLimits::default())
+            .expect("valid binary-UUID dictionary");
+        assert!(dictionary.has_binary_uuids());
+        assert_eq!(None, dictionary.binary_uuid(0));
+        assert_eq!(None, dictionary.binary_uuid(2));
+        assert_eq!(Some(&uuids[..16]), dictionary.binary_uuid(1));
+        let values: Vec<&[u8]> = dictionary
+            .entries()
+            .map(VariableDictionaryEntry::value)
+            .collect();
+        assert_eq!(entries.to_vec(), values);
+        let plain = section(&entries);
+        assert_eq!(
+            decode_variable_dictionary(take(&plain), DictionaryLimits::default())
+                .expect("valid plain dictionary"),
+            dictionary
+        );
+
+        // A frame marking more UUIDs than the section stores is refused.
+        let mut short = BINARY_UUIDS_MARKER.to_le_bytes().to_vec();
+        short.extend_from_slice(&4_u64.to_le_bytes());
+        short.extend_from_slice(&1_u64.to_le_bytes());
+        let short_frame = zstd::bulk::compress(&uuids[..16], 3).expect("compress UUID");
+        short.extend_from_slice(&(short_frame.len() as u64).to_le_bytes());
+        short.extend_from_slice(&short_frame);
+        short.extend_from_slice(&zstd::bulk::compress(&frame, 3).expect("compress frame"));
+        assert!(decode_variable_dictionary(take(&short), DictionaryLimits::default()).is_err());
+    }
 
     fn section(entries: &[&[u8]]) -> Vec<u8> {
         let mut encoded = u64::try_from(entries.len())

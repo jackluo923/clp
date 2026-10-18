@@ -77,6 +77,22 @@ pub(super) fn wildcard_match(value: &[u8], pattern: &str, ignore_case: bool) -> 
 }
 
 #[inline]
+/// The bytes a pattern with no wildcard matches exactly, with its escapes removed, or `None` when
+/// it has a `*` or `?`.
+pub(super) fn exact_pattern(pattern: &str) -> Option<Vec<u8>> {
+    let pattern = pattern.as_bytes();
+    let mut bytes = Vec::with_capacity(pattern.len());
+    let mut index = 0;
+    while let Some((token, next)) = next_token(pattern, index) {
+        match token {
+            PatternToken::Literal(byte) => bytes.push(byte),
+            PatternToken::Many | PatternToken::One => return None,
+        }
+        index = next;
+    }
+    Some(bytes)
+}
+
 fn next_token(pattern: &[u8], index: usize) -> Option<(PatternToken, usize)> {
     let byte = *pattern.get(index)?;
     Some(match byte {

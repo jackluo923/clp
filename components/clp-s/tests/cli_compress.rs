@@ -1820,6 +1820,117 @@ fn adaptive_string_columns_read_back_exactly_and_answer_searches_the_same() {
 }
 
 #[test]
+fn binary_uuids_read_back_exactly_and_answer_searches_the_same() {
+    // Canonical UUIDs in their own fields and inside messages are stored as bytes; an uppercase
+    // one and a near miss stay text. Every search must answer as it does with UUIDs as text.
+    // Version-4 UUIDs are random but for their version and variant bits; splitmix64 stands in.
+    let uuid = |seed: u64| {
+        let mix = |mut value: u64| {
+            value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            value ^ (value >> 31)
+        };
+        let (high, low) = (mix(seed), mix(seed ^ 0xFFFF));
+        format!(
+            "{:08x}-{:04x}-4{:03x}-{:x}{:03x}-{:012x}",
+            high >> 32,
+            (high >> 16) & 0xFFFF,
+            high & 0xFFF,
+            8 + (low >> 62),
+            (low >> 48) & 0xFFF,
+            low & 0xFFFF_FFFF_FFFF
+        )
+    };
+    let mut input = String::new();
+    for index in 0..200_u32 {
+        let id = uuid(u64::from(index));
+        let parent = uuid(u64::from(index / 2));
+        input.push_str(&format!(
+            "{{\"n\":{index},\"uuid\":\"{id}\",\"parentUuid\":\"{parent}\",\
+             \"msg\":\"request {id} failed after {} ms\",\"upper\":\"{}\",\
+             \"near\":\"{}\"}}\n",
+            index % 13,
+            uuid(u64::from(index) + 1000).to_uppercase(),
+            &uuid(u64::from(index) + 2000)[..35]
+        ));
+    }
+    let temporary = TestDirectory::new("binary-uuids");
+    let input_path = temporary.path().join("input.jsonl");
+    fs::write(&input_path, &input).expect("write binary-UUID fixture");
+    let compress = |name: &str, extra: &[&str]| {
+        let archives_path = temporary.path().join(name);
+        let mut arguments: Vec<&OsStr> = vec!["c".as_ref(), "--single-file-archive".as_ref()];
+        arguments.extend(extra.iter().map(|argument| OsStr::new(*argument)));
+        arguments.extend([archives_path.as_os_str(), input_path.as_os_str()]);
+        let result = clp_s(&arguments);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        only_entry(&archives_path)
+    };
+    let text = compress("text", &["--no-binary-uuids"]);
+    let binary = compress("binary", &[]);
+    assert!(
+        fs::metadata(&binary).expect("stat binary archive").len()
+            < fs::metadata(&text).expect("stat text archive").len()
+    );
+    assert_eq!(
+        extract_original(&text, &temporary.path().join("text-extracted")),
+        extract_original(&binary, &temporary.path().join("binary-extracted"))
+    );
+    let search = |archive: &Path, arguments: &[&str]| {
+        let mut all: Vec<&OsStr> = vec!["s".as_ref(), archive.as_os_str()];
+        all.extend(arguments.iter().map(|argument| OsStr::new(*argument)));
+        let result = clp_s(&all);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        result.stdout
+    };
+    let id = uuid(17);
+    for arguments in [
+        vec![format!("uuid:\"{id}\""), "--projection".into(), "n".into()],
+        vec![format!("parentUuid:\"{id}\"")],
+        vec![
+            format!("msg:\"*{id}*\""),
+            "--projection".into(),
+            "msg".into(),
+        ],
+        vec![
+            format!("uuid:\"{}*\"", &id[..4]),
+            "--projection".into(),
+            "uuid".into(),
+        ],
+        vec![
+            format!("upper:\"{}\"", uuid(1017).to_uppercase()),
+            "--projection".into(),
+            "n".into(),
+        ],
+        vec![
+            format!("uuid:\"{}\"", id.to_uppercase()),
+            "--ignore-case".into(),
+        ],
+        vec![format!("near:\"{}\"", &uuid(2017)[..35])],
+        vec![
+            "n > 190".into(),
+            "--projection".into(),
+            "uuid".into(),
+            "parentUuid".into(),
+        ],
+    ] {
+        let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        let expected = search(&text, &arguments);
+        assert!(!expected.is_empty(), "{arguments:?} matches the fixture");
+        assert_eq!(expected, search(&binary, &arguments), "{arguments:?}");
+    }
+}
+
+#[test]
 fn field_logtype_dictionaries_read_back_exactly_and_answer_searches_the_same() {
     // Several text fields, some sharing a message, so their sections overlap and a field's search
     // must load only its own entries.

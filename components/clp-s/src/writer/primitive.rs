@@ -974,16 +974,17 @@ impl PrimitiveArchive {
             let (section, remap) = self.encode_field_logtype_dictionaries(options)?;
             (section, Some(remap))
         } else {
-            (self.log_type_dictionary.encode(options)?, None)
+            (self.log_type_dictionary.encode(options, false)?, None)
         };
         let (table_metadata, tables) = self.tables.encode_tables(options, remap.as_ref())?;
         let sections = [
             schema_tree,
             schema_map,
             table_metadata,
-            self.variable_dictionary.encode(options)?,
+            self.variable_dictionary
+                .encode(options, options.binary_uuids())?,
             log_type_dictionary,
-            self.array_dictionary.encode(options)?,
+            self.array_dictionary.encode(options, false)?,
             tables,
         ];
         check_section_limits(&sections, options.limits())?;
@@ -1213,17 +1214,54 @@ impl DictionaryBuilder {
         debug_assert_eq!(reservations.resulting_entry_count, self.entry_count());
     }
 
-    fn encode(&self, options: WriterOptions) -> Result<Vec<u8>, WriterError> {
+    /// Encodes the dictionary: its entry count, then one zstd frame of each entry's eight-byte
+    /// length and bytes. With `binary_uuids`, an entry that is a canonical UUID is stored as its 16
+    /// bytes, in a zstd frame of its own ahead of the main one, which holds only a placeholder
+    /// length for it. A random UUID's bytes take less than zstd shrinks its text to, and the frame
+    /// still shrinks UUIDs that share structure, such as time-based ones.
+    fn encode(&self, options: WriterOptions, binary_uuids: bool) -> Result<Vec<u8>, WriterError> {
+        use crate::archive::BINARY_UUID_LENGTH;
+        use crate::archive::BINARY_UUIDS_MARKER;
+        use crate::archive::canonical_uuid;
         if 0 == self.entry_count() {
             return encode_empty_dictionary();
         }
+        let mut uuids = Vec::new();
+        let mut uuid_value_bytes = 0_usize;
+        if binary_uuids {
+            for index in 0..self.entry_count() {
+                let entry = dictionary_entry(&self.values, &self.entry_ends, index)
+                    .expect("stored dictionary offset must address an arena entry");
+                if let Some(uuid) = canonical_uuid(entry) {
+                    uuids.extend_from_slice(&uuid);
+                    uuid_value_bytes += entry.len();
+                }
+            }
+        }
+        let uuid_frame = if uuids.is_empty() {
+            Vec::new()
+        } else {
+            zstd::bulk::compress(&uuids, options.dictionary_compression_level())
+                .map_err(WriterError::Io)?
+        };
         let mut section = Vec::new();
+        let header = if uuids.is_empty() {
+            size_of::<u64>()
+        } else {
+            4 * size_of::<u64>() + uuid_frame.len()
+        };
         section
-            .try_reserve_exact(size_of::<u64>())
-            .map_err(|_| WriterError::AllocationFailed {
-                requested: size_of::<u64>(),
-            })?;
+            .try_reserve_exact(header)
+            .map_err(|_| WriterError::AllocationFailed { requested: header })?;
+        if !uuids.is_empty() {
+            section.extend_from_slice(&BINARY_UUIDS_MARKER.to_le_bytes());
+        }
         section.extend_from_slice(&usize_u64(self.entry_count())?.to_le_bytes());
+        if !uuids.is_empty() {
+            section.extend_from_slice(&usize_u64(uuids.len() / 16)?.to_le_bytes());
+            section.extend_from_slice(&usize_u64(uuid_frame.len())?.to_le_bytes());
+            section.extend_from_slice(&uuid_frame);
+        }
         let mut pending = Vec::new();
         pending
             .try_reserve_exact(DICTIONARY_ENCODE_BUFFER_CAPACITY)
@@ -1237,7 +1275,7 @@ impl DictionaryBuilder {
             // The pledged size lets zstd shrink the window to the dictionary, so a small archive
             // does not pay for a 128 MiB one. It is the exact count of bytes written below: one
             // eight-byte length per entry plus every value.
-            let pledged = usize_u64(self.values.len())?
+            let pledged = usize_u64(self.values.len() - uuid_value_bytes)?
                 .checked_add(
                     usize_u64(self.entry_count())?
                         .checked_mul(DICTIONARY_ENTRY_LENGTH_SIZE)
@@ -1257,6 +1295,14 @@ impl DictionaryBuilder {
         for index in 0..self.entry_count() {
             let entry = dictionary_entry(&self.values, &self.entry_ends, index)
                 .expect("stored dictionary offset must address an arena entry");
+            if !uuids.is_empty() && canonical_uuid(entry).is_some() {
+                write_dictionary_encode_bytes(
+                    &mut encoder,
+                    &mut pending,
+                    &BINARY_UUID_LENGTH.to_le_bytes(),
+                )?;
+                continue;
+            }
             write_dictionary_encode_bytes(
                 &mut encoder,
                 &mut pending,
@@ -5309,7 +5355,7 @@ mod tests {
         );
 
         let encoded = dictionary
-            .encode(WriterOptions::new(1))
+            .encode(WriterOptions::new(1), false)
             .expect("encode packed dictionary");
         assert_eq!(
             5,
@@ -5338,6 +5384,7 @@ mod tests {
                 WriterOptions::new(1)
                     .with_dictionary_compression_level(9)
                     .with_dictionary_long_distance_matching(true),
+                false,
             )
             .expect("encode dictionary with long-distance matching");
         assert_eq!(
@@ -5355,7 +5402,7 @@ mod tests {
         assert_eq!(
             encoded,
             independently_hashed
-                .encode(WriterOptions::new(1))
+                .encode(WriterOptions::new(1), false)
                 .expect("encode independently hashed dictionary")
         );
     }

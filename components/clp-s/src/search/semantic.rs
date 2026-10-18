@@ -31,6 +31,7 @@ use super::array::ArrayScratch;
 use super::array::ArraySearchError;
 use super::array::evaluate as evaluate_array;
 use super::timestamp_query::resolve_timestamp_literal;
+use super::wildcard::exact_pattern;
 use super::wildcard::wildcard_match;
 use crate::ExtractionPlan;
 use crate::ExtractionPlanError;
@@ -2070,9 +2071,40 @@ impl<'query, 'archive, 'cache> Compiler<'query, 'archive, 'cache> {
             self.options.limits().max_dictionary_entries_scanned(),
             SearchResource::DictionaryEntries,
         )?;
+        // An archive storing UUIDs as binary renders their text only for a pattern that needs it.
+        // An exact literal compares against their bytes, and no number parses from a UUID.
+        let exact = (DictionaryMatchKind::String == kind
+            && dictionary.has_binary_uuids()
+            && !self.options.ignore_case())
+        .then(|| variable_pattern(predicate).or_else(|| clp_pattern(predicate)))
+        .flatten()
+        .and_then(exact_pattern);
+        let exact_uuid = exact.as_deref().and_then(crate::archive::canonical_uuid);
         let mut matching_ids = Vec::new();
-        for entry in dictionary.entries() {
-            let is_match = match kind {
+        for entry in (0..dictionary.len() as u64).filter_map(|id| {
+            let binary = dictionary.binary_uuid(id);
+            let decided = match (kind, binary, exact.as_deref()) {
+                (DictionaryMatchKind::Float | DictionaryMatchKind::Timestamp(_), Some(_), _) => {
+                    Some(false)
+                }
+                (DictionaryMatchKind::String, Some(uuid), Some(_)) => {
+                    Some(exact_uuid.is_some_and(|literal| literal.as_slice() == uuid))
+                }
+                (DictionaryMatchKind::String, None, Some(literal)) => Some(
+                    dictionary
+                        .entry(id)
+                        .is_some_and(|entry| entry.value() == literal),
+                ),
+                _ => None,
+            };
+            match decided {
+                Some(true) => dictionary.entry(id).map(|entry| (entry, Some(true))),
+                Some(false) => None,
+                None => dictionary.entry(id).map(|entry| (entry, None)),
+            }
+        }) {
+            let (entry, decided) = entry;
+            let is_match = decided.unwrap_or_else(|| match kind {
                 DictionaryMatchKind::String => {
                     string_value_matches(entry.value(), predicate, self.options.ignore_case())
                 }
@@ -2092,7 +2124,7 @@ impl<'query, 'archive, 'cache> Compiler<'query, 'archive, 'cache> {
                             )
                         })
                 }
-            };
+            });
             if is_match {
                 add_limited(
                     &mut self.counters.dictionary_matches,

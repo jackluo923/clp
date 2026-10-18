@@ -477,11 +477,27 @@ pub struct WriterOptions {
 }
 
 /// Which columns of a table stored one frame per column take the smallest of a set of
-/// lightweight encodings: numbers, and with them strings.
+/// lightweight encodings, numbers and with them strings, and whether UUIDs are stored as binary.
+/// One byte of flags, which keeps [`WriterOptions`] small enough to pass by value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct AdaptiveColumns {
-    numeric: bool,
-    strings: bool,
+struct AdaptiveColumns(u8);
+
+impl AdaptiveColumns {
+    const NUMERIC: u8 = 1;
+    const STRINGS: u8 = 1 << 1;
+    const BINARY_UUIDS: u8 = 1 << 2;
+
+    const fn has(self, flag: u8) -> bool {
+        0 != self.0 & flag
+    }
+
+    const fn with(self, flag: u8, enabled: bool) -> Self {
+        Self(if enabled {
+            self.0 | flag
+        } else {
+            self.0 & !flag
+        })
+    }
 }
 
 impl WriterOptions {
@@ -511,10 +527,7 @@ impl WriterOptions {
             separate_columns_min_size: 0,
             // Library default stays conservative (0.5.0, C++-reference-compatible). The `clp-s`
             // compression CLI turns this on by default; embedders opt in via the builder.
-            adaptive: AdaptiveColumns {
-                numeric: false,
-                strings: true,
-            },
+            adaptive: AdaptiveColumns(AdaptiveColumns::STRINGS | AdaptiveColumns::BINARY_UUIDS),
         }
     }
 
@@ -549,14 +562,14 @@ impl WriterOptions {
     /// Disabling it restores byte-identical 0.5.0 output (the format the C++ reference reads).
     #[must_use]
     pub const fn with_adaptive_numeric_columns(mut self, enabled: bool) -> Self {
-        self.adaptive.numeric = enabled;
+        self.adaptive = self.adaptive.with(AdaptiveColumns::NUMERIC, enabled);
         self
     }
 
     /// Returns whether adaptive per-column numeric encoding is enabled.
     #[must_use]
     pub const fn adaptive_numeric_columns(self) -> bool {
-        self.adaptive.numeric
+        self.adaptive.has(AdaptiveColumns::NUMERIC)
     }
 
     /// Enables or disables adaptive encoding of string columns, which takes effect only with
@@ -568,15 +581,34 @@ impl WriterOptions {
     /// separately. Such an archive is stamped version 0.8.0, which earlier readers refuse.
     #[must_use]
     pub const fn with_adaptive_string_columns(mut self, enabled: bool) -> Self {
-        self.adaptive.strings = enabled;
+        self.adaptive = self.adaptive.with(AdaptiveColumns::STRINGS, enabled);
         self
+    }
+
+    /// Enables or disables storing canonical UUIDs in the variable dictionary as their 16 bytes,
+    /// which takes effect only with adaptive string columns.
+    ///
+    /// When enabled (the default), a dictionary entry that is a UUID in canonical text form,
+    /// lowercase hex grouped 8-4-4-4-12, is stored as its 16 bytes rather than its 36 characters.
+    /// Its ID is unchanged and a reader rebuilds the same text, so nothing else in the archive
+    /// changes.
+    #[must_use]
+    pub const fn with_binary_uuids(mut self, enabled: bool) -> Self {
+        self.adaptive = self.adaptive.with(AdaptiveColumns::BINARY_UUIDS, enabled);
+        self
+    }
+
+    /// Returns whether canonical UUIDs are stored as binary: enabled, with adaptive string columns.
+    #[must_use]
+    pub const fn binary_uuids(self) -> bool {
+        self.adaptive.has(AdaptiveColumns::BINARY_UUIDS) && self.adaptive_string_columns()
     }
 
     /// Returns whether string columns are encoded adaptively: enabled, with adaptive numeric
     /// columns.
     #[must_use]
     pub const fn adaptive_string_columns(self) -> bool {
-        self.adaptive.strings && self.adaptive.numeric
+        self.adaptive.has(AdaptiveColumns::STRINGS) && self.adaptive.has(AdaptiveColumns::NUMERIC)
     }
 
     /// Replaces the writer resource limits.
@@ -711,7 +743,7 @@ impl WriterOptions {
     /// [`with_field_logtype_dictionaries`](Self::with_field_logtype_dictionaries).
     #[must_use]
     pub const fn field_logtype_dictionaries(self) -> bool {
-        self.dictionary_compression.per_field && self.adaptive.numeric
+        self.dictionary_compression.per_field && self.adaptive.has(AdaptiveColumns::NUMERIC)
     }
 
     /// Resource limits applied during finalization.

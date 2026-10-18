@@ -202,6 +202,10 @@ struct CompressArgs {
     /// which earlier readers refuse.
     #[arg(long, default_value_t = false)]
     no_adaptive_string_columns: bool,
+    /// Store UUIDs in the variable dictionary as text rather than as their 16 bytes (binary is the
+    /// default with adaptive string columns).
+    #[arg(long, default_value_t = false)]
+    no_binary_uuids: bool,
     /// Path of the authoritative timestamp field.
     #[arg(long)]
     timestamp_key: Option<String>,
@@ -519,6 +523,7 @@ fn run_compress(arguments: &CompressArgs) -> CliResult<()> {
         .with_separate_columns_min_size(arguments.separate_columns_min_size)
         .with_adaptive_numeric_columns(!arguments.no_adaptive_numeric_columns)
         .with_adaptive_string_columns(!arguments.no_adaptive_string_columns)
+        .with_binary_uuids(!arguments.no_binary_uuids)
         .with_log_order(!arguments.representation.disable_log_order)
         .with_log_order_column(!arguments.representation.no_log_order_column);
     let mut archive_set = ArchiveSetWriter::new(
