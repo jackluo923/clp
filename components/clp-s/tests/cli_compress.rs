@@ -1860,6 +1860,120 @@ fn adaptive_string_columns_read_back_exactly_and_answer_searches_the_same() {
 }
 
 #[test]
+fn grouped_array_tables_read_back_exactly_and_answer_searches_the_same() {
+    // Records whose arrays differ only in length and element order share a grouped stream: mixed
+    // element types, objects whose fields vary, nested arrays, and CLP-string messages inside.
+    let mut input = String::new();
+    for index in 0..240_u32 {
+        let elements: Vec<String> = (0..=(index % 5))
+            .map(|position| match (index + position) % 4 {
+                0 => format!("{{\"type\":\"text\",\"text\":\"step {position} took {index} ms\"}}"),
+                1 => format!(
+                    "{{\"type\":\"tool\",\"id\":\"t{index}\",\"is_error\":{}}}",
+                    0 == index % 3
+                ),
+                2 => format!("\"note {position}\""),
+                _ => format!("[{position},{index}]"),
+            })
+            .collect();
+        input.push_str(&format!(
+            "{{\"n\":{index},\"kind\":\"{}\",\"content\":[{}]}}\n",
+            ["a", "b"][index as usize % 2],
+            elements.join(",")
+        ));
+    }
+    let temporary = TestDirectory::new("grouped-array-tables");
+    let input_path = temporary.path().join("input.jsonl");
+    fs::write(&input_path, &input).expect("write grouped-table fixture");
+    let compress = |name: &str, extra: &[&str]| {
+        let archives_path = temporary.path().join(name);
+        let mut arguments: Vec<&OsStr> = vec!["c".as_ref()];
+        arguments.extend(extra.iter().map(|argument| OsStr::new(*argument)));
+        arguments.extend([archives_path.as_os_str(), input_path.as_os_str()]);
+        let result = clp_s(&arguments);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        only_entry(&archives_path)
+    };
+    let ordered = |archive: &Path, name: &str| {
+        let output = temporary.path().join(name);
+        let result = clp_s(&[
+            "x".as_ref(),
+            "--ordered".as_ref(),
+            archive.as_os_str(),
+            output.as_os_str(),
+        ]);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let mut bytes = Vec::new();
+        let mut files: Vec<PathBuf> = fs::read_dir(&output)
+            .expect("list extraction")
+            .map(|entry| entry.expect("extraction entry").path())
+            .collect();
+        files.sort();
+        for file in files {
+            bytes.extend(fs::read(file).expect("read extraction"));
+        }
+        bytes
+    };
+    let search = |archive: &Path, query: &str, projection: &[&str]| {
+        let mut arguments: Vec<&OsStr> = vec!["s".as_ref(), archive.as_os_str(), query.as_ref()];
+        if !projection.is_empty() {
+            arguments.push("--projection".as_ref());
+            arguments.extend(projection.iter().map(|path| OsStr::new(*path)));
+        }
+        let result = clp_s(&arguments);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let mut lines: Vec<String> = String::from_utf8(result.stdout)
+            .expect("search output is UTF-8")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.sort();
+        lines
+    };
+    for layout in [&[][..], &["--single-file-archive"][..]] {
+        let separate: Vec<&str> = layout
+            .iter()
+            .copied()
+            .chain(["--no-grouped-array-tables"])
+            .collect();
+        let name = if layout.is_empty() { "dir" } else { "sfa" };
+        let plain = compress(&format!("{name}-plain"), &separate);
+        let grouped = compress(&format!("{name}-grouped"), layout);
+        assert_eq!(
+            ordered(&plain, &format!("{name}-plain-extracted")),
+            ordered(&grouped, &format!("{name}-grouped-extracted")),
+            "{name}"
+        );
+        for (query, projection) in [
+            ("content.is_error:true", &["n", "content"][..]),
+            ("content.text:\"*took 7*\"", &["n"][..]),
+            ("kind:b AND n > 200", &[][..]),
+            ("content.type:tool", &["content"][..]),
+        ] {
+            let expected = search(&plain, query, projection);
+            assert!(!expected.is_empty(), "{query} matches the fixture");
+            assert_eq!(
+                expected,
+                search(&grouped, query, projection),
+                "{name} {query} {projection:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn binary_uuids_read_back_exactly_and_answer_searches_the_same() {
     // Canonical UUIDs in their own fields and inside messages are stored as bytes; an uppercase
     // one and a near miss stay text. Every search must answer as it does with UUIDs as text.

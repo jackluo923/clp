@@ -531,6 +531,32 @@ pub(super) fn decode_column_frames(
     })
 }
 
+/// Frames' compressed byte ranges, and separately their decompressed sizes.
+pub(super) type FrameRanges = (Vec<(u64, u64)>, Vec<usize>);
+
+/// Each frame's compressed byte range and decompressed size in a grouped stream that starts at
+/// `start`, its frames stored back to back.
+pub(super) fn grouped_frame_ranges(
+    grouped: &super::GroupedStream,
+    start: u64,
+) -> Result<FrameRanges, PackedStreamError> {
+    let mut offsets = Vec::with_capacity(grouped.frames().len());
+    let mut sizes = Vec::with_capacity(grouped.frames().len());
+    let mut cursor = start;
+    for frame in grouped.frames() {
+        let end = cursor
+            .checked_add(frame.compressed_size())
+            .ok_or(PackedStreamError::SizeOverflow)?;
+        offsets.push((cursor, end));
+        sizes.push(
+            usize::try_from(frame.uncompressed_size())
+                .map_err(|_| PackedStreamError::SizeOverflow)?,
+        );
+        cursor = end;
+    }
+    Ok((offsets, sizes))
+}
+
 /// Decompresses one whole zstd frame into `output`, which must come out exactly full.
 fn decode_frame_into(
     context: &mut zstd::zstd_safe::DCtx<'_>,
@@ -615,6 +641,15 @@ impl DecodedPackedStream {
         Self {
             bytes,
             column_layout: Some(layout),
+        }
+    }
+
+    /// A whole stream of tables laid out back to back, as a shared frame decodes to.
+    #[must_use]
+    pub(crate) const fn from_tables(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            column_layout: None,
         }
     }
 

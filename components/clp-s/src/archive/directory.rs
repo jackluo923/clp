@@ -48,6 +48,7 @@ use super::packed_stream::decode_column_frames;
 use super::packed_stream::decode_log_order_prefix;
 use super::packed_stream::decode_packed_stream;
 use super::packed_stream::decode_packed_stream_prefix;
+use super::packed_stream::grouped_frame_ranges;
 use super::packed_stream::is_raw_frame;
 use super::packed_stream::ColumnTruncation;
 use super::packed_stream::packed_stream_range;
@@ -485,6 +486,26 @@ impl<S: DirectoryArchiveSource> DirectoryArchiveReader<S> {
         }
         let tables_size = self.member_size(DirectoryArchiveMember::PackedStreams);
         let (stream, range) = packed_stream_range(table_metadata, stream_id, tables_size)?;
+        // A grouped stream is one frame per node; the catalog rebuilds its tables from them.
+        if let Some(grouped) = table_metadata.grouped_stream_for(stream_id as u64) {
+            let (offsets, sizes) = grouped_frame_ranges(grouped, range.start)?;
+            let raw_frames = self.header().version().supports_raw_column_frames();
+            return decode_column_frames(
+                &offsets,
+                &sizes,
+                None,
+                limits,
+                raw_frames,
+                |range, buffer| {
+                    let length = usize::try_from(range.end - range.start)
+                        .map_err(|_| io::Error::other("compressed frame run exceeds memory"))?;
+                    buffer.clear();
+                    buffer.resize(length, 0);
+                    self.reader_for_member_range(DirectoryArchiveMember::PackedStreams, range)?
+                        .read_exact(buffer)
+                },
+            );
+        }
         let compressed = self
             .reader_for_member_range(DirectoryArchiveMember::PackedStreams, range)
             .map_err(PackedStreamError::Io)?;

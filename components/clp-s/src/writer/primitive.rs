@@ -4663,6 +4663,14 @@ struct PackedTables {
     streams: Vec<PackedStreamWire>,
     tables: Vec<SchemaTableWire>,
     separate: Vec<SeparateColumnWire>,
+    grouped: Vec<GroupedStreamWire>,
+}
+
+/// One packed stream holding several tables, with one frame per node across them.
+struct GroupedStreamWire {
+    stream_id: u64,
+    /// `(node, encoding, uncompressed_size, compressed_size)` per frame, in stored order.
+    frames: Vec<(u32, crate::archive::GroupedFrameEncoding, u64, u64)>,
 }
 /// One packed stream that holds a single table as one zstd frame per column.
 struct SeparateColumnWire {
@@ -4696,6 +4704,7 @@ fn pack_tables(
         streams: Vec::new(),
         tables: Vec::new(),
         separate: Vec::new(),
+        grouped: Vec::new(),
     };
     packed
         .streams
@@ -4723,6 +4732,10 @@ fn pack_tables(
         .map_err(|_| WriterError::AllocationFailed {
             requested: order.len(),
         })?;
+    // Tables differing only in their arrays share a stream, keyed by their non-array entries and
+    // the set of nodes inside their arrays, in the order their first member comes.
+    let mut array_groups: Vec<Vec<usize>> = Vec::new();
+    let mut group_of: HashMap<(&[u32], Vec<u32>), usize> = HashMap::new();
     for table_index in order.iter().copied() {
         let table = &tables[table_index];
         // Adaptive integer encoding needs per-column zstd frames, so it rides the separate-column
@@ -4731,10 +4744,38 @@ fn pack_tables(
             && usize_u64(table.uncompressed_size)? >= min_separate
             && table.columns.len() > 1)
             || (adaptive && table_has_numeric_column(table));
-        if separate {
-            encode_separate_table(table, options, &mut column_compressor, remap, &mut packed)?;
-        } else {
+        if !separate {
             grouped.push(table_index);
+        } else if options.grouped_array_tables() {
+            let (ordered, unordered) = table.entries.split_at(table.ordered_entry_count);
+            let mut nodes: Vec<u32> = unordered
+                .iter()
+                .copied()
+                .filter(|entry| 0 == entry >> 24)
+                .collect();
+            nodes.sort_unstable();
+            nodes.dedup();
+            let next = array_groups.len();
+            let group = *group_of.entry((ordered, nodes)).or_insert(next);
+            if group == next {
+                array_groups.push(Vec::new());
+            }
+            array_groups[group].push(table_index);
+        } else {
+            encode_separate_table(table, options, &mut column_compressor, remap, &mut packed)?;
+        }
+    }
+    for members in &array_groups {
+        if let [table_index] = members.as_slice() {
+            encode_separate_table(
+                &tables[*table_index],
+                options,
+                &mut column_compressor,
+                remap,
+                &mut packed,
+            )?;
+        } else {
+            encode_grouped_tables(tables, members, &mut column_compressor, remap, &mut packed)?;
         }
     }
     let order = grouped.as_slice();
@@ -4971,6 +5012,167 @@ fn encode_adaptive_float_column(
     )
 }
 
+/// One node of a grouped stream: its ID, its type, and its columns with their tables' row counts.
+type GroupedNode<'a> = (u32, NodeType, Vec<(&'a TableColumn, u64)>);
+
+/// Writes tables that differ only in their arrays as one packed stream with one frame per node.
+///
+/// Each node's frame holds its columns from every table, in table order and then schema order,
+/// encoded as one: 8-byte columns by the adaptive integer or float schemes over all their values,
+/// CLP strings by the same over all their descriptors and all their variables, and anything else
+/// plainly. The stream advertises its tables laid out back to back, as in a shared frame, which is
+/// what a reader rebuilds from the frames.
+fn encode_grouped_tables(
+    tables: &[TableBuilder],
+    members: &[usize],
+    compressor: &mut zstd::bulk::Compressor<'_>,
+    remap: Option<&LogTypeRemap>,
+    packed: &mut PackedTables,
+) -> Result<(), WriterError> {
+    use crate::archive::GroupedFrameEncoding;
+    let file_offset = len_u64(&packed.compressed)?;
+    let stream_id = usize_u64(packed.streams.len())?;
+    let mut stream_offset = 0_u64;
+    // Each node's columns, in table order and then schema order, with their tables' row counts.
+    let mut nodes: Vec<GroupedNode<'_>> = Vec::new();
+    let mut node_index: HashMap<u32, usize> = HashMap::new();
+    for table_index in members {
+        let table = &tables[*table_index];
+        packed.tables.push(SchemaTableWire {
+            stream_id,
+            stream_offset,
+            schema_id: table.schema_id,
+            message_count: table.message_count,
+        });
+        stream_offset = stream_offset
+            .checked_add(usize_u64(table.uncompressed_size)?)
+            .ok_or(WriterError::SizeOverflow)?;
+        for column in &table.columns {
+            let next = nodes.len();
+            let index = *node_index.entry(column.node_id).or_insert(next);
+            if index == next {
+                nodes.push((column.node_id, column.node_type, Vec::new()));
+            }
+            nodes[index].2.push((column, table.message_count));
+        }
+    }
+    let mut frames = Vec::with_capacity(nodes.len());
+    for (node_id, node_type, columns) in &nodes {
+        let mut plain = Vec::new();
+        for (column, _) in columns {
+            column.write_remapped(&mut plain, remap)?;
+        }
+        let values = |bytes: &[u8]| -> Vec<i64> {
+            bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|chunk| i64::from_le_bytes(*chunk))
+                .collect()
+        };
+        let (encoding, payload) = match node_type {
+            NodeType::Integer | NodeType::VarString | NodeType::DictionaryFloat => (
+                GroupedFrameEncoding::Integer,
+                best_candidate(adaptive_int::candidates(&values(&plain)), compressor)?,
+            ),
+            NodeType::Float => {
+                let bits: Vec<u64> = values(&plain)
+                    .iter()
+                    .map(|value| value.cast_unsigned())
+                    .collect();
+                (
+                    GroupedFrameEncoding::Float,
+                    best_candidate(adaptive_float::candidates(&bits), compressor)?,
+                )
+            }
+            NodeType::ClpString => (
+                GroupedFrameEncoding::ClpString,
+                grouped_clp_string_payload(&plain, columns, compressor)?,
+            ),
+            _ => (GroupedFrameEncoding::Plain, plain),
+        };
+        let start = packed.compressed.len();
+        packed
+            .compressed
+            .extend_from_slice(&column_frame(&payload, compressor, true)?);
+        frames.push((
+            *node_id,
+            encoding,
+            len_u64(&payload)?,
+            usize_u64(packed.compressed.len() - start)?,
+        ));
+    }
+    packed.streams.push(PackedStreamWire {
+        file_offset,
+        uncompressed_size: stream_offset,
+    });
+    packed.grouped.push(GroupedStreamWire { stream_id, frames });
+    Ok(())
+}
+
+/// Encodes the CLP-string columns of one node in a grouped stream: the column count and each
+/// column's variable count, then the length of the encoded descriptors, the descriptors of every
+/// column, and the variables of every column, the two runs each in their smallest integer scheme.
+fn grouped_clp_string_payload(
+    plain: &[u8],
+    columns: &[(&TableColumn, u64)],
+    compressor: &mut zstd::bulk::Compressor<'_>,
+) -> Result<Vec<u8>, WriterError> {
+    let mut descriptors = Vec::new();
+    let mut variables = Vec::new();
+    let mut counts = Vec::with_capacity(columns.len());
+    let mut rest = plain;
+    for (_, rows) in columns {
+        let descriptor_bytes = usize::try_from(*rows)
+            .ok()
+            .and_then(|rows| rows.checked_mul(size_of::<u64>()))
+            .filter(|bytes| {
+                bytes
+                    .checked_add(size_of::<u64>())
+                    .is_some_and(|end| end <= rest.len())
+            })
+            .ok_or(WriterError::SizeOverflow)?;
+        let (column_descriptors, after) = rest.split_at(descriptor_bytes);
+        let (count, after) = after.split_at(size_of::<u64>());
+        let count = u64::from_le_bytes(count.try_into().expect("8-byte count"));
+        let variable_bytes = usize::try_from(count)
+            .ok()
+            .and_then(|count| count.checked_mul(size_of::<u64>()))
+            .filter(|bytes| *bytes <= after.len())
+            .ok_or(WriterError::SizeOverflow)?;
+        let (column_variables, after) = after.split_at(variable_bytes);
+        descriptors.extend_from_slice(column_descriptors);
+        variables.extend_from_slice(column_variables);
+        counts.push(count);
+        rest = after;
+    }
+    let values = |bytes: &[u8]| -> Vec<i64> {
+        bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| i64::from_le_bytes(*chunk))
+            .collect()
+    };
+    let descriptors = best_candidate(adaptive_int::candidates(&values(&descriptors)), compressor)?;
+    let variables = if variables.is_empty() {
+        Vec::new()
+    } else {
+        best_candidate(adaptive_int::candidates(&values(&variables)), compressor)?
+    };
+    let mut payload = Vec::with_capacity(
+        (counts.len() + 2) * size_of::<u64>() + descriptors.len() + variables.len(),
+    );
+    payload.extend_from_slice(&usize_u64(counts.len())?.to_le_bytes());
+    for count in &counts {
+        payload.extend_from_slice(&count.to_le_bytes());
+    }
+    payload.extend_from_slice(&len_u64(&descriptors)?.to_le_bytes());
+    payload.extend_from_slice(&descriptors);
+    payload.extend_from_slice(&variables);
+    Ok(payload)
+}
+
 /// Writes one table as its own packed stream, one zstd frame per column.
 ///
 /// Without adaptive numeric encoding, each column frame's uncompressed bytes are identical to what
@@ -5151,7 +5353,41 @@ fn encode_table_metadata(
         append_u64(&mut raw, table.message_count);
     }
     debug_assert_eq!(capacity, raw.len());
+    append_grouped_streams(&mut raw, &packed.grouped)?;
     zstd::stream::encode_all(raw.as_slice(), compression_level).map_err(WriterError::Io)
+}
+
+/// Appends the grouped-stream section when any stream is grouped: the marker, the stream count,
+/// then per stream its ID and frame count, and per frame its node, encoding tag, and decompressed
+/// and compressed sizes, all varints but the tag.
+fn append_grouped_streams(
+    raw: &mut Vec<u8>,
+    grouped: &[GroupedStreamWire],
+) -> Result<(), WriterError> {
+    if grouped.is_empty() {
+        return Ok(());
+    }
+    raw.push(crate::archive::GROUPED_STREAMS_MARKER);
+    append_varint(raw, usize_u64(grouped.len())?);
+    for stream in grouped {
+        append_varint(raw, stream.stream_id);
+        append_varint(raw, usize_u64(stream.frames.len())?);
+        for (node_id, encoding, uncompressed, compressed) in &stream.frames {
+            append_varint(raw, u64::from(*node_id));
+            raw.push(encoding.to_wire());
+            append_varint(raw, *uncompressed);
+            append_varint(raw, *compressed);
+        }
+    }
+    Ok(())
+}
+
+fn append_varint(raw: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        raw.push(value.to_le_bytes()[0] | 0x80);
+        value >>= 7;
+    }
+    raw.push(value.to_le_bytes()[0]);
 }
 
 fn check_section_limits(sections: &[Vec<u8>; 7], limits: WriterLimits) -> Result<(), WriterError> {

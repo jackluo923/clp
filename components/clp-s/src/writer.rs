@@ -486,6 +486,7 @@ impl AdaptiveColumns {
     const NUMERIC: u8 = 1;
     const STRINGS: u8 = 1 << 1;
     const BINARY_UUIDS: u8 = 1 << 2;
+    const GROUPED_TABLES: u8 = 1 << 3;
 
     const fn has(self, flag: u8) -> bool {
         0 != self.0 & flag
@@ -527,7 +528,11 @@ impl WriterOptions {
             separate_columns_min_size: 0,
             // Library default stays conservative (0.5.0, C++-reference-compatible). The `clp-s`
             // compression CLI turns this on by default; embedders opt in via the builder.
-            adaptive: AdaptiveColumns(AdaptiveColumns::STRINGS | AdaptiveColumns::BINARY_UUIDS),
+            adaptive: AdaptiveColumns(
+                AdaptiveColumns::STRINGS
+                    | AdaptiveColumns::BINARY_UUIDS
+                    | AdaptiveColumns::GROUPED_TABLES,
+            ),
         }
     }
 
@@ -602,6 +607,27 @@ impl WriterOptions {
     #[must_use]
     pub const fn binary_uuids(self) -> bool {
         self.adaptive.has(AdaptiveColumns::BINARY_UUIDS) && self.adaptive_string_columns()
+    }
+
+    /// Enables or disables grouping tables that differ only in their arrays, which takes effect
+    /// only with adaptive string columns.
+    ///
+    /// When enabled (the default), tables stored one frame per column that share their non-array
+    /// columns and the set of nodes inside their arrays, differing only in how many elements their
+    /// arrays hold and in what order, share one packed stream, which keeps one frame per node
+    /// holding that node's columns from every table. Many small tables then compress as a few
+    /// long columns. Their schemas, and so every read, are unchanged.
+    #[must_use]
+    pub const fn with_grouped_array_tables(mut self, enabled: bool) -> Self {
+        self.adaptive = self.adaptive.with(AdaptiveColumns::GROUPED_TABLES, enabled);
+        self
+    }
+
+    /// Returns whether tables differing only in their arrays share a grouped stream: enabled, with
+    /// adaptive string columns.
+    #[must_use]
+    pub const fn grouped_array_tables(self) -> bool {
+        self.adaptive.has(AdaptiveColumns::GROUPED_TABLES) && self.adaptive_string_columns()
     }
 
     /// Returns whether string columns are encoded adaptively: enabled, with adaptive numeric

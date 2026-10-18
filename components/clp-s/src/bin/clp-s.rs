@@ -206,6 +206,11 @@ struct CompressArgs {
     /// default with adaptive string columns).
     #[arg(long, default_value_t = false)]
     no_binary_uuids: bool,
+    /// Store each table of a group differing only in its arrays in its own stream, rather than the
+    /// group sharing one stream with one frame per node (sharing is the default with adaptive
+    /// string columns).
+    #[arg(long, default_value_t = false)]
+    no_grouped_array_tables: bool,
     /// Path of the authoritative timestamp field.
     #[arg(long)]
     timestamp_key: Option<String>,
@@ -524,6 +529,7 @@ fn run_compress(arguments: &CompressArgs) -> CliResult<()> {
         .with_adaptive_numeric_columns(!arguments.no_adaptive_numeric_columns)
         .with_adaptive_string_columns(!arguments.no_adaptive_string_columns)
         .with_binary_uuids(!arguments.no_binary_uuids)
+        .with_grouped_array_tables(!arguments.no_grouped_array_tables)
         .with_log_order(!arguments.representation.disable_log_order)
         .with_log_order_column(!arguments.representation.no_log_order_column);
     let mut archive_set = ArchiveSetWriter::new(

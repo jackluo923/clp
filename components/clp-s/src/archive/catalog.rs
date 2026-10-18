@@ -336,6 +336,9 @@ impl ArchiveCatalog {
         stream: DecodedPackedStream,
         limits: ColumnLimits,
     ) -> Result<DecodedPackedStream, TableStreamError> {
+        if let Some(grouped) = self.table_metadata.grouped_stream_for(stream_id) {
+            return self.rebuild_grouped_tables(stream_id, grouped, &stream, limits);
+        }
         // Only 0.6+ archives carry adaptive columns; 0.5.x integer columns are already plain.
         if !self.version.supports_adaptive_numeric() {
             return Ok(stream);
@@ -446,6 +449,258 @@ impl ArchiveCatalog {
         }
         Ok(DecodedPackedStream::from_columns(columns, &sizes))
     }
+}
+
+impl ArchiveCatalog {
+    /// Rebuilds the tables of a grouped stream, read as its frames, laid out back to back as a
+    /// shared frame holds them. Each frame's encoding is inverted to its node's columns end to end,
+    /// which are then dealt out to the tables in order, each table taking its columns in schema
+    /// order and each column as many bytes as its type and the table's rows make it.
+    fn rebuild_grouped_tables(
+        &self,
+        stream_id: u64,
+        grouped: &super::GroupedStream,
+        stream: &DecodedPackedStream,
+        limits: ColumnLimits,
+    ) -> Result<DecodedPackedStream, TableStreamError> {
+        use super::GroupedFrameEncoding;
+        use crate::adaptive_int::AdaptiveDecodeError;
+        let tables: Vec<_> = self
+            .table_metadata
+            .schema_tables()
+            .iter()
+            .filter(|table| table.stream_id() == stream_id)
+            .collect();
+        let first = tables
+            .first()
+            .ok_or(TableStreamError::StreamHasNoTables { stream_id })?;
+        let malformed = |source| TableStreamError::AdaptiveNumeric {
+            schema_id: first.schema_id(),
+            column_index: 0,
+            source,
+        };
+        let members = self.grouped_members(&tables, limits, malformed)?;
+        // How many values each node's frame holds across the tables.
+        let mut node_rows: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for (rows, columns) in &members {
+            for (node_id, _) in columns {
+                *node_rows.entry(*node_id).or_default() += rows;
+            }
+        }
+        // Each frame inverted to its node's plain columns end to end.
+        let layout = stream
+            .column_layout()
+            .ok_or(TableStreamError::SizeOverflow)?;
+        if layout.len() != grouped.frames().len() {
+            return Err(malformed(AdaptiveDecodeError::Malformed));
+        }
+        let bytes = stream.as_bytes();
+        let mut offset = 0_usize;
+        let mut plain: std::collections::HashMap<u32, (Vec<u8>, usize)> =
+            std::collections::HashMap::new();
+        for (frame, slot) in grouped.frames().iter().zip(layout) {
+            let stored = bytes
+                .get(offset..offset + slot.stored)
+                .ok_or(TableStreamError::SizeOverflow)?;
+            offset += slot.stored;
+            let rows = node_rows.get(&frame.node_id()).copied().unwrap_or(0);
+            let decoded = match frame.encoding() {
+                GroupedFrameEncoding::Plain => stored.to_vec(),
+                GroupedFrameEncoding::Integer => crate::adaptive_int::decode(stored, rows)
+                    .map_err(malformed)?
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+                GroupedFrameEncoding::Float => crate::adaptive_float::decode(stored, rows)
+                    .map_err(malformed)?
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+                GroupedFrameEncoding::ClpString => {
+                    let occurrences: Vec<usize> = members
+                        .iter()
+                        .flat_map(|(rows, columns)| {
+                            columns
+                                .iter()
+                                .filter(|(node_id, _)| *node_id == frame.node_id())
+                                .map(move |_| *rows)
+                        })
+                        .collect();
+                    decode_grouped_clp_strings(stored, &occurrences, limits).map_err(malformed)?
+                }
+            };
+            if plain.insert(frame.node_id(), (decoded, 0)).is_some() {
+                return Err(malformed(AdaptiveDecodeError::Malformed));
+            }
+        }
+        // Deal the columns out to the tables.
+        let total = self
+            .table_metadata
+            .packed_stream(usize::try_from(stream_id).map_err(|_| TableStreamError::SizeOverflow)?)
+            .map(super::table_metadata::PackedStreamMetadata::uncompressed_size)
+            .ok_or(TableStreamError::SizeOverflow)?;
+        let mut tables_bytes = Vec::new();
+        tables_bytes
+            .try_reserve_exact(usize::try_from(total).map_err(|_| TableStreamError::SizeOverflow)?)
+            .map_err(|_| TableStreamError::SizeOverflow)?;
+        for (rows, columns) in &members {
+            for (node_id, node_type) in columns {
+                let (values, cursor) = plain
+                    .get_mut(node_id)
+                    .ok_or_else(|| malformed(AdaptiveDecodeError::Malformed))?;
+                let rest = values
+                    .get(*cursor..)
+                    .ok_or_else(|| malformed(AdaptiveDecodeError::Truncated))?;
+                let size = plain_column_size(*node_type, *rows, rest)
+                    .ok_or_else(|| malformed(AdaptiveDecodeError::Truncated))?;
+                tables_bytes.extend_from_slice(&rest[..size]);
+                *cursor += size;
+            }
+        }
+        if plain
+            .values()
+            .any(|(values, cursor)| *cursor != values.len())
+        {
+            return Err(malformed(AdaptiveDecodeError::Malformed));
+        }
+        Ok(DecodedPackedStream::from_tables(tables_bytes))
+    }
+
+    /// Each table's value columns, as (node, type), with its row count.
+    fn grouped_members(
+        &self,
+        tables: &[&super::SchemaTableMetadata],
+        limits: ColumnLimits,
+        malformed: impl Fn(crate::adaptive_int::AdaptiveDecodeError) -> TableStreamError,
+    ) -> Result<Vec<GroupedMember>, TableStreamError> {
+        use crate::adaptive_int::AdaptiveDecodeError;
+        let mut members = Vec::with_capacity(tables.len());
+        for (table_index, table) in tables.iter().enumerate() {
+            if table.message_count() > limits.max_messages() {
+                return Err(malformed(AdaptiveDecodeError::Malformed));
+            }
+            let schema = self.schema_map.get(table.schema_id()).ok_or_else(|| {
+                TableStreamError::UnknownSchemaId {
+                    table_index,
+                    schema_id: table.schema_id(),
+                }
+            })?;
+            let mut columns = Vec::new();
+            for entry in schema.entries() {
+                let SchemaEntry::Node(node_id) = *entry else {
+                    continue;
+                };
+                let node_type = self
+                    .schema_tree
+                    .get(usize::try_from(node_id).map_err(|_| TableStreamError::SizeOverflow)?)
+                    .map(super::schema_tree::SchemaNode::node_type)
+                    .ok_or(TableStreamError::SizeOverflow)?;
+                if is_value_bearing(node_type) {
+                    columns.push((node_id, node_type));
+                }
+            }
+            let rows = usize::try_from(table.message_count())
+                .map_err(|_| TableStreamError::SizeOverflow)?;
+            members.push((rows, columns));
+        }
+        Ok(members)
+    }
+}
+
+/// A grouped stream's table: its row count and its value columns, as (node, type).
+type GroupedMember = (usize, Vec<(u32, NodeType)>);
+
+/// The bytes one plain column of `node_type` with `rows` rows takes at the start of `bytes`: a
+/// fixed width per row, or for a CLP string its descriptors, its variable count and its variables.
+fn plain_column_size(node_type: NodeType, rows: usize, bytes: &[u8]) -> Option<usize> {
+    let size = match node_type {
+        NodeType::Integer
+        | NodeType::DeltaInteger
+        | NodeType::Float
+        | NodeType::DictionaryFloat
+        | NodeType::VarString => rows.checked_mul(8)?,
+        NodeType::Boolean => rows,
+        NodeType::FormattedFloat => rows.checked_mul(10)?,
+        NodeType::Timestamp | NodeType::DeprecatedDateString => rows.checked_mul(16)?,
+        NodeType::ClpString | NodeType::UnstructuredArray => {
+            let descriptors = rows.checked_mul(8)?;
+            let count = bytes.get(descriptors..descriptors.checked_add(8)?)?;
+            let count = usize::try_from(u64::from_le_bytes(count.try_into().ok()?)).ok()?;
+            descriptors
+                .checked_add(8)?
+                .checked_add(count.checked_mul(8)?)?
+        }
+        _ => return None,
+    };
+    (size <= bytes.len()).then_some(size)
+}
+
+/// Inverts a grouped stream's CLP-string frame to its columns' plain layouts end to end: for the
+/// column of each of `occurrences` rows, its descriptors, its variable count and its variables.
+fn decode_grouped_clp_strings(
+    stored: &[u8],
+    occurrences: &[usize],
+    limits: ColumnLimits,
+) -> Result<Vec<u8>, crate::adaptive_int::AdaptiveDecodeError> {
+    use crate::adaptive_int::AdaptiveDecodeError;
+    let read_u64 = |at: usize| -> Result<u64, AdaptiveDecodeError> {
+        stored
+            .get(at..at + 8)
+            .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("8-byte chunk")))
+            .ok_or(AdaptiveDecodeError::Truncated)
+    };
+    let columns = usize::try_from(read_u64(0)?).map_err(|_| AdaptiveDecodeError::Malformed)?;
+    if columns != occurrences.len() {
+        return Err(AdaptiveDecodeError::Malformed);
+    }
+    let mut counts = Vec::with_capacity(columns);
+    let mut total_variables = 0_u64;
+    for index in 0..columns {
+        let count = read_u64(8 + index * 8)?;
+        if count > limits.max_encoded_variables_per_column() {
+            return Err(AdaptiveDecodeError::Malformed);
+        }
+        total_variables = total_variables
+            .checked_add(count)
+            .ok_or(AdaptiveDecodeError::Malformed)?;
+        counts.push(usize::try_from(count).map_err(|_| AdaptiveDecodeError::Malformed)?);
+    }
+    let descriptors_at = 8 + columns * 8;
+    let descriptor_length =
+        usize::try_from(read_u64(descriptors_at)?).map_err(|_| AdaptiveDecodeError::Malformed)?;
+    let descriptors_start = descriptors_at + 8;
+    let descriptors_end = descriptors_start
+        .checked_add(descriptor_length)
+        .ok_or(AdaptiveDecodeError::Malformed)?;
+    let descriptors = stored
+        .get(descriptors_start..descriptors_end)
+        .ok_or(AdaptiveDecodeError::Truncated)?;
+    let variables = &stored[descriptors_end..];
+    let descriptors = crate::adaptive_int::decode(descriptors, occurrences.iter().sum())?;
+    let total_variables =
+        usize::try_from(total_variables).map_err(|_| AdaptiveDecodeError::Malformed)?;
+    let variables = if 0 == total_variables {
+        if !variables.is_empty() {
+            return Err(AdaptiveDecodeError::Malformed);
+        }
+        Vec::new()
+    } else {
+        crate::adaptive_int::decode(variables, total_variables)?
+    };
+    let mut plain = Vec::with_capacity((descriptors.len() + columns + variables.len()) * 8);
+    let (mut next_descriptor, mut next_variable) = (0, 0);
+    for (rows, count) in occurrences.iter().zip(&counts) {
+        for value in &descriptors[next_descriptor..next_descriptor + rows] {
+            plain.extend_from_slice(&value.to_le_bytes());
+        }
+        next_descriptor += rows;
+        plain.extend_from_slice(&(*count as u64).to_le_bytes());
+        for value in &variables[next_variable..next_variable + count] {
+            plain.extend_from_slice(&value.to_le_bytes());
+        }
+        next_variable += count;
+    }
+    Ok(plain)
 }
 
 /// Inverts an adaptive CLP-string column to its plain layout: the descriptors as 8-byte values,

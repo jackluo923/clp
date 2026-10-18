@@ -229,6 +229,108 @@ pub struct TableMetadata {
     total_uncompressed_stream_size: u64,
     record_count: u64,
     separate_columns: Vec<SeparateColumnStream>,
+    grouped_streams: Vec<GroupedStream>,
+}
+
+/// Starts the optional table-metadata section listing grouped streams (archive 0.8.0).
+pub const GROUPED_STREAMS_MARKER: u8 = 0x47;
+
+/// How a grouped stream's frame encodes the columns of its node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupedFrameEncoding {
+    /// The member columns' plain bytes, one after another.
+    Plain,
+    /// The member columns' 8-byte values, one after another, in an adaptive integer scheme.
+    Integer,
+    /// The member columns' float bit patterns, one after another, in an adaptive float scheme.
+    Float,
+    /// The member CLP-string columns: their variable counts, then all their descriptors and all
+    /// their variables, each run in an adaptive integer scheme.
+    ClpString,
+}
+
+impl GroupedFrameEncoding {
+    const fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Plain),
+            1 => Some(Self::Integer),
+            2 => Some(Self::Float),
+            3 => Some(Self::ClpString),
+            _ => None,
+        }
+    }
+
+    /// The encoding's tag in the table metadata.
+    #[must_use]
+    pub const fn to_wire(self) -> u8 {
+        match self {
+            Self::Plain => 0,
+            Self::Integer => 1,
+            Self::Float => 2,
+            Self::ClpString => 3,
+        }
+    }
+}
+
+/// One frame of a grouped stream: every column of one schema node across the stream's tables.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GroupedFrame {
+    node_id: u32,
+    encoding: GroupedFrameEncoding,
+    uncompressed_size: u64,
+    compressed_size: u64,
+}
+
+impl GroupedFrame {
+    /// The schema node whose columns the frame holds.
+    #[must_use]
+    pub const fn node_id(self) -> u32 {
+        self.node_id
+    }
+
+    /// How the frame encodes those columns.
+    #[must_use]
+    pub const fn encoding(self) -> GroupedFrameEncoding {
+        self.encoding
+    }
+
+    /// Bytes the frame inflates to, before its encoding is inverted.
+    #[must_use]
+    pub const fn uncompressed_size(self) -> u64 {
+        self.uncompressed_size
+    }
+
+    /// Bytes the frame occupies in `/0`.
+    #[must_use]
+    pub const fn compressed_size(self) -> u64 {
+        self.compressed_size
+    }
+}
+
+/// A packed stream holding several tables whose same-node columns share one frame per node.
+///
+/// Its tables share their non-array columns and the set of nodes inside their arrays, differing
+/// only in their arrays' lengths and element order, so each node's columns, laid end to end in
+/// table order and then schema order, compress as one. The stream's advertised size is that of
+/// its tables laid out as in a shared frame, which reading it rebuilds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupedStream {
+    stream_id: u64,
+    frames: Vec<GroupedFrame>,
+}
+
+impl GroupedStream {
+    /// The packed stream this describes.
+    #[must_use]
+    pub const fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    /// The stream's frames, in the order they are stored.
+    #[must_use]
+    pub fn frames(&self) -> &[GroupedFrame] {
+        &self.frames
+    }
 }
 
 /// One column's zstd frame inside a separate-column packed stream.
@@ -292,7 +394,16 @@ impl TableMetadata {
 
     /// Returns schema tables in physical decompression order.
     #[must_use]
+    /// The frames of `stream_id`, when it is a grouped stream.
+    pub fn grouped_stream_for(&self, stream_id: u64) -> Option<&GroupedStream> {
+        self.grouped_streams
+            .binary_search_by_key(&stream_id, |entry| entry.stream_id)
+            .ok()
+            .map(|index| &self.grouped_streams[index])
+    }
+
     /// The column frames of `stream_id`, when it is a separate-column stream.
+    #[must_use]
     pub fn separate_columns_for(&self, stream_id: u64) -> Option<&SeparateColumnStream> {
         self.separate_columns
             .binary_search_by_key(&stream_id, |entry| entry.stream_id)
@@ -383,6 +494,8 @@ fn decode_entries<R: Read>(
     )?;
 
     validate_separate_columns(&separate_columns, &decoded_streams.entries, &decoded_tables.entries)?;
+    let grouped_streams =
+        decode_grouped_streams(reader, &decoded_streams.entries, &separate_columns)?;
     Ok(TableMetadata {
         packed_streams: decoded_streams.entries,
         schema_tables: decoded_tables.entries,
@@ -390,7 +503,91 @@ fn decode_entries<R: Read>(
         total_uncompressed_stream_size: decoded_streams.total_uncompressed_size,
         record_count: decoded_tables.record_count,
         separate_columns,
+        grouped_streams,
     })
+}
+
+/// Reads the optional grouped-stream section: after [`GROUPED_STREAMS_MARKER`], the number of
+/// grouped streams, then for each its stream ID and frame count, and for each frame its node ID,
+/// encoding tag, and decompressed and compressed sizes, all varints but the tag. An archive
+/// without the section ends after its tables.
+fn decode_grouped_streams<R: Read>(
+    reader: &mut R,
+    packed_streams: &[PackedStreamMetadata],
+    separate_columns: &[SeparateColumnStream],
+) -> Result<Vec<GroupedStream>, TableMetadataError> {
+    let mut section = Vec::new();
+    reader
+        .read_to_end(&mut section)
+        .map_err(TableMetadataError::Io)?;
+    let Some((&marker, mut rest)) = section.split_first() else {
+        return Ok(Vec::new());
+    };
+    let malformed = || TableMetadataError::TrailingDecompressedData;
+    if GROUPED_STREAMS_MARKER != marker {
+        return Err(malformed());
+    }
+    let count = take_varint(&mut rest)?;
+    let mut streams: Vec<GroupedStream> = Vec::new();
+    for _ in 0..count {
+        let stream_id = take_varint(&mut rest)?;
+        let stream = usize::try_from(stream_id)
+            .ok()
+            .and_then(|index| packed_streams.get(index))
+            .ok_or_else(malformed)?;
+        if streams
+            .last()
+            .is_some_and(|last| last.stream_id >= stream_id)
+            || separate_columns
+                .binary_search_by_key(&stream_id, |entry| entry.stream_id)
+                .is_ok()
+        {
+            return Err(malformed());
+        }
+        let frame_count = take_varint(&mut rest)?;
+        let mut frames = Vec::new();
+        let mut compressed = 0_u64;
+        for _ in 0..frame_count {
+            let node_id = u32::try_from(take_varint(&mut rest)?).map_err(|_| malformed())?;
+            let (&tag, after_tag) = rest.split_first().ok_or_else(malformed)?;
+            rest = after_tag;
+            let encoding = GroupedFrameEncoding::from_wire(tag).ok_or_else(malformed)?;
+            let uncompressed_size = take_varint(&mut rest)?;
+            let compressed_size = take_varint(&mut rest)?;
+            compressed = compressed
+                .checked_add(compressed_size)
+                .ok_or(TableMetadataError::SizeOverflow)?;
+            frames.push(GroupedFrame {
+                node_id,
+                encoding,
+                uncompressed_size,
+                compressed_size,
+            });
+        }
+        if compressed != stream.compressed_size {
+            return Err(malformed());
+        }
+        streams.push(GroupedStream { stream_id, frames });
+    }
+    if !rest.is_empty() {
+        return Err(malformed());
+    }
+    Ok(streams)
+}
+
+fn take_varint(bytes: &mut &[u8]) -> Result<u64, TableMetadataError> {
+    let mut value = 0_u64;
+    for shift in (0..64).step_by(7) {
+        let (&byte, rest) = bytes
+            .split_first()
+            .ok_or(TableMetadataError::TrailingDecompressedData)?;
+        *bytes = rest;
+        value |= u64::from(byte & 0x7F) << shift;
+        if 0 == byte & 0x80 {
+            return Ok(value);
+        }
+    }
+    Err(TableMetadataError::TrailingDecompressedData)
 }
 
 struct DecodedPackedStreams {
