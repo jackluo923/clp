@@ -1747,6 +1747,79 @@ fn searches_through_structured_arrays_read_only_what_they_need_and_answer_exactl
 }
 
 #[test]
+fn adaptive_string_columns_read_back_exactly_and_answer_searches_the_same() {
+    // Tables holding a number are stored one frame per column, so their string and CLP-string
+    // columns are encoded adaptively: a few repeated strings (dictionary IDs that suit the
+    // dictionary or run-length schemes), unique ones, and messages whose variables vary.
+    let mut input = String::new();
+    for index in 0..300 {
+        input.push_str(&format!(
+            "{{\"n\":{index},\"level\":\"{}\",\"id\":\"req-{index}\",\
+             \"msg\":\"took {} ms for user u{}\",\"const\":\"same\"}}\n",
+            ["info", "warn", "error"][index % 3],
+            index * 7 % 50,
+            index % 11
+        ));
+    }
+    let temporary = TestDirectory::new("adaptive-strings");
+    let input_path = temporary.path().join("input.jsonl");
+    fs::write(&input_path, &input).expect("write adaptive-string fixture");
+    let compress = |name: &str, extra: &[&str]| {
+        let archives_path = temporary.path().join(name);
+        let mut arguments: Vec<&OsStr> = vec!["c".as_ref(), "--single-file-archive".as_ref()];
+        arguments.extend(extra.iter().map(|argument| OsStr::new(*argument)));
+        arguments.extend([archives_path.as_os_str(), input_path.as_os_str()]);
+        let result = clp_s(&arguments);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        only_entry(&archives_path)
+    };
+    let plain = compress("plain", &["--no-adaptive-string-columns"]);
+    let adaptive = compress("adaptive", &[]);
+    assert_ne!(
+        fs::read(&plain).expect("read plain archive"),
+        fs::read(&adaptive).expect("read adaptive archive")
+    );
+    assert_eq!(
+        extract_original(&plain, &temporary.path().join("plain-extracted")),
+        extract_original(&adaptive, &temporary.path().join("adaptive-extracted"))
+    );
+    let search = |archive: &Path, query: &str, projection: &[&str]| {
+        let mut arguments: Vec<&OsStr> = vec!["s".as_ref(), archive.as_os_str(), query.as_ref()];
+        if !projection.is_empty() {
+            arguments.push("--projection".as_ref());
+            arguments.extend(projection.iter().map(|path| OsStr::new(*path)));
+        }
+        let result = clp_s(&arguments);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        result.stdout
+    };
+    for (query, projection) in [
+        ("level:warn", &["n", "id"][..]),
+        ("id:\"req-17\"", &[][..]),
+        ("msg:\"*user u3*\"", &["msg", "const"][..]),
+        ("const:same AND n > 290", &["msg"][..]),
+    ] {
+        let expected = search(&plain, query, projection);
+        assert!(!expected.is_empty(), "{query} matches the fixture");
+        assert_eq!(
+            expected,
+            search(&adaptive, query, projection),
+            "{query} {projection:?}"
+        );
+    }
+    let version = |archive: &Path| fs::read(archive).expect("read archive")[4..8].to_vec();
+    assert_eq!(vec![0, 0, 8, 0], version(&adaptive));
+}
+
+#[test]
 fn field_logtype_dictionaries_read_back_exactly_and_answer_searches_the_same() {
     // Several text fields, some sharing a message, so their sections overlap and a field's search
     // must load only its own entries.
@@ -1819,10 +1892,18 @@ fn field_logtype_dictionaries_read_back_exactly_and_answer_searches_the_same() {
             "{query} {projection:?}"
         );
     }
-    // The default stamps 0.7.0. Without adaptive numeric columns the layout is not used, so such
-    // an archive stays at the 0.5.0 every reader accepts. The header's version is bytes 4 to 8.
+    // Per-field dictionaries stamp 0.7.0, or 0.8.0 with the default adaptive string columns.
+    // Without adaptive numeric columns neither layout is used, so such an archive stays at the
+    // 0.5.0 every reader accepts. The header's version is bytes 4 to 8.
     let version = |archive: &Path| fs::read(archive).expect("read archive")[4..8].to_vec();
-    assert_eq!(vec![0, 0, 7, 0], version(&fields));
+    assert_eq!(vec![0, 0, 8, 0], version(&fields));
+    assert_eq!(
+        vec![0, 0, 7, 0],
+        version(&compress(
+            "plain-strings",
+            &["--no-adaptive-string-columns"]
+        ))
+    );
     assert_eq!(
         vec![0, 0, 5, 0],
         version(&compress("no-adaptive", &["--no-adaptive-numeric-columns"]))

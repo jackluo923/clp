@@ -41,6 +41,10 @@ impl ArchiveVersion {
     /// Stamped only when the writer's per-field log-type dictionaries are enabled.
     pub const FIELD_DICTIONARIES: Self = Self::new(0, 7, 0);
 
+    /// First version whose separate-column string and CLP-string columns may carry an adaptive
+    /// encoding header (0.7 plus those encodings). Stamped only when the writer encodes them.
+    pub const ADAPTIVE_STRINGS: Self = Self::new(0, 8, 0);
+
     /// Creates a version from its semantic components.
     #[must_use]
     pub const fn new(major: u8, minor: u8, patch: u16) -> Self {
@@ -84,7 +88,8 @@ impl ArchiveVersion {
         self.major == Self::CURRENT.major
             && (self.minor == Self::CURRENT.minor
                 || self.minor == Self::ADAPTIVE_NUMERIC.minor
-                || self.minor == Self::FIELD_DICTIONARIES.minor)
+                || self.minor == Self::FIELD_DICTIONARIES.minor
+                || self.minor == Self::ADAPTIVE_STRINGS.minor)
     }
 
     /// Whether a separate-column integer stream in an archive at this version may carry an adaptive
@@ -92,6 +97,13 @@ impl ArchiveVersion {
     #[must_use]
     pub const fn supports_adaptive_numeric(self) -> bool {
         self.to_wire() >= Self::ADAPTIVE_NUMERIC.to_wire()
+    }
+
+    /// Whether a separate-column string or CLP-string stream in an archive at this version may
+    /// carry an adaptive encoding header. False before 0.8, where such columns are always plain.
+    #[must_use]
+    pub const fn supports_adaptive_strings(self) -> bool {
+        self.to_wire() >= Self::ADAPTIVE_STRINGS.to_wire()
     }
 
     /// Returns the major version component.
@@ -434,7 +446,11 @@ mod tests {
         // A minor outside the supported set, or a different major, changes the layout unknowably,
         // so it stays refused.
         assert!(!ArchiveVersion::new(0, 4, 0).is_readable());
-        assert!(!ArchiveVersion::new(0, 8, 0).is_readable());
+        // 0.8 adds adaptive string and CLP-string columns.
+        assert!(ArchiveVersion::ADAPTIVE_STRINGS.is_readable());
+        assert!(ArchiveVersion::ADAPTIVE_STRINGS.supports_adaptive_numeric());
+        assert!(!ArchiveVersion::FIELD_DICTIONARIES.supports_adaptive_strings());
+        assert!(!ArchiveVersion::new(0, 9, 0).is_readable());
         assert!(!ArchiveVersion::new(1, 5, 0).is_readable());
     }
 

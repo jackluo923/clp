@@ -4786,6 +4786,85 @@ fn encode_adaptive_integer_column(
     write_best_candidate(adaptive_int::candidates(&values), compressor, out)
 }
 
+/// The candidate whose zstd frame is smallest, as raw (pre-zstd) bytes. Ties keep the earliest,
+/// which is plain.
+fn best_candidate(
+    candidates: Vec<Vec<u8>>,
+    compressor: &mut zstd::bulk::Compressor<'_>,
+) -> Result<Vec<u8>, WriterError> {
+    let mut best: Option<(usize, Vec<u8>)> = None;
+    for candidate in candidates {
+        let size = compressor
+            .compress(&candidate)
+            .map_err(WriterError::Io)?
+            .len();
+        if best.as_ref().is_none_or(|(best_size, _)| size < *best_size) {
+            best = Some((size, candidate));
+        }
+    }
+    Ok(best.map(|(_, candidate)| candidate).unwrap_or_default())
+}
+
+/// Encodes one CLP-string column adaptively and appends its zstd frame to `out`.
+///
+/// The column is two runs of 8-byte values: one descriptor per row (log-type ID and where the row's
+/// variables start), then the encoded variables. Each run takes the smallest of the integer
+/// schemes on its own (see [`adaptive_int::candidates`]), and the frame holds the descriptors'
+/// encoded length, the descriptors, the variable count, then the variables. The reader inverts it
+/// back to the plain layout.
+fn encode_adaptive_clp_string_column(
+    column: &TableColumn,
+    rows: u64,
+    compressor: &mut zstd::bulk::Compressor<'_>,
+    remap: Option<&LogTypeRemap>,
+    out: &mut Vec<u8>,
+) -> Result<u64, WriterError> {
+    let length = column.encoded_len();
+    if 0 == length {
+        return Ok(0);
+    }
+    let mut raw = Vec::new();
+    raw.try_reserve_exact(length)
+        .map_err(|_| WriterError::AllocationFailed { requested: length })?;
+    column.write_remapped(&mut raw, remap)?;
+    let descriptor_bytes = usize::try_from(rows)
+        .ok()
+        .and_then(|rows| rows.checked_mul(size_of::<u64>()))
+        .filter(|size| {
+            size.checked_add(size_of::<u64>())
+                .is_some_and(|end| end <= raw.len())
+        })
+        .ok_or(WriterError::SizeOverflow)?;
+    let (descriptors, rest) = raw.split_at(descriptor_bytes);
+    let (count, variables) = rest.split_at(size_of::<u64>());
+    let values = |bytes: &[u8]| -> Vec<i64> {
+        bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| i64::from_le_bytes(*chunk))
+            .collect()
+    };
+    let descriptors = best_candidate(adaptive_int::candidates(&values(descriptors)), compressor)?;
+    let variables = if variables.is_empty() {
+        Vec::new()
+    } else {
+        best_candidate(adaptive_int::candidates(&values(variables)), compressor)?
+    };
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(2 * size_of::<u64>() + descriptors.len() + variables.len())
+        .map_err(|_| WriterError::AllocationFailed {
+            requested: descriptors.len() + variables.len(),
+        })?;
+    payload.extend_from_slice(&len_u64(&descriptors)?.to_le_bytes());
+    payload.extend_from_slice(&descriptors);
+    payload.extend_from_slice(count);
+    payload.extend_from_slice(&variables);
+    out.extend_from_slice(&compressor.compress(&payload).map_err(WriterError::Io)?);
+    len_u64(&payload)
+}
+
 /// Encodes one float column with the smallest adaptive scheme (see [`adaptive_float::candidates`])
 /// and appends its zstd frame to `out`. Operates on the raw IEEE bit patterns so `NaN`/`inf`/`-0.0`
 /// round-trip exactly; the reader inverts it via [`adaptive_float::decode`].
@@ -4835,6 +4914,7 @@ fn encode_separate_table(
     let mut uncompressed_size = 0_u64;
     for column in &table.columns {
         let start = packed.compressed.len();
+        let strings = options.adaptive_string_columns();
         let uncompressed = match (options.adaptive_numeric_columns(), column.node_type) {
             (true, NodeType::Integer) => {
                 encode_adaptive_integer_column(column, compressor, &mut packed.compressed)?
@@ -4842,6 +4922,16 @@ fn encode_separate_table(
             (true, NodeType::Float) => {
                 encode_adaptive_float_column(column, compressor, &mut packed.compressed)?
             }
+            (true, NodeType::VarString | NodeType::DictionaryFloat) if strings => {
+                encode_adaptive_integer_column(column, compressor, &mut packed.compressed)?
+            }
+            (true, NodeType::ClpString) if strings => encode_adaptive_clp_string_column(
+                column,
+                table.message_count,
+                compressor,
+                remap,
+                &mut packed.compressed,
+            )?,
             _ => encode_plain_column(column, compressor, remap, &mut packed.compressed)?,
         };
         let compressed = usize_u64(packed.compressed.len() - start)?;

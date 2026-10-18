@@ -473,7 +473,15 @@ pub struct WriterOptions {
     record_log_order: bool,
     emit_log_order_column: bool,
     separate_columns_min_size: u64,
-    adaptive_numeric_columns: bool,
+    adaptive: AdaptiveColumns,
+}
+
+/// Which columns of a table stored one frame per column take the smallest of a set of
+/// lightweight encodings: numbers, and with them strings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdaptiveColumns {
+    numeric: bool,
+    strings: bool,
 }
 
 impl WriterOptions {
@@ -503,7 +511,10 @@ impl WriterOptions {
             separate_columns_min_size: 0,
             // Library default stays conservative (0.5.0, C++-reference-compatible). The `clp-s`
             // compression CLI turns this on by default; embedders opt in via the builder.
-            adaptive_numeric_columns: false,
+            adaptive: AdaptiveColumns {
+                numeric: false,
+                strings: true,
+            },
         }
     }
 
@@ -538,14 +549,34 @@ impl WriterOptions {
     /// Disabling it restores byte-identical 0.5.0 output (the format the C++ reference reads).
     #[must_use]
     pub const fn with_adaptive_numeric_columns(mut self, enabled: bool) -> Self {
-        self.adaptive_numeric_columns = enabled;
+        self.adaptive.numeric = enabled;
         self
     }
 
     /// Returns whether adaptive per-column numeric encoding is enabled.
     #[must_use]
     pub const fn adaptive_numeric_columns(self) -> bool {
-        self.adaptive_numeric_columns
+        self.adaptive.numeric
+    }
+
+    /// Enables or disables adaptive encoding of string columns, which takes effect only with
+    /// adaptive numeric columns.
+    ///
+    /// When enabled (the default), a string column stored one zstd frame per column, which holds
+    /// one variable-dictionary ID per row, takes the smallest of the integer schemes as an integer
+    /// column does, and a CLP-string column does so for its descriptors and its encoded variables
+    /// separately. Such an archive is stamped version 0.8.0, which earlier readers refuse.
+    #[must_use]
+    pub const fn with_adaptive_string_columns(mut self, enabled: bool) -> Self {
+        self.adaptive.strings = enabled;
+        self
+    }
+
+    /// Returns whether string columns are encoded adaptively: enabled, with adaptive numeric
+    /// columns.
+    #[must_use]
+    pub const fn adaptive_string_columns(self) -> bool {
+        self.adaptive.strings && self.adaptive.numeric
     }
 
     /// Replaces the writer resource limits.
@@ -680,7 +711,7 @@ impl WriterOptions {
     /// [`with_field_logtype_dictionaries`](Self::with_field_logtype_dictionaries).
     #[must_use]
     pub const fn field_logtype_dictionaries(self) -> bool {
-        self.dictionary_compression.per_field && self.adaptive_numeric_columns
+        self.dictionary_compression.per_field && self.adaptive.numeric
     }
 
     /// Resource limits applied during finalization.
@@ -1031,7 +1062,9 @@ impl EncodedEmptyArchive {
 
         // Stamp the adaptive-integer format version only when the opt-in flag is set, so default
         // writes remain byte-identical 0.5.0 archives that 0.5.x readers still accept.
-        let version = if options.field_logtype_dictionaries() {
+        let version = if options.adaptive_string_columns() {
+            crate::archive::ArchiveVersion::ADAPTIVE_STRINGS
+        } else if options.field_logtype_dictionaries() {
             crate::archive::ArchiveVersion::FIELD_DICTIONARIES
         } else if options.adaptive_numeric_columns() {
             crate::archive::ArchiveVersion::ADAPTIVE_NUMERIC
@@ -1735,8 +1768,8 @@ mod tests {
             let (version, decoded) = adaptive_column_values(bytes);
             assert_eq!(
                 version,
-                crate::archive::ArchiveVersion::FIELD_DICTIONARIES,
-                "an adaptive archive, with per-field log-type dictionaries by default, is stamped 0.7.0"
+                crate::archive::ArchiveVersion::ADAPTIVE_STRINGS,
+                "an adaptive archive, with per-field log-type dictionaries and adaptive string columns by default, is stamped 0.8.0"
             );
             assert_eq!(decoded, values, "the column round-trips through the adaptive pipeline");
         }
@@ -1840,8 +1873,8 @@ mod tests {
             let (version, bits) = adaptive_float_column_bits(adaptive_float_archive(&values));
             assert_eq!(
                 version,
-                crate::archive::ArchiveVersion::FIELD_DICTIONARIES,
-                "an adaptive archive, with per-field log-type dictionaries by default, is stamped 0.7.0"
+                crate::archive::ArchiveVersion::ADAPTIVE_STRINGS,
+                "an adaptive archive, with per-field log-type dictionaries and adaptive string columns by default, is stamped 0.8.0"
             );
             assert_eq!(bits, expected, "float column round-trips bit-exact");
         }

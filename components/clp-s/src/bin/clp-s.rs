@@ -196,6 +196,12 @@ struct CompressArgs {
     /// output that the C++ reference reads.
     #[arg(long, default_value_t = false)]
     no_adaptive_numeric_columns: bool,
+    /// Store string and CLP-string columns plainly rather than adaptively (adaptive is the default
+    /// with adaptive numeric columns). Adaptive encoding gives each string column, a run of
+    /// dictionary IDs, the smallest of the integer schemes, and stamps archive version 0.8.0,
+    /// which earlier readers refuse.
+    #[arg(long, default_value_t = false)]
+    no_adaptive_string_columns: bool,
     /// Path of the authoritative timestamp field.
     #[arg(long)]
     timestamp_key: Option<String>,
@@ -512,6 +518,7 @@ fn run_compress(arguments: &CompressArgs) -> CliResult<()> {
         .with_minimum_packed_stream_size(arguments.min_table_size)
         .with_separate_columns_min_size(arguments.separate_columns_min_size)
         .with_adaptive_numeric_columns(!arguments.no_adaptive_numeric_columns)
+        .with_adaptive_string_columns(!arguments.no_adaptive_string_columns)
         .with_log_order(!arguments.representation.disable_log_order)
         .with_log_order_column(!arguments.representation.no_log_order_column);
     let mut archive_set = ArchiveSetWriter::new(

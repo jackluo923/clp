@@ -344,6 +344,7 @@ impl ArchiveCatalog {
         let Some(layout) = stream.column_layout() else {
             return Ok(stream);
         };
+        let strings = self.version.supports_adaptive_strings();
         // A separate-column stream holds exactly one table; resolve its schema and row count.
         let table = self
             .table_metadata
@@ -404,12 +405,25 @@ impl ArchiveCatalog {
             if !slot.loaded {
                 columns.push(None);
                 sizes.push(slot.size);
-            } else if node_type == Some(NodeType::Integer) && !stored.is_empty() {
+            } else if (node_type == Some(NodeType::Integer)
+                || strings
+                    && matches!(
+                        node_type,
+                        Some(NodeType::VarString | NodeType::DictionaryFloat)
+                    ))
+                && !stored.is_empty()
+            {
                 let values = crate::adaptive_int::decode(stored, message_count).map_err(decode_err)?;
                 let mut raw = Vec::with_capacity(values.len() * 8);
                 for value in values {
                     raw.extend_from_slice(&value.to_le_bytes());
                 }
+                sizes.push(raw.len());
+                columns.push(Some(raw));
+                changed = true;
+            } else if strings && node_type == Some(NodeType::ClpString) && !stored.is_empty() {
+                let raw = decode_adaptive_clp_string(stored, message_count, limits)
+                    .map_err(decode_err)?;
                 sizes.push(raw.len());
                 columns.push(Some(raw));
                 changed = true;
@@ -432,6 +446,57 @@ impl ArchiveCatalog {
         }
         Ok(DecodedPackedStream::from_columns(columns, &sizes))
     }
+}
+
+/// Inverts an adaptive CLP-string column to its plain layout: the descriptors as 8-byte values,
+/// the variable count, then the variables as 8-byte values. The stored form holds the encoded
+/// descriptors' length, the descriptors, the variable count, then the encoded variables, each
+/// run in one of the integer schemes.
+fn decode_adaptive_clp_string(
+    stored: &[u8],
+    rows: usize,
+    limits: ColumnLimits,
+) -> Result<Vec<u8>, crate::adaptive_int::AdaptiveDecodeError> {
+    use crate::adaptive_int::AdaptiveDecodeError;
+    let read_u64 = |bytes: &[u8], at: usize| -> Result<u64, AdaptiveDecodeError> {
+        bytes
+            .get(at..at + 8)
+            .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("8-byte chunk")))
+            .ok_or(AdaptiveDecodeError::Truncated)
+    };
+    let descriptor_length =
+        usize::try_from(read_u64(stored, 0)?).map_err(|_| AdaptiveDecodeError::Malformed)?;
+    let descriptors_end = descriptor_length
+        .checked_add(8)
+        .ok_or(AdaptiveDecodeError::Malformed)?;
+    let descriptors = stored
+        .get(8..descriptors_end)
+        .ok_or(AdaptiveDecodeError::Truncated)?;
+    let count = read_u64(stored, descriptors_end)?;
+    // The count sizes an allocation, so it is bounded as the plain column decoder bounds it.
+    if count > limits.max_encoded_variables_per_column() {
+        return Err(AdaptiveDecodeError::Malformed);
+    }
+    let count = usize::try_from(count).map_err(|_| AdaptiveDecodeError::Malformed)?;
+    let variables = &stored[descriptors_end + 8..];
+    let descriptors = crate::adaptive_int::decode(descriptors, rows)?;
+    let variables = if 0 == count {
+        if !variables.is_empty() {
+            return Err(AdaptiveDecodeError::Malformed);
+        }
+        Vec::new()
+    } else {
+        crate::adaptive_int::decode(variables, count)?
+    };
+    let mut raw = Vec::with_capacity((descriptors.len() + 1 + variables.len()) * 8);
+    for value in &descriptors {
+        raw.extend_from_slice(&value.to_le_bytes());
+    }
+    raw.extend_from_slice(&(count as u64).to_le_bytes());
+    for value in &variables {
+        raw.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(raw)
 }
 
 /// Layout-independent inputs needed to assemble an [`ArchiveCatalog`].
