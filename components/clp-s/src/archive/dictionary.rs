@@ -182,7 +182,8 @@ pub struct VariableDictionary {
     /// Bytes the dictionary frame decoded to. An entry stored as a binary UUID has a range of 36
     /// bytes at or past this, which addresses its text in `rendered` rather than `storage`.
     frame_len: usize,
-    /// The 16 bytes of each binary-UUID entry, in ID order.
+    /// The binary-UUID entries in ID order, laid out as 16 byte columns (see [`uuid_columns`]),
+    /// as the archive stores them; a UUID's bytes are gathered only when one is read.
     uuids: Vec<u8>,
     /// The text of every binary-UUID entry, built the first time one is read.
     rendered: std::sync::OnceLock<Vec<u8>>,
@@ -241,10 +242,16 @@ impl VariableDictionary {
     /// The 16 bytes of an entry stored as a binary UUID, or `None` for any other entry. Reading
     /// them needs no text, so a search can compare a UUID literal without rendering the UUIDs.
     #[must_use]
-    pub fn binary_uuid(&self, id: u64) -> Option<&[u8]> {
+    pub fn binary_uuid(&self, id: u64) -> Option<[u8; 16]> {
         let range = self.storage.ranges.get(usize::try_from(id).ok()?)?;
         let index = self.uuid_index(range)?;
-        self.uuids.get(index * 16..index * 16 + 16)
+        Some(self.gather_uuid(index))
+    }
+
+    /// The 16 bytes of the `index`th binary UUID, one from each byte column.
+    fn gather_uuid(&self, index: usize) -> [u8; 16] {
+        let count = self.uuids.len() / 16;
+        std::array::from_fn(|column| self.uuids[column * count + index])
     }
 
     /// Whether some entries are stored as binary UUIDs.
@@ -263,9 +270,10 @@ impl VariableDictionary {
             return &self.storage.bytes.as_slice()[range.clone()];
         }
         let rendered = self.rendered.get_or_init(|| {
-            let mut rendered = Vec::with_capacity(self.uuids.len() / 16 * 36);
-            for uuid in self.uuids.as_chunks::<16>().0 {
-                render_uuid(uuid, &mut rendered);
+            let count = self.uuids.len() / 16;
+            let mut rendered = Vec::with_capacity(count * 36);
+            for index in 0..count {
+                render_uuid(&self.gather_uuid(index), &mut rendered);
             }
             rendered
         });
@@ -570,9 +578,10 @@ pub(super) fn decode_variable_dictionary<R: Read>(
             rendered: std::sync::OnceLock::new(),
         });
     }
-    // Entries that are canonical UUIDs are stored as their 16 bytes, in ID order, in a zstd frame
-    // of their own ahead of the frame holding the rest; that frame marks each one's place with a
-    // length of `BINARY_UUID_LENGTH` and no bytes.
+    // Entries that are canonical UUIDs are stored as their 16 bytes, in ID order and laid out as
+    // byte columns (see `uuid_columns`), in a zstd frame of their own ahead of the frame holding
+    // the rest; that frame marks each one's place with a length of `BINARY_UUID_LENGTH` and no
+    // bytes.
     let entry_count = read_u64(&mut section)?;
     let uuid_count = read_u64(&mut section)?;
     if uuid_count > entry_count || entry_count > limits.entries {
@@ -600,7 +609,44 @@ pub(super) fn decode_variable_dictionary<R: Read>(
     section
         .read_exact(&mut frame)
         .map_err(DictionaryError::Io)?;
-    let uuids = decode_sized_frame(&frame, uuid_bytes, limits.decompressed)?;
+    // Sixteen frames, one per byte column, each holding one byte of every UUID.
+    let column_bytes = uuid_bytes / UUID_SIZE;
+    let uuid_bytes = usize::try_from(uuid_bytes).map_err(|_| DictionaryError::SizeOverflow)?;
+    let mut columns = Vec::new();
+    columns
+        .try_reserve_exact(uuid_bytes)
+        .map_err(|_| DictionaryError::AllocationFailed {
+            requested: uuid_bytes,
+        })?;
+    columns.resize(uuid_bytes, 0);
+    let mut rest = frame.as_slice();
+    let column_bytes = usize::try_from(column_bytes).map_err(|_| DictionaryError::SizeOverflow)?;
+    if 0 != column_bytes {
+        // One context decompresses every column straight into its place.
+        let invalid = |message: &'static str| {
+            DictionaryError::Io(io::Error::new(io::ErrorKind::InvalidData, message))
+        };
+        let mut context = zstd::zstd_safe::DCtx::create();
+        for column in columns.chunks_exact_mut(column_bytes) {
+            let frame_len = zstd::zstd_safe::find_frame_compressed_size(rest)
+                .map_err(|_| invalid("binary UUIDs are not sixteen complete zstd frames"))?;
+            let written = context
+                .decompress(column, &rest[..frame_len])
+                .map_err(|_| invalid("a binary-UUID column does not decompress"))?;
+            if written != column_bytes {
+                return Err(invalid(
+                    "a binary-UUID column holds the wrong number of bytes",
+                ));
+            }
+            rest = &rest[frame_len..];
+        }
+    }
+    if !rest.is_empty() {
+        return Err(DictionaryError::TrailingCompressedData {
+            remaining: u64::try_from(rest.len()).map_err(|_| DictionaryError::SizeOverflow)?,
+        });
+    }
+    let uuids = columns;
     let storage = decode_entry_sequence(section, limits, entry_count, Some(&uuids))?;
     Ok(VariableDictionary {
         frame_len: storage.bytes.as_slice().len(),
@@ -645,6 +691,21 @@ pub fn canonical_uuid(value: &[u8]) -> Option<[u8; 16]> {
         nibble += 1;
     }
     Some(bytes)
+}
+
+/// Lays UUIDs out as 16 byte columns, the first byte of every UUID, then the second, and so on, as
+/// a dictionary stores them. A column of a byte the UUID version fixes, or of a slowly changing
+/// time-based prefix, then compresses on its own, where interleaved it would not.
+#[must_use]
+pub fn uuid_columns(rows: &[u8]) -> Vec<u8> {
+    let count = rows.len() / 16;
+    let mut columns = vec![0_u8; count * 16];
+    for (row, uuid) in rows.as_chunks::<16>().0.iter().enumerate() {
+        for (column, byte) in uuid.iter().enumerate() {
+            columns[column * count + row] = *byte;
+        }
+    }
+    columns
 }
 
 /// Appends the canonical text of a UUID's 16 bytes: lowercase hex grouped 8-4-4-4-12 by hyphens.
@@ -1527,7 +1588,11 @@ mod tests {
         let mut encoded = BINARY_UUIDS_MARKER.to_le_bytes().to_vec();
         encoded.extend_from_slice(&4_u64.to_le_bytes());
         encoded.extend_from_slice(&2_u64.to_le_bytes());
-        let uuid_frame = zstd::bulk::compress(&uuids, 3).expect("compress UUIDs");
+        let columns = uuid_columns(&uuids);
+        let uuid_frame: Vec<u8> = columns
+            .chunks_exact(uuids.len() / 16)
+            .flat_map(|column| zstd::bulk::compress(column, 3).expect("compress UUID column"))
+            .collect();
         encoded.extend_from_slice(&(uuid_frame.len() as u64).to_le_bytes());
         encoded.extend_from_slice(&uuid_frame);
         encoded.extend_from_slice(&zstd::bulk::compress(&frame, 3).expect("compress frame"));
@@ -1536,7 +1601,10 @@ mod tests {
         assert!(dictionary.has_binary_uuids());
         assert_eq!(None, dictionary.binary_uuid(0));
         assert_eq!(None, dictionary.binary_uuid(2));
-        assert_eq!(Some(&uuids[..16]), dictionary.binary_uuid(1));
+        assert_eq!(
+            Some(<[u8; 16]>::try_from(&uuids[..16]).expect("16 bytes")),
+            dictionary.binary_uuid(1)
+        );
         let values: Vec<&[u8]> = dictionary
             .entries()
             .map(VariableDictionaryEntry::value)
@@ -1553,7 +1621,12 @@ mod tests {
         let mut short = BINARY_UUIDS_MARKER.to_le_bytes().to_vec();
         short.extend_from_slice(&4_u64.to_le_bytes());
         short.extend_from_slice(&1_u64.to_le_bytes());
-        let short_frame = zstd::bulk::compress(&uuids[..16], 3).expect("compress UUID");
+        let short_frame: Vec<u8> = uuids[..16]
+            .iter()
+            .flat_map(|byte| {
+                zstd::bulk::compress(std::slice::from_ref(byte), 3).expect("compress UUID column")
+            })
+            .collect();
         short.extend_from_slice(&(short_frame.len() as u64).to_le_bytes());
         short.extend_from_slice(&short_frame);
         short.extend_from_slice(&zstd::bulk::compress(&frame, 3).expect("compress frame"));

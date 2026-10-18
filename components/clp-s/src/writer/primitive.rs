@@ -1216,9 +1216,10 @@ impl DictionaryBuilder {
 
     /// Encodes the dictionary: its entry count, then one zstd frame of each entry's eight-byte
     /// length and bytes. With `binary_uuids`, an entry that is a canonical UUID is stored as its 16
-    /// bytes, in a zstd frame of its own ahead of the main one, which holds only a placeholder
-    /// length for it. A random UUID's bytes take less than zstd shrinks its text to, and the frame
-    /// still shrinks UUIDs that share structure, such as time-based ones.
+    /// bytes, laid out as byte columns in a zstd frame of its own ahead of the main one, which holds
+    /// only a placeholder length for it. A random UUID's bytes take less than zstd shrinks its text
+    /// to, and the columns let the frame shrink the bytes a UUID version fixes or a time-based
+    /// prefix barely changes.
     fn encode(&self, options: WriterOptions, binary_uuids: bool) -> Result<Vec<u8>, WriterError> {
         use crate::archive::BINARY_UUID_LENGTH;
         use crate::archive::BINARY_UUIDS_MARKER;
@@ -1238,12 +1239,19 @@ impl DictionaryBuilder {
                 }
             }
         }
-        let uuid_frame = if uuids.is_empty() {
-            Vec::new()
-        } else {
-            zstd::bulk::compress(&uuids, options.dictionary_compression_level())
-                .map_err(WriterError::Io)?
-        };
+        // One frame per byte column, so each gets its own entropy tables: a column of a byte the
+        // UUID version fixes then shrinks, where sharing a block's tables with random columns it
+        // would not.
+        let mut uuid_frame = Vec::new();
+        if !uuids.is_empty() {
+            let columns = crate::archive::uuid_columns(&uuids);
+            for column in columns.chunks_exact(uuids.len() / 16) {
+                uuid_frame.extend_from_slice(
+                    &zstd::bulk::compress(column, options.dictionary_compression_level())
+                        .map_err(WriterError::Io)?,
+                );
+            }
+        }
         let mut section = Vec::new();
         let header = if uuids.is_empty() {
             size_of::<u64>()

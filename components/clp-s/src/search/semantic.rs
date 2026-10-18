@@ -2088,7 +2088,7 @@ impl<'query, 'archive, 'cache> Compiler<'query, 'archive, 'cache> {
                     Some(false)
                 }
                 (DictionaryMatchKind::String, Some(uuid), Some(_)) => {
-                    Some(exact_uuid.is_some_and(|literal| literal.as_slice() == uuid))
+                    Some(exact_uuid.is_some_and(|literal| literal == uuid))
                 }
                 (DictionaryMatchKind::String, None, Some(literal)) => Some(
                     dictionary

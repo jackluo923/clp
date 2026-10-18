@@ -65,6 +65,7 @@ pub use dictionary::LogTypePlaceholderCounts;
 pub use dictionary::VariableDictionary;
 pub use dictionary::VariableDictionaryEntry;
 pub(crate) use dictionary::canonical_uuid;
+pub(crate) use dictionary::uuid_columns;
 pub use directory::DirectoryArchiveMember;
 pub use directory::DirectoryArchiveOpenError;
 pub use directory::DirectoryArchiveReader;
