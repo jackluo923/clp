@@ -97,9 +97,39 @@ pub fn append_clp_message<V: EncodedVariableSource + ?Sized>(
 ///
 /// A variable becomes `%int%`, `%float%` or `%str%` (a variable-dictionary value). An escaped
 /// byte is written as itself, and a literal `%` is doubled so it cannot be mistaken for a
-/// placeholder. This is the rendering the C++ `shape(...)` projection emits.
+/// placeholder. This is the rendering the C++ `shape(...)` projection emits. A logtype without
+/// placeholders, as a string stored verbatim has, is first parsed as CLP encoding parses its text,
+/// so the template is the same however the string was stored.
 pub fn append_logtype_template(logtype: LogTypeDictionaryEntry<'_>, output: &mut Vec<u8>) {
-    let mut bytes = logtype.escaped_value().iter();
+    let escaped = logtype.escaped_value();
+    if let Some(message) = template_free_message(escaped)
+        && let Some(template) = crate::writer::message_logtype(&message)
+    {
+        append_escaped_template(&template, output);
+        return;
+    }
+    append_escaped_template(escaped, output);
+}
+
+/// The text of a logtype without placeholders, as a string stored verbatim has, with its escapes
+/// removed; `None` when the logtype has a placeholder. Such a string was stored whole, so its
+/// template is the one CLP encoding gives its text, which is also what a string encoded without
+/// variables gets back.
+fn template_free_message(escaped: &[u8]) -> Option<Vec<u8>> {
+    let mut message = Vec::with_capacity(escaped.len());
+    let mut bytes = escaped.iter();
+    while let Some(&byte) = bytes.next() {
+        match byte {
+            ESCAPE_MARKER => message.push(*bytes.next()?),
+            INTEGER_PLACEHOLDER | FLOAT_PLACEHOLDER | DICTIONARY_PLACEHOLDER => return None,
+            literal => message.push(literal),
+        }
+    }
+    Some(message)
+}
+
+fn append_escaped_template(escaped: &[u8], output: &mut Vec<u8>) {
+    let mut bytes = escaped.iter();
     while let Some(&byte) = bytes.next() {
         match byte {
             ESCAPE_MARKER => {

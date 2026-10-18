@@ -78,7 +78,7 @@ impl OpenDirectoryArchive {
     pub fn new(options: WriterOptions) -> Self {
         Self {
             options,
-            records: PrimitiveArchive::default(),
+            records: PrimitiveArchive::with_verbatim_text_fields(options.verbatim_text_fields()),
         }
     }
 

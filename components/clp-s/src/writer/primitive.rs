@@ -670,9 +670,53 @@ pub(super) struct PrimitiveArchive {
     record_count: u64,
     resident_bytes: u64,
     encoded_data_size: u64,
+    text_fields: TextFields,
+}
+
+/// For each CLP-string field, its strings so far and the templates they brought, which decide
+/// whether its next strings are stored verbatim; see [`crate::writer::prefers_verbatim_text`].
+#[derive(Debug, Default)]
+struct TextFields {
+    enabled: bool,
+    fields: HashMap<u32, FieldTemplates>,
+}
+
+#[derive(Debug, Default)]
+struct FieldTemplates {
+    strings: u64,
+    new_templates: u64,
+    seen: std::collections::HashSet<u64>,
+}
+
+impl TextFields {
+    /// Whether `node`'s next string is stored verbatim.
+    fn verbatim(&self, node: u32) -> bool {
+        self.enabled
+            && self.fields.get(&node).is_some_and(|field| {
+                crate::writer::prefers_verbatim_text(field.strings, field.new_templates)
+            })
+    }
+
+    /// Counts a committed record's strings, each as its field and its template's hash.
+    fn commit(&mut self, uses: Vec<(u32, u64)>) {
+        for (node, template) in uses {
+            let field = self.fields.entry(node).or_default();
+            field.strings += 1;
+            if field.seen.insert(template) {
+                field.new_templates += 1;
+            }
+        }
+    }
 }
 
 impl PrimitiveArchive {
+    /// An empty archive whose text fields may store their strings verbatim when `enabled`.
+    pub(super) fn with_verbatim_text_fields(enabled: bool) -> Self {
+        let mut archive = Self::default();
+        archive.text_fields.enabled = enabled;
+        archive
+    }
+
     pub(super) const fn record_count(&self) -> u64 {
         self.record_count
     }
@@ -831,6 +875,7 @@ impl PrimitiveArchive {
             self.record_layout_cache = Some(record_layout_cache);
         }
         self.last_record_layout_cache_hit = cached_layout_matched;
+        self.text_fields.commit(plan.template_uses);
         self.record_count += 1;
         self.resident_bytes = plan.resulting_resident_bytes;
         self.encoded_data_size = plan.resulting_encoded_data_size;
@@ -1482,6 +1527,9 @@ struct DictionaryPlans<'archive> {
     timestamp_base: &'archive TimestampDictionaryBuilder,
     timestamp: TimestampPlan,
     resulting_value_bytes: u64,
+    text_fields: &'archive TextFields,
+    /// Each CLP string's field and template hash, counted when the record commits.
+    template_uses: Vec<(u32, u64)>,
 }
 
 impl<'archive> DictionaryPlans<'archive> {
@@ -1502,6 +1550,8 @@ impl<'archive> DictionaryPlans<'archive> {
             timestamp_base: &archive.timestamp_dictionary,
             timestamp: TimestampPlan::default(),
             resulting_value_bytes,
+            text_fields: &archive.text_fields,
+            template_uses: Vec::new(),
         })
     }
 
@@ -1803,6 +1853,7 @@ struct RecordPlan {
     cached_layout_matched: bool,
     resulting_resident_bytes: u64,
     resulting_encoded_data_size: u64,
+    template_uses: Vec<(u32, u64)>,
 }
 
 #[derive(Debug)]
@@ -3045,6 +3096,7 @@ impl<'archive, 'record, 'scratch> RecordPlanBuilder<'archive, 'record, 'scratch>
             log_type_dictionary: dictionaries.log_type,
             array_dictionary: dictionaries.array,
             timestamp_dictionary: dictionaries.timestamp,
+            template_uses: dictionaries.template_uses,
             table,
             cached_layout_matched: cached_layout_matches,
             resulting_resident_bytes: sizes.resident_bytes,
@@ -3363,12 +3415,30 @@ fn encode_values(
                 value,
                 node_type: NodeType::ClpString,
             } => {
-                let clp = clp::encode_clp_string(
-                    value,
-                    limits.max_dictionary_entry_size(),
-                    limits.max_encoded_variables_per_column(),
-                    |variable| dictionaries.resolve_variable(variable, None, limits),
-                )?;
+                let verbatim = dictionaries.text_fields.verbatim(node_id);
+                let clp = if verbatim {
+                    clp::encode_verbatim_clp_string(value, limits.max_dictionary_entry_size())?
+                } else {
+                    clp::encode_clp_string(
+                        value,
+                        limits.max_dictionary_entry_size(),
+                        limits.max_encoded_variables_per_column(),
+                        |variable| dictionaries.resolve_variable(variable, None, limits),
+                    )?
+                };
+                if dictionaries.text_fields.enabled {
+                    // A verbatim string still counts by the template it would have had.
+                    let template = if verbatim {
+                        clp::message_logtype(value).map_or(0, |logtype| clp::logtype_hash(&logtype))
+                    } else {
+                        clp::logtype_hash(&clp.logtype)
+                    };
+                    dictionaries
+                        .template_uses
+                        .try_reserve(1)
+                        .map_err(|_| append_allocation(AppendResource::ResidentBytes, 1))?;
+                    dictionaries.template_uses.push((node_id, template));
+                }
                 let log_type_id = dictionaries.resolve_log_type(
                     clp.logtype.as_slice(),
                     dictionary_hint,

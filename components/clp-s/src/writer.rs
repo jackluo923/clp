@@ -46,6 +46,7 @@ pub use archive_set::NoopArchiveSetStats;
 pub use array::UnstructuredArrayError;
 pub use array::UnstructuredArrayRef;
 pub use array::UnstructuredArraySyntaxErrorKind;
+pub(crate) use clp::message_logtype;
 pub use directory::DirectoryArchiveSink;
 pub use directory::DirectoryWriterError;
 pub use directory::EncodedDirectoryArchive;
@@ -477,6 +478,21 @@ pub struct WriterOptions {
 }
 
 /// Which columns of a table stored one frame per column take the smallest of a set of
+/// Fewest strings a text field has before its strings may be stored verbatim.
+const VERBATIM_TEXT_MIN_STRINGS: u64 = 16;
+
+/// Whether a CLP-string field whose `strings` so far brought `new_templates` templates it had not
+/// used before stores its next strings verbatim; see [`WriterOptions::with_verbatim_text_fields`].
+///
+/// A heuristic, kept in one place so it can be tuned. A field of log messages reuses a few
+/// templates, while a field of prose, code or command output brings a new one with nearly every
+/// string. Once a field has enough strings to judge, more than half bringing a new template marks
+/// it as text. The writer asks again for every string, so a field can change its mind.
+#[must_use]
+pub const fn prefers_verbatim_text(strings: u64, new_templates: u64) -> bool {
+    strings >= VERBATIM_TEXT_MIN_STRINGS && new_templates.saturating_mul(2) > strings
+}
+
 /// lightweight encodings, numbers and with them strings, and whether UUIDs are stored as binary.
 /// One byte of flags, which keeps [`WriterOptions`] small enough to pass by value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -487,6 +503,7 @@ impl AdaptiveColumns {
     const STRINGS: u8 = 1 << 1;
     const BINARY_UUIDS: u8 = 1 << 2;
     const GROUPED_TABLES: u8 = 1 << 3;
+    const VERBATIM_TEXT: u8 = 1 << 4;
 
     const fn has(self, flag: u8) -> bool {
         0 != self.0 & flag
@@ -531,7 +548,8 @@ impl WriterOptions {
             adaptive: AdaptiveColumns(
                 AdaptiveColumns::STRINGS
                     | AdaptiveColumns::BINARY_UUIDS
-                    | AdaptiveColumns::GROUPED_TABLES,
+                    | AdaptiveColumns::GROUPED_TABLES
+                    | AdaptiveColumns::VERBATIM_TEXT,
             ),
         }
     }
@@ -621,6 +639,29 @@ impl WriterOptions {
     pub const fn with_grouped_array_tables(mut self, enabled: bool) -> Self {
         self.adaptive = self.adaptive.with(AdaptiveColumns::GROUPED_TABLES, enabled);
         self
+    }
+
+    /// Enables or disables storing the strings of text fields verbatim, which takes effect only
+    /// with adaptive string columns.
+    ///
+    /// When enabled (the default), a CLP-string field whose strings keep bringing templates it has
+    /// not used before, such as prose, code or command output, stores its later strings whole, as
+    /// templates without variables; see [`prefers_verbatim_text`]. Splitting such text into a
+    /// template and variables costs more than it saves: each string still gets its own template,
+    /// and the variables pulled out of it, mostly line numbers and counts, compress worse apart
+    /// from their text. Fields whose strings share templates, as log messages do, keep them.
+    /// Readers need no change; `shape(...)` parses a template-free string when it reads it.
+    #[must_use]
+    pub const fn with_verbatim_text_fields(mut self, enabled: bool) -> Self {
+        self.adaptive = self.adaptive.with(AdaptiveColumns::VERBATIM_TEXT, enabled);
+        self
+    }
+
+    /// Returns whether text fields may store their strings verbatim: enabled, with adaptive string
+    /// columns.
+    #[must_use]
+    pub const fn verbatim_text_fields(self) -> bool {
+        self.adaptive.has(AdaptiveColumns::VERBATIM_TEXT) && self.adaptive_string_columns()
     }
 
     /// Returns whether tables differing only in their arrays share a grouped stream: enabled, with
@@ -859,7 +900,7 @@ impl<W> OpenArchive<W> {
         Self {
             output,
             options,
-            records: PrimitiveArchive::default(),
+            records: PrimitiveArchive::with_verbatim_text_fields(options.verbatim_text_fields()),
         }
     }
 
@@ -1452,6 +1493,22 @@ impl Error for WriterError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn text_fields_turn_verbatim_once_most_strings_bring_new_templates() {
+        use super::prefers_verbatim_text;
+        assert!(!prefers_verbatim_text(15, 15), "too few strings to judge");
+        assert!(prefers_verbatim_text(16, 9));
+        assert!(
+            !prefers_verbatim_text(16, 8),
+            "half new is not more than half"
+        );
+        assert!(
+            !prefers_verbatim_text(10_000, 40),
+            "log messages reuse their templates"
+        );
+        assert!(prefers_verbatim_text(10_000, 9_800));
+    }
+
     use std::io::Cursor;
     use std::io::Read;
 

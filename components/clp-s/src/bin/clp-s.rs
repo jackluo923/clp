@@ -211,6 +211,11 @@ struct CompressArgs {
     /// string columns).
     #[arg(long, default_value_t = false)]
     no_grouped_array_tables: bool,
+    /// Keep extracting variables from text fields whose strings rarely share a template, instead
+    /// of storing those strings whole (storing them whole is the default with adaptive string
+    /// columns).
+    #[arg(long, default_value_t = false)]
+    no_verbatim_text_fields: bool,
     /// Path of the authoritative timestamp field.
     #[arg(long)]
     timestamp_key: Option<String>,
@@ -530,6 +535,7 @@ fn run_compress(arguments: &CompressArgs) -> CliResult<()> {
         .with_adaptive_string_columns(!arguments.no_adaptive_string_columns)
         .with_binary_uuids(!arguments.no_binary_uuids)
         .with_grouped_array_tables(!arguments.no_grouped_array_tables)
+        .with_verbatim_text_fields(!arguments.no_verbatim_text_fields)
         .with_log_order(!arguments.representation.disable_log_order)
         .with_log_order_column(!arguments.representation.no_log_order_column);
     let mut archive_set = ArchiveSetWriter::new(

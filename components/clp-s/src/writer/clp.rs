@@ -67,6 +67,41 @@ pub(super) fn node_is_clp_string(value: &[u8]) -> bool {
     value.contains(&b' ')
 }
 
+/// Encodes `message` whole, as a logtype without variables that holds its text with any marker
+/// bytes escaped.
+pub(super) fn encode_verbatim_clp_string(
+    message: &[u8],
+    max_logtype_bytes: u64,
+) -> Result<EncodedClpString, AppendError> {
+    let escapes = if contains_marker(message) {
+        message.iter().filter(|byte| is_marker(**byte)).count()
+    } else {
+        0
+    };
+    let mut logtype = SmallVec::new();
+    append_escaped_constant(message, escapes, &mut logtype, max_logtype_bytes)?;
+    Ok(EncodedClpString {
+        logtype,
+        variables: SmallVec::new(),
+    })
+}
+
+/// The logtype CLP encoding gives `message`, whose dictionary variables are not resolved.
+pub fn message_logtype(message: &[u8]) -> Option<SmallVec<[u8; 128]>> {
+    let unresolved: fn(&[u8]) -> Result<u64, AppendError> = |_| Ok(0);
+    encode_clp_string(message, u64::MAX, u64::MAX, unresolved)
+        .ok()
+        .map(|encoded| encoded.logtype)
+}
+
+/// A fixed hash of a logtype, which identifies it among a field's templates.
+pub(super) fn logtype_hash(logtype: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(logtype);
+    hasher.finish()
+}
+
 pub(super) fn encode_clp_string<F>(
     message: &[u8],
     max_logtype_bytes: u64,
@@ -627,6 +662,24 @@ mod tests {
 
     fn encode(message: &[u8]) -> EncodedClpString {
         encode_clp_string(message, u64::MAX, u64::MAX, |_| Ok(7)).expect("encode CLP string")
+    }
+
+    #[test]
+    fn verbatim_strings_keep_their_text_with_markers_escaped() {
+        let plain = encode_verbatim_clp_string(b"took 12 ms for user u7", u64::MAX)
+            .expect("encode verbatim");
+        assert_eq!(b"took 12 ms for user u7", plain.logtype.as_slice());
+        assert!(plain.variables.is_empty());
+        let marked = encode_verbatim_clp_string(b"a \x11 b \\ c", u64::MAX)
+            .expect("encode verbatim with markers");
+        assert_eq!(b"a \\\x11 b \\\\ c", marked.logtype.as_slice());
+        assert!(marked.variables.is_empty());
+        assert!(encode_verbatim_clp_string(b"too long", 7).is_err());
+        // The template a verbatim string counts by is the one ordinary encoding gives it.
+        assert_eq!(
+            encode(b"took 12 ms for user u7").logtype,
+            message_logtype(b"took 12 ms for user u7").expect("template")
+        );
     }
 
     fn assert_marker_free_scanners_match(message: &[u8]) {

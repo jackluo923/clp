@@ -1860,6 +1860,116 @@ fn adaptive_string_columns_read_back_exactly_and_answer_searches_the_same() {
 }
 
 #[test]
+fn verbatim_text_fields_read_back_exactly_and_answer_searches_and_shapes_the_same() {
+    // `msg` reuses a few templates like log messages; `note` brings a new one with nearly every
+    // string, as prose does, so its strings are stored whole once there are enough to judge. Some
+    // notes hold marker bytes, which a verbatim string must escape.
+    let words = [
+        "alpha", "beta", "gamma", "delta", "kappa", "omega", "sigma", "theta",
+    ];
+    let mut input = String::new();
+    for index in 0..120_usize {
+        let note: Vec<String> = (0..=(index % 6))
+            .map(|position| words[(index * 7 + position * 3 + index / 8) % 8].to_owned())
+            .collect();
+        let marker = if 0 == index % 10 { "\\u0011 \\\\ " } else { "" };
+        input.push_str(&format!(
+            "{{\"n\":{index},\"msg\":\"request {index} took {} ms\",\
+             \"note\":\"{marker}step {index}: {} then file_{}.rs line {}\"}}\n",
+            index * 3 % 50,
+            note.join(" "),
+            index % 13,
+            index * 11
+        ));
+    }
+    let temporary = TestDirectory::new("verbatim-text-fields");
+    let input_path = temporary.path().join("input.jsonl");
+    fs::write(&input_path, &input).expect("write verbatim-text fixture");
+    let compress = |name: &str, extra: &[&str]| {
+        let archives_path = temporary.path().join(name);
+        let mut arguments: Vec<&OsStr> = vec!["c".as_ref()];
+        arguments.extend(extra.iter().map(|argument| OsStr::new(*argument)));
+        arguments.extend([archives_path.as_os_str(), input_path.as_os_str()]);
+        let result = clp_s(&arguments);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        only_entry(&archives_path)
+    };
+    let ordered = |archive: &Path, name: &str| {
+        let output = temporary.path().join(name);
+        let result = clp_s(&[
+            "x".as_ref(),
+            "--ordered".as_ref(),
+            archive.as_os_str(),
+            output.as_os_str(),
+        ]);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let mut files: Vec<PathBuf> = fs::read_dir(&output)
+            .expect("list extraction")
+            .map(|entry| entry.expect("extraction entry").path())
+            .collect();
+        files.sort();
+        files
+            .into_iter()
+            .flat_map(|file| fs::read(file).expect("read extraction"))
+            .collect::<Vec<u8>>()
+    };
+    let search = |archive: &Path, query: &str, projection: &[&str]| {
+        let mut arguments: Vec<&OsStr> = vec!["s".as_ref(), archive.as_os_str(), query.as_ref()];
+        if !projection.is_empty() {
+            arguments.push("--projection".as_ref());
+            arguments.extend(projection.iter().map(|path| OsStr::new(*path)));
+        }
+        let result = clp_s(&arguments);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let mut lines: Vec<String> = String::from_utf8(result.stdout)
+            .expect("search output is UTF-8")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.sort();
+        lines
+    };
+    let templated = compress("templated", &["--no-verbatim-text-fields"]);
+    let verbatim = compress("verbatim", &[]);
+    assert_ne!(
+        fs::read(templated.join("log.dict")).expect("read templated log.dict"),
+        fs::read(verbatim.join("log.dict")).expect("read verbatim log.dict"),
+        "the notes are stored verbatim"
+    );
+    assert_eq!(
+        ordered(&templated, "templated-extracted"),
+        ordered(&verbatim, "verbatim-extracted")
+    );
+    for (query, projection) in [
+        ("note:\"*file_7.rs*\"", &["n", "note"][..]),
+        ("note:\"*gamma*\"", &[][..]),
+        ("msg:\"request 4* took *\"", &["msg"][..]),
+        ("n > 100", &["shape(note)", "shape(msg)"][..]),
+        ("note:*", &["shape(note)"][..]),
+    ] {
+        let expected = search(&templated, query, projection);
+        assert!(!expected.is_empty(), "{query} matches the fixture");
+        assert_eq!(
+            expected,
+            search(&verbatim, query, projection),
+            "{query} {projection:?}"
+        );
+    }
+}
+
+#[test]
 fn grouped_array_tables_read_back_exactly_and_answer_searches_the_same() {
     // Records whose arrays differ only in length and element order share a grouped stream: mixed
     // element types, objects whose fields vary, nested arrays, and CLP-string messages inside.
