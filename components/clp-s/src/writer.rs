@@ -451,12 +451,14 @@ impl Default for WriterLimits {
     }
 }
 
-/// How the variable, log-type and array dictionaries are compressed.
+/// How the variable, log-type and array dictionaries are compressed, and when a CLP string goes
+/// into the log-type dictionary whole, which fills what would be padding beside the level. Whether
+/// long-distance matching is used and the log-type dictionary is stored per field are flags in
+/// [`AdaptiveColumns`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DictionaryCompression {
     level: i32,
-    long_distance_matching: bool,
-    per_field: bool,
+    verbatim_text: VerbatimText,
     per_field_frame_size: u64,
 }
 
@@ -477,24 +479,64 @@ pub struct WriterOptions {
     adaptive: AdaptiveColumns,
 }
 
-/// Which columns of a table stored one frame per column take the smallest of a set of
-/// Fewest strings a text field has before its strings may be stored verbatim.
-const VERBATIM_TEXT_MIN_STRINGS: u64 = 16;
-
-/// Whether a CLP-string field whose `strings` so far brought `new_templates` templates it had not
-/// used before stores its next strings verbatim; see [`WriterOptions::with_verbatim_text_fields`].
+/// When the strings of a CLP-string field are stored whole; see
+/// [`WriterOptions::with_verbatim_text_fields`].
 ///
-/// A heuristic, kept in one place so it can be tuned. A field of log messages reuses a few
-/// templates, while a field of prose, code or command output brings a new one with nearly every
-/// string. Once a field has enough strings to judge, more than half bringing a new template marks
-/// it as text. The writer asks again for every string, so a field can change its mind.
-#[must_use]
-pub const fn prefers_verbatim_text(strings: u64, new_templates: u64) -> bool {
-    strings >= VERBATIM_TEXT_MIN_STRINGS && new_templates.saturating_mul(2) > strings
+/// Two rules, either enough, and each turned off by a zero. A string whose template is at least
+/// [`Self::template_bytes`] long is stored whole: a template that long is almost always text that
+/// will not recur, such as reasoning, tool output or a stack trace. And once a field has
+/// [`Self::min_strings`] strings, more than half of which brought a template the field had not
+/// used before, its next strings are stored whole: a field of log messages reuses a few templates,
+/// while a field of prose, code or commands brings a new one with nearly every string. The writer
+/// asks for every string, so a field can change its mind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerbatimText {
+    template_bytes: u16,
+    min_strings: u16,
 }
 
-/// lightweight encodings, numbers and with them strings, and whether UUIDs are stored as binary.
-/// One byte of flags, which keeps [`WriterOptions`] small enough to pass by value.
+impl VerbatimText {
+    /// Templates of 256 bytes or more, and fields of 64 strings or more. On Claude Code sessions
+    /// these store most text whole, while server logs (HDFS, Hive) keep their templates except for
+    /// long one-off messages.
+    pub const DEFAULT: Self = Self {
+        template_bytes: 256,
+        min_strings: 64,
+    };
+
+    /// Shortest template whose string is stored whole; zero turns the rule off.
+    #[must_use]
+    pub const fn template_bytes(self) -> u16 {
+        self.template_bytes
+    }
+
+    /// Fewest strings a field has before its template reuse decides; zero turns the rule off.
+    #[must_use]
+    pub const fn min_strings(self) -> u16 {
+        self.min_strings
+    }
+
+    /// Whether a string whose template is `template_len` bytes, in a field whose `strings` so far
+    /// brought `new_templates` templates it had not used before, is stored whole.
+    #[must_use]
+    pub const fn prefers_verbatim(
+        self,
+        template_len: usize,
+        strings: u64,
+        new_templates: u64,
+    ) -> bool {
+        let long = 0 != self.template_bytes && template_len as u64 >= self.template_bytes as u64;
+        let unshared = 0 != self.min_strings
+            && strings >= self.min_strings as u64
+            && new_templates.saturating_mul(2) > strings;
+        long || unshared
+    }
+}
+
+/// Which columns of a table stored one frame per column take the smallest of a set of
+/// lightweight encodings, numbers and with them strings, whether UUIDs are stored as binary, the
+/// other storage choices below, and how dictionaries are compressed. One byte of flags, which
+/// keeps [`WriterOptions`] small enough to pass by value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AdaptiveColumns(u8);
 
@@ -504,6 +546,8 @@ impl AdaptiveColumns {
     const BINARY_UUIDS: u8 = 1 << 2;
     const GROUPED_TABLES: u8 = 1 << 3;
     const VERBATIM_TEXT: u8 = 1 << 4;
+    const DICTIONARY_LONG_DISTANCE_MATCHING: u8 = 1 << 5;
+    const FIELD_DICTIONARIES: u8 = 1 << 6;
 
     const fn has(self, flag: u8) -> bool {
         0 != self.0 & flag
@@ -533,8 +577,7 @@ impl WriterOptions {
             compression_level,
             dictionary_compression: DictionaryCompression {
                 level: Self::DEFAULT_DICTIONARY_COMPRESSION_LEVEL,
-                long_distance_matching: true,
-                per_field: true,
+                verbatim_text: VerbatimText::DEFAULT,
                 per_field_frame_size: 0,
             },
             limits: WriterLimits::DEFAULT,
@@ -549,7 +592,9 @@ impl WriterOptions {
                 AdaptiveColumns::STRINGS
                     | AdaptiveColumns::BINARY_UUIDS
                     | AdaptiveColumns::GROUPED_TABLES
-                    | AdaptiveColumns::VERBATIM_TEXT,
+                    | AdaptiveColumns::VERBATIM_TEXT
+                    | AdaptiveColumns::DICTIONARY_LONG_DISTANCE_MATCHING
+                    | AdaptiveColumns::FIELD_DICTIONARIES,
             ),
         }
     }
@@ -644,24 +689,45 @@ impl WriterOptions {
     /// Enables or disables storing the strings of text fields verbatim, which takes effect only
     /// with adaptive string columns.
     ///
-    /// When enabled (the default), a CLP-string field whose strings keep bringing templates it has
-    /// not used before, such as prose, code or command output, stores its later strings whole, as
-    /// templates without variables; see [`prefers_verbatim_text`]. Splitting such text into a
-    /// template and variables costs more than it saves: each string still gets its own template,
-    /// and the variables pulled out of it, mostly line numbers and counts, compress worse apart
-    /// from their text. Fields whose strings share templates, as log messages do, keep them.
-    /// Readers need no change; `shape(...)` parses a template-free string when it reads it.
+    /// When enabled (the default), a CLP string that is prose, code or command output rather than
+    /// a log message is stored whole, as a template without variables; [`VerbatimText`] says
+    /// which, and [`Self::with_verbatim_template_bytes`] and
+    /// [`Self::with_verbatim_text_min_strings`] tune it. Splitting such text into a template and
+    /// variables costs more than it saves: each string still gets its own template, and the
+    /// variables pulled out of it, mostly line numbers and counts, compress worse apart from their
+    /// text. Strings that share templates, as log messages do, keep them. Readers need no change;
+    /// `shape(...)` parses a template-free string when it reads it.
     #[must_use]
     pub const fn with_verbatim_text_fields(mut self, enabled: bool) -> Self {
         self.adaptive = self.adaptive.with(AdaptiveColumns::VERBATIM_TEXT, enabled);
         self
     }
 
-    /// Returns whether text fields may store their strings verbatim: enabled, with adaptive string
-    /// columns.
+    /// Stores a string whole when its template is at least `bytes` long; zero turns this rule off.
+    /// The default is [`VerbatimText::DEFAULT`]'s.
     #[must_use]
-    pub const fn verbatim_text_fields(self) -> bool {
-        self.adaptive.has(AdaptiveColumns::VERBATIM_TEXT) && self.adaptive_string_columns()
+    pub const fn with_verbatim_template_bytes(mut self, bytes: u16) -> Self {
+        self.dictionary_compression.verbatim_text.template_bytes = bytes;
+        self
+    }
+
+    /// Lets a field's template reuse decide once it has `strings` strings; zero turns this rule
+    /// off. The default is [`VerbatimText::DEFAULT`]'s.
+    #[must_use]
+    pub const fn with_verbatim_text_min_strings(mut self, strings: u16) -> Self {
+        self.dictionary_compression.verbatim_text.min_strings = strings;
+        self
+    }
+
+    /// Returns when text is stored whole, or `None` when it never is: disabled, or without
+    /// adaptive string columns.
+    #[must_use]
+    pub const fn verbatim_text(self) -> Option<VerbatimText> {
+        if self.adaptive.has(AdaptiveColumns::VERBATIM_TEXT) && self.adaptive_string_columns() {
+            Some(self.dictionary_compression.verbatim_text)
+        } else {
+            None
+        }
     }
 
     /// Returns whether tables differing only in their arrays share a grouped stream: enabled, with
@@ -751,7 +817,9 @@ impl WriterOptions {
     /// default limit, so no reader change is needed.
     #[must_use]
     pub const fn with_dictionary_long_distance_matching(mut self, enabled: bool) -> Self {
-        self.dictionary_compression.long_distance_matching = enabled;
+        self.adaptive = self
+            .adaptive
+            .with(AdaptiveColumns::DICTIONARY_LONG_DISTANCE_MATCHING, enabled);
         self
     }
 
@@ -771,7 +839,8 @@ impl WriterOptions {
     /// Whether the variable, log-type and array dictionaries use zstd long-distance matching.
     #[must_use]
     pub const fn dictionary_long_distance_matching(self) -> bool {
-        self.dictionary_compression.long_distance_matching
+        self.adaptive
+            .has(AdaptiveColumns::DICTIONARY_LONG_DISTANCE_MATCHING)
     }
 
     /// Stores `/log.dict` as one dictionary per CLP-string field, so a query reads only the
@@ -786,7 +855,9 @@ impl WriterOptions {
     /// refuse. On by default.
     #[must_use]
     pub const fn with_field_logtype_dictionaries(mut self, enabled: bool) -> Self {
-        self.dictionary_compression.per_field = enabled;
+        self.adaptive = self
+            .adaptive
+            .with(AdaptiveColumns::FIELD_DICTIONARIES, enabled);
         self
     }
 
@@ -810,7 +881,8 @@ impl WriterOptions {
     /// [`with_field_logtype_dictionaries`](Self::with_field_logtype_dictionaries).
     #[must_use]
     pub const fn field_logtype_dictionaries(self) -> bool {
-        self.dictionary_compression.per_field && self.adaptive.has(AdaptiveColumns::NUMERIC)
+        self.adaptive.has(AdaptiveColumns::FIELD_DICTIONARIES)
+            && self.adaptive.has(AdaptiveColumns::NUMERIC)
     }
 
     /// Resource limits applied during finalization.
@@ -900,7 +972,7 @@ impl<W> OpenArchive<W> {
         Self {
             output,
             options,
-            records: PrimitiveArchive::with_verbatim_text_fields(options.verbatim_text_fields()),
+            records: PrimitiveArchive::with_verbatim_text(options.verbatim_text()),
         }
     }
 
@@ -1494,19 +1566,30 @@ impl Error for WriterError {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn text_fields_turn_verbatim_once_most_strings_bring_new_templates() {
-        use super::prefers_verbatim_text;
-        assert!(!prefers_verbatim_text(15, 15), "too few strings to judge");
-        assert!(prefers_verbatim_text(16, 9));
+    fn text_is_stored_whole_when_its_template_is_long_or_its_field_rarely_shares_one() {
+        use super::VerbatimText;
+        let rules = VerbatimText::DEFAULT;
+        assert!(rules.prefers_verbatim(256, 0, 0), "a long template");
+        assert!(!rules.prefers_verbatim(255, 0, 0));
         assert!(
-            !prefers_verbatim_text(16, 8),
+            !rules.prefers_verbatim(10, 63, 63),
+            "too few strings to judge"
+        );
+        assert!(rules.prefers_verbatim(10, 64, 33));
+        assert!(
+            !rules.prefers_verbatim(10, 64, 32),
             "half new is not more than half"
         );
         assert!(
-            !prefers_verbatim_text(10_000, 40),
+            !rules.prefers_verbatim(10, 10_000, 40),
             "log messages reuse their templates"
         );
-        assert!(prefers_verbatim_text(10_000, 9_800));
+        let length_only = super::WriterOptions::default()
+            .with_verbatim_text_min_strings(0)
+            .dictionary_compression
+            .verbatim_text;
+        assert!(!length_only.prefers_verbatim(10, 10_000, 10_000));
+        assert!(length_only.prefers_verbatim(300, 1, 1));
     }
 
     use std::io::Cursor;

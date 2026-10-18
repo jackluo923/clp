@@ -1862,13 +1862,14 @@ fn adaptive_string_columns_read_back_exactly_and_answer_searches_the_same() {
 #[test]
 fn verbatim_text_fields_read_back_exactly_and_answer_searches_and_shapes_the_same() {
     // `msg` reuses a few templates like log messages; `note` brings a new one with nearly every
-    // string, as prose does, so its strings are stored whole once there are enough to judge. Some
-    // notes hold marker bytes, which a verbatim string must escape.
+    // string, as prose does, so its strings are stored whole once there are enough to judge, or,
+    // with a low enough length cutoff, because their templates are long. Some notes hold marker
+    // bytes, which a verbatim string must escape.
     let words = [
         "alpha", "beta", "gamma", "delta", "kappa", "omega", "sigma", "theta",
     ];
     let mut input = String::new();
-    for index in 0..120_usize {
+    for index in 0..200_usize {
         let note: Vec<String> = (0..=(index % 6))
             .map(|position| words[(index * 7 + position * 3 + index / 8) % 8].to_owned())
             .collect();
@@ -1942,30 +1943,53 @@ fn verbatim_text_fields_read_back_exactly_and_answer_searches_and_shapes_the_sam
         lines
     };
     let templated = compress("templated", &["--no-verbatim-text-fields"]);
-    let verbatim = compress("verbatim", &[]);
-    assert_ne!(
-        fs::read(templated.join("log.dict")).expect("read templated log.dict"),
-        fs::read(verbatim.join("log.dict")).expect("read verbatim log.dict"),
-        "the notes are stored verbatim"
+    let templated_log = fs::read(templated.join("log.dict")).expect("read templated log.dict");
+    let templated_records = ordered(&templated, "templated-extracted");
+    let by_reuse = compress("by-reuse", &["--verbatim-template-bytes", "0"]);
+    let by_length = compress(
+        "by-length",
+        &[
+            "--verbatim-text-min-strings",
+            "0",
+            "--verbatim-template-bytes",
+            "40",
+        ],
     );
-    assert_eq!(
-        ordered(&templated, "templated-extracted"),
-        ordered(&verbatim, "verbatim-extracted")
-    );
-    for (query, projection) in [
-        ("note:\"*file_7.rs*\"", &["n", "note"][..]),
-        ("note:\"*gamma*\"", &[][..]),
-        ("msg:\"request 4* took *\"", &["msg"][..]),
-        ("n > 100", &["shape(note)", "shape(msg)"][..]),
-        ("note:*", &["shape(note)"][..]),
+    // The defaults judge reuse only from 64 strings and length only from 256 bytes, which no
+    // note reaches, so they store the same notes whole as reuse alone.
+    let defaults = compress("defaults", &[]);
+    for (name, archive) in [
+        ("by-reuse", &by_reuse),
+        ("by-length", &by_length),
+        ("defaults", &defaults),
     ] {
-        let expected = search(&templated, query, projection);
-        assert!(!expected.is_empty(), "{query} matches the fixture");
-        assert_eq!(
-            expected,
-            search(&verbatim, query, projection),
-            "{query} {projection:?}"
+        assert_ne!(
+            templated_log,
+            fs::read(archive.join("log.dict")).expect("read log.dict"),
+            "{name} stores notes whole"
         );
+        assert_eq!(
+            templated_records,
+            ordered(archive, &format!("{name}-extracted")),
+            "{name}"
+        );
+    }
+    for verbatim in [&by_reuse, &by_length, &defaults] {
+        for (query, projection) in [
+            ("note:\"*file_7.rs*\"", &["n", "note"][..]),
+            ("note:\"*gamma*\"", &[][..]),
+            ("msg:\"request 4* took *\"", &["msg"][..]),
+            ("n > 100", &["shape(note)", "shape(msg)"][..]),
+            ("note:*", &["shape(note)"][..]),
+        ] {
+            let expected = search(&templated, query, projection);
+            assert!(!expected.is_empty(), "{query} matches the fixture");
+            assert_eq!(
+                expected,
+                search(verbatim, query, projection),
+                "{query} {projection:?}"
+            );
+        }
     }
 }
 

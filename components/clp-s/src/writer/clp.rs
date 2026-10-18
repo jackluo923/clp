@@ -106,9 +106,31 @@ pub(super) fn encode_clp_string<F>(
     message: &[u8],
     max_logtype_bytes: u64,
     max_variables: u64,
+    resolve_dictionary: F,
+) -> Result<EncodedClpString, AppendError>
+where
+    F: FnMut(&[u8]) -> Result<u64, AppendError>, {
+    encode_clp_string_or_verbatim(
+        message,
+        max_logtype_bytes,
+        max_variables,
+        |_| false,
+        resolve_dictionary,
+    )
+}
+
+/// Encodes `message` as [`encode_clp_string`] does, unless `verbatim`, given the logtype that
+/// gives it, chooses to store it whole as [`encode_verbatim_clp_string`] does. The choice comes
+/// before any dictionary variable is resolved, so a string stored whole adds none.
+pub(super) fn encode_clp_string_or_verbatim<V, F>(
+    message: &[u8],
+    max_logtype_bytes: u64,
+    max_variables: u64,
+    verbatim: V,
     mut resolve_dictionary: F,
 ) -> Result<EncodedClpString, AppendError>
 where
+    V: FnOnce(&[u8]) -> bool,
     F: FnMut(&[u8]) -> Result<u64, AppendError>, {
     let reserve = message
         .len()
@@ -118,6 +140,9 @@ where
         .try_reserve(reserve)
         .map_err(|_| allocation_failed(AppendResource::DictionaryValueBytes, reserve))?;
     let mut variables = SmallVec::new();
+    // Each dictionary variable's position among the variables and its token, resolved in order
+    // once the logtype is known.
+    let mut dictionary_tokens: SmallVec<[(usize, usize, usize); 4]> = SmallVec::new();
     let mut previous_end = 0_usize;
     let mut scan_end = 0_usize;
     let mut constant_escapes = 0_usize;
@@ -143,8 +168,11 @@ where
         } else if let Some(float) = encode_float(token) {
             (FLOAT_PLACEHOLDER, float)
         } else {
-            let id = resolve_dictionary(token)?;
-            (DICTIONARY_PLACEHOLDER, i64::from_le_bytes(id.to_le_bytes()))
+            dictionary_tokens
+                .try_reserve(1)
+                .map_err(|_| allocation_failed(AppendResource::EncodedVariablesPerColumn, 1))?;
+            dictionary_tokens.push((variables.len(), variable.begin, variable.end));
+            (DICTIONARY_PLACEHOLDER, 0)
         };
         append_logtype_byte(placeholder, &mut logtype, max_logtype_bytes)?;
         let proposed = u64::try_from(variables.len())
@@ -172,6 +200,13 @@ where
         &mut logtype,
         max_logtype_bytes,
     )?;
+    if verbatim(&logtype) {
+        return encode_verbatim_clp_string(message, max_logtype_bytes);
+    }
+    for (index, begin, end) in dictionary_tokens {
+        let id = resolve_dictionary(&message[begin..end])?;
+        variables[index] = i64::from_le_bytes(id.to_le_bytes());
+    }
     Ok(EncodedClpString { logtype, variables })
 }
 

@@ -211,11 +211,18 @@ struct CompressArgs {
     /// string columns).
     #[arg(long, default_value_t = false)]
     no_grouped_array_tables: bool,
-    /// Keep extracting variables from text fields whose strings rarely share a template, instead
-    /// of storing those strings whole (storing them whole is the default with adaptive string
-    /// columns).
+    /// Keep extracting variables from every CLP string, instead of storing text that is not a log
+    /// message whole (storing it whole is the default with adaptive string columns).
     #[arg(long, default_value_t = false)]
     no_verbatim_text_fields: bool,
+    /// Store a CLP string whole when its template is at least this many bytes; 0 turns this rule
+    /// off.
+    #[arg(long, default_value_t = clp_s::writer::VerbatimText::DEFAULT.template_bytes())]
+    verbatim_template_bytes: u16,
+    /// Store a field's CLP strings whole once it has this many and more than half brought a new
+    /// template; 0 turns this rule off.
+    #[arg(long, default_value_t = clp_s::writer::VerbatimText::DEFAULT.min_strings())]
+    verbatim_text_min_strings: u16,
     /// Path of the authoritative timestamp field.
     #[arg(long)]
     timestamp_key: Option<String>,
@@ -536,6 +543,8 @@ fn run_compress(arguments: &CompressArgs) -> CliResult<()> {
         .with_binary_uuids(!arguments.no_binary_uuids)
         .with_grouped_array_tables(!arguments.no_grouped_array_tables)
         .with_verbatim_text_fields(!arguments.no_verbatim_text_fields)
+        .with_verbatim_template_bytes(arguments.verbatim_template_bytes)
+        .with_verbatim_text_min_strings(arguments.verbatim_text_min_strings)
         .with_log_order(!arguments.representation.disable_log_order)
         .with_log_order_column(!arguments.representation.no_log_order_column);
     let mut archive_set = ArchiveSetWriter::new(

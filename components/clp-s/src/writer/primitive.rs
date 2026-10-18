@@ -673,11 +673,11 @@ pub(super) struct PrimitiveArchive {
     text_fields: TextFields,
 }
 
-/// For each CLP-string field, its strings so far and the templates they brought, which decide
-/// whether its next strings are stored verbatim; see [`crate::writer::prefers_verbatim_text`].
+/// When CLP strings are stored whole and, for each CLP-string field, its strings so far and the
+/// templates they brought; see [`crate::writer::VerbatimText`].
 #[derive(Debug, Default)]
 struct TextFields {
-    enabled: bool,
+    rules: Option<crate::writer::VerbatimText>,
     fields: HashMap<u32, FieldTemplates>,
 }
 
@@ -689,12 +689,20 @@ struct FieldTemplates {
 }
 
 impl TextFields {
-    /// Whether `node`'s next string is stored verbatim.
-    fn verbatim(&self, node: u32) -> bool {
-        self.enabled
-            && self.fields.get(&node).is_some_and(|field| {
-                crate::writer::prefers_verbatim_text(field.strings, field.new_templates)
-            })
+    /// Whether `node`'s next string, whose template is `template`, is stored whole.
+    fn verbatim(&self, node: u32, template: &[u8]) -> bool {
+        self.rules.is_some_and(|rules| {
+            let (strings, new_templates) = self
+                .fields
+                .get(&node)
+                .map_or((0, 0), |field| (field.strings, field.new_templates));
+            rules.prefers_verbatim(template.len(), strings, new_templates)
+        })
+    }
+
+    /// Whether field statistics are kept, which only the reuse rule reads.
+    fn counts_templates(&self) -> bool {
+        self.rules.is_some_and(|rules| 0 != rules.min_strings())
     }
 
     /// Counts a committed record's strings, each as its field and its template's hash.
@@ -710,10 +718,10 @@ impl TextFields {
 }
 
 impl PrimitiveArchive {
-    /// An empty archive whose text fields may store their strings verbatim when `enabled`.
-    pub(super) fn with_verbatim_text_fields(enabled: bool) -> Self {
+    /// An empty archive that stores CLP strings whole as `rules` says, or never for `None`.
+    pub(super) fn with_verbatim_text(rules: Option<crate::writer::VerbatimText>) -> Self {
         let mut archive = Self::default();
-        archive.text_fields.enabled = enabled;
+        archive.text_fields.rules = rules;
         archive
     }
 
@@ -3415,24 +3423,22 @@ fn encode_values(
                 value,
                 node_type: NodeType::ClpString,
             } => {
-                let verbatim = dictionaries.text_fields.verbatim(node_id);
-                let clp = if verbatim {
-                    clp::encode_verbatim_clp_string(value, limits.max_dictionary_entry_size())?
-                } else {
-                    clp::encode_clp_string(
-                        value,
-                        limits.max_dictionary_entry_size(),
-                        limits.max_encoded_variables_per_column(),
-                        |variable| dictionaries.resolve_variable(variable, None, limits),
-                    )?
-                };
-                if dictionaries.text_fields.enabled {
-                    // A verbatim string still counts by the template it would have had.
-                    let template = if verbatim {
-                        clp::message_logtype(value).map_or(0, |logtype| clp::logtype_hash(&logtype))
-                    } else {
-                        clp::logtype_hash(&clp.logtype)
-                    };
+                let text_fields = dictionaries.text_fields;
+                // A string stored whole still counts by the template it would have had.
+                let mut template = None;
+                let clp = clp::encode_clp_string_or_verbatim(
+                    value,
+                    limits.max_dictionary_entry_size(),
+                    limits.max_encoded_variables_per_column(),
+                    |logtype| {
+                        if text_fields.counts_templates() {
+                            template = Some(clp::logtype_hash(logtype));
+                        }
+                        text_fields.verbatim(node_id, logtype)
+                    },
+                    |variable| dictionaries.resolve_variable(variable, None, limits),
+                )?;
+                if let Some(template) = template {
                     dictionaries
                         .template_uses
                         .try_reserve(1)
