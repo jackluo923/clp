@@ -1730,6 +1730,145 @@ mod tests {
         assert_eq!(expected[..half], values[..]);
     }
 
+    /// The Boolean values of the one table in stream 0, as many as every column holds.
+    fn stream_booleans(
+        catalog: &crate::archive::ArchiveCatalog,
+        stream: &crate::archive::DecodedPackedStream,
+    ) -> Vec<bool> {
+        let stream = catalog
+            .materialize_adaptive_numerics(0, stream.clone(), ColumnLimits::default())
+            .expect("materialize adaptive columns");
+        let mut tables = catalog
+            .schema_tables(0, &stream, ColumnLimits::default())
+            .expect("open stream");
+        let decoded = tables
+            .next()
+            .expect("stream holds one table")
+            .expect("decode table");
+        let rows = decoded.table().matchable_rows();
+        decoded
+            .table()
+            .columns()
+            .iter()
+            .find_map(|column| match column.data() {
+                ColumnData::Boolean(values) => Some(values.iter().take(rows).collect::<Vec<_>>()),
+                _ => None,
+            })
+            .expect("a Boolean column")
+    }
+
+    /// The position of the log-order column among the value columns of stream 0's table.
+    fn log_order_column(catalog: &crate::archive::ArchiveCatalog) -> usize {
+        let log_order = crate::LogOrderLocator::discover(catalog.schema_tree())
+            .expect("discover log order")
+            .expect("a log-order column")
+            .node_id();
+        let schema_id = catalog.table_metadata().schema_tables()[0].schema_id();
+        catalog
+            .schema_map()
+            .get(schema_id)
+            .expect("schema")
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                crate::archive::SchemaEntry::Node(node) => Some(*node),
+                crate::archive::SchemaEntry::UnorderedContainer { .. } => None,
+            })
+            .filter(|node| {
+                let node = catalog.schema_tree().get(*node as usize).expect("node");
+                crate::archive::is_value_bearing(node.node_type())
+            })
+            .position(|node| node == log_order)
+            .expect("the log order is a value column")
+    }
+
+    #[test]
+    fn raw_column_frames_read_back_whole_projected_and_truncated() {
+        // A table this small stores columns zstd cannot shrink raw, the log order included, so
+        // every read path meets a raw frame.
+        let mut archive = OpenArchive::new(
+            Cursor::new(Vec::new()),
+            WriterOptions::default().with_adaptive_numeric_columns(true),
+        );
+        for row in 0..3_i64 {
+            let fields = [
+                FieldRef::new(b"n".as_slice(), ValueRef::I64(row)),
+                FieldRef::new(b"b".as_slice(), ValueRef::Bool(0 == row % 2)),
+            ];
+            archive
+                .append_record(RecordRef::new(&fields))
+                .expect("append raw-frame record");
+        }
+        let bytes = archive
+            .finish()
+            .expect("finish raw-frame archive")
+            .into_inner()
+            .into_inner();
+        let mut reader = SingleFileArchiveReader::open(Cursor::new(bytes)).expect("open archive");
+        let catalog = reader
+            .read_catalog(ArchiveCatalogLimits::default())
+            .expect("read catalog");
+        assert!(catalog.version().supports_raw_column_frames());
+        let table_metadata = catalog.table_metadata();
+        let frames = table_metadata
+            .separate_columns_for(0)
+            .expect("stream 0 stores one frame per column")
+            .columns();
+        let log_order_column = log_order_column(&catalog);
+        let log_order_frame = frames[log_order_column];
+        assert_eq!(
+            log_order_frame.compressed_size(),
+            log_order_frame.uncompressed_size(),
+            "the log order is stored raw"
+        );
+        let whole = reader
+            .read_packed_stream(
+                catalog.metadata(),
+                table_metadata,
+                0,
+                PackedStreamLimits::default(),
+            )
+            .expect("read whole");
+        assert_eq!(vec![true, false, true], stream_booleans(&catalog, &whole));
+        let wanted = vec![true; frames.len()];
+        let projected = reader
+            .read_packed_stream_frames(
+                catalog.metadata(),
+                table_metadata,
+                0,
+                Some(&wanted),
+                None,
+                PackedStreamLimits::default(),
+            )
+            .expect("read projected");
+        assert_eq!(
+            vec![true, false, true],
+            stream_booleans(&catalog, &projected)
+        );
+        // The Boolean column is one byte per row; stop it with the log order.
+        let truncatable: Vec<bool> = frames
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| index != log_order_column && 3 == frame.uncompressed_size())
+            .collect();
+        let truncated = reader
+            .read_packed_stream_frames(
+                catalog.metadata(),
+                table_metadata,
+                0,
+                Some(&wanted),
+                Some(ColumnTruncation {
+                    log_order_column,
+                    limit: 2,
+                    total_rows: 3,
+                    truncatable: &truncatable,
+                }),
+                PackedStreamLimits::default(),
+            )
+            .expect("read truncated");
+        assert_eq!(vec![true, false], stream_booleans(&catalog, &truncated));
+    }
+
     /// Builds a single-integer-column archive with adaptive integer encoding enabled.
     fn adaptive_column_archive(values: &[i64]) -> Vec<u8> {
         let mut archive = OpenArchive::new(

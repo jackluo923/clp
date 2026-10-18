@@ -106,6 +106,14 @@ impl ArchiveVersion {
         self.to_wire() >= Self::ADAPTIVE_STRINGS.to_wire()
     }
 
+    /// Whether a column frame of a separate-column stream in an archive at this version is stored
+    /// raw when its compressed and uncompressed sizes are equal, as the writer does from 0.8 for a
+    /// column zstd would not shrink, such as a constant column.
+    #[must_use]
+    pub const fn supports_raw_column_frames(self) -> bool {
+        self.to_wire() >= Self::ADAPTIVE_STRINGS.to_wire()
+    }
+
     /// Returns the major version component.
     #[must_use]
     pub const fn major(self) -> u8 {

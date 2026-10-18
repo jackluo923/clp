@@ -192,6 +192,46 @@ impl ColumnTruncation<'_> {
 
 /// Rows decoded per block while looking for where a log-order column crosses a limit.
 ///
+/// Whether a column frame is stored raw rather than as zstd: in an archive that stores a column raw
+/// when zstd would not shrink it ([`super::ArchiveVersion::supports_raw_column_frames`]), a frame
+/// whose compressed and uncompressed sizes are equal, since the writer stores raw whenever zstd
+/// comes out no smaller.
+pub(super) const fn is_raw_frame(raw_frames: bool, metadata: &PackedStreamMetadata) -> bool {
+    raw_frames
+        && 0 != metadata.uncompressed_size()
+        && metadata.compressed_size() == metadata.uncompressed_size()
+}
+
+/// Reads the first `length` bytes of a column frame stored raw.
+///
+/// # Errors
+///
+/// Returns a framing, resource, or I/O error.
+pub(super) fn read_raw_frame<R: Read>(
+    mut compressed: Take<R>,
+    metadata: &PackedStreamMetadata,
+    length: u64,
+    limits: PackedStreamLimits,
+) -> Result<Vec<u8>, PackedStreamError> {
+    validate_frame_sizes(
+        compressed.limit(),
+        metadata.compressed_size(),
+        metadata.uncompressed_size(),
+        limits,
+    )?;
+    let length = usize::try_from(length.min(metadata.uncompressed_size()))
+        .map_err(|_| PackedStreamError::SizeOverflow)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| PackedStreamError::AllocationFailed { requested: length })?;
+    bytes.resize(length, 0);
+    compressed
+        .read_exact(&mut bytes)
+        .map_err(PackedStreamError::Io)?;
+    Ok(bytes)
+}
+
 /// A whole number of rows so a block boundary is always a row boundary.
 const LOG_ORDER_BLOCK_ROWS: usize = 8192;
 
@@ -218,7 +258,26 @@ pub(super) fn decode_log_order_prefix<R: Read>(
     metadata: &PackedStreamMetadata,
     limit: u64,
     limits: PackedStreamLimits,
+    raw_frames: bool,
 ) -> Result<(Vec<u8>, usize), PackedStreamError> {
+    if is_raw_frame(raw_frames, metadata) {
+        let mut bytes = read_raw_frame(compressed, metadata, metadata.uncompressed_size(), limits)?;
+        let mut current = 0_i64;
+        for (row, delta) in bytes
+            .as_chunks::<LOG_ORDER_ROW_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            current = current.wrapping_add(i64::from_le_bytes(*delta));
+            if current >= 0 && current.cast_unsigned() >= limit {
+                bytes.truncate(row * LOG_ORDER_ROW_BYTES);
+                return Ok((bytes, row));
+            }
+        }
+        let rows = bytes.len() / LOG_ORDER_ROW_BYTES;
+        return Ok((bytes, rows));
+    }
     if validate_frame_sizes(
         compressed.limit(),
         metadata.compressed_size(),
@@ -407,6 +466,7 @@ pub(super) fn decode_column_frames(
     sizes: &[usize],
     wanted: Option<&[bool]>,
     limits: PackedStreamLimits,
+    raw_frames: bool,
     mut read_run: impl FnMut(Range<u64>, &mut Vec<u8>) -> io::Result<()>,
 ) -> Result<DecodedPackedStream, PackedStreamError> {
     let loaded: Vec<bool> = (0..sizes.len())
@@ -459,6 +519,7 @@ pub(super) fn decode_column_frames(
                 input,
                 &mut bytes[output_start..output_end],
                 limits,
+                raw_frames,
             )?;
             output_start = output_end;
         }
@@ -476,10 +537,15 @@ fn decode_frame_into(
     compressed: &[u8],
     output: &mut [u8],
     limits: PackedStreamLimits,
+    raw_frames: bool,
 ) -> Result<(), PackedStreamError> {
     let compressed_size = usize_to_u64(compressed.len())?;
     let advertised = usize_to_u64(output.len())?;
     if validate_frame_sizes(compressed_size, compressed_size, advertised, limits)? {
+        return Ok(());
+    }
+    if raw_frames && compressed.len() == output.len() {
+        output.copy_from_slice(compressed);
         return Ok(());
     }
     let zstd_error = |code| {

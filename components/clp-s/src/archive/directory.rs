@@ -48,8 +48,10 @@ use super::packed_stream::decode_column_frames;
 use super::packed_stream::decode_log_order_prefix;
 use super::packed_stream::decode_packed_stream;
 use super::packed_stream::decode_packed_stream_prefix;
+use super::packed_stream::is_raw_frame;
 use super::packed_stream::ColumnTruncation;
 use super::packed_stream::packed_stream_range;
+use super::packed_stream::read_raw_frame;
 use super::schema_map::SchemaMap;
 use super::schema_map::SchemaMapError;
 use super::schema_map::SchemaMapLimits;
@@ -526,15 +528,23 @@ impl<S: DirectoryArchiveSource> DirectoryArchiveReader<S> {
             );
             cursor = end;
         }
+        let raw_frames = self.header().version().supports_raw_column_frames();
         if truncate.is_none() {
-            return decode_column_frames(&offsets, &sizes, wanted, limits, |range, buffer| {
-                let length = usize::try_from(range.end - range.start)
-                    .map_err(|_| io::Error::other("compressed column run exceeds memory"))?;
-                buffer.clear();
-                buffer.resize(length, 0);
-                self.reader_for_member_range(DirectoryArchiveMember::PackedStreams, range)?
-                    .read_exact(buffer)
-            });
+            return decode_column_frames(
+                &offsets,
+                &sizes,
+                wanted,
+                limits,
+                raw_frames,
+                |range, buffer| {
+                    let length = usize::try_from(range.end - range.start)
+                        .map_err(|_| io::Error::other("compressed column run exceeds memory"))?;
+                    buffer.clear();
+                    buffer.resize(length, 0);
+                    self.reader_for_member_range(DirectoryArchiveMember::PackedStreams, range)?
+                        .read_exact(buffer)
+                },
+            );
         }
         let mut columns: Vec<Option<Vec<u8>>> = vec![None; frames.len()];
         let mut read = vec![false; frames.len()];
@@ -553,7 +563,7 @@ impl<S: DirectoryArchiveSource> DirectoryArchiveReader<S> {
                 .reader_for_member_range(DirectoryArchiveMember::PackedStreams, start..end)
                 .map_err(PackedStreamError::Io)?;
             let (bytes, crossed) =
-                decode_log_order_prefix(compressed, &frame_meta, plan.limit, limits)?;
+                decode_log_order_prefix(compressed, &frame_meta, plan.limit, limits, raw_frames)?;
             rows = Some(crossed);
             columns[plan.log_order_column] = Some(bytes);
             read[plan.log_order_column] = true;
@@ -581,6 +591,12 @@ impl<S: DirectoryArchiveSource> DirectoryArchiveReader<S> {
                 truncate.and_then(|plan| plan.prefix(index, size, rows))
             });
             let decoded = match prefix {
+                _ if is_raw_frame(raw_frames, &frame_meta) => read_raw_frame(
+                    compressed,
+                    &frame_meta,
+                    prefix.map_or_else(|| frame.uncompressed_size(), |prefix| prefix as u64),
+                    limits,
+                )?,
                 Some(prefix) => {
                     decode_packed_stream_prefix(compressed, &frame_meta, prefix as u64, limits)?
                 }
