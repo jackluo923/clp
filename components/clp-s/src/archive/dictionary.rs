@@ -141,6 +141,9 @@ impl Display for DictionarySection {
 struct DictionaryStorage {
     bytes: StorageBytes,
     ranges: Vec<Range<usize>>,
+    /// For a log-type dictionary whose layout marks them, which entries hold a CLP string whole
+    /// rather than its template; empty when none do.
+    verbatim: Vec<bool>,
 }
 
 /// The bytes a dictionary's entries lie in: its own, or a decompressed frame its field shares with
@@ -163,6 +166,14 @@ impl StorageBytes {
 impl DictionaryStorage {
     const fn entry_count(&self) -> usize {
         self.ranges.len()
+    }
+
+    fn is_verbatim(&self, id: u64) -> bool {
+        usize::try_from(id)
+            .ok()
+            .and_then(|index| self.verbatim.get(index))
+            .copied()
+            .unwrap_or(false)
     }
 
     fn value(&self, id: u64) -> Option<&[u8]> {
@@ -200,6 +211,7 @@ impl VariableDictionary {
             storage: DictionaryStorage {
                 bytes: StorageBytes::Owned(Vec::new()),
                 ranges: Vec::new(),
+                verbatim: Vec::new(),
             },
             frame_len: 0,
             uuids: Vec::new(),
@@ -393,6 +405,7 @@ impl LogTypeDictionary {
             storage: DictionaryStorage {
                 bytes: StorageBytes::Owned(Vec::new()),
                 ranges: Vec::new(),
+                verbatim: Vec::new(),
             },
             fields: Vec::new(),
             per_field: false,
@@ -463,6 +476,7 @@ impl ArrayDictionary {
             storage: DictionaryStorage {
                 bytes: StorageBytes::Owned(Vec::new()),
                 ranges: Vec::new(),
+                verbatim: Vec::new(),
             },
         }
     }
@@ -496,6 +510,7 @@ impl ArrayDictionary {
 pub struct LogTypeDictionaryEntry<'a> {
     id: u64,
     escaped_value: &'a [u8],
+    verbatim: bool,
 }
 
 impl<'a> LogTypeDictionaryEntry<'a> {
@@ -509,6 +524,14 @@ impl<'a> LogTypeDictionaryEntry<'a> {
     #[must_use]
     pub const fn escaped_value(self) -> &'a [u8] {
         self.escaped_value
+    }
+
+    /// Whether the entry holds a CLP string whole, its text escaped but its variables left in
+    /// place, rather than its template. Such an entry has no placeholders; its template is the one
+    /// CLP encoding gives its text.
+    #[must_use]
+    pub const fn is_verbatim(self) -> bool {
+        self.verbatim
     }
 
     /// Counts the placeholders and escape sequences, scanning the entry on each call.
@@ -543,6 +566,7 @@ fn logtype_entry(storage: &DictionaryStorage, id: u64) -> Option<LogTypeDictiona
     Some(LogTypeDictionaryEntry {
         id,
         escaped_value: storage.value(id)?,
+        verbatim: storage.is_verbatim(id),
     })
 }
 
@@ -554,6 +578,7 @@ fn logtype_entries(
         .map(|(id, range)| LogTypeDictionaryEntry {
             id,
             escaped_value: &storage.bytes.as_slice()[range.clone()],
+            verbatim: storage.is_verbatim(id),
         })
 }
 
@@ -743,7 +768,10 @@ pub(super) fn decode_logtype_dictionary_fields<R: Read>(
     }
     let first = read_u64(&mut section)?;
     if FIELD_DICTIONARIES_MARKER == first {
-        return decode_field_dictionaries(section, limits, fields);
+        return decode_field_dictionaries(section, limits, fields, false);
+    }
+    if FIELD_DICTIONARIES_VERBATIM_MARKER == first {
+        return decode_field_dictionaries(section, limits, fields, true);
     }
     Ok(LogTypeDictionary {
         storage: decode_entry_sequence(section, limits, first, None)?,
@@ -757,6 +785,15 @@ pub(super) fn decode_logtype_dictionary_fields<R: Read>(
 /// stores its entry count, and exceeds any count a reader accepts, so a reader that does not know
 /// the layout refuses the dictionary rather than misreading it.
 pub const FIELD_DICTIONARIES_MARKER: u64 = 0xC1F5_F1E1_DD1C_7002;
+
+/// Marks a `/log.dict` stored per field whose entry lengths carry, in their top bit, whether the
+/// entry holds a CLP string whole rather than its template (archive 0.9.0). A reader that does not
+/// know it refuses the dictionary as it refuses any count it does not accept.
+pub const FIELD_DICTIONARIES_VERBATIM_MARKER: u64 = 0xC1F5_F1E1_DD1C_7003;
+
+/// The top bit of an entry length under [`FIELD_DICTIONARIES_VERBATIM_MARKER`]: the entry holds a
+/// CLP string whole.
+pub const VERBATIM_ENTRY_FLAG: u32 = 1 << 31;
 
 /// One field's dictionary as the index describes it: its schema node, entry count, the frame
 /// holding it, and where it lies in that frame's decompressed bytes.
@@ -780,6 +817,7 @@ fn decode_field_dictionaries<R: Read>(
     mut section: Take<R>,
     limits: DictionaryLimits,
     fields: Option<&[u32]>,
+    verbatim_flags: bool,
 ) -> Result<LogTypeDictionary, DictionaryError> {
     let count_limit = limits.entries.saturating_add(1);
     let dictionary_count = read_u64(&mut section)?;
@@ -794,19 +832,7 @@ fn decode_field_dictionaries<R: Read>(
     }
     let index = read_field_index(&mut section, dictionary_count, frame_count, limits)?;
     let frames = read_frame_index(&mut section, frame_count, limits)?;
-    // The dictionaries of each frame must tile it from the start, in order.
-    for (frame, (_, decompressed)) in frames.iter().enumerate() {
-        let mut expected = 0_u64;
-        for entry in index.iter().filter(|entry| entry.frame == frame) {
-            if entry.start != expected {
-                return Err(DictionaryError::TrailingDecompressedData);
-            }
-            expected = entry.end;
-        }
-        if expected != *decompressed {
-            return Err(DictionaryError::TrailingDecompressedData);
-        }
-    }
+    check_frames_tiled(&index, &frames)?;
 
     let mut compressed = Vec::new();
     section
@@ -852,7 +878,13 @@ fn decode_field_dictionaries<R: Read>(
         decompress_prefix(&compressed[range], &mut bytes, prefix)?;
         let bytes = std::sync::Arc::new(bytes);
         for entry in in_frame[..=last].iter().filter(|entry| wanted(entry)) {
-            let ranges = field_ranges(&bytes, entry, limits, &mut total_value_bytes)?;
+            let (ranges, verbatim) = field_ranges(
+                &bytes,
+                entry,
+                limits,
+                verbatim_flags,
+                &mut total_value_bytes,
+            )?;
             let node = u32::try_from(entry.node).map_err(|_| DictionaryError::SizeOverflow)?;
             loaded.push((
                 node,
@@ -860,6 +892,7 @@ fn decode_field_dictionaries<R: Read>(
                     storage: DictionaryStorage {
                         bytes: StorageBytes::Shared(std::sync::Arc::clone(&bytes)),
                         ranges,
+                        verbatim,
                     },
                     fields: Vec::new(),
                     per_field: false,
@@ -874,11 +907,32 @@ fn decode_field_dictionaries<R: Read>(
         storage: DictionaryStorage {
             bytes: StorageBytes::Owned(Vec::new()),
             ranges: Vec::new(),
+            verbatim: Vec::new(),
         },
         fields: loaded,
         per_field: true,
         complete,
     })
+}
+
+/// Checks that the dictionaries of each frame tile it from the start, in order.
+fn check_frames_tiled(
+    index: &[FieldDictionaryIndex],
+    frames: &[(u64, u64)],
+) -> Result<(), DictionaryError> {
+    for (frame, (_, decompressed)) in frames.iter().enumerate() {
+        let mut expected = 0_u64;
+        for entry in index.iter().filter(|entry| entry.frame == frame) {
+            if entry.start != expected {
+                return Err(DictionaryError::TrailingDecompressedData);
+            }
+            expected = entry.end;
+        }
+        if expected != *decompressed {
+            return Err(DictionaryError::TrailingDecompressedData);
+        }
+    }
+    Ok(())
 }
 
 /// Reads the per-dictionary part of the index.
@@ -983,13 +1037,16 @@ fn decompress_prefix(
 }
 
 /// Locates the entries of one field's dictionary in its decompressed frame: `entries` 4-byte
-/// lengths, then the bytes, between the index's start and end.
+/// lengths, then the bytes, between the index's start and end. With `verbatim_flags`, a length's
+/// top bit marks an entry holding a CLP string whole, returned as the second value; it is empty
+/// when no entry is marked.
 fn field_ranges(
     frame: &[u8],
     entry: &FieldDictionaryIndex,
     limits: DictionaryLimits,
+    verbatim_flags: bool,
     total_value_bytes: &mut u64,
-) -> Result<Vec<Range<usize>>, DictionaryError> {
+) -> Result<(Vec<Range<usize>>, Vec<bool>), DictionaryError> {
     let start = usize::try_from(entry.start).map_err(|_| DictionaryError::SizeOverflow)?;
     let end = usize::try_from(entry.end).map_err(|_| DictionaryError::SizeOverflow)?;
     let entries = usize::try_from(entry.entries).map_err(|_| DictionaryError::SizeOverflow)?;
@@ -1002,6 +1059,7 @@ fn field_ranges(
     ranges
         .try_reserve_exact(entries)
         .map_err(|_| DictionaryError::AllocationFailed { requested: entries })?;
+    let mut verbatim = Vec::new();
     let mut offset = lengths_end;
     for (entry_id, length) in frame[start..lengths_end]
         .as_chunks::<4>()
@@ -1009,7 +1067,19 @@ fn field_ranges(
         .iter()
         .enumerate()
     {
-        let length = u32::from_le_bytes(*length);
+        let mut length = u32::from_le_bytes(*length);
+        if verbatim_flags && 0 != length & VERBATIM_ENTRY_FLAG {
+            length &= !VERBATIM_ENTRY_FLAG;
+            if verbatim.is_empty() {
+                verbatim
+                    .try_reserve_exact(entries)
+                    .map_err(|_| DictionaryError::AllocationFailed { requested: entries })?;
+                verbatim.resize(entry_id, false);
+            }
+            verbatim.push(true);
+        } else if !verbatim.is_empty() {
+            verbatim.push(false);
+        }
         if u64::from(length) > limits.entry_bytes {
             return Err(DictionaryError::EntryTooLarge {
                 entry_id: wire_id(entry_id)?,
@@ -1037,7 +1107,7 @@ fn field_ranges(
     if offset != end {
         return Err(DictionaryError::TrailingDecompressedData);
     }
-    Ok(ranges)
+    Ok((ranges, verbatim))
 }
 
 pub(super) fn decode_array_dictionary<R: Read>(
@@ -1087,6 +1157,7 @@ fn decode_entry_sequence<R: Read>(
         return Ok(DictionaryStorage {
             bytes: StorageBytes::Owned(Vec::new()),
             ranges: Vec::new(),
+            verbatim: Vec::new(),
         });
     }
 
@@ -1250,6 +1321,7 @@ fn reserve_dictionary(entry_count: usize) -> Result<DictionaryStorage, Dictionar
     Ok(DictionaryStorage {
         bytes: StorageBytes::Owned(Vec::new()),
         ranges,
+        verbatim: Vec::new(),
     })
 }
 
@@ -1718,6 +1790,12 @@ mod tests {
 
     /// A per-field `/log.dict` holding `frames`.
     fn field_dictionaries(frames: Frames<'_>) -> Vec<u8> {
+        marked_field_dictionaries(frames, None)
+    }
+
+    /// A per-field `/log.dict` holding `frames`, in the layout that marks entries holding a string
+    /// whole when `marked` lists them as (field, position).
+    fn marked_field_dictionaries(frames: Frames<'_>, marked: Option<&[(u64, usize)]>) -> Vec<u8> {
         let mut index = Vec::new();
         let mut frame_index = Vec::new();
         let mut payloads = Vec::new();
@@ -1725,8 +1803,11 @@ mod tests {
             let mut payload = Vec::new();
             for (field, entries) in *dictionaries {
                 let start = payload.len() as u64;
-                for entry in *entries {
-                    let length = u32::try_from(entry.len()).expect("test entry fits u32");
+                for (position, entry) in entries.iter().enumerate() {
+                    let mut length = u32::try_from(entry.len()).expect("test entry fits u32");
+                    if marked.is_some_and(|marked| marked.contains(&(*field, position))) {
+                        length |= VERBATIM_ENTRY_FLAG;
+                    }
                     payload.extend_from_slice(&length.to_le_bytes());
                 }
                 for entry in *entries {
@@ -1746,7 +1827,11 @@ mod tests {
         }
         let mut encoded = Vec::new();
         for word in [
-            FIELD_DICTIONARIES_MARKER,
+            if marked.is_some() {
+                FIELD_DICTIONARIES_VERBATIM_MARKER
+            } else {
+                FIELD_DICTIONARIES_MARKER
+            },
             index.len() as u64,
             frame_index.len() as u64,
         ] {
@@ -1757,6 +1842,49 @@ mod tests {
         }
         encoded.extend_from_slice(&payloads);
         encoded
+    }
+
+    #[test]
+    fn only_marked_entries_are_parsed_for_their_template() {
+        fn templates(bytes: &[u8]) -> Vec<(bool, String)> {
+            let dictionary =
+                decode_logtype_dictionary_fields(take(bytes), DictionaryLimits::default(), None)
+                    .expect("per-field dictionary");
+            dictionary
+                .for_field(3)
+                .entries()
+                .map(|entry| {
+                    let mut template = Vec::new();
+                    super::super::append_logtype_template(entry, &mut template);
+                    (
+                        entry.is_verbatim(),
+                        String::from_utf8(template).expect("UTF-8 template"),
+                    )
+                })
+                .collect()
+        }
+
+        // A template from KV-IR input may hold text CLP encoding would split, such as a number;
+        // it is rendered as stored. The same text stored whole is a separate, marked entry, whose
+        // template is the one CLP encoding gives it.
+        let frames: Frames<'_> = &[&[(3, &[b"took 5 ms", b"took 5 ms", b"100% \\\\ done"])]];
+        assert_eq!(
+            vec![
+                (false, "took 5 ms".to_owned()),
+                (true, "took %int% ms".to_owned()),
+                (true, "%int%%% \\ done".to_owned()),
+            ],
+            templates(&marked_field_dictionaries(frames, Some(&[(3, 1), (3, 2)])))
+        );
+        assert_eq!(
+            vec![
+                (false, "took 5 ms".to_owned()),
+                (false, "took 5 ms".to_owned()),
+                (false, "100%% \\ done".to_owned()),
+            ],
+            templates(&field_dictionaries(frames)),
+            "the earlier layout marks nothing"
+        );
     }
 
     #[test]

@@ -898,6 +898,8 @@ impl PrimitiveArchive {
         options: WriterOptions,
     ) -> Result<(Vec<u8>, LogTypeRemap), WriterError> {
         use crate::archive::FIELD_DICTIONARIES_MARKER;
+        use crate::archive::FIELD_DICTIONARIES_VERBATIM_MARKER;
+        use crate::archive::VERBATIM_ENTRY_FLAG;
 
         let dictionary = &self.log_type_dictionary;
         let entry_count = dictionary.entry_count();
@@ -914,11 +916,14 @@ impl PrimitiveArchive {
                     .filter(|id| *id < entry_count)
                     .and_then(|id| dictionary_entry(&dictionary.values, &dictionary.entry_ends, id))
                     .ok_or(WriterError::SizeOverflow)?;
-                if u32::try_from(value.len()).is_err() {
+                let (text, _) = stored_logtype(value);
+                if u32::try_from(text.len())
+                    .map_or(true, |length| 0 != length & VERBATIM_ENTRY_FLAG)
+                {
                     return Err(WriterError::SizeOverflow);
                 }
                 size = size
-                    .checked_add(size_of::<u32>() + value.len())
+                    .checked_add(size_of::<u32>() + text.len())
                     .ok_or(WriterError::SizeOverflow)?;
             }
             dictionaries.push((node, ids, size));
@@ -942,6 +947,7 @@ impl PrimitiveArchive {
         let mut index = Vec::new();
         let mut frame_index = Vec::new();
         let mut payload = Vec::new();
+        let mut any_verbatim = false;
         for (frame, members) in frames.iter().enumerate() {
             let mut raw = Vec::new();
             for position in members {
@@ -954,14 +960,7 @@ impl PrimitiveArchive {
                             .expect("checked above")
                     })
                     .collect();
-                for value in &values {
-                    let length =
-                        u32::try_from(value.len()).map_err(|_| WriterError::SizeOverflow)?;
-                    raw.extend_from_slice(&length.to_le_bytes());
-                }
-                for value in &values {
-                    raw.extend_from_slice(value);
-                }
+                any_verbatim |= append_field_entries(&mut raw, &values)?;
                 index.push([
                     u64::from(*node),
                     usize_u64(ids.len())?,
@@ -976,7 +975,16 @@ impl PrimitiveArchive {
         }
 
         let mut section = Vec::new();
-        append_u64(&mut section, FIELD_DICTIONARIES_MARKER);
+        // Only a dictionary holding a string whole needs the layout that marks one, so archives
+        // without any keep the layout earlier readers accept.
+        append_u64(
+            &mut section,
+            if any_verbatim {
+                FIELD_DICTIONARIES_VERBATIM_MARKER
+            } else {
+                FIELD_DICTIONARIES_MARKER
+            },
+        );
         append_u64(&mut section, usize_u64(index.len())?);
         append_u64(&mut section, usize_u64(frame_index.len())?);
         for word in index.iter().flatten().chain(frame_index.iter().flatten()) {
@@ -1027,6 +1035,15 @@ impl PrimitiveArchive {
             let (section, remap) = self.encode_field_logtype_dictionaries(options)?;
             (section, Some(remap))
         } else {
+            // Strings are stored whole only with per-field dictionaries, whose layout marks them.
+            debug_assert!(
+                (0..self.log_type_dictionary.entry_count()).all(|id| {
+                    self.log_type_dictionary
+                        .entry(id as u64)
+                        .is_none_or(|value| !stored_logtype(value).1)
+                }),
+                "a string stored whole needs per-field log-type dictionaries"
+            );
             (self.log_type_dictionary.encode(options, false)?, None)
         };
         let (table_metadata, tables) = self.tables.encode_tables(options, remap.as_ref())?;
@@ -1694,9 +1711,16 @@ fn resolve_dictionary(
         );
     }
     let value_len = usize_u64_append(value.len())?;
+    // The key of a string stored whole carries a prefix the archive does not store.
+    let entry_len = match kind {
+        DictionaryKind::LogType if value.starts_with(&clp::VERBATIM_KEY_PREFIX) => {
+            usize_u64_append(value.len() - clp::VERBATIM_KEY_PREFIX.len())?
+        }
+        _ => value_len,
+    };
     check_append_limit(
         AppendResource::DictionaryEntryBytes,
-        value_len,
+        entry_len,
         limits.max_dictionary_entry_size(),
     )?;
     let proposed_entries = usize_u64_append(base.entry_count())?
@@ -4050,6 +4074,33 @@ fn compress_dictionary_frame(raw: &[u8], options: WriterOptions) -> Result<Vec<u
     }
     encoder.write_all(raw).map_err(WriterError::Io)?;
     encoder.finish().map_err(WriterError::Io)
+}
+
+/// Appends one field's dictionary entries as the per-field layout stores them: their 4-byte
+/// lengths, each with [`crate::archive::VERBATIM_ENTRY_FLAG`] set when the entry holds a string
+/// whole, then their bytes. Returns whether any entry holds a string whole.
+fn append_field_entries(raw: &mut Vec<u8>, values: &[&[u8]]) -> Result<bool, WriterError> {
+    let mut any_verbatim = false;
+    for value in values {
+        let (text, verbatim) = stored_logtype(value);
+        let mut length = u32::try_from(text.len()).map_err(|_| WriterError::SizeOverflow)?;
+        if verbatim {
+            length |= crate::archive::VERBATIM_ENTRY_FLAG;
+            any_verbatim = true;
+        }
+        raw.extend_from_slice(&length.to_le_bytes());
+    }
+    for value in values {
+        raw.extend_from_slice(stored_logtype(value).0);
+    }
+    Ok(any_verbatim)
+}
+
+/// A log-type dictionary key as the archive stores it, and whether it holds a string whole, which
+/// the key marks with [`clp::VERBATIM_KEY_PREFIX`].
+fn stored_logtype(key: &[u8]) -> (&[u8], bool) {
+    key.strip_prefix(&clp::VERBATIM_KEY_PREFIX)
+        .map_or((key, false), |text| (text, true))
 }
 
 /// Each CLP-string field's archive-wide logtype IDs, sorted: a field's local ID for a logtype is

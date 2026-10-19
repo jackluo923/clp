@@ -67,8 +67,14 @@ pub(super) fn node_is_clp_string(value: &[u8]) -> bool {
     value.contains(&b' ')
 }
 
-/// Encodes `message` whole, as a logtype without variables that holds its text with any marker
-/// bytes escaped.
+/// Starts the dictionary key of a string stored whole, which the writer strips when it marks the
+/// entry in the per-field dictionary. A logtype escapes only marker bytes, so an escape before a
+/// zero byte never starts one: a template and a string stored whole with the same bytes, such as
+/// a KV-IR template without variables, stay separate entries.
+pub(super) const VERBATIM_KEY_PREFIX: [u8; 2] = [ESCAPE_MARKER, 0];
+
+/// Encodes `message` whole, without variables: [`VERBATIM_KEY_PREFIX`], then its text with any
+/// marker bytes escaped. `max_logtype_bytes` bounds the text, not the prefix.
 pub(super) fn encode_verbatim_clp_string(
     message: &[u8],
     max_logtype_bytes: u64,
@@ -79,7 +85,14 @@ pub(super) fn encode_verbatim_clp_string(
         0
     };
     let mut logtype = SmallVec::new();
-    append_escaped_constant(message, escapes, &mut logtype, max_logtype_bytes)?;
+    logtype.extend_from_slice(&VERBATIM_KEY_PREFIX);
+    let prefix = u64::try_from(VERBATIM_KEY_PREFIX.len()).map_err(|_| AppendError::SizeOverflow)?;
+    append_escaped_constant(
+        message,
+        escapes,
+        &mut logtype,
+        max_logtype_bytes.saturating_add(prefix),
+    )?;
     Ok(EncodedClpString {
         logtype,
         variables: SmallVec::new(),
@@ -703,11 +716,15 @@ mod tests {
     fn verbatim_strings_keep_their_text_with_markers_escaped() {
         let plain = encode_verbatim_clp_string(b"took 12 ms for user u7", u64::MAX)
             .expect("encode verbatim");
-        assert_eq!(b"took 12 ms for user u7", plain.logtype.as_slice());
+        assert_eq!(b"\\\0took 12 ms for user u7", plain.logtype.as_slice());
         assert!(plain.variables.is_empty());
         let marked = encode_verbatim_clp_string(b"a \x11 b \\ c", u64::MAX)
             .expect("encode verbatim with markers");
-        assert_eq!(b"a \\\x11 b \\\\ c", marked.logtype.as_slice());
+        assert_eq!(b"\\\0a \\\x11 b \\\\ c", marked.logtype.as_slice());
+        assert!(
+            encode_verbatim_clp_string(b"exactly8", 8).is_ok(),
+            "the prefix is not counted"
+        );
         assert!(marked.variables.is_empty());
         assert!(encode_verbatim_clp_string(b"too long", 7).is_err());
         // The template a verbatim string counts by is the one ordinary encoding gives it.

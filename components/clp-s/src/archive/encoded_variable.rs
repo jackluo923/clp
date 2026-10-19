@@ -97,12 +97,14 @@ pub fn append_clp_message<V: EncodedVariableSource + ?Sized>(
 ///
 /// A variable becomes `%int%`, `%float%` or `%str%` (a variable-dictionary value). An escaped
 /// byte is written as itself, and a literal `%` is doubled so it cannot be mistaken for a
-/// placeholder. This is the rendering the C++ `shape(...)` projection emits. A logtype without
-/// placeholders, as a string stored verbatim has, is first parsed as CLP encoding parses its text,
-/// so the template is the same however the string was stored.
+/// placeholder. This is the rendering the C++ `shape(...)` projection emits. An entry that holds a
+/// string whole ([`LogTypeDictionaryEntry::is_verbatim`]) is first parsed as CLP encoding parses
+/// its text, so the template is the same however the string was stored. Any other entry, such as
+/// a template from KV-IR input, is rendered exactly as stored.
 pub fn append_logtype_template(logtype: LogTypeDictionaryEntry<'_>, output: &mut Vec<u8>) {
     let escaped = logtype.escaped_value();
-    if let Some(message) = template_free_message(escaped)
+    if logtype.is_verbatim()
+        && let Some(message) = unescaped_text(escaped)
         && let Some(template) = crate::writer::message_logtype(&message)
     {
         append_escaped_template(&template, output);
@@ -111,11 +113,9 @@ pub fn append_logtype_template(logtype: LogTypeDictionaryEntry<'_>, output: &mut
     append_escaped_template(escaped, output);
 }
 
-/// The text of a logtype without placeholders, as a string stored verbatim has, with its escapes
-/// removed; `None` when the logtype has a placeholder. Such a string was stored whole, so its
-/// template is the one CLP encoding gives its text, which is also what a string encoded without
-/// variables gets back.
-fn template_free_message(escaped: &[u8]) -> Option<Vec<u8>> {
+/// The text an entry holding a string whole stores, with its escapes removed; `None` if it has a
+/// placeholder after all, which leaves it rendered as stored.
+fn unescaped_text(escaped: &[u8]) -> Option<Vec<u8>> {
     let mut message = Vec::with_capacity(escaped.len());
     let mut bytes = escaped.iter();
     while let Some(&byte) = bytes.next() {

@@ -687,16 +687,17 @@ impl WriterOptions {
     }
 
     /// Enables or disables storing the strings of text fields verbatim, which takes effect only
-    /// with adaptive string columns.
+    /// with adaptive string columns and per-field log-type dictionaries.
     ///
     /// When enabled (the default), a CLP string that is prose, code or command output rather than
-    /// a log message is stored whole, as a template without variables; [`VerbatimText`] says
-    /// which, and [`Self::with_verbatim_template_bytes`] and
+    /// a log message is stored whole, in a log-type dictionary entry marked as holding it, without
+    /// variables; [`VerbatimText`] says which, and [`Self::with_verbatim_template_bytes`] and
     /// [`Self::with_verbatim_text_min_strings`] tune it. Splitting such text into a template and
     /// variables costs more than it saves: each string still gets its own template, and the
     /// variables pulled out of it, mostly line numbers and counts, compress worse apart from their
-    /// text. Strings that share templates, as log messages do, keep them. Readers need no change;
-    /// `shape(...)` parses a template-free string when it reads it.
+    /// text. Strings that share templates, as log messages do, keep them. `shape(...)` parses a
+    /// marked entry's text when it reads it, so its template is the same either way. The archive is
+    /// stamped 0.9.0, and earlier readers refuse it.
     #[must_use]
     pub const fn with_verbatim_text_fields(mut self, enabled: bool) -> Self {
         self.adaptive = self.adaptive.with(AdaptiveColumns::VERBATIM_TEXT, enabled);
@@ -720,10 +721,14 @@ impl WriterOptions {
     }
 
     /// Returns when text is stored whole, or `None` when it never is: disabled, or without
-    /// adaptive string columns.
+    /// adaptive string columns or per-field log-type dictionaries, whose layout marks such
+    /// entries.
     #[must_use]
     pub const fn verbatim_text(self) -> Option<VerbatimText> {
-        if self.adaptive.has(AdaptiveColumns::VERBATIM_TEXT) && self.adaptive_string_columns() {
+        if self.adaptive.has(AdaptiveColumns::VERBATIM_TEXT)
+            && self.adaptive_string_columns()
+            && self.field_logtype_dictionaries()
+        {
             Some(self.dictionary_compression.verbatim_text)
         } else {
             None
@@ -1233,7 +1238,9 @@ impl EncodedEmptyArchive {
 
         // Stamp the adaptive-integer format version only when the opt-in flag is set, so default
         // writes remain byte-identical 0.5.0 archives that 0.5.x readers still accept.
-        let version = if options.adaptive_string_columns() {
+        let version = if options.verbatim_text().is_some() {
+            crate::archive::ArchiveVersion::VERBATIM_TEXT
+        } else if options.adaptive_string_columns() {
             crate::archive::ArchiveVersion::ADAPTIVE_STRINGS
         } else if options.field_logtype_dictionaries() {
             crate::archive::ArchiveVersion::FIELD_DICTIONARIES
@@ -2105,8 +2112,8 @@ mod tests {
             let (version, decoded) = adaptive_column_values(bytes);
             assert_eq!(
                 version,
-                crate::archive::ArchiveVersion::ADAPTIVE_STRINGS,
-                "an adaptive archive, with per-field log-type dictionaries and adaptive string columns by default, is stamped 0.8.0"
+                crate::archive::ArchiveVersion::VERBATIM_TEXT,
+                "an adaptive archive, with per-field log-type dictionaries, adaptive string columns and text stored whole by default, is stamped 0.9.0"
             );
             assert_eq!(decoded, values, "the column round-trips through the adaptive pipeline");
         }
@@ -2210,8 +2217,8 @@ mod tests {
             let (version, bits) = adaptive_float_column_bits(adaptive_float_archive(&values));
             assert_eq!(
                 version,
-                crate::archive::ArchiveVersion::ADAPTIVE_STRINGS,
-                "an adaptive archive, with per-field log-type dictionaries and adaptive string columns by default, is stamped 0.8.0"
+                crate::archive::ArchiveVersion::VERBATIM_TEXT,
+                "an adaptive archive, with per-field log-type dictionaries, adaptive string columns and text stored whole by default, is stamped 0.9.0"
             );
             assert_eq!(bits, expected, "float column round-trips bit-exact");
         }

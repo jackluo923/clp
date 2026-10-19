@@ -1856,7 +1856,8 @@ fn adaptive_string_columns_read_back_exactly_and_answer_searches_the_same() {
         );
     }
     let version = |archive: &Path| fs::read(archive).expect("read archive")[4..8].to_vec();
-    assert_eq!(vec![0, 0, 8, 0], version(&adaptive));
+    // Text may be stored whole by default, which stamps 0.9.0.
+    assert_eq!(vec![0, 0, 9, 0], version(&adaptive));
 }
 
 #[test]
@@ -2291,11 +2292,12 @@ fn field_logtype_dictionaries_read_back_exactly_and_answer_searches_the_same() {
             "{query} {projection:?}"
         );
     }
-    // Per-field dictionaries stamp 0.7.0, or 0.8.0 with the default adaptive string columns.
-    // Without adaptive numeric columns neither layout is used, so such an archive stays at the
-    // 0.5.0 every reader accepts. The header's version is bytes 4 to 8.
+    // Per-field dictionaries stamp 0.7.0, 0.8.0 with the default adaptive string columns, or
+    // 0.9.0 when text may also be stored whole, as it may by default. Without adaptive numeric
+    // columns neither layout is used, so such an archive stays at the 0.5.0 every reader accepts.
+    // The header's version is bytes 4 to 8.
     let version = |archive: &Path| fs::read(archive).expect("read archive")[4..8].to_vec();
-    assert_eq!(vec![0, 0, 8, 0], version(&fields));
+    assert_eq!(vec![0, 0, 9, 0], version(&fields));
     assert_eq!(
         vec![0, 0, 7, 0],
         version(&compress(

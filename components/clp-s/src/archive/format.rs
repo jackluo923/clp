@@ -45,6 +45,11 @@ impl ArchiveVersion {
     /// encoding header (0.7 plus those encodings). Stamped only when the writer encodes them.
     pub const ADAPTIVE_STRINGS: Self = Self::new(0, 8, 0);
 
+    /// First version whose per-field `/log.dict` may mark entries that hold a CLP string whole
+    /// rather than its template (0.8 plus those entries). Stamped when the writer may store text
+    /// whole.
+    pub const VERBATIM_TEXT: Self = Self::new(0, 9, 0);
+
     /// Creates a version from its semantic components.
     #[must_use]
     pub const fn new(major: u8, minor: u8, patch: u16) -> Self {
@@ -80,8 +85,9 @@ impl ArchiveVersion {
     /// every section byte-identical, so rejecting it would refuse archives this crate decodes
     /// correctly. The 0.6 line is also accepted: it is 0.5 plus optional adaptive-integer column
     /// encodings this crate's reader understands ([`Self::supports_adaptive_numeric`]), and 0.7 is
-    /// 0.6 plus a per-field `/log.dict` layout it also reads. A differing major, or a minor outside
-    /// {5, 6, 7}, is still refused, because that is where unknown layout
+    /// 0.6 plus a per-field `/log.dict` layout it also reads, 0.8 adds adaptive string columns and
+    /// 0.9 marks dictionary entries holding text whole. A differing major, or a minor outside
+    /// {5, 6, 7, 8, 9}, is still refused, because that is where unknown layout
     /// changes land, and reading one as if it were 0.5 would misparse rather than fail.
     #[must_use]
     pub const fn is_readable(self) -> bool {
@@ -89,7 +95,8 @@ impl ArchiveVersion {
             && (self.minor == Self::CURRENT.minor
                 || self.minor == Self::ADAPTIVE_NUMERIC.minor
                 || self.minor == Self::FIELD_DICTIONARIES.minor
-                || self.minor == Self::ADAPTIVE_STRINGS.minor)
+                || self.minor == Self::ADAPTIVE_STRINGS.minor
+                || self.minor == Self::VERBATIM_TEXT.minor)
     }
 
     /// Whether a separate-column integer stream in an archive at this version may carry an adaptive
@@ -458,7 +465,10 @@ mod tests {
         assert!(ArchiveVersion::ADAPTIVE_STRINGS.is_readable());
         assert!(ArchiveVersion::ADAPTIVE_STRINGS.supports_adaptive_numeric());
         assert!(!ArchiveVersion::FIELD_DICTIONARIES.supports_adaptive_strings());
-        assert!(!ArchiveVersion::new(0, 9, 0).is_readable());
+        // 0.9 marks log-type dictionary entries that hold a string whole.
+        assert!(ArchiveVersion::VERBATIM_TEXT.is_readable());
+        assert!(ArchiveVersion::VERBATIM_TEXT.supports_adaptive_strings());
+        assert!(!ArchiveVersion::new(0, 10, 0).is_readable());
         assert!(!ArchiveVersion::new(1, 5, 0).is_readable());
     }
 
