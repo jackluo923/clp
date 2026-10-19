@@ -103,13 +103,18 @@ pub enum FieldForm {
     Shape,
     /// Spelled `shape(<descriptor>, all)` or `shape(<descriptor>,all)`: a CLP string as its
     /// template, a string stored whole parsed for the template it would have had, as the C++
-    /// `shape(...)` writes every string. A key that itself ends in `, all` is selected by writing
-    /// its comma as `\u002c`.
+    /// `shape(...)` writes every string.
     ParsedShape,
 }
 
 impl FieldForm {
     /// Splits a projected field into its descriptor and how it is written.
+    ///
+    /// A shape's descriptor may be double-quoted, as in `shape("x, all", all)`, so that nothing in
+    /// it reads as the `, all` that follows; inside the quotes `\"` is a quote and the descriptor
+    /// is otherwise written as usual. An unquoted descriptor ends where an exact `, all` or `,all`
+    /// suffix begins, so its own spaces stay part of it. A quote that is not closed, or is followed
+    /// by anything else, is part of the descriptor, as it always was.
     #[must_use]
     pub fn split(field: &str) -> (&str, Self) {
         let Some(inner) = field
@@ -118,7 +123,13 @@ impl FieldForm {
         else {
             return (field, Self::Value);
         };
-        // The suffix is matched exactly, so a key's own spaces stay part of it.
+        if let Some((descriptor, rest)) = split_quoted(inner) {
+            match rest {
+                "" => return (descriptor, Self::Shape),
+                ", all" | ",all" => return (descriptor, Self::ParsedShape),
+                _ => {}
+            }
+        }
         inner
             .strip_suffix(", all")
             .or_else(|| inner.strip_suffix(",all"))
@@ -132,6 +143,23 @@ impl FieldForm {
     pub const fn is_shape(self) -> bool {
         !matches!(self, Self::Value)
     }
+}
+
+/// A double-quoted start of `text`, split into what the quotes enclose and what follows them; a
+/// backslash keeps the byte after it, a quote included, inside the quotes. `None` when `text`
+/// does not start with a quote or the quote is not closed.
+fn split_quoted(text: &str) -> Option<(&str, &str)> {
+    let body = text.strip_prefix('"')?;
+    let mut escaped = false;
+    for (index, byte) in body.bytes().enumerate() {
+        match byte {
+            _ if escaped => escaped = false,
+            b'\\' => escaped = true,
+            b'"' => return Some((&body[..index], &body[index + 1..])),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Search-result projection resolved independently of any archive.
@@ -1067,6 +1095,20 @@ mod tests {
             ),
             "both shapes of one field would write the same key"
         );
+        let literal = Projection::selected(&["shape(x\\u002c all)"], ProjectionLimits::default())
+            .expect("parse");
+        assert_eq!(
+            "x, all",
+            literal.selected_columns().expect("selected mode")[0].components()[0].value()
+        );
+        assert!(matches!(
+            Projection::selected(&["shape(a.*)"], ProjectionLimits::default()),
+            Err(ProjectionError::WildcardColumn { .. })
+        ));
+    }
+
+    #[test]
+    fn shape_spellings_split_into_descriptor_and_form() {
         assert_eq!(("a.b", FieldForm::Value), FieldForm::split("a.b"));
         assert_eq!(("a.b", FieldForm::Shape), FieldForm::split("shape(a.b)"));
         assert_eq!(
@@ -1092,16 +1134,38 @@ mod tests {
             FieldForm::split("shape(x\\u002c all)"),
             "an escaped comma selects a key ending in `, all`"
         );
-        let literal = Projection::selected(&["shape(x\\u002c all)"], ProjectionLimits::default())
-            .expect("parse");
         assert_eq!(
-            "x, all",
-            literal.selected_columns().expect("selected mode")[0].components()[0].value()
+            ("x, all", FieldForm::Shape),
+            FieldForm::split("shape(\"x, all\")"),
+            "a quoted descriptor is read whole"
         );
-        assert!(matches!(
-            Projection::selected(&["shape(a.*)"], ProjectionLimits::default()),
-            Err(ProjectionError::WildcardColumn { .. })
-        ));
+        assert_eq!(
+            ("x, all", FieldForm::ParsedShape),
+            FieldForm::split("shape(\"x, all\", all)")
+        );
+        assert_eq!(
+            ("say \\\"hi\\\"", FieldForm::Shape),
+            FieldForm::split("shape(\"say \\\"hi\\\"\")"),
+            "an escaped quote stays inside"
+        );
+        assert_eq!(
+            ("\"open", FieldForm::Shape),
+            FieldForm::split("shape(\"open)"),
+            "an unclosed quote is part of the descriptor"
+        );
+        assert_eq!(
+            ("\"a\" b", FieldForm::Shape),
+            FieldForm::split("shape(\"a\" b)"),
+            "so is a quote followed by anything but `, all`"
+        );
+        let quoted =
+            Projection::selected(&["shape(\"a\\.b, all\", all)"], ProjectionLimits::default())
+                .expect("parse");
+        assert_eq!(
+            "a.b, all",
+            quoted.selected_columns().expect("selected mode")[0].components()[0].value(),
+            "inside the quotes a dot is escaped as usual"
+        );
     }
 
     #[test]
