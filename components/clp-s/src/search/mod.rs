@@ -102,6 +102,7 @@ pub use msgpack::SearchMsgpackOptions;
 pub use msgpack::SearchMsgpackResource;
 pub use msgpack::SearchMsgpackString;
 pub use parser::parse_kql;
+pub use projection::FieldForm;
 pub use projection::Projection;
 pub use projection::ProjectionError;
 pub use projection::ProjectionLimits;

@@ -1975,13 +1975,35 @@ fn verbatim_text_fields_read_back_exactly_and_answer_searches_and_shapes_the_sam
             "{name}"
         );
     }
+    // `shape(...)` writes what the dictionary holds: a note's template where notes are templated,
+    // its text where it is stored whole, as a long note is under the 40-byte rule.
+    // `shape(..., all)` parses that text into the template it would have had.
+    let long_note = |archive: &Path, projection: &str| {
+        search(archive, "n:197", &[projection])
+            .pop()
+            .expect("note 197 matches")
+    };
+    let note = input.lines().nth(197).expect("fixture has note 197");
+    let note: serde_json::Value = serde_json::from_str(note).expect("fixture is JSONL");
+    let stored_whole = long_note(&by_length, "shape(note)");
+    assert_eq!(
+        serde_json::json!({ "note": note["note"].as_str().expect("note text").replace('%', "%%") }),
+        serde_json::from_str::<serde_json::Value>(&stored_whole).expect("shape is JSON"),
+        "a note stored whole is its own shape"
+    );
+    assert_eq!(
+        long_note(&templated, "shape(note)"),
+        long_note(&by_length, "shape(note, all)"),
+        "parsed, it is the template it would have had"
+    );
+    assert_ne!(stored_whole, long_note(&templated, "shape(note)"));
     for verbatim in [&by_reuse, &by_length, &defaults] {
         for (query, projection) in [
             ("note:\"*file_7.rs*\"", &["n", "note"][..]),
             ("note:\"*gamma*\"", &[][..]),
             ("msg:\"request 4* took *\"", &["msg"][..]),
-            ("n > 100", &["shape(note)", "shape(msg)"][..]),
-            ("note:*", &["shape(note)"][..]),
+            ("n > 100", &["shape(note, all)", "shape(msg, all)"][..]),
+            ("note:*", &["shape(note, all)"][..]),
         ] {
             let expected = search(&templated, query, projection);
             assert!(!expected.is_empty(), "{query} matches the fixture");

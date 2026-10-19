@@ -93,17 +93,55 @@ impl Default for ProjectionLimits {
     }
 }
 
+/// How a projected field is written.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FieldForm {
+    /// Its value.
+    Value,
+    /// Spelled `shape(<descriptor>)`: a CLP string as its log-type dictionary entry holds it, its
+    /// template, or the text of a string stored whole, which is not a log shape.
+    Shape,
+    /// Spelled `shape(<descriptor>, all)`: a CLP string as its template, a string stored whole
+    /// parsed for the template it would have had, as the C++ `shape(...)` writes every string.
+    ParsedShape,
+}
+
+impl FieldForm {
+    /// Splits a projected field into its descriptor and how it is written.
+    #[must_use]
+    pub fn split(field: &str) -> (&str, Self) {
+        let Some(inner) = field
+            .strip_prefix("shape(")
+            .and_then(|inner| inner.strip_suffix(')'))
+        else {
+            return (field, Self::Value);
+        };
+        match inner.rsplit_once(',') {
+            Some((descriptor, mode)) if "all" == mode.trim() => {
+                (descriptor.trim_end(), Self::ParsedShape)
+            }
+            _ => (inner, Self::Shape),
+        }
+    }
+
+    /// Whether the field is written as a shape of either kind.
+    #[must_use]
+    pub const fn is_shape(self) -> bool {
+        !matches!(self, Self::Value)
+    }
+}
+
 /// Search-result projection resolved independently of any archive.
 ///
 /// [`Self::all`] returns every ordinary event field. [`Self::selected`] parses the same escaped
 /// dot descriptors as the C++ `--projection` option and rejects wildcard or duplicate columns. A
-/// descriptor wrapped as `shape(...)` selects its field as the C++ projection function does: a
-/// CLP-encoded string is written as its logtype template, each variable a placeholder.
+/// descriptor wrapped as `shape(...)` or `shape(..., all)` selects its field as the C++ projection
+/// function does, a CLP-encoded string written as a template; see [`FieldForm`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Projection {
     columns: Option<Vec<ColumnPath>>,
-    /// Whether each selected column was wrapped in `shape(...)`.
-    shapes: Vec<bool>,
+    /// How each selected column is written.
+    shapes: Vec<FieldForm>,
     limits: ProjectionLimits,
 }
 
@@ -139,7 +177,7 @@ impl Projection {
         parsed
             .try_reserve_exact(columns.len())
             .map_err(|_| allocation(ProjectionResource::Columns, columns.len()))?;
-        let mut shapes = Vec::new();
+        let mut shapes: Vec<FieldForm> = Vec::new();
         shapes
             .try_reserve_exact(columns.len())
             .map_err(|_| allocation(ProjectionResource::Columns, columns.len()))?;
@@ -154,26 +192,29 @@ impl Projection {
                 total_source_bytes,
                 limits.max_owned_string_bytes(),
             )?;
-            let (descriptor, shape) = source
-                .as_ref()
-                .strip_prefix("shape(")
-                .and_then(|inner| inner.strip_suffix(')'))
-                .map_or_else(|| (source.as_ref(), false), |inner| (inner, true));
+            let (descriptor, form) = FieldForm::split(source.as_ref());
             let column =
                 parse_descriptor(descriptor, column_index, limits, &mut total_string_bytes)?;
             // The pinned C++ `ColumnDescriptor::operator==` deliberately/observably compares the
             // descriptor tokens and type flags but not the namespace. As in C++, a column may be
-            // selected both plainly and as `shape(...)`.
-            if let Some(first_column) = parsed.iter().zip(&shapes).position(|(existing, &mode)| {
-                existing.components() == column.components() && mode == shape
-            }) {
+            // selected both plainly and as `shape(...)`, though only one shape of it can be
+            // written.
+            if let Some(first_column) =
+                parsed
+                    .iter()
+                    .zip(&shapes)
+                    .position(|(existing, existing_form)| {
+                        existing.components() == column.components()
+                            && existing_form.is_shape() == form.is_shape()
+                    })
+            {
                 return Err(ProjectionError::DuplicateColumn {
                     first_column,
                     duplicate_column: column_index,
                 });
             }
             parsed.push(column);
-            shapes.push(shape);
+            shapes.push(form);
         }
         Ok(Self {
             columns: Some(parsed),
@@ -185,15 +226,27 @@ impl Projection {
     /// Returns whether any selected column is wrapped in `shape(...)`.
     #[must_use]
     pub fn has_shapes(&self) -> bool {
-        self.shapes.contains(&true)
+        self.shapes.iter().any(|form| form.is_shape())
     }
 
-    /// Resolves the `shape(...)` columns to the CLP-encoded string nodes written as their logtype
-    /// templates. A node of another type at such a path is written as its value, as in C++, and
-    /// so is a CLP string inside a structured array, which no descriptor addresses.
+    /// Resolves the `shape(...)` columns, then the `shape(..., all)` columns, to the CLP-encoded
+    /// string nodes written as templates. A node of another type at such a path is written as its
+    /// value, as in C++, and so is a CLP string inside a structured array, which no descriptor
+    /// addresses.
     pub(super) fn resolve_shapes(
         &self,
         schema_tree: &SchemaTree,
+    ) -> Result<(Vec<u32>, Vec<u32>), ProjectionError> {
+        Ok((
+            self.resolve_shape_form(schema_tree, FieldForm::Shape)?,
+            self.resolve_shape_form(schema_tree, FieldForm::ParsedShape)?,
+        ))
+    }
+
+    fn resolve_shape_form(
+        &self,
+        schema_tree: &SchemaTree,
+        form: FieldForm,
     ) -> Result<Vec<u32>, ProjectionError> {
         let Some(columns) = &self.columns else {
             return Ok(Vec::new());
@@ -201,13 +254,13 @@ impl Projection {
         let shaped: Vec<ColumnPath> = columns
             .iter()
             .zip(&self.shapes)
-            .filter(|(_, shape)| **shape)
+            .filter(|(_, shape)| form == **shape)
             .map(|(column, _)| column.clone())
             .collect();
         if shaped.is_empty() {
             return Ok(Vec::new());
         }
-        let plain = vec![false; shaped.len()];
+        let plain = vec![FieldForm::Value; shaped.len()];
         let resolved = Self {
             columns: Some(shaped),
             shapes: plain,
@@ -1001,6 +1054,31 @@ mod tests {
             Projection::selected(&["shape(id)", "shape(id)"], ProjectionLimits::default()),
             Err(ProjectionError::DuplicateColumn { .. })
         ));
+        assert!(
+            matches!(
+                Projection::selected(
+                    &["shape(id)", "shape(id, all)"],
+                    ProjectionLimits::default()
+                ),
+                Err(ProjectionError::DuplicateColumn { .. })
+            ),
+            "both shapes of one field would write the same key"
+        );
+        assert_eq!(("a.b", FieldForm::Value), FieldForm::split("a.b"));
+        assert_eq!(("a.b", FieldForm::Shape), FieldForm::split("shape(a.b)"));
+        assert_eq!(
+            ("a.b", FieldForm::ParsedShape),
+            FieldForm::split("shape(a.b, all)")
+        );
+        assert_eq!(
+            ("a.b", FieldForm::ParsedShape),
+            FieldForm::split("shape(a.b,all)")
+        );
+        assert_eq!(
+            ("a.b, some", FieldForm::Shape),
+            FieldForm::split("shape(a.b, some)"),
+            "only `all` selects the parsed shape"
+        );
         assert!(matches!(
             Projection::selected(&["shape(a.*)"], ProjectionLimits::default()),
             Err(ProjectionError::WildcardColumn { .. })

@@ -491,7 +491,11 @@ impl<'sink, 'text, 'options, S: SearchResultsCacheBatchSink + ?Sized>
             self.options.byte_policy(),
             self.options.record_limits(),
         )
-        .map(|program| program.with_shape_nodes(&shape_nodes))
+        .map(|program| {
+            program
+                .with_shape_nodes(&shape_nodes.0)
+                .with_parsed_shape_nodes(&shape_nodes.1)
+        })
         .map_err(|source| SearchResultsCacheAdapterError::Program { schema_id, source })
     }
 

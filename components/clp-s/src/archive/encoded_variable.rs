@@ -93,15 +93,25 @@ pub fn append_clp_message<V: EncodedVariableSource + ?Sized>(
     )
 }
 
-/// Appends a CLP logtype's template: the message with each variable replaced by a placeholder.
+/// Appends a CLP logtype as its dictionary entry holds it.
 ///
-/// A variable becomes `%int%`, `%float%` or `%str%` (a variable-dictionary value). An escaped
+/// That is a template, the message with each variable replaced by a placeholder, or the text of a
+/// string stored whole ([`LogTypeDictionaryEntry::is_verbatim`]), which is not a log shape. A
+/// variable becomes `%int%`, `%float%` or `%str%` (a variable-dictionary value). An escaped
 /// byte is written as itself, and a literal `%` is doubled so it cannot be mistaken for a
-/// placeholder. This is the rendering the C++ `shape(...)` projection emits. An entry that holds a
-/// string whole ([`LogTypeDictionaryEntry::is_verbatim`]) is first parsed as CLP encoding parses
-/// its text, so the template is the same however the string was stored. Any other entry, such as
-/// a template from KV-IR input, is rendered exactly as stored.
+/// placeholder. This is what `shape(...)` writes; [`append_parsed_logtype_template`] is what
+/// `shape(..., all)` writes.
 pub fn append_logtype_template(logtype: LogTypeDictionaryEntry<'_>, output: &mut Vec<u8>) {
+    append_escaped_template(logtype.escaped_value(), output);
+}
+
+/// Appends a CLP logtype's template, parsing a string stored whole for the one it would have had.
+///
+/// It renders as [`append_logtype_template`] does, except that an entry holding a string whole is
+/// first parsed as CLP encoding parses its text. This is the rendering the C++ `shape(...)`
+/// projection emits, and what `shape(..., all)` writes. Any other entry, such as a template from
+/// KV-IR input, is rendered exactly as stored.
+pub fn append_parsed_logtype_template(logtype: LogTypeDictionaryEntry<'_>, output: &mut Vec<u8>) {
     let escaped = logtype.escaped_value();
     if logtype.is_verbatim()
         && let Some(message) = unescaped_text(escaped)

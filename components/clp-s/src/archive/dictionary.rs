@@ -1855,7 +1855,7 @@ mod tests {
                 .entries()
                 .map(|entry| {
                     let mut template = Vec::new();
-                    super::super::append_logtype_template(entry, &mut template);
+                    super::super::append_parsed_logtype_template(entry, &mut template);
                     (
                         entry.is_verbatim(),
                         String::from_utf8(template).expect("UTF-8 template"),

@@ -26,10 +26,12 @@ use clp_s::archive::is_value_bearing;
 use clp_s::LogOrderLocator;
 use clp_s::archive::append_clp_message_bounded;
 use clp_s::archive::append_logtype_template;
+use clp_s::archive::append_parsed_logtype_template;
 use clp_s::search::ArchiveSearchOptions;
 use clp_s::search::DictionaryMatches;
 use clp_s::search::ColumnNamespace;
 use clp_s::search::ExpressionKind;
+use clp_s::search::FieldForm;
 use clp_s::search::ParsedQuery;
 use clp_s::search::PathComponent;
 use clp_s::search::resolve_filter_path;
@@ -248,8 +250,8 @@ pub struct ProjectedScanner {
     options: ArchiveSearchOptions,
     /// Candidate schema nodes per requested field, in request order.
     field_nodes: Vec<Vec<u32>>,
-    /// Whether each requested field asks for its CLP strings' logtype templates.
-    field_shapes: Vec<bool>,
+    /// How each requested field is written: its value, or its CLP strings as templates.
+    field_shapes: Vec<FieldForm>,
     /// Sorted schema nodes the filter reads, or `None` when they cannot be pinned down.
     filter_nodes: Option<Vec<u32>>,
     /// Sorted schema nodes the scan reads, or `None` to read every column.
@@ -494,15 +496,6 @@ fn filter_nodes(parsed: &ParsedQuery, tree: &SchemaTree) -> Option<Vec<u32>> {
     Some(nodes)
 }
 
-/// Splits a requested field into its descriptor and whether it asks for the logtype template,
-/// which a field spelled `shape(<descriptor>)` does.
-fn field_descriptor(field: &str) -> (&str, bool) {
-    field
-        .strip_prefix("shape(")
-        .and_then(|inner| inner.strip_suffix(')'))
-        .map_or((field, false), |inner| (inner, true))
-}
-
 impl ProjectedScanner {
     pub fn open(
         reader: Box<dyn ArchiveReader>,
@@ -517,14 +510,14 @@ impl ProjectedScanner {
         let mut catalog = reader
             .read_catalog(catalog_limits)
             .map_err(|source| ScanError::Archive(format!("failed to read catalog: {source}")))?;
-        let field_shapes: Vec<bool> = fields
+        let field_shapes: Vec<FieldForm> = fields
             .iter()
-            .map(|field| field_descriptor(field).1)
+            .map(|field| FieldForm::split(field).1)
             .collect();
         let field_nodes = fields
             .iter()
             .map(|field| {
-                let components = split_descriptor(field_descriptor(field).0);
+                let components = split_descriptor(FieldForm::split(field).0);
                 let borrowed: Vec<&str> = components.iter().map(String::as_str).collect();
                 resolve_path(catalog.schema_tree(), &borrowed)
             })
@@ -581,13 +574,13 @@ impl ProjectedScanner {
         let shaped: Vec<u32> = field_nodes
             .iter()
             .zip(&field_shapes)
-            .filter(|(_, shape)| **shape)
+            .filter(|(_, shape)| shape.is_shape())
             .flat_map(|(nodes, _)| nodes.iter().copied())
             .collect();
         let plain: Vec<u32> = field_nodes
             .iter()
             .zip(&field_shapes)
-            .filter(|(_, shape)| !**shape)
+            .filter(|(_, shape)| !shape.is_shape())
             .flat_map(|(nodes, _)| nodes.iter().copied())
             .filter(|node| held.get(*node as usize).copied().unwrap_or(false))
             .collect();
@@ -1083,13 +1076,14 @@ impl ProjectedScanner {
     }
 }
 
-/// Reads one row's projected values out of the decoded columns. A field among `shapes` writes a
-/// CLP string as its logtype template rather than its value, and a timestamp as the text it was
-/// stored from, as a whole record would show it, since such a field has no record to read it from.
+/// Reads one row's projected values out of the decoded columns. A field `shapes` marks as a shape
+/// writes a CLP string as its template, as its dictionary entry holds it or parsed (see
+/// [`FieldForm`]), rather than its value, and a timestamp as the text it was stored from, as a
+/// whole record would show it, since such a field has no record to read it from.
 fn project_row(
     decoded: &DecodedSchemaTable<'_, '_>,
     columns: &[Option<usize>],
-    shapes: &[bool],
+    shapes: &[FieldForm],
     timestamps: &TimestampPatternCatalog,
     row: usize,
     cells: &mut Vec<Cell>,
@@ -1125,7 +1119,9 @@ fn project_row(
             ColumnData::Boolean(values) => values.get(row).map_or_else(Cell::absent, |value| {
                 Cell::scalar(kind::BOOLEAN, i64::from(value), 0.0)
             }),
-            ColumnData::Timestamp(values) if shapes.get(field).copied().unwrap_or(false) => {
+            ColumnData::Timestamp(values)
+                if shapes.get(field).is_some_and(|form| form.is_shape()) =>
+            {
                 match values.get(row) {
                     Some(value) => {
                         let mut formatted = String::new();
@@ -1163,11 +1159,17 @@ fn project_row(
             ColumnData::VarString(values) | ColumnData::DictionaryFloat(values) => values
                 .value(row)
                 .map_or_else(Cell::absent, |bytes| push_text(kind::STRING, bytes, text)),
-            ColumnData::ClpString(values) if shapes.get(field).copied().unwrap_or(false) => {
+            ColumnData::ClpString(values)
+                if shapes.get(field).is_some_and(|form| form.is_shape()) =>
+            {
                 match values.record(row) {
                     Some(record) => {
                         let start = text.len();
-                        append_logtype_template(record.logtype(), text);
+                        if Some(&FieldForm::ParsedShape) == shapes.get(field) {
+                            append_parsed_logtype_template(record.logtype(), text);
+                        } else {
+                            append_logtype_template(record.logtype(), text);
+                        }
                         Cell {
                             kind: kind::STRING,
                             integer: 0,
