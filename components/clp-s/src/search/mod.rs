@@ -107,6 +107,7 @@ pub use projection::Projection;
 pub use projection::ProjectionError;
 pub use projection::ProjectionLimits;
 pub use projection::ProjectionResource;
+pub use projection::ShapeSyntaxError;
 pub use reducer::ReducerProtocol;
 pub use reducer::ReducerProtocolError;
 pub use results_cache::AggregationResultsCacheAdapter;

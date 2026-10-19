@@ -522,14 +522,20 @@ impl ProjectedScanner {
         let mut catalog = reader
             .read_catalog(catalog_limits)
             .map_err(|source| ScanError::Archive(format!("failed to read catalog: {source}")))?;
-        let field_shapes: Vec<FieldForm> = fields
+        let parsed_fields = fields
             .iter()
-            .map(|field| FieldForm::split(field).1)
-            .collect();
-        let field_nodes = fields
+            .enumerate()
+            .map(|(index, field)| {
+                FieldForm::parse(field).map_err(|error| {
+                    ScanError::Projection(format!("projected field {index} `{field}`: {error}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let field_shapes: Vec<FieldForm> = parsed_fields.iter().map(|(_, form)| *form).collect();
+        let field_nodes = parsed_fields
             .iter()
-            .map(|field| {
-                let components = split_descriptor(FieldForm::split(field).0);
+            .map(|(descriptor, _)| {
+                let components = split_descriptor(descriptor);
                 let borrowed: Vec<&str> = components.iter().map(String::as_str).collect();
                 resolve_path(catalog.schema_tree(), &borrowed)
             })

@@ -110,32 +110,51 @@ pub enum FieldForm {
 impl FieldForm {
     /// Splits a projected field into its descriptor and how it is written.
     ///
-    /// A shape's descriptor may be double-quoted, as in `shape("x, all", all)`, so that nothing in
-    /// it reads as the `, all` that follows; inside the quotes `\"` is a quote and the descriptor
-    /// is otherwise written as usual. An unquoted descriptor ends where an exact `, all` or `,all`
-    /// suffix begins, so its own spaces stay part of it. A quote that is not closed, or is followed
-    /// by anything else, is part of the descriptor, as it always was.
-    #[must_use]
-    pub fn split(field: &str) -> (&str, Self) {
-        let Some(inner) = field
-            .strip_prefix("shape(")
-            .and_then(|inner| inner.strip_suffix(')'))
-        else {
-            return (field, Self::Value);
+    /// A field not spelled `shape(...)` is its own descriptor, written as its value. A shape is
+    /// `shape(PATH)` or `shape(PATH, all)`. PATH may be double-quoted, and must be when it holds a
+    /// comma or a quote: inside the quotes `\"` is a quote, and the path is otherwise written as
+    /// usual, a dot that is part of a key escaped as `\.`. Spaces are part of the path, quoted or
+    /// not.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ShapeSyntaxError`] for a shape without its closing `)`, without a path, with an
+    /// unclosed quote or text after the quotes, with an option other than `all`, or with an
+    /// unquoted comma or quote in its path.
+    pub fn parse(field: &str) -> Result<(&str, Self), ShapeSyntaxError> {
+        let Some(rest) = field.strip_prefix("shape(") else {
+            return Ok((field, Self::Value));
         };
-        if let Some((descriptor, rest)) = split_quoted(inner) {
-            match rest {
-                "" => return (descriptor, Self::Shape),
-                ", all" | ",all" => return (descriptor, Self::ParsedShape),
-                _ => {}
+        let inner = rest.strip_suffix(')').ok_or(ShapeSyntaxError::Unclosed)?;
+        let (descriptor, form) = if inner.starts_with('"') {
+            let (descriptor, after) =
+                split_quoted(inner).ok_or(ShapeSyntaxError::UnterminatedQuote)?;
+            let form = if after.is_empty() {
+                Self::Shape
+            } else {
+                let option =
+                    after
+                        .strip_prefix(',')
+                        .ok_or_else(|| ShapeSyntaxError::TextAfterQuote {
+                            text: after.to_owned(),
+                        })?;
+                shape_option(option)?
+            };
+            (descriptor, form)
+        } else {
+            let (descriptor, form) = match inner.rsplit_once(',') {
+                Some((descriptor, option)) => (descriptor, shape_option(option)?),
+                None => (inner, Self::Shape),
+            };
+            if let Some(character) = first_unescaped(descriptor, &[',', '"']) {
+                return Err(ShapeSyntaxError::Unquoted { character });
             }
+            (descriptor, form)
+        };
+        if descriptor.is_empty() {
+            return Err(ShapeSyntaxError::EmptyPath);
         }
-        inner
-            .strip_suffix(", all")
-            .or_else(|| inner.strip_suffix(",all"))
-            .map_or((inner, Self::Shape), |descriptor| {
-                (descriptor, Self::ParsedShape)
-            })
+        Ok((descriptor, form))
     }
 
     /// Whether the field is written as a shape of either kind.
@@ -144,6 +163,84 @@ impl FieldForm {
         !matches!(self, Self::Value)
     }
 }
+
+/// The shape written for the option after a path's comma: `all`, spaces around it allowed.
+fn shape_option(option: &str) -> Result<FieldForm, ShapeSyntaxError> {
+    if "all" == option.trim() {
+        Ok(FieldForm::ParsedShape)
+    } else {
+        Err(ShapeSyntaxError::UnknownOption {
+            option: option.trim().to_owned(),
+        })
+    }
+}
+
+/// The first of `characters` in `text` that no backslash escapes.
+fn first_unescaped(text: &str, characters: &[char]) -> Option<char> {
+    let mut escaped = false;
+    for character in text.chars() {
+        if escaped {
+            escaped = false;
+        } else if '\\' == character {
+            escaped = true;
+        } else if characters.contains(&character) {
+            return Some(character);
+        }
+    }
+    None
+}
+
+/// A malformed `shape(...)` projection; see [`FieldForm::parse`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ShapeSyntaxError {
+    /// `shape(` without its closing `)`.
+    Unclosed,
+    /// `shape()`, or a shape of `""`: no path.
+    EmptyPath,
+    /// A quoted path without its closing quote.
+    UnterminatedQuote,
+    /// Text after a quoted path other than `, all`.
+    TextAfterQuote {
+        /// What follows the closing quote.
+        text: String,
+    },
+    /// An option other than `all`.
+    UnknownOption {
+        /// The option, its surrounding spaces removed.
+        option: String,
+    },
+    /// A comma or quote in an unquoted path.
+    Unquoted {
+        /// The character.
+        character: char,
+    },
+}
+
+impl Display for ShapeSyntaxError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unclosed => formatter.write_str("`shape(` is missing its closing `)`"),
+            Self::EmptyPath => formatter.write_str("`shape(...)` names no field"),
+            Self::UnterminatedQuote => formatter.write_str(
+                "the quoted field has no closing `\"`; write a quote inside it as `\\\"`",
+            ),
+            Self::TextAfterQuote { text } => write!(
+                formatter,
+                "unexpected `{text}` after the quoted field; expected `)` or `, all)`, and a quote inside the field written as `\\\"`"
+            ),
+            Self::UnknownOption { option } => write!(
+                formatter,
+                "unknown shape option `{option}`; the only option is `all`, and a field holding a comma must be quoted, as in `shape(\"a,b\")`"
+            ),
+            Self::Unquoted { character } => write!(
+                formatter,
+                "`{character}` in an unquoted field; quote the field, as in `shape(\"say \\\"hi\\\", ok\")`"
+            ),
+        }
+    }
+}
+
+impl Error for ShapeSyntaxError {}
 
 /// A double-quoted start of `text`, split into what the quotes enclose and what follows them; a
 /// backslash keeps the byte after it, a quote included, inside the quotes. `None` when `text`
@@ -223,7 +320,12 @@ impl Projection {
                 total_source_bytes,
                 limits.max_owned_string_bytes(),
             )?;
-            let (descriptor, form) = FieldForm::split(source.as_ref());
+            let (descriptor, form) = FieldForm::parse(source.as_ref()).map_err(|error| {
+                ProjectionError::ShapeSyntax {
+                    column_index,
+                    error,
+                }
+            })?;
             let column =
                 parse_descriptor(descriptor, column_index, limits, &mut total_string_bytes)?;
             // The pinned C++ `ColumnDescriptor::operator==` deliberately/observably compares the
@@ -969,6 +1071,13 @@ pub enum ProjectionError {
         /// Requested element or byte count.
         requested: usize,
     },
+    /// A `shape(...)` descriptor is malformed.
+    ShapeSyntax {
+        /// Zero-based descriptor index.
+        column_index: usize,
+        /// What is wrong with it.
+        error: ShapeSyntaxError,
+    },
     /// Checked size arithmetic or a wire-node conversion overflowed.
     SizeOverflow,
 }
@@ -1004,6 +1113,10 @@ impl Display for ProjectionError {
                 formatter,
                 "projection column {duplicate_column} duplicates column {first_column}"
             ),
+            Self::ShapeSyntax {
+                column_index,
+                error,
+            } => write!(formatter, "projection column {column_index}: {error}"),
             Self::LimitExceeded {
                 resource,
                 actual,
@@ -1109,55 +1222,83 @@ mod tests {
 
     #[test]
     fn shape_spellings_split_into_descriptor_and_form() {
-        assert_eq!(("a.b", FieldForm::Value), FieldForm::split("a.b"));
-        assert_eq!(("a.b", FieldForm::Shape), FieldForm::split("shape(a.b)"));
-        assert_eq!(
-            ("a.b", FieldForm::ParsedShape),
-            FieldForm::split("shape(a.b, all)")
-        );
-        assert_eq!(
-            ("a.b", FieldForm::ParsedShape),
-            FieldForm::split("shape(a.b,all)")
-        );
-        assert_eq!(
-            ("a.b, some", FieldForm::Shape),
-            FieldForm::split("shape(a.b, some)"),
-            "only `all` selects the parsed shape"
-        );
+        let parse = |field| FieldForm::parse(field).expect("valid shape syntax");
+        assert_eq!(("a.b", FieldForm::Value), parse("a.b"));
+        assert_eq!(("a.b", FieldForm::Shape), parse("shape(a.b)"));
+        assert_eq!(("a.b", FieldForm::ParsedShape), parse("shape(a.b, all)"));
+        assert_eq!(("a.b", FieldForm::ParsedShape), parse("shape(a.b,all)"));
         assert_eq!(
             ("my key ", FieldForm::ParsedShape),
-            FieldForm::split("shape(my key , all)"),
+            parse("shape(my key ,  all )"),
             "a key's own spaces stay part of it"
         );
-        assert_eq!(
-            ("x\\u002c all", FieldForm::Shape),
-            FieldForm::split("shape(x\\u002c all)"),
-            "an escaped comma selects a key ending in `, all`"
-        );
-        assert_eq!(
-            ("x, all", FieldForm::Shape),
-            FieldForm::split("shape(\"x, all\")"),
-            "a quoted descriptor is read whole"
-        );
+        assert_eq!(("x, all", FieldForm::Shape), parse("shape(\"x, all\")"));
         assert_eq!(
             ("x, all", FieldForm::ParsedShape),
-            FieldForm::split("shape(\"x, all\", all)")
+            parse("shape(\"x, all\", all)")
         );
         assert_eq!(
             ("say \\\"hi\\\"", FieldForm::Shape),
-            FieldForm::split("shape(\"say \\\"hi\\\"\")"),
+            parse("shape(\"say \\\"hi\\\"\")"),
             "an escaped quote stays inside"
         );
         assert_eq!(
-            ("\"open", FieldForm::Shape),
-            FieldForm::split("shape(\"open)"),
-            "an unclosed quote is part of the descriptor"
+            ("say \\\"hi\\\"", FieldForm::Shape),
+            parse("shape(say \\\"hi\\\")"),
+            "so does an escaped quote in an unquoted field"
         );
         assert_eq!(
-            ("\"a\" b", FieldForm::Shape),
-            FieldForm::split("shape(\"a\" b)"),
-            "so is a quote followed by anything but `, all`"
+            ("x\\u002c all", FieldForm::Shape),
+            parse("shape(x\\u002c all)")
         );
+        for (field, error) in [
+            ("shape(a.b", ShapeSyntaxError::Unclosed),
+            ("shape()", ShapeSyntaxError::EmptyPath),
+            ("shape(\"\")", ShapeSyntaxError::EmptyPath),
+            ("shape(, all)", ShapeSyntaxError::EmptyPath),
+            ("shape(\"open)", ShapeSyntaxError::UnterminatedQuote),
+            (
+                "shape(\"say \"hi\"\")",
+                ShapeSyntaxError::TextAfterQuote {
+                    text: "hi\"\"".to_owned(),
+                },
+            ),
+            (
+                "shape(\"a\".\"b\")",
+                ShapeSyntaxError::TextAfterQuote {
+                    text: ".\"b\"".to_owned(),
+                },
+            ),
+            (
+                "shape(a.b, some)",
+                ShapeSyntaxError::UnknownOption {
+                    option: "some".to_owned(),
+                },
+            ),
+            (
+                "shape(x, \"all\")",
+                ShapeSyntaxError::UnknownOption {
+                    option: "\"all\"".to_owned(),
+                },
+            ),
+            (
+                "shape(a,b, all)",
+                ShapeSyntaxError::Unquoted { character: ',' },
+            ),
+            (
+                "shape(say \"hi\")",
+                ShapeSyntaxError::Unquoted { character: '"' },
+            ),
+        ] {
+            assert_eq!(Err(error), FieldForm::parse(field), "{field}");
+        }
+        assert!(matches!(
+            Projection::selected(&["a", "shape(a,b)"], ProjectionLimits::default()),
+            Err(ProjectionError::ShapeSyntax {
+                column_index: 1,
+                error: ShapeSyntaxError::UnknownOption { .. }
+            })
+        ));
         let quoted =
             Projection::selected(&["shape(\"a\\.b, all\", all)"], ProjectionLimits::default())
                 .expect("parse");
