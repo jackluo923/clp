@@ -221,17 +221,29 @@ pub fn archive_field_types(tree: &SchemaTree) -> Vec<ArchiveFieldType> {
 
 /// Splits an escaped dot descriptor into its components.
 ///
-/// A backslash escapes the following byte, so a key containing a literal dot survives the split.
+/// A backslash escapes the following character, so a key containing a literal dot survives the
+/// split, and `\uXXXX` names a character by its code, as a search projection's descriptor may;
+/// `_shape` writes a comma this way.
 fn split_descriptor(source: &str) -> Vec<String> {
     let mut components = Vec::new();
     let mut current = String::new();
-    let mut escaped = false;
-    for character in source.chars() {
-        if escaped {
-            current.push(character);
-            escaped = false;
-        } else if '\\' == character {
-            escaped = true;
+    let mut characters = source.chars();
+    while let Some(character) = characters.next() {
+        if '\\' == character {
+            match characters.next() {
+                Some('u') => {
+                    let hex: String = characters.clone().take(4).collect();
+                    match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                        Some(decoded) if 4 == hex.len() => {
+                            current.push(decoded);
+                            characters.nth(3);
+                        }
+                        _ => current.push('u'),
+                    }
+                }
+                Some(escaped) => current.push(escaped),
+                None => {}
+            }
         } else if '.' == character {
             components.push(std::mem::take(&mut current));
         } else {
@@ -1233,5 +1245,24 @@ fn push_text(kind: u32, bytes: &[u8], text: &mut Vec<u8>) -> Cell {
         real: 0.0,
         text_offset: start,
         text_length: bytes.len(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_descriptor;
+
+    #[test]
+    fn descriptors_split_on_unescaped_dots_and_decode_escapes() {
+        assert_eq!(vec!["a", "b"], split_descriptor("a.b"));
+        assert_eq!(vec!["a.b", "c"], split_descriptor("a\\.b.c"));
+        assert_eq!(vec!["back\\slash"], split_descriptor("back\\\\slash"));
+        assert_eq!(vec!["x, all"], split_descriptor("x\\u002c all"));
+        assert_eq!(vec!["my key "], split_descriptor("my key "));
+        assert_eq!(
+            vec!["u002"],
+            split_descriptor("\\u002"),
+            "an incomplete code is the letter it starts with"
+        );
     }
 }

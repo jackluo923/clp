@@ -101,8 +101,10 @@ pub enum FieldForm {
     /// Spelled `shape(<descriptor>)`: a CLP string as its log-type dictionary entry holds it, its
     /// template, or the text of a string stored whole, which is not a log shape.
     Shape,
-    /// Spelled `shape(<descriptor>, all)`: a CLP string as its template, a string stored whole
-    /// parsed for the template it would have had, as the C++ `shape(...)` writes every string.
+    /// Spelled `shape(<descriptor>, all)` or `shape(<descriptor>,all)`: a CLP string as its
+    /// template, a string stored whole parsed for the template it would have had, as the C++
+    /// `shape(...)` writes every string. A key that itself ends in `, all` is selected by writing
+    /// its comma as `\u002c`.
     ParsedShape,
 }
 
@@ -116,12 +118,13 @@ impl FieldForm {
         else {
             return (field, Self::Value);
         };
-        match inner.rsplit_once(',') {
-            Some((descriptor, mode)) if "all" == mode.trim() => {
-                (descriptor.trim_end(), Self::ParsedShape)
-            }
-            _ => (inner, Self::Shape),
-        }
+        // The suffix is matched exactly, so a key's own spaces stay part of it.
+        inner
+            .strip_suffix(", all")
+            .or_else(|| inner.strip_suffix(",all"))
+            .map_or((inner, Self::Shape), |descriptor| {
+                (descriptor, Self::ParsedShape)
+            })
     }
 
     /// Whether the field is written as a shape of either kind.
@@ -1078,6 +1081,22 @@ mod tests {
             ("a.b, some", FieldForm::Shape),
             FieldForm::split("shape(a.b, some)"),
             "only `all` selects the parsed shape"
+        );
+        assert_eq!(
+            ("my key ", FieldForm::ParsedShape),
+            FieldForm::split("shape(my key , all)"),
+            "a key's own spaces stay part of it"
+        );
+        assert_eq!(
+            ("x\\u002c all", FieldForm::Shape),
+            FieldForm::split("shape(x\\u002c all)"),
+            "an escaped comma selects a key ending in `, all`"
+        );
+        let literal = Projection::selected(&["shape(x\\u002c all)"], ProjectionLimits::default())
+            .expect("parse");
+        assert_eq!(
+            "x, all",
+            literal.selected_columns().expect("selected mode")[0].components()[0].value()
         );
         assert!(matches!(
             Projection::selected(&["shape(a.*)"], ProjectionLimits::default()),
