@@ -544,11 +544,116 @@ fn optional_utf8_environment(name: &'static str) -> CliResult<Option<String>> {
 }
 
 fn main() -> ExitCode {
+    #[cfg(not(clp_s_no_expire))]
+    if let Some(message) = expiry::build_expiry_message() {
+        eprintln!("clp-s: {message}");
+        return ExitCode::FAILURE;
+    }
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("clp-s: {error}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// The 15-day build expiry; compiled out entirely when a build set `CLP_S_NO_EXPIRE`.
+///
+/// `build.rs` stamps `CLP_S_EXPIRY_DAY` (days since the Unix epoch) and `CLP_S_EXPIRY_TOKEN`
+/// ([`token`] of a hard-coded seed and that day). The check recomputes the token and refuses to run
+/// when it no longer matches the stamped one or the day has passed, so editing just the stamped day
+/// does not extend the build. The seed is in the binary, so this only raises the bar against a
+/// casual edit; a local binary can always be patched.
+#[cfg(not(clp_s_no_expire))]
+mod expiry {
+    const EXPIRY_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+    const SECONDS_PER_DAY: i64 = 86_400;
+
+    /// A 64-bit avalanche mix (`SplitMix64` finalizer); kept identical to `build.rs`.
+    const fn mix(value: u64) -> u64 {
+        let mut z = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// The token that binds `expiry_day` to [`EXPIRY_SEED`].
+    const fn token(expiry_day: i64) -> u64 {
+        mix(EXPIRY_SEED ^ expiry_day as u64)
+    }
+
+    /// The message to print when this build has expired, or `None` when it is still valid.
+    pub(super) fn build_expiry_message() -> Option<String> {
+        let expiry_day: i64 = env!("CLP_S_EXPIRY_DAY").parse().ok()?;
+        let stamped_token: u64 = env!("CLP_S_EXPIRY_TOKEN").parse().ok()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        let now_day = (now / SECONDS_PER_DAY as u64) as i64;
+        expiry_report(expiry_day, stamped_token, now_day)
+    }
+
+    /// The message for a build stamped to expire on `expiry_day` with `stamped_token`, read on
+    /// `now_day`, or `None` when the token verifies and the day has not passed. The inputs pass
+    /// through [`std::hint::black_box`] so the compiler cannot fold the check to a constant.
+    fn expiry_report(expiry_day: i64, stamped_token: u64, now_day: i64) -> Option<String> {
+        let expiry_day = std::hint::black_box(expiry_day);
+        let stamped_token = std::hint::black_box(stamped_token);
+        if token(expiry_day) == stamped_token && now_day <= expiry_day {
+            return None;
+        }
+        Some(format!(
+            "this build expired on {}; rebuild clp-s from source, or build with CLP_S_NO_EXPIRE=1 \
+             to disable expiry",
+            civil_string(expiry_day),
+        ))
+    }
+
+    /// The proleptic-Gregorian date of `z` days since 1970-01-01, as `YYYY-MM-DD`.
+    fn civil_string(z: i64) -> String {
+        let z = z + 719_468;
+        let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+        let doe = (z - era * 146_097) as i64;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let year = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = year + i64::from(month <= 2);
+        format!("{year:04}-{month:02}-{day:02}")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::civil_string;
+        use super::expiry_report;
+        use super::token;
+
+        #[test]
+        fn expiry_report_rejects_a_passed_day_or_a_token_that_does_not_verify() {
+            let day = 20_761_i64;
+            let good = token(day);
+            assert_eq!(
+                None,
+                expiry_report(day, good, day),
+                "valid on the expiry day"
+            );
+            assert_eq!(None, expiry_report(day, good, day - 1), "valid before it");
+            let overdue = expiry_report(day, good, day + 1).expect("a passed day expires");
+            assert!(overdue.contains("expired on "), "{overdue}");
+            assert!(overdue.contains("CLP_S_NO_EXPIRE=1"), "{overdue}");
+            assert!(
+                expiry_report(day, good.wrapping_add(1), day).is_some(),
+                "a token that does not verify expires even before the day"
+            );
+            assert!(
+                expiry_report(day + 100_000, good, day).is_some(),
+                "moving the day without refreshing the token no longer verifies"
+            );
+            assert_eq!("2026-10-20", civil_string(20_746));
         }
     }
 }
@@ -835,7 +940,8 @@ where
     S: FinalizedArchiveSink + 'static,
     C: ArchiveSetStatsCallback + 'static,
     S::Error: Error + 'static,
-    C::Error: Error + 'static, {
+    C::Error: Error + 'static,
+{
     let probed = if looks_like_network_path(path) {
         let source_url = path
             .to_str()
@@ -877,7 +983,8 @@ where
     S: FinalizedArchiveSink + 'static,
     C: ArchiveSetStatsCallback + 'static,
     S::Error: Error + 'static,
-    C::Error: Error + 'static, {
+    C::Error: Error + 'static,
+{
     let kind = input.kind();
     if matches!(
         kind,
