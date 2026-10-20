@@ -110,9 +110,11 @@ impl ColumnLimits {
 
 impl Default for ColumnLimits {
     fn default() -> Self {
-        const MEBIBYTE: u64 = 1024 * 1024;
+        const GIBIBYTE: u64 = 1024 * 1024 * 1024;
+        // The byte bound matches the packed-stream default: a table's column data is what one
+        // packed stream holds, so a stream the reader accepts must not then be refused here.
         Self::new(
-            1024 * MEBIBYTE,
+            8 * GIBIBYTE,
             128 * 1024 * 1024,
             1024 * 1024,
             128 * 1024 * 1024,

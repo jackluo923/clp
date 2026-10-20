@@ -247,6 +247,19 @@ clp_s_status clp_s_v1_query_compile(
 void clp_s_v1_query_free(clp_s_query *query);
 
 /**
+ * Replaces the per-packed-stream decompression limits used by this query's archive scans. A zero
+ * limit keeps the current value. The defaults are sized for archives this project's CLI writes
+ * (the writer rotates an archive at 8 GiB of encoded output), so a reader of untrusted input may
+ * want lower ones.
+ */
+clp_s_status clp_s_v1_query_set_packed_stream_limits(
+        clp_s_query *query,
+        uint64_t max_compressed_bytes,
+        uint64_t max_decompressed_bytes,
+        clp_s_error_buffer *error
+);
+
+/**
  * Creates a bounded serializer and stages its preamble. NULL options select four-byte defaults.
  * NULL metadata with zero length means no user metadata; non-NULL empty metadata is invalid JSON.
  * `out_serializer` is always initialized to NULL before validation.

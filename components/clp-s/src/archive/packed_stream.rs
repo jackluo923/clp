@@ -13,10 +13,10 @@ use super::table_metadata::TableMetadata;
 
 /// Resource limits applied while decompressing one packed stream from `/0`.
 ///
-/// [`Default`] is intentionally safety-oriented for untrusted inputs. A valid archive created
-/// with the C++ CLI's multi-gibibyte target size can contain a larger single-schema stream, so
-/// compatibility-oriented applications should select explicit limits from their own memory and
-/// archive-size policy.
+/// [`Default`] bounds a single stream but stays above what this crate's own CLI produces: it
+/// rotates an archive at 8 GiB of encoded output by default, so a table in a legitimate archive
+/// can decompress past a gibibyte. Applications that read untrusted input, or that have a tighter
+/// memory budget, should select explicit limits from their own policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PackedStreamLimits {
     compressed: u64,
@@ -48,8 +48,8 @@ impl PackedStreamLimits {
 
 impl Default for PackedStreamLimits {
     fn default() -> Self {
-        const MEBIBYTE: u64 = 1024 * 1024;
-        Self::new(256 * MEBIBYTE, 1024 * MEBIBYTE)
+        const GIBIBYTE: u64 = 1024 * 1024 * 1024;
+        Self::new(GIBIBYTE, 8 * GIBIBYTE)
     }
 }
 
@@ -1125,8 +1125,8 @@ mod tests {
         ));
 
         let defaults = PackedStreamLimits::default();
-        assert_eq!(256 * 1024 * 1024, defaults.max_compressed_size());
-        assert_eq!(1024 * 1024 * 1024, defaults.max_decompressed_size());
+        assert_eq!(1024 * 1024 * 1024, defaults.max_compressed_size());
+        assert_eq!(8 * 1024 * 1024 * 1024, defaults.max_decompressed_size());
     }
 
     #[test]

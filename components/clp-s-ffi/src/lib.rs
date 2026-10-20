@@ -68,6 +68,7 @@ use clp_s::JsonlRecordSink;
 use clp_s::archive::DirectoryArchiveReader;
 use clp_s::archive::FsDirectoryArchiveSource;
 use clp_s::archive::MetadataLimits;
+use clp_s::archive::PackedStreamLimits;
 use clp_s::archive::SingleFileArchiveReader;
 use clp_s::extract_jsonl_records;
 use clp_s::archive::ArchiveCatalogLimits;
@@ -2452,6 +2453,49 @@ pub unsafe extern "C" fn clp_s_v1_query_free(query: *mut ClpSQuery) {
         // SAFETY: The caller transfers unique ownership of one live handle.
         drop(unsafe { Box::from_raw(query) });
     }));
+}
+
+/// Replaces the per-packed-stream decompression limits used by this query's archive scans.
+///
+/// A zero limit keeps the current value, so a caller can raise or lower just one of the two. The
+/// defaults are sized for archives this project's CLI writes; a caller reading untrusted input,
+/// or one with a tighter memory budget, should lower them.
+///
+/// # Safety
+///
+/// `query` must be a live handle from [`clp_s_v1_query_compile`] that is not in use by any
+/// concurrent operation. `error` follows [`ClpSErrorBuffer`]'s contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clp_s_v1_query_set_packed_stream_limits(
+    query: *mut ClpSQuery,
+    max_compressed_bytes: u64,
+    max_decompressed_bytes: u64,
+    error: *mut ClpSErrorBuffer,
+) -> ClpSStatus {
+    // SAFETY: All raw arguments are governed by this function's contract.
+    unsafe {
+        ffi_entry(error, || {
+            // SAFETY: The caller guarantees one live handle borrowed exclusively for this call.
+            let handle = query.as_mut().ok_or_else(|| {
+                ApiError::InvalidArgument("query handle must not be null".to_owned())
+            })?;
+            let current = handle.options.packed_stream();
+            let limits = PackedStreamLimits::new(
+                if 0 == max_compressed_bytes {
+                    current.max_compressed_size()
+                } else {
+                    max_compressed_bytes
+                },
+                if 0 == max_decompressed_bytes {
+                    current.max_decompressed_size()
+                } else {
+                    max_decompressed_bytes
+                },
+            );
+            handle.options = handle.options.with_packed_stream(limits);
+            Ok(())
+        })
+    }
 }
 
 /// Creates a bounded KV-IR serializer and stages its preamble.
