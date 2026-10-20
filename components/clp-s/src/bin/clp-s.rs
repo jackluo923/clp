@@ -66,6 +66,8 @@ use clp_s::ingest::probe_structured_input;
 use clp_s::json::JsonBytePolicy;
 use clp_s::json::JsonEscapeLimits;
 use clp_s::json::append_json_string;
+use clp_s::json_number::FloatFormat;
+use clp_s::json_number::FloatNotation;
 use clp_s::network::ForwardSeekReader;
 use clp_s::network::HttpClient;
 use clp_s::network::HttpClientOptions;
@@ -252,8 +254,13 @@ struct CompressionOutputArgs {
 
 #[derive(Debug, Args)]
 struct CompressionRepresentationArgs {
-    /// Decode floating-point values without retaining their exact source spelling.
+    /// Keep each float's exact source spelling, such as `1.50` or `1e-7`, so `x` and `s` can write
+    /// it as spelled (`--float-notation original`). By default a float is stored only as its
+    /// binary64 value.
     #[arg(long)]
+    retain_float_format: bool,
+    /// Floats are stored as values by default; accepted so earlier command lines keep working.
+    #[arg(long, hide = true, conflicts_with = "retain_float_format")]
     no_retain_float_format: bool,
     /// Store each array whole, as a string in the array dictionary, instead of encoding its
     /// elements as structured schema nodes (the default).
@@ -286,6 +293,44 @@ struct CompressionPathArgs {
     remove_leading_slash: bool,
 }
 
+/// How `x` and `s` write floats.
+#[derive(Debug, Args)]
+struct FloatOutputArgs {
+    /// How floats are spelled: as the input spelled them where the archive kept the spelling
+    /// (`c --retain-float-format`), otherwise as `auto` (original); scientific only below 1e-6 or
+    /// from 1e21 (auto); never scientific (plain); or always scientific (scientific). Any notation
+    /// but `original`, or a precision, writes every float from its value.
+    #[arg(long, value_enum, default_value = "original")]
+    float_notation: FloatNotationArg,
+    /// Digits after the decimal point, of the mantissa when scientific, for each float written
+    /// from its value; by default, the shortest digits that read back as the same value. `plain`
+    /// with 6 writes floats as C++ `std::to_string` does.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(0..=i64::from(FloatFormat::MAX_PRECISION)))]
+    float_precision: Option<u16>,
+}
+
+impl FloatOutputArgs {
+    const fn format(&self) -> FloatFormat {
+        FloatFormat::new(
+            match self.float_notation {
+                FloatNotationArg::Original => FloatNotation::Original,
+                FloatNotationArg::Auto => FloatNotation::Auto,
+                FloatNotationArg::Plain => FloatNotation::Plain,
+                FloatNotationArg::Scientific => FloatNotation::Scientific,
+            },
+            self.float_precision,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum FloatNotationArg {
+    Original,
+    Auto,
+    Plain,
+    Scientific,
+}
+
 #[derive(Debug, Args)]
 struct ExtractArgs {
     /// Path to one archive or a directory containing archives.
@@ -313,6 +358,8 @@ struct ExtractArgs {
     /// MongoDB collection for ordered-decompression metadata.
     #[arg(long)]
     mongodb_collection: Option<String>,
+    #[command(flatten)]
+    floats: FloatOutputArgs,
 }
 
 #[derive(Debug, Args)]
@@ -387,6 +434,8 @@ struct SearchArgs {
     /// Results-cache dataset name.
     #[arg(long)]
     dataset: Option<String>,
+    #[command(flatten)]
+    floats: FloatOutputArgs,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -559,7 +608,7 @@ fn run_compress(arguments: &CompressArgs) -> CliResult<()> {
         arguments.max_document_size,
     );
     let json_options = JsonArchiveOptions::new()
-        .with_retain_float_format(!arguments.representation.no_retain_float_format)
+        .with_retain_float_format(arguments.representation.retain_float_format)
         .with_structurize_arrays(!arguments.representation.no_structurize_arrays)
         .with_structured_array_limits(JsonStructuredArrayLimits::new(u64::MAX, u64::MAX));
     let stream_options = StructuredStreamOptions::new()
@@ -1137,6 +1186,7 @@ fn run_configured_stdout_search(
         CliStdoutSearchOptions {
             archive: archive_options,
             projection,
+            float_format: arguments.floats.format(),
             ignore_case: arguments.ignore_case,
             has_timestamp_filter: arguments.tge.is_some() || arguments.tle.is_some(),
             direct_search_supported: arguments.projection.is_empty(),
@@ -1228,6 +1278,7 @@ fn validate_aggregation_output(
 struct CliStdoutSearchOptions<'options> {
     archive: &'options ArchiveSearchOptions,
     projection: Projection,
+    float_format: FloatFormat,
     ignore_case: bool,
     has_timestamp_filter: bool,
     direct_search_supported: bool,
@@ -1240,7 +1291,8 @@ fn run_stdout_search(
     options: CliStdoutSearchOptions<'_>,
 ) -> CliResult<()> {
     let jsonl_options = SearchJsonlOptions::new(options.projection)
-        .with_byte_policy(JsonBytePolicy::PreserveInvalidUtf8);
+        .with_byte_policy(JsonBytePolicy::PreserveInvalidUtf8)
+        .with_float_format(options.float_format);
 
     let stdout = io::stdout();
     let mut output = WriteJsonlSink(BufWriter::with_capacity(
@@ -2036,6 +2088,7 @@ fn run_extract(arguments: &ExtractArgs) -> CliResult<()> {
                 &archive_path,
                 source_network.as_ref(),
                 &arguments.output_dir,
+                arguments.floats.format(),
             )?;
         }
     }
@@ -2310,13 +2363,14 @@ fn extract_unordered_archive(
     archive_path: &Path,
     source_network: Option<&CliNetworkContext>,
     output_dir: &Path,
+    float_format: FloatFormat,
 ) -> CliResult<()> {
     let mut sink = UnorderedFileSink::new(output_dir.join("original"));
     let extraction = with_archive_reader(archive_path, source_network, |archive| {
         extract_jsonl_records(
             archive,
             &mut sink,
-            extraction_options(ExtractionMode::Unordered),
+            extraction_options(ExtractionMode::Unordered, float_format),
         )
     });
     match extraction {
@@ -2342,7 +2396,7 @@ fn extract_ordered_archive(
         extract_jsonl_records(
             archive,
             &mut sink,
-            extraction_options(ExtractionMode::LogOrder),
+            extraction_options(ExtractionMode::LogOrder, arguments.floats.format()),
         )
     });
 
@@ -2354,7 +2408,12 @@ fn extract_ordered_archive(
                 "clp-s: archive '{}' has no log-order metadata; falling back to physical order",
                 diagnostic_source_name(archive_path)
             );
-            extract_unordered_archive(archive_path, source_network, &arguments.output_dir)
+            extract_unordered_archive(
+                archive_path,
+                source_network,
+                &arguments.output_dir,
+                arguments.floats.format(),
+            )
         }
         Ok(Err(error)) => {
             drop(sink.abort());
@@ -2367,8 +2426,10 @@ fn extract_ordered_archive(
     }
 }
 
-fn extraction_options(mode: ExtractionMode) -> ExtractionOptions {
-    ExtractionOptions::new(mode).with_byte_policy(JsonBytePolicy::PreserveInvalidUtf8)
+fn extraction_options(mode: ExtractionMode, float_format: FloatFormat) -> ExtractionOptions {
+    ExtractionOptions::new(mode)
+        .with_byte_policy(JsonBytePolicy::PreserveInvalidUtf8)
+        .with_float_format(float_format)
 }
 
 fn with_archive_reader<T>(

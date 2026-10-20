@@ -3487,8 +3487,8 @@ mod tests {
             scratch = writer.into_scratch();
         }
         let expected: &[&[u8]] = &[
-            br#"{"id":-7,"metrics":{"load":1.250000,"ok":true},"missing":null}"#.as_slice(),
-            br#"{"id":42,"metrics":{"load":2.500000,"ok":false},"missing":null}"#.as_slice(),
+            br#"{"id":-7,"metrics":{"load":1.25,"ok":true},"missing":null}"#.as_slice(),
+            br#"{"id":42,"metrics":{"load":2.5,"ok":false},"missing":null}"#.as_slice(),
             br#"{"id":9,"enabled":false}"#.as_slice(),
         ];
         let actual = extracted.iter().map(Vec::as_slice).collect::<Vec<_>>();

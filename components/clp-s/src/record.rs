@@ -43,10 +43,11 @@ use crate::json::JsonEscapeError;
 use crate::json::JsonEscapeLimits;
 use crate::json::append_json_key_bytes;
 use crate::json::append_json_string_bytes;
+use crate::json_number::FloatFormat;
 use crate::json_number::JsonNumberError;
-use crate::json_number::MAX_F64_JSON_BYTES;
+use crate::json_number::MAX_F64_FORMATTED_JSON_BYTES;
 use crate::json_number::MAX_I64_JSON_BYTES;
-use crate::json_number::append_json_f64;
+use crate::json_number::append_json_f64_formatted;
 use crate::json_number::append_json_i64;
 use crate::timestamp_catalog::TimestampCatalogFormatError;
 use crate::timestamp_catalog::TimestampPatternCatalog;
@@ -181,6 +182,8 @@ pub struct RecordProgram {
     shape_nodes: Vec<u32>,
     parsed_shape_nodes: Vec<u32>,
     byte_policy: JsonBytePolicy,
+    /// How a float without a retained spelling is written.
+    float_format: FloatFormat,
     limits: RecordLimits,
 }
 
@@ -235,6 +238,15 @@ impl RecordProgram {
         self.shape_nodes = nodes.to_vec();
         self.shape_nodes.sort_unstable();
         self.shape_nodes.dedup();
+        self
+    }
+
+    /// Writes a float without a retained source spelling as `format` says; the default writes the
+    /// shortest digits that read back as the same value. A float with its spelling is written as
+    /// spelled.
+    #[must_use]
+    pub const fn with_float_format(mut self, format: FloatFormat) -> Self {
+        self.float_format = format;
         self
     }
 
@@ -576,6 +588,7 @@ fn append_row(context: &mut RowContext<'_, '_, '_, '_, '_>) -> Result<(), Record
             context.row_index,
             context.timestamps,
             context.program.byte_policy,
+            context.program.float_format,
             context.program.limits.scratch_bytes,
             context.scratch,
             &mut output,
@@ -664,6 +677,7 @@ fn append_dynamic_value(
     row_index: usize,
     timestamps: &TimestampPatternCatalog,
     byte_policy: JsonBytePolicy,
+    float_format: FloatFormat,
     scratch_limit: usize,
     scratch: &mut RecordScratch,
     output: &mut BoundedRecordOutput<'_>,
@@ -683,16 +697,32 @@ fn append_dynamic_value(
             let value = column
                 .get(row_index)
                 .ok_or_else(|| missing(step, row_index))?;
-            append_float(value, step, scratch, output)
+            append_float(value, float_format, step, scratch, output)
+        }
+        ColumnCursor::FormattedFloat(column) if float_format.keeps_spelling() => {
+            append_original_float(*column, step, row_index, scratch, output)
         }
         ColumnCursor::FormattedFloat(column) => {
-            append_original_float(*column, step, row_index, scratch, output)
+            let value = column
+                .get(row_index)
+                .ok_or_else(|| missing(step, row_index))?
+                .value();
+            append_float(value, float_format, step, scratch, output)
         }
         ColumnCursor::DictionaryFloat(column) => {
             let value = column
                 .value(row_index)
                 .ok_or_else(|| missing(step, row_index))?;
-            append_raw_bytes(value, step, byte_policy, output)
+            // A spelling kept in the dictionary is reformatted from the value it reads as; one
+            // that does not read as a finite float stays as it is.
+            match std::str::from_utf8(value)
+                .ok()
+                .and_then(|text| text.parse::<f64>().ok())
+                .filter(|parsed| parsed.is_finite() && !float_format.keeps_spelling())
+            {
+                Some(parsed) => append_float(parsed, float_format, step, scratch, output),
+                None => append_raw_bytes(value, step, byte_policy, output),
+            }
         }
         ColumnCursor::Boolean(column) => {
             let value = column
@@ -770,15 +800,18 @@ fn append_integer(
 
 fn append_float(
     value: f64,
+    format: FloatFormat,
     step: ValueStep,
     scratch: &mut RecordScratch,
     output: &mut BoundedRecordOutput<'_>,
 ) -> Result<(), RecordError> {
     scratch.bytes.clear();
-    append_json_f64(value, &mut scratch.bytes).map_err(|source| RecordError::JsonNumber {
-        column_index: step.column_index,
-        node_id: step.node_id,
-        source,
+    append_json_f64_formatted(value, format, &mut scratch.bytes).map_err(|source| {
+        RecordError::JsonNumber {
+            column_index: step.column_index,
+            node_id: step.node_id,
+            source,
+        }
     })?;
     output.append(&scratch.bytes)
 }
@@ -1075,7 +1108,7 @@ fn bind_column<'table, 'archive>(
 const fn fixed_scratch_requirement(data: ColumnData<'_, '_>) -> usize {
     match data {
         ColumnData::Integer(_) | ColumnData::DeltaInteger(_) => MAX_I64_JSON_BYTES,
-        ColumnData::Float(_) => MAX_F64_JSON_BYTES,
+        ColumnData::Float(_) => MAX_F64_FORMATTED_JSON_BYTES,
         ColumnData::FormattedFloat(_) => MAX_FORMATTED_FLOAT_BYTES,
         _ => 0,
     }
@@ -1493,6 +1526,7 @@ impl<'a> ProgramCompiler<'a> {
             shape_nodes: Vec::new(),
             parsed_shape_nodes: Vec::new(),
             byte_policy: self.byte_policy,
+            float_format: FloatFormat::default(),
             limits: self.limits,
         }
     }
@@ -2621,13 +2655,13 @@ mod tests {
             .expect("bind all-value writer");
         let expected = [
             concat!(
-                r#"{"integer":-1,"delta":10,"float":1.250000,"formatted":8.2500,"#,
+                r#"{"integer":-1,"delta":10,"float":1.25,"formatted":8.2500,"#,
                 r#""dict_float":1e+03,"boolean":true,"string":"a\"b","clp":"msg 42","#,
                 r#""array":[1,true],"timestamp":1700000000123}"#,
             )
             .as_bytes(),
             concat!(
-                r#"{"integer":9223372036854775807,"delta":7,"float":-0.000000,"#,
+                r#"{"integer":9223372036854775807,"delta":7,"float":-0.0,"#,
                 r#""formatted":8.25,"dict_float":-0.0,"boolean":false,"#,
                 r#""string":"snowman:☃","clp":"msg -7","array":[1,true],"#,
                 r#""timestamp":1700000000124}"#,

@@ -44,6 +44,117 @@ pub fn append_json_i64(value: i64, destination: &mut Vec<u8>) -> Result<(), Json
     append_preformatted(formatted, destination)
 }
 
+/// Maximum bytes [`append_json_f64_formatted`] emits for one finite binary64 value: a sign, 309
+/// integer digits, a decimal point and [`FloatFormat::MAX_PRECISION`] fraction digits.
+pub const MAX_F64_FORMATTED_JSON_BYTES: usize = 660;
+
+/// How a float is spelled; see [`FloatFormat`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FloatNotation {
+    /// As the input spelled it, when the archive retained the spelling, and otherwise as
+    /// [`Self::Auto`]: the best effort at the original.
+    #[default]
+    Original,
+    /// Scientific for a magnitude below 1e-6 or from 1e21, as JavaScript writes numbers, and
+    /// plain otherwise.
+    Auto,
+    /// Never scientific.
+    Plain,
+    /// Always scientific.
+    Scientific,
+}
+
+/// How a float is written as a JSON number.
+///
+/// The default, [`FloatNotation::Original`], writes a float as the input spelled it when the
+/// archive retained the spelling. Any other notation, a precision, and a float without its spelling
+/// write it from its binary64 value: by default the shortest digits that read back as the same
+/// value. A precision instead writes that many digits after the decimal point, of the mantissa when
+/// scientific: plain notation with six is what C++ `std::to_string` writes. Without a precision, a
+/// float always reads as one, so `2.0` is written `2.0` rather than `2`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FloatFormat {
+    notation: FloatNotation,
+    precision: Option<u16>,
+}
+
+impl FloatFormat {
+    /// The most digits after the decimal point a precision may ask for, enough to write the
+    /// smallest binary64 value in plain notation.
+    pub const MAX_PRECISION: u16 = 340;
+
+    /// A format with `notation` and, when given, `precision` digits after the decimal point, at
+    /// most [`Self::MAX_PRECISION`].
+    #[must_use]
+    pub const fn new(notation: FloatNotation, precision: Option<u16>) -> Self {
+        let precision = match precision {
+            Some(digits) if digits > Self::MAX_PRECISION => Some(Self::MAX_PRECISION),
+            precision => precision,
+        };
+        Self {
+            notation,
+            precision,
+        }
+    }
+
+    /// How floats are spelled.
+    #[must_use]
+    pub const fn notation(self) -> FloatNotation {
+        self.notation
+    }
+
+    /// Whether a float's retained spelling is written as it is: in the original notation, unless
+    /// a precision asks for every float to be written from its value.
+    #[must_use]
+    pub const fn keeps_spelling(self) -> bool {
+        matches!(self.notation, FloatNotation::Original) && self.precision.is_none()
+    }
+
+    /// Digits after the decimal point, or `None` for the shortest exact digits.
+    #[must_use]
+    pub const fn precision(self) -> Option<u16> {
+        self.precision
+    }
+}
+
+/// Appends a finite binary64 value as a JSON number written as `format` says, as
+/// [`FloatNotation::Auto`] for [`FloatNotation::Original`], since the value has no spelling.
+///
+/// The destination contents remain unchanged on every error.
+///
+/// # Errors
+///
+/// Returns [`JsonNumberError::NonFiniteFloat`] for NaN or either infinity, or an error if
+/// destination-size arithmetic overflows or the exact bounded reservation fails.
+pub fn append_json_f64_formatted(
+    value: f64,
+    format: FloatFormat,
+    destination: &mut Vec<u8>,
+) -> Result<(), JsonNumberError> {
+    if !value.is_finite() {
+        return Err(JsonNumberError::NonFiniteFloat(classify_non_finite(value)));
+    }
+    let scientific = match format.notation {
+        FloatNotation::Plain => false,
+        FloatNotation::Scientific => true,
+        FloatNotation::Original | FloatNotation::Auto => {
+            0.0 != value && !(1e-6..1e21).contains(&value.abs())
+        }
+    };
+    let mut text = String::new();
+    let written = match (scientific, format.precision.map(usize::from)) {
+        (false, None) => write!(text, "{value}"),
+        (false, Some(digits)) => write!(text, "{value:.digits$}"),
+        (true, None) => write!(text, "{value:e}"),
+        (true, Some(digits)) => write!(text, "{value:.digits$e}"),
+    };
+    written.map_err(|_| JsonNumberError::OutputSizeOverflow)?;
+    if format.precision.is_none() && !text.contains(['.', 'e']) {
+        text.push_str(".0");
+    }
+    append_preformatted(text.as_bytes(), destination)
+}
+
 /// Appends the C++ CLP-S JSON spelling of a finite binary64 value.
 ///
 /// Output uses fixed notation with exactly six fractional digits, matching
@@ -246,13 +357,143 @@ impl Error for JsonNumberError {}
 mod tests {
     use std::fmt::Write as _;
 
+    use super::FloatFormat;
+    use super::FloatNotation;
     use super::JsonNumberError;
+    use super::MAX_F64_FORMATTED_JSON_BYTES;
     use super::MAX_F64_JSON_BYTES;
     use super::MAX_I64_JSON_BYTES;
     use super::NonFiniteFloat;
     use super::StackBuffer;
     use super::append_json_f64;
+    use super::append_json_f64_formatted;
     use super::append_json_i64;
+
+    #[test]
+    fn formatted_floats_take_their_notation_and_precision() {
+        let format = |value: f64, notation, precision| {
+            let mut output = Vec::new();
+            append_json_f64_formatted(value, FloatFormat::new(notation, precision), &mut output)
+                .expect("finite float");
+            String::from_utf8(output).expect("ASCII")
+        };
+        let values = [
+            0.1,
+            0.000_012_3,
+            1e-7,
+            452.073_574_999_999_95,
+            2.0,
+            1e21,
+            -0.0,
+        ];
+        let expect = |notation, precision, expected: [&str; 7]| {
+            for (value, expected) in values.iter().zip(expected) {
+                assert_eq!(
+                    expected,
+                    format(*value, notation, precision),
+                    "{value} {notation:?} {precision:?}"
+                );
+            }
+        };
+        let shortest = [
+            "0.1",
+            "0.0000123",
+            "1e-7",
+            "452.07357499999995",
+            "2.0",
+            "1e21",
+            "-0.0",
+        ];
+        expect(FloatNotation::Original, None, shortest);
+        expect(FloatNotation::Auto, None, shortest);
+        expect(
+            FloatNotation::Plain,
+            None,
+            [
+                "0.1",
+                "0.0000123",
+                "0.0000001",
+                "452.07357499999995",
+                "2.0",
+                "1000000000000000000000.0",
+                "-0.0",
+            ],
+        );
+        expect(
+            FloatNotation::Scientific,
+            None,
+            [
+                "1e-1",
+                "1.23e-5",
+                "1e-7",
+                "4.5207357499999995e2",
+                "2e0",
+                "1e21",
+                "-0e0",
+            ],
+        );
+        expect(
+            FloatNotation::Plain,
+            Some(6),
+            [
+                "0.100000",
+                "0.000012",
+                "0.000000",
+                "452.073575",
+                "2.000000",
+                "1000000000000000000000.000000",
+                "-0.000000",
+            ],
+        );
+        expect(
+            FloatNotation::Scientific,
+            Some(2),
+            [
+                "1.00e-1", "1.23e-5", "1.00e-7", "4.52e2", "2.00e0", "1.00e21", "-0.00e0",
+            ],
+        );
+    }
+
+    #[test]
+    fn shortest_floats_read_back_exactly_and_precision_is_capped() {
+        let values = [
+            0.1,
+            0.000_012_3,
+            1e-7,
+            452.073_574_999_999_95,
+            2.0,
+            1e21,
+            -0.0,
+        ];
+        for value in values {
+            let mut output = Vec::new();
+            append_json_f64_formatted(value, FloatFormat::default(), &mut output)
+                .expect("finite float");
+            let parsed: f64 = String::from_utf8(output)
+                .expect("ASCII")
+                .parse()
+                .expect("a JSON number");
+            assert_eq!(
+                value.to_bits(),
+                parsed.to_bits(),
+                "{value} reads back exactly"
+            );
+        }
+        let mut longest = Vec::new();
+        append_json_f64_formatted(
+            -f64::MAX,
+            FloatFormat::new(FloatNotation::Plain, Some(u16::MAX)),
+            &mut longest,
+        )
+        .expect("finite float");
+        assert!(
+            longest.len() <= MAX_F64_FORMATTED_JSON_BYTES,
+            "the precision is capped"
+        );
+        assert!(FloatFormat::default().keeps_spelling());
+        assert!(!FloatFormat::new(FloatNotation::Original, Some(2)).keeps_spelling());
+        assert!(!FloatFormat::new(FloatNotation::Auto, None).keeps_spelling());
+    }
 
     const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
     const FNV_PRIME: u64 = 1_099_511_628_211;

@@ -44,7 +44,7 @@ const FOUR_BYTE_KV_TIMESTAMP_SPLIT_HEX: &str =
     include_str!("fixtures/kv-ir-v0.1.0-timestamp-split-four-cpp.hex");
 const EXPECTED_KV_IR_JSONL: &[u8] = concat!(
     "{\"empty\":{},\"message\":\"task 42 done\",\"none\":null,",
-    "\"ok\":true,\"ratio\":1.250000}\n"
+    "\"ok\":true,\"ratio\":1.25}\n"
 )
 .as_bytes();
 const EXPECTED_KV_TIMESTAMP_JSONL: &[u8] = concat!(
@@ -2014,6 +2014,107 @@ fn verbatim_text_fields_read_back_exactly_and_answer_searches_and_shapes_the_sam
             );
         }
     }
+}
+
+#[test]
+fn floats_are_stored_as_values_unless_asked_and_written_as_asked() {
+    // A float is stored as its binary64 value unless `--retain-float-format` keeps its spelling.
+    // `x` and `s` write it as spelled where kept (`original`, the default), and otherwise, or for
+    // any other notation or a precision, from its value.
+    let temporary = TestDirectory::new("float-formats");
+    let input_path = temporary.path().join("input.jsonl");
+    fs::write(
+        &input_path,
+        "{\"a\":0.1,\"b\":1e-7,\"c\":2.50,\"d\":452.07357499999995}\n",
+    )
+    .expect("write float fixture");
+    let compress = |name: &str, extra: &[&str]| {
+        let archives_path = temporary.path().join(name);
+        let mut arguments: Vec<&OsStr> = vec!["c".as_ref()];
+        arguments.extend(extra.iter().map(|argument| OsStr::new(*argument)));
+        arguments.extend([archives_path.as_os_str(), input_path.as_os_str()]);
+        let result = clp_s(&arguments);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        only_entry(&archives_path)
+    };
+    let search = |archive: &Path, extra: &[&str]| {
+        let mut arguments: Vec<&OsStr> = vec!["s".as_ref(), archive.as_os_str(), "*".as_ref()];
+        arguments.extend(extra.iter().map(|argument| OsStr::new(*argument)));
+        let result = clp_s(&arguments);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        String::from_utf8(result.stdout).expect("UTF-8 output")
+    };
+    let values = compress("values", &[]);
+    let spelled = compress("spelled", &["--retain-float-format"]);
+    let legacy = compress("legacy", &["--no-retain-float-format"]);
+    let shortest = "{\"a\":0.1,\"b\":1e-7,\"c\":2.5,\"d\":452.07357499999995}\n";
+    assert_eq!(shortest, search(&values, &[]));
+    assert_eq!(shortest, search(&legacy, &[]), "the old flag is accepted");
+    assert_eq!(
+        "{\"a\":0.1,\"b\":1e-7,\"c\":2.50,\"d\":452.07357499999995}\n",
+        search(&spelled, &[]),
+        "a kept spelling is written as spelled"
+    );
+    for archive in [&values, &spelled] {
+        assert_eq!(shortest, search(archive, &["--float-notation", "auto"]));
+        assert_eq!(
+            "{\"a\":0.1,\"b\":0.0000001,\"c\":2.5,\"d\":452.07357499999995}\n",
+            search(archive, &["--float-notation", "plain"])
+        );
+        assert_eq!(
+            "{\"a\":1e-1,\"b\":1e-7,\"c\":2.5e0,\"d\":4.5207357499999995e2}\n",
+            search(archive, &["--float-notation", "scientific"])
+        );
+        assert_eq!(
+            "{\"a\":0.100000,\"b\":0.000000,\"c\":2.500000,\"d\":452.073575}\n",
+            search(
+                archive,
+                &["--float-notation", "plain", "--float-precision", "6"]
+            )
+        );
+        assert_eq!(
+            "{\"a\":0.10,\"b\":1.00e-7,\"c\":2.50,\"d\":452.07}\n",
+            search(archive, &["--float-precision", "2"]),
+            "a precision rewrites even a kept spelling"
+        );
+    }
+    let output = temporary.path().join("extracted");
+    let result = clp_s(&[
+        "x".as_ref(),
+        "--float-notation".as_ref(),
+        "scientific".as_ref(),
+        spelled.as_os_str(),
+        output.as_os_str(),
+    ]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let extracted: Vec<u8> = fs::read_dir(&output)
+        .expect("list extraction")
+        .flat_map(|entry| fs::read(entry.expect("entry").path()).expect("read extraction"))
+        .collect();
+    assert_eq!(
+        b"{\"a\":1e-1,\"b\":1e-7,\"c\":2.5e0,\"d\":4.5207357499999995e2}\n".as_slice(),
+        extracted.as_slice()
+    );
+    let too_precise = clp_s(&[
+        "s".as_ref(),
+        values.as_os_str(),
+        "*".as_ref(),
+        "--float-precision".as_ref(),
+        "341".as_ref(),
+    ]);
+    assert!(!too_precise.status.success());
 }
 
 #[test]

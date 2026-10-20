@@ -2874,7 +2874,7 @@ mod tests {
         include_str!("../../tests/fixtures/sfa-v0.5.0-kv-ir-timestamps-eight-cpp.hex");
     const EXPECTED_JSON: &[u8] = concat!(
         "{\"empty\":{},\"message\":\"task 42 done\",\"none\":null,",
-        "\"ok\":true,\"ratio\":1.250000}\n"
+        "\"ok\":true,\"ratio\":1.25}\n"
     )
     .as_bytes();
     const EXPECTED_CPP_TIMESTAMP_JSON: &[u8] = concat!(

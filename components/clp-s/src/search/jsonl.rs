@@ -24,6 +24,7 @@ use crate::RecordLimits;
 use crate::RecordProgram;
 use crate::RecordScratch;
 use crate::json::JsonBytePolicy;
+use crate::json_number::FloatFormat;
 
 /// Projection and record-formatting configuration for [`SearchJsonlAdapter`].
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,6 +33,7 @@ pub struct SearchJsonlOptions {
     plan: ExtractionPlanLimits,
     record: RecordLimits,
     byte_policy: JsonBytePolicy,
+    float_format: FloatFormat,
 }
 
 impl SearchJsonlOptions {
@@ -43,7 +45,21 @@ impl SearchJsonlOptions {
             plan: ExtractionPlanLimits::default(),
             record: RecordLimits::default(),
             byte_policy: JsonBytePolicy::StrictUtf8,
+            float_format: FloatFormat::default(),
         }
+    }
+
+    /// Writes floats without a retained source spelling as `format` says.
+    #[must_use]
+    pub const fn with_float_format(mut self, format: FloatFormat) -> Self {
+        self.float_format = format;
+        self
+    }
+
+    /// Returns how floats without a retained source spelling are written.
+    #[must_use]
+    pub const fn float_format(&self) -> FloatFormat {
+        self.float_format
     }
 
     /// Replaces extraction-plan compilation limits.
@@ -184,6 +200,7 @@ impl<'sink, 'options, S: JsonlRecordSink + ?Sized> SearchJsonlAdapter<'sink, 'op
             program
                 .with_shape_nodes(&shape_nodes.0)
                 .with_parsed_shape_nodes(&shape_nodes.1)
+                .with_float_format(self.options.float_format())
         })
         .map_err(|source| SearchJsonlAdapterError::Program { schema_id, source })
     }
