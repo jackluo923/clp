@@ -18,6 +18,7 @@ use clp_s::archive::ColumnData;
 use clp_s::archive::ColumnTruncation;
 use clp_s::archive::DecodedPackedStream;
 use clp_s::archive::DecodedSchemaTable;
+use clp_s::archive::DeltaI64Values;
 use clp_s::archive::NodeType;
 use clp_s::archive::SchemaEntry;
 use clp_s::archive::SchemaTableMetadata;
@@ -810,9 +811,10 @@ impl ProjectedScanner {
                 } else if data.is_none() {
                     ColumnView { kind: kind::ABSENT, reserved: 0, data: std::ptr::null() }
                 } else {
+                    let mut deltas = [data.and_then(ForwardDelta::from_column)];
                     for row in bitmap.matching_rows() {
                         project_row(
-                            &decoded, &[*slot], &self.field_shapes[field..field + 1],
+                            &decoded, &[*slot], &self.field_shapes[field..field + 1], &mut deltas,
                             self.catalog.timestamp_patterns(), row, &mut buffer.cells, &mut self.text,
                         )?;
                     }
@@ -1254,11 +1256,16 @@ impl ProjectedScanner {
                 continue;
             }
             let columns = self.column_slots(&decoded);
+            let mut deltas: Vec<_> = columns.iter().map(|slot| {
+                slot.and_then(|i| decoded.table().column(i))
+                    .and_then(|c| ForwardDelta::from_column(c.data()))
+            }).collect();
             for row in bitmap.matching_rows() {
                 project_row(
                     &decoded,
                     &columns,
                     &self.field_shapes,
+                    &mut deltas,
                     self.catalog.timestamp_patterns(),
                     row,
                     &mut cells,
@@ -1295,6 +1302,31 @@ impl ProjectedScanner {
     }
 }
 
+/// Monotonically selected rows share one delta prefix, avoiding quadratic random access.
+struct ForwardDelta<'a> {
+    values: DeltaI64Values<'a>,
+    next_row: usize,
+}
+impl<'a> ForwardDelta<'a> {
+    fn from_column(data: ColumnData<'a, '_>) -> Option<Self> {
+        let values = match data {
+            ColumnData::Timestamp(v) => v.epochs().values(),
+            ColumnData::DeltaInteger(v) => v.values(),
+            _ => return None,
+        };
+        Some(Self {
+            values,
+            next_row: 0,
+        })
+    }
+    fn get(&mut self, row: usize) -> Option<i64> {
+        let skip = row.checked_sub(self.next_row)?;
+        let value = self.values.nth(skip)?;
+        self.next_row = row + 1;
+        Some(value)
+    }
+}
+
 /// Reads one row's projected values out of the decoded columns. A field `shapes` marks as a shape
 /// writes a CLP string as its template, as its dictionary entry holds it or parsed (see
 /// [`FieldForm`]), rather than its value, and a timestamp as the text it was stored from, as a
@@ -1303,6 +1335,7 @@ fn project_row(
     decoded: &DecodedSchemaTable<'_, '_>,
     columns: &[Option<usize>],
     shapes: &[FieldForm],
+    deltas: &mut [Option<ForwardDelta<'_>>],
     timestamps: &TimestampPatternCatalog,
     row: usize,
     cells: &mut Vec<Cell>,
@@ -1319,17 +1352,28 @@ fn project_row(
             continue;
         };
         let cell = match column.data() {
-            ColumnData::MixedInteger(values) => values.get(row).map_or_else(Cell::absent, |value| {
-                Cell::scalar(if value.is_large() { kind::UNSIGNED } else { kind::INTEGER }, value.bits() as i64, 0.0)
-            }),
+            ColumnData::MixedInteger(values) => {
+                values.get(row).map_or_else(Cell::absent, |value| {
+                    Cell::scalar(
+                        if value.is_large() {
+                            kind::UNSIGNED
+                        } else {
+                            kind::INTEGER
+                        },
+                        value.bits() as i64,
+                        0.0,
+                    )
+                })
+            }
             ColumnData::Integer(values) => values.get(row).map_or_else(Cell::absent, |value| {
                 Cell::scalar(kind::INTEGER, value, 0.0)
             }),
-            ColumnData::DeltaInteger(values) => {
-                values.get(row).map_or_else(Cell::absent, |value| {
+            ColumnData::DeltaInteger(_) => deltas[field]
+                .as_mut()
+                .and_then(|delta| delta.get(row))
+                .map_or_else(Cell::absent, |value| {
                     Cell::scalar(kind::INTEGER, value, 0.0)
-                })
-            }
+                }),
             ColumnData::Float(values) => values
                 .get(row)
                 .map_or_else(Cell::absent, |value| Cell::scalar(kind::FLOAT, 0, value)),
@@ -1344,15 +1388,15 @@ fn project_row(
             ColumnData::Timestamp(values)
                 if shapes.get(field).is_some_and(|form| form.is_shape()) =>
             {
-                match values.get(row) {
-                    Some(value) => {
+                match deltas[field]
+                    .as_mut()
+                    .and_then(|delta| delta.get(row))
+                    .zip(values.pattern_ids().get(row))
+                {
+                    Some((epoch, pattern)) => {
                         let mut formatted = String::new();
                         if timestamps
-                            .append_epoch_nanoseconds(
-                                value.pattern_id(),
-                                value.epoch_nanoseconds(),
-                                &mut formatted,
-                            )
+                            .append_epoch_nanoseconds(pattern, epoch, &mut formatted)
                             .is_ok()
                         {
                             // The text is a JSON literal: a quoted string, or a bare number.
@@ -1366,27 +1410,31 @@ fn project_row(
                             } else if let Ok(real) = formatted.parse::<f64>() {
                                 Cell::scalar(kind::FLOAT, 0, real)
                             } else {
-                                Cell::scalar(kind::TIMESTAMP, value.epoch_nanoseconds(), 0.0)
+                                Cell::scalar(kind::TIMESTAMP, epoch, 0.0)
                             }
                         } else {
-                            Cell::scalar(kind::TIMESTAMP, value.epoch_nanoseconds(), 0.0)
+                            Cell::scalar(kind::TIMESTAMP, epoch, 0.0)
                         }
                     }
                     None => Cell::absent(),
                 }
             }
-            ColumnData::Timestamp(values) => match values.get(row) {
-                Some(value) => {
+            ColumnData::Timestamp(values) => match deltas[field]
+                .as_mut()
+                .and_then(|delta| delta.get(row))
+                .zip(values.pattern_ids().get(row))
+            {
+                Some((epoch, pattern)) => {
                     // The epoch is search metadata, not the source JSON value. Carry both:
                     // SQL projections must preserve the original unit and scalar type.
                     let mut formatted = String::new();
-                    timestamps.append_epoch_nanoseconds(
-                        value.pattern_id(), value.epoch_nanoseconds(), &mut formatted,
-                    ).map_err(|source| ScanError::Projection(format!(
-                        "failed to format timestamp: {source}"
-                    )))?;
+                    timestamps
+                        .append_epoch_nanoseconds(pattern, epoch, &mut formatted)
+                        .map_err(|source| {
+                            ScanError::Projection(format!("failed to format timestamp: {source}"))
+                        })?;
                     let mut cell = push_text(kind::TIMESTAMP, formatted.as_bytes(), text);
-                    cell.integer = value.epoch_nanoseconds();
+                    cell.integer = epoch;
                     cell
                 }
                 None => Cell::absent(),

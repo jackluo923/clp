@@ -3575,3 +3575,5 @@ mod tests {
 }
 
 mod numeric_aggregate;
+
+mod timestamp_summary;

@@ -1073,6 +1073,27 @@ impl PrimitiveArchive {
                             summary.float.add(f64::from_le_bytes(bytes.try_into().unwrap())).ok_or(WriterError::SizeOverflow)?;
                         }
                     }
+                    TableColumnData::Timestamp {
+                        deltas, pattern_ids, ..
+                    } => {
+                        let mut epoch = 0_i64;
+                        let mut complete = true;
+                        for (delta, pattern) in deltas.chunks_exact(8).zip(pattern_ids.chunks_exact(8)) {
+                            epoch = epoch.wrapping_add(i64::from_le_bytes(delta.try_into().unwrap()));
+                            let id = u64::from_le_bytes(pattern.try_into().unwrap());
+                            let Some(scale) = self.timestamp_dictionary.integer_scale(id) else {
+                                complete = false;
+                                break;
+                            };
+                            // Summarize the original JSON integer, not rounded range bounds.
+                            summary
+                                .add_integer(i128::from(epoch / scale))
+                                .ok_or(WriterError::SizeOverflow)?;
+                        }
+                        if !complete {
+                            continue;
+                        }
+                    }
                     TableColumnData::FormattedFloat { values, .. } => {
                         for bytes in values.chunks_exact(8) {
                             summary.float.add(f64::from_le_bytes(bytes.try_into().unwrap())).ok_or(WriterError::SizeOverflow)?;

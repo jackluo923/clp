@@ -192,6 +192,16 @@ impl TimestampDictionaryBuilder {
         })
     }
 
+    pub(super) fn integer_scale(&self, id: u64) -> Option<i64> {
+        Some(match self.patterns.get(usize::try_from(id).ok()?)?.raw() {
+            r"\E" => 1_000_000_000,
+            r"\L" => 1_000_000,
+            r"\C" => 1_000,
+            r"\N" => 1,
+            _ => return None,
+        })
+    }
+
     fn find_pattern(&self, raw: &str) -> Option<usize> {
         self.pattern_buckets
             .get(&hash_bytes(raw.as_bytes()))
