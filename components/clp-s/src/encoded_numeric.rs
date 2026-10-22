@@ -39,6 +39,71 @@ fn dictionary(bytes: &[u8]) -> Result<(usize, &[u8], u8, &[u8]), Error> {
     Ok((count, values, width, codes))
 }
 
+/// Validate the span even when every representable code is a valid index. Small
+/// packed widths otherwise check a byte at a time; unused padding bits are ignored.
+fn validate_dictionary_codes(codes: &[u8], width: u8, rows: usize, entries: usize) -> Result<(), Error> {
+    let decoded = unpack_bits_iter(codes, width, rows)?;
+    if (entries as u128) >= (1u128 << width) { return Ok(()); }
+    if rows >= 256 && matches!(width, 1 | 2 | 4 | 8) {
+        let lanes = 8 / usize::from(width);
+        let mask = (1usize << width) - 1;
+        let mut valid = [true; 256];
+        for (byte, valid) in valid.iter_mut().enumerate() {
+            *valid = (0..lanes).all(|lane| ((byte >> (lane * usize::from(width))) & mask) < entries);
+        }
+        let full_bytes = rows / lanes;
+        if codes[..full_bytes].iter().any(|&byte| !valid[usize::from(byte)]) {
+            return Err(Error::Truncated);
+        }
+        for lane in 0..rows % lanes {
+            let code = (usize::from(codes[full_bytes]) >> (lane * usize::from(width))) & mask;
+            if code >= entries { return Err(Error::Truncated); }
+        }
+    } else {
+        for code in decoded {
+            if code >= entries as u64 { return Err(Error::Truncated); }
+        }
+    }
+    Ok(())
+}
+
+/// Each input byte expands to LANES predicate masks. Blending preserves any
+/// previous True/False/Unknown result on rows this predicate does not match.
+fn or_dictionary_bytes<const LANES: usize>(codes: &[u8], start: usize, bitmap: &mut [u8],
+    truth: u8, accepted: &[bool]) {
+    let width = 8 / LANES;
+    let code_mask = (1usize << width) - 1;
+    let head = ((LANES - start % LANES) % LANES).min(bitmap.len());
+    let (prefix, rest) = bitmap.split_at_mut(head);
+    for (i, dest) in prefix.iter_mut().enumerate() {
+        let row = start + i;
+        let code = (usize::from(codes[row / LANES]) >> ((row % LANES) * width)) & code_mask;
+        if accepted[code] { *dest = truth; }
+    }
+    let mut lookup = [[0u8; LANES]; 256];
+    for (byte, masks) in lookup.iter_mut().enumerate() {
+        for (lane, mask) in masks.iter_mut().enumerate() {
+            let code = (byte >> (lane * width)) & code_mask;
+            *mask = if accepted.get(code).copied().unwrap_or(false) { u8::MAX } else { 0 };
+        }
+    }
+    let full = rest.len() / LANES;
+    let byte_start = (start + head) / LANES;
+    let (middle, tail) = rest.split_at_mut(full * LANES);
+    for (dest, &code_byte) in middle.as_chunks_mut::<LANES>().0.iter_mut()
+        .zip(&codes[byte_start..byte_start + full]) {
+        for (value, &mask) in dest.iter_mut().zip(&lookup[usize::from(code_byte)]) {
+            *value = (*value & !mask) | (truth & mask);
+        }
+    }
+    if !tail.is_empty() {
+        let byte = usize::from(codes[byte_start + full]);
+        for (lane, dest) in tail.iter_mut().enumerate() {
+            if accepted[(byte >> (lane * width)) & code_mask] { *dest = truth; }
+        }
+    }
+}
+
 /// Appends a compact representation, or leaves the destination alone for other codecs.
 /// A failed destination is discarded by the caller, as with the canonical decoder.
 pub(crate) fn prepare(bytes: &[u8], rows: usize, float: bool, out: &mut Vec<u8>)
@@ -99,9 +164,7 @@ impl<'a> NumericColumn<'a> {
             NumericEncoding::Constant => { u64_at(bytes, 0)?; }
             NumericEncoding::Dictionary => {
                 let (count, _, width, codes) = dictionary(bytes)?;
-                for code in unpack_bits_iter(codes, width, rows)? {
-                    if code >= count as u64 { return Err(Error::Truncated); }
-                }
+                validate_dictionary_codes(codes, width, rows, count)?;
             }
             NumericEncoding::RunEnds => {
                 let runs = u32_at(bytes, 0)? as usize;
@@ -255,8 +318,19 @@ impl<'a> NumericColumn<'a> {
                 let (_, values, width, codes) = dictionary(self.bytes).unwrap();
                 let accepted: Vec<bool> = values.chunks_exact(8)
                     .map(|v| matches(u64::from_le_bytes(v.try_into().unwrap()))).collect();
-                for (dest, code) in bitmap.iter_mut().zip(Self::codes(codes, width, start, count)) {
-                    if accepted[code as usize] { *dest = truth; }
+                if accepted.iter().all(|value| *value) {
+                    bitmap.fill(truth);
+                } else if accepted.iter().any(|value| *value) {
+                    // Amortize the byte lookup table only on larger spans.
+                    match (width, count >= 256) {
+                        (1, true) => or_dictionary_bytes::<8>(codes, start, bitmap, truth, &accepted),
+                        (2, true) => or_dictionary_bytes::<4>(codes, start, bitmap, truth, &accepted),
+                        (4, true) => or_dictionary_bytes::<2>(codes, start, bitmap, truth, &accepted),
+                        (8, true) => or_dictionary_bytes::<1>(codes, start, bitmap, truth, &accepted),
+                        _ => for (dest, code) in bitmap.iter_mut().zip(Self::codes(codes, width, start, count)) {
+                            if accepted[code as usize] { *dest = truth; }
+                        },
+                    }
                 }
             }
             NumericEncoding::RunEnds => {
@@ -411,6 +485,64 @@ mod tests {
             assert_eq!(calls, comparisons);
             assert_eq!(bitmap, column.iter().map(|v| u8::from(v == 42)).collect::<Vec<_>>());
         }
+    }
+
+    #[test]
+    fn packed_dictionary_fast_paths_match_scalar_with_slices_and_tri_states() {
+        for width in [1u8, 2, 3, 4, 7, 8] {
+            for entries in [1usize << width, (1usize << width) - 1] {
+                let rows = 777;
+                let indices: Vec<u64> = (0..rows).map(|i| ((i * 17 + i / 3) % entries) as u64).collect();
+                let mut bytes = (entries as u32).to_le_bytes().to_vec();
+                for value in 0..entries { bytes.extend((value as u64).to_le_bytes()); }
+                bytes.push(width);
+                adaptive_int::pack_bits(&indices, width, &mut bytes);
+                let column = NumericColumn::encoded(&bytes, rows, NumericEncoding::Dictionary).unwrap();
+                for start in 0..17 {
+                    let slice = column.slice(start, rows - start).unwrap();
+                    for skip in [0, 1, 7] {
+                        for count in [0, 1, 255, 256, 257, rows] {
+                            for mode in 0..3 {
+                                let predicate = |v: u64| match mode { 0 => v % 3 == 0, 1 => true, _ => false };
+                                let mut actual: Vec<u8> = (0..count).map(|i| (i % 3) as u8).collect();
+                                let mut expected = actual.clone();
+                                for (dest, &value) in expected.iter_mut().zip(indices.iter().skip(start + skip)) {
+                                    if predicate(value) { *dest = 1; }
+                                }
+                                assert!(slice.or_matches(skip, &mut actual, 1, predicate));
+                                assert_eq!(actual, expected, "width={width} entries={entries} start={start} skip={skip} count={count}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dictionary_validation_proofs_still_check_spans_codes_and_padding() {
+        for width in [1u8, 2, 4, 8] {
+            let rows = 513usize;
+            let full_space = 1usize << width;
+            let mut codes = Vec::new();
+            adaptive_int::pack_bits(&vec![0; rows], width, &mut codes);
+            let tail_bits = (rows * usize::from(width)) % 8;
+            if tail_bits != 0 { *codes.last_mut().unwrap() |= !((1u8 << tail_bits) - 1); }
+            for entries in [full_space - 1, full_space] {
+                assert!(validate_dictionary_codes(&codes, width, rows, entries).is_ok());
+                assert!(validate_dictionary_codes(&codes[..codes.len() - 1], width, rows, entries).is_err());
+            }
+            for row in [0, 101, rows - 1] {
+                let mut bad = codes.clone();
+                let bit = row * usize::from(width);
+                bad[bit / 8] |= ((full_space - 1) as u8) << (bit % 8);
+                assert!(validate_dictionary_codes(&bad, width, rows, full_space - 1).is_err(), "width={width}, row={row}");
+            }
+        }
+        assert!(validate_dictionary_codes(&[], 65, 0, 1).is_err());
+        assert!(validate_dictionary_codes(&[], 0, 1000, 0).is_err());
+        assert!(validate_dictionary_codes(&[], 0, 1000, 1).is_ok());
+        assert!(validate_dictionary_codes(&[], 64, usize::MAX, 1).is_err());
     }
 
     #[test]
