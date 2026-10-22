@@ -2935,11 +2935,7 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
                 self.release_bitmap(timestamp_bitmap.len());
             }
         }
-        let mut match_count = 0_usize;
-        for value in &mut bitmap {
-            *value = u8::from(*value == Tri::True as u8);
-            match_count += usize::from(*value);
-        }
+        let match_count = normalize_matches(&mut bitmap);
         Ok(MatchBitmap {
             bytes: bitmap,
             match_count,
@@ -3941,8 +3937,35 @@ fn timestamp_in_range(
         && end_nanoseconds.is_none_or(|end| value <= end)
 }
 
+// Internal tri-state bytes are exactly False=0, True=1, Unknown=2. Each
+// eight-byte word is eight independent lanes; shifts are masked to prevent any
+// cross-lane bits. Loads/stores use byte arrays and need no alignment or unsafe.
+const TRUE_LANES: u64 = 0x0101_0101_0101_0101;
+const UNKNOWN_LANES: u64 = TRUE_LANES << 1;
+
+fn normalize_matches(bitmap: &mut [u8]) -> usize {
+    let (words, tail) = bitmap.as_chunks_mut::<8>();
+    let mut count = 0;
+    for bytes in words {
+        let matches = u64::from_ne_bytes(*bytes) & TRUE_LANES;
+        count += matches.count_ones() as usize;
+        *bytes = matches.to_ne_bytes();
+    }
+    for value in tail {
+        *value = u8::from(*value == Tri::True as u8);
+        count += usize::from(*value);
+    }
+    count
+}
+
 fn invert(bitmap: &mut [u8]) {
-    for value in bitmap {
+    let (words, tail) = bitmap.as_chunks_mut::<8>();
+    for bytes in words {
+        let word = u64::from_ne_bytes(*bytes);
+        let false_lanes = !(word | (word >> 1)) & TRUE_LANES;
+        *bytes = (false_lanes | (word & UNKNOWN_LANES)).to_ne_bytes();
+    }
+    for value in tail {
         *value = match *value {
             value if value == Tri::False as u8 => Tri::True as u8,
             value if value == Tri::True as u8 => Tri::False as u8,
@@ -3952,12 +3975,30 @@ fn invert(bitmap: &mut [u8]) {
 }
 
 fn combine(left: &mut [u8], right: &[u8], operator: BooleanOperator) {
-    for (left, right) in left.iter_mut().zip(right) {
-        *left = match operator {
-            BooleanOperator::And => tri_and(*left, *right),
-            BooleanOperator::Or => tri_or(*left, *right),
-        };
+    match operator {
+        // The scalar expression already compiles efficiently; the word formula
+        // benchmarks slower for AND. Keep this loop, with dispatch outside it.
+        BooleanOperator::And => for (l, r) in left.iter_mut().zip(right) {
+            *l = tri_and(*l, *r);
+        },
+        BooleanOperator::Or => combine_words(left, right, |l, r| {
+            let truth = (l | r) & TRUE_LANES;
+            let unknown = ((l | r) >> 1) & !truth & TRUE_LANES;
+            truth | (unknown << 1)
+        }, tri_or),
     }
+}
+
+fn combine_words(left: &mut [u8], right: &[u8],
+    words: impl Fn(u64, u64) -> u64, scalar: impl Fn(u8, u8) -> u8)
+{
+    let count = left.len().min(right.len());
+    let (left_words, left_tail) = left[..count].as_chunks_mut::<8>();
+    let (right_words, right_tail) = right[..count].as_chunks::<8>();
+    for (l, r) in left_words.iter_mut().zip(right_words) {
+        *l = words(u64::from_ne_bytes(*l), u64::from_ne_bytes(*r)).to_ne_bytes();
+    }
+    for (l, r) in left_tail.iter_mut().zip(right_tail) { *l = scalar(*l, *r); }
 }
 
 const fn tri_and(left: u8, right: u8) -> u8 {
@@ -4564,6 +4605,79 @@ mod tests {
                 or_matches(&mut expected, floats.iter().copied(), |v| scalar_f64_matches(v, predicate, Some(timestamp)));
                 or_f64_matches(&mut actual, floats.iter().copied(), predicate, Some(timestamp));
                 assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn word_bitmaps_preserve_tri_state_truth_tables_and_tails() {
+        for offset in 0..16 {
+            for len in 0..130 {
+                let source: Vec<u8> = (0..len + offset + 8).map(|i| (i % 3) as u8).collect();
+                let other: Vec<u8> = (0..len + offset + 8).map(|i| ((i / 3 + 1) % 3) as u8).collect();
+                let original = &source[offset..offset + len];
+                for right_len in [len.saturating_sub(3), len, len + 3] {
+                    for operator in [BooleanOperator::And, BooleanOperator::Or] {
+                        let mut actual = source.clone();
+                        let mut expected = source.clone();
+                        let right = &other[offset..offset + right_len];
+                        for (l, r) in expected[offset..offset + len].iter_mut().zip(right) {
+                            *l = match operator { BooleanOperator::And => tri_and(*l, *r), BooleanOperator::Or => tri_or(*l, *r) };
+                        }
+                        combine(&mut actual[offset..offset + len], right, operator);
+                        assert_eq!(actual, expected, "{operator:?} len={len} offset={offset}");
+                    }
+                }
+                let mut actual = source.clone();
+                invert(&mut actual[offset..offset + len]);
+                let mut expected = source.clone();
+                for v in &mut expected[offset..offset + len] { *v = if *v == 0 { 1 } else if *v == 1 { 0 } else { 2 }; }
+                assert_eq!(actual, expected);
+                invert(&mut actual[offset..offset + len]);
+                assert_eq!(actual, source);
+                let count = normalize_matches(&mut actual[offset..offset + len]);
+                assert_eq!(count, original.iter().filter(|v| **v == 1).count());
+                assert_eq!(&actual[..offset], &source[..offset]);
+                assert_eq!(&actual[offset + len..], &source[offset + len..]);
+                assert_eq!(actual[offset..offset + len], original.iter().map(|v| u8::from(*v == 1)).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic release-mode bitmap benchmark; no timing assertions"]
+    fn benchmark_bitmap_kernels() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let source: Vec<u8> = (0..1_000_000).map(|i| (i % 3) as u8).collect();
+        let right: Vec<u8> = (0..source.len()).map(|i| ((i / 3 + 1) % 3) as u8).collect();
+        for operation in ["and", "or", "invert", "normalize"] {
+            for method in ["scalar", "words"] {
+                let mut times = Vec::new();
+                for _ in 0..11 {
+                    let mut values = source.clone();
+                    let values = black_box(&mut values);
+                    let right = black_box(&right);
+                    let start = Instant::now();
+                    match (operation, method) {
+                        ("and", "scalar") => for (l, r) in values.iter_mut().zip(right) { *l = tri_and(*l, *r); },
+                        ("or", "scalar") => for (l, r) in values.iter_mut().zip(right) { *l = tri_or(*l, *r); },
+                        ("invert", "scalar") => for v in values.iter_mut() { *v = if *v == 0 { 1 } else if *v == 1 { 0 } else { 2 }; },
+                        ("normalize", "scalar") => {
+                            let mut count = 0_usize;
+                            for v in values.iter_mut() { *v = u8::from(*v == 1); count += usize::from(*v); }
+                            black_box(count);
+                        },
+                        ("and", _) => combine(values, right, BooleanOperator::And),
+                        ("or", _) => combine(values, right, BooleanOperator::Or),
+                        ("invert", _) => invert(values),
+                        _ => { black_box(normalize_matches(values)); },
+                    }
+                    times.push(start.elapsed().as_nanos());
+                    black_box(values);
+                }
+                times.remove(0); times.sort_unstable();
+                println!("BITMAP {operation} {method} median_ns={}", (times[4] + times[5]) / 2);
             }
         }
     }
