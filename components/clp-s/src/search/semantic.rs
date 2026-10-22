@@ -1630,10 +1630,73 @@ struct CompiledList {
     values: Vec<CompiledValue>,
 }
 
+/// Exact membership, chosen once per predicate. IDs arrive sorted and unique from
+/// the archive dictionary scan. Bound the dense representation by both the sparse
+/// list size and 1 MiB, so sparse/large dictionaries cannot inflate query memory.
+#[derive(Clone, Debug)]
+enum DictionaryIds {
+    Empty,
+    One(u64),
+    Small([u64; 4]),
+    Sorted(Vec<u64>),
+    Dense { first_word: u64, words: Vec<u64> },
+}
+
+impl DictionaryIds {
+    fn new(ids: Vec<u64>) -> Self {
+        match ids.len() {
+            0 => return Self::Empty,
+            1 => return Self::One(ids[0]),
+            2..=4 => {
+                let mut small = [ids[0]; 4];
+                small[..ids.len()].copy_from_slice(&ids);
+                return Self::Small(small);
+            },
+            _ => {}
+        }
+        let first_word = ids[0] / 64;
+        let word_count = ids[ids.len() - 1] / 64 - first_word + 1;
+        if let Ok(count) = usize::try_from(word_count)
+            && count <= ids.len()
+            && count <= (1024 * 1024 / 8)
+        {
+            let mut words = Vec::new();
+            if words.try_reserve_exact(count).is_ok() {
+                words.resize(count, 0_u64);
+                for id in ids {
+                    words[(id / 64 - first_word) as usize] |= 1_u64 << (id % 64);
+                }
+                return Self::Dense { first_word, words };
+            }
+        }
+        Self::Sorted(ids)
+    }
+
+    const fn is_empty(&self) -> bool { matches!(self, Self::Empty) }
+
+    fn or_matches(&self, bitmap: &mut [u8], values: impl Iterator<Item = u64>) {
+        // Dispatch outside the row loop so each representation has a simple kernel.
+        match self {
+            Self::Empty => {},
+            Self::One(id) => or_matches(bitmap, values, |value| value == *id),
+            Self::Small(ids) => or_matches(bitmap, values, |value| {
+                (value == ids[0]) | (value == ids[1]) | (value == ids[2]) | (value == ids[3])
+            }),
+            Self::Sorted(ids) => or_matches(bitmap, values, |value| ids.binary_search(&value).is_ok()),
+            Self::Dense { first_word, words } => or_matches(bitmap, values, |value| {
+                (value / 64).checked_sub(*first_word)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .and_then(|index| words.get(index))
+                    .is_some_and(|word| word & (1_u64 << (value % 64)) != 0)
+            }),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct CompiledValue {
-    variable_ids: Vec<u64>,
-    dictionary_float_ids: Vec<u64>,
+    variable_ids: DictionaryIds,
+    dictionary_float_ids: DictionaryIds,
     timestamp_nanoseconds: Option<i64>,
 }
 
@@ -1993,8 +2056,8 @@ impl<'query, 'archive, 'cache> Compiler<'query, 'archive, 'cache> {
     ) -> Result<CompiledValue, SearchError> {
         let timestamp_nanoseconds = compile_literal(expression, predicate)?;
         let mut compiled = CompiledValue {
-            variable_ids: Vec::new(),
-            dictionary_float_ids: Vec::new(),
+            variable_ids: DictionaryIds::Empty,
+            dictionary_float_ids: DictionaryIds::Empty,
             timestamp_nanoseconds,
         };
         let ResolvedPath::Schema(schema) = resolved else {
@@ -2045,14 +2108,14 @@ impl<'query, 'archive, 'cache> Compiler<'query, 'archive, 'cache> {
         value_index: usize,
         predicate: PredicateRef<'_>,
         kind: DictionaryMatchKind,
-    ) -> Result<Vec<u64>, SearchError> {
+    ) -> Result<DictionaryIds, SearchError> {
         let node = expression.index();
         if let Some(matches) = self.matches.as_deref()
             && let Some(ids) = matches.get(node, value_index, kind)
         {
-            return Ok(ids.to_vec());
+            return Ok(ids.clone());
         }
-        let ids = self.match_dictionary(predicate, kind)?;
+        let ids = DictionaryIds::new(self.match_dictionary(predicate, kind)?);
         if let Some(matches) = self.matches.as_deref_mut() {
             matches.insert(node, value_index, kind, &ids);
         }
@@ -2157,7 +2220,7 @@ enum DictionaryMatchKind {
 /// again for the same archive can carry this across and pay for each distinct scan once.
 #[derive(Debug, Default)]
 pub struct DictionaryMatches {
-    entries: Vec<(usize, usize, DictionaryMatchKind, Vec<u64>)>,
+    entries: Vec<(usize, usize, DictionaryMatchKind, DictionaryIds)>,
 }
 
 impl DictionaryMatches {
@@ -2169,18 +2232,18 @@ impl DictionaryMatches {
         }
     }
 
-    fn get(&self, node: usize, value: usize, kind: DictionaryMatchKind) -> Option<&[u64]> {
+    fn get(&self, node: usize, value: usize, kind: DictionaryMatchKind) -> Option<&DictionaryIds> {
         self.entries
             .iter()
             .find(|(n, v, k, _)| *n == node && *v == value && *k == kind)
-            .map(|(_, _, _, ids)| ids.as_slice())
+            .map(|(_, _, _, ids)| ids)
     }
 
-    fn insert(&mut self, node: usize, value: usize, kind: DictionaryMatchKind, ids: &[u64]) {
+    fn insert(&mut self, node: usize, value: usize, kind: DictionaryMatchKind, ids: &DictionaryIds) {
         if self.entries.try_reserve(1).is_err() {
             return;
         }
-        self.entries.push((node, value, kind, ids.to_vec()));
+        self.entries.push((node, value, kind, ids.clone()));
     }
 }
 
@@ -3224,9 +3287,7 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
                 });
             }
             ColumnData::DictionaryFloat(column) => {
-                or_matches(bitmap, column.ids().iter().skip(skip), |id| {
-                    filter.value.dictionary_float_ids.binary_search(&id).is_ok()
-                });
+                filter.value.dictionary_float_ids.or_matches(bitmap, column.ids().iter().skip(skip));
             }
             ColumnData::Boolean(column) => {
                 let expected = match filter.predicate.value() {
@@ -3236,9 +3297,7 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
                 or_matches(bitmap, column.iter().skip(skip), |value| value == expected);
             }
             ColumnData::VarString(column) => {
-                or_matches(bitmap, column.ids().iter().skip(skip), |id| {
-                    filter.value.variable_ids.binary_search(&id).is_ok()
-                });
+                filter.value.variable_ids.or_matches(bitmap, column.ids().iter().skip(skip));
             }
             ColumnData::ClpString(column) => {
                 self.scan_clp(filter.expression, filter.predicate, column, skip, bitmap)?;
@@ -4307,6 +4366,76 @@ mod tests {
     use crate::writer::UnstructuredArrayRef;
     use crate::writer::ValueRef;
     use crate::writer::WriterOptions;
+
+    #[test]
+    fn adaptive_dictionary_ids_preserve_exact_membership_and_prior_states() {
+        let cases = [vec![], vec![7], vec![1, 7], vec![1, 7, 64], vec![1, 7, 64, 255],
+            vec![1, 7, 63, 64, 65, 127, 128, 255],
+            (0..1024).step_by(3).collect(), (0..32).map(|i| i * 1_000_000).collect(),
+            (0..32).map(|i| u64::MAX - 31 + i).collect()];
+        for ids in cases {
+            let set = DictionaryIds::new(ids.clone());
+            let mut values: Vec<u64> = (0..1100).collect();
+            values.extend([u64::MAX, u64::MAX - 1, 31_000_000, 32_000_000]);
+            values.extend(&ids);
+            for skip in [0, 1, 7, 64] {
+                let values = &values[skip..];
+                let mut actual: Vec<u8> = (0..values.len() + 3).map(|i| (i % 3) as u8).collect();
+                let mut expected = actual.clone();
+                for (dest, value) in expected.iter_mut().zip(values) {
+                    if ids.binary_search(value).is_ok() { *dest = Tri::True as u8; }
+                }
+                set.or_matches(&mut actual, values.iter().copied());
+                assert_eq!(actual, expected, "{set:?}, skip {skip}");
+                assert_eq!(set.is_empty(), ids.is_empty());
+            }
+        }
+        assert!(matches!(DictionaryIds::new(vec![1]), DictionaryIds::One(1)));
+        assert!(matches!(DictionaryIds::new((0..4).collect()), DictionaryIds::Small(_)));
+        assert!(matches!(DictionaryIds::new((0..9).collect()), DictionaryIds::Dense { .. }));
+        assert!(matches!(DictionaryIds::new((0..9).map(|i| i * 1_000_000).collect()), DictionaryIds::Sorted(_)));
+        // A dense span above the hard cap must still remain sparse.
+        assert!(matches!(DictionaryIds::new((0..131_073).map(|i| i * 64).collect()), DictionaryIds::Sorted(_)));
+    }
+
+    #[test]
+    #[ignore = "diagnostic release-mode membership benchmark; no timing assertions"]
+    fn benchmark_dictionary_membership() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        for (name, ids, universe) in [
+            ("one", vec![37], 4096),
+            ("four", vec![1, 37, 129, 2048], 4096),
+            ("eight", (0..8).map(|i| i * 17).collect(), 4096),
+            ("dense", (0..4096).step_by(2).collect(), 4096),
+            ("sparse", (0..4096).map(|i| i * 65536).collect(), 1 << 28),
+        ] {
+            let values: Vec<u64> = (0..1_000_000_u64).map(|i| i.wrapping_mul(6364136223846793005) % universe).collect();
+            let set = DictionaryIds::new(ids.clone());
+            let hash: HashSet<u64> = ids.iter().copied().collect();
+            let mut bitmap = vec![0; values.len()];
+            for method in ["sorted", "hash", "adaptive"] {
+                let mut times = Vec::new();
+                for _ in 0..11 {
+                    bitmap.fill(0);
+                    let baseline_ids = black_box(&ids);
+                    let baseline_hash = black_box(&hash);
+                    let start = Instant::now();
+                    match method {
+                        "sorted" => or_matches(black_box(&mut bitmap), black_box(&values).iter().copied(), |id| baseline_ids.binary_search(&id).is_ok()),
+                        "hash" => or_matches(black_box(&mut bitmap), black_box(&values).iter().copied(), |id| baseline_hash.contains(&id)),
+                        _ => black_box(&set).or_matches(black_box(&mut bitmap), black_box(&values).iter().copied()),
+                    }
+                    times.push(start.elapsed().as_nanos());
+                    black_box(&bitmap);
+                    let expected: usize = values.iter().filter(|id| ids.binary_search(id).is_ok()).count();
+                    assert_eq!(bitmap.iter().filter(|v| **v == Tri::True as u8).count(), expected);
+                }
+                times.remove(0); times.sort_unstable();
+                println!("MEMBERSHIP {name} {method} median_ns={}", (times[4] + times[5]) / 2);
+            }
+        }
+    }
 
     const STRUCTURED_ARRAY_FIXTURE_HEX: &str =
         include_str!("../../tests/fixtures/sfa-v0.5.0-structured-arrays-cpp.hex");
