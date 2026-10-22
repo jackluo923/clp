@@ -432,7 +432,8 @@ impl ArchiveCatalog {
             capacity_offset += slot.stored;
             sum.checked_add(size).ok_or(TableStreamError::SizeOverflow)
         })?;
-        let mut output = Vec::with_capacity(capacity);
+        let mut output = super::packed_stream::stream_buffers::take(capacity);
+        output.reserve_exact(capacity);
         let mut output_layout = Vec::with_capacity(layout.len());
         let mut offset = 0usize;
         let mut changed = false;
