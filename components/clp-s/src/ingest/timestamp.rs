@@ -5,6 +5,7 @@ use std::fmt;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::str;
+use std::sync::OnceLock;
 
 use super::ClassifiedJsonNumber;
 use super::JsonNumberClassificationError;
@@ -948,18 +949,25 @@ fn resolve_iso_date_time(source: &str) -> Result<(i64, &'static str), JsonTimest
     } else {
         false
     };
-    if cursor != bytes.len() {
+    let offset = if !zulu && matches!(bytes.get(cursor), Some(b'+' | b'-')) {
+        Some(IsoOffset::parse(&source[cursor..])?)
+    } else if cursor == bytes.len() {
+        None
+    } else {
         return Err(JsonTimestampError::UnsupportedLexeme {
             kind: JsonTimestampScalarKind::String,
         });
-    }
+    };
 
     let days = days_from_civil(i64::from(year), month, day)?;
     let seconds = i128::from(days)
         .checked_mul(86_400)
         .and_then(|value| value.checked_add(i128::from(hour) * 3_600))
         .and_then(|value| value.checked_add(i128::from(minute) * 60))
-        .and_then(|value| value.checked_add(i128::from(source_second.min(59))))
+        .and_then(|value| value.checked_add(i128::from(source_second)))
+        .and_then(|value| {
+            value.checked_sub(i128::from(offset.map_or(0, IsoOffset::minutes_east)) * 60)
+        })
         .ok_or(JsonTimestampError::EpochNanosecondsOutOfRange)?;
     let mut epoch = seconds
         .checked_mul(i128::from(NANOSECONDS_PER_SECOND))
@@ -975,8 +983,101 @@ fn resolve_iso_date_time(source: &str) -> Result<(i64, &'static str), JsonTimest
             .ok_or(JsonTimestampError::EpochNanosecondsOutOfRange)?;
     }
     let epoch = i64::try_from(epoch).map_err(|_| JsonTimestampError::EpochNanosecondsOutOfRange)?;
-    let pattern = iso_date_time_pattern(bytes[10], fraction, zulu)?;
+    let pattern = match offset {
+        Some(offset) => iso_offset_pattern(bytes[10], fraction, offset)?,
+        None => iso_date_time_pattern(bytes[10], fraction, zulu)?,
+    };
     Ok((epoch, pattern))
+}
+
+#[derive(Clone, Copy)]
+struct IsoOffset<'a> {
+    source: &'a str,
+    hours: usize,
+    minutes: usize,
+    negative: bool,
+    style: usize,
+}
+
+impl<'a> IsoOffset<'a> {
+    fn parse(source: &'a str) -> Result<Self, JsonTimestampError> {
+        let invalid = || JsonTimestampError::UnsupportedLexeme {
+            kind: JsonTimestampScalarKind::String,
+        };
+        let bytes = source.as_bytes();
+        if !matches!(bytes.first(), Some(b'+' | b'-')) {
+            return Err(invalid());
+        }
+        // ISO 8601 allows hour-only, basic and extended numeric UTC offsets.
+        let (style, minute_start) = match bytes.len() {
+            3 => (0, None),
+            5 => (1, Some(3)),
+            6 if bytes[3] == b':' => (2, Some(4)),
+            _ => return Err(invalid()),
+        };
+        let hours = parse_date_digits(bytes, 1, 2)? as usize;
+        let minutes = match minute_start {
+            Some(start) => parse_date_digits(bytes, start, 2)? as usize,
+            None => 0,
+        };
+        if hours > 23 || minutes > 59 {
+            return Err(invalid());
+        }
+        Ok(Self {
+            source,
+            hours,
+            minutes,
+            negative: bytes[0] == b'-',
+            style,
+        })
+    }
+
+    fn minutes_east(self) -> i32 {
+        let minutes = (self.hours * 60 + self.minutes) as i32;
+        if self.negative { -minutes } else { minutes }
+    }
+}
+
+// Resolved patterns must outlive borrowed record events. Intern only the finite
+// ISO format domain, allocating slots lazily by format and signed hour. Repeated
+// timestamps with the same offset allocate nothing; no input dates are retained.
+// 2 separators x 9 fraction formats x 3 offset spellings, then 48 signed hours
+// and 60 minutes. Keeping the sign also preserves the spelling of negative zero.
+type OffsetMinutePatterns = [OnceLock<String>; 60];
+type OffsetHourPatterns = [OnceLock<Box<OffsetMinutePatterns>>; 48];
+static ISO_OFFSET_PATTERNS: [OnceLock<Box<OffsetHourPatterns>>; 54] =
+    [const { OnceLock::new() }; 54];
+
+fn iso_offset_pattern(
+    separator: u8,
+    fraction: Option<(u8, &str, FractionPrecision)>,
+    offset: IsoOffset<'_>,
+) -> Result<&'static str, JsonTimestampError> {
+    let base = iso_date_time_pattern(separator, fraction, false)?;
+    let fraction_index = match fraction {
+        None => 0,
+        Some((punctuation, _, precision)) => {
+            let precision_index = match precision {
+                FractionPrecision::Milliseconds => 0,
+                FractionPrecision::Microseconds => 1,
+                FractionPrecision::Nanoseconds => 2,
+                FractionPrecision::Variable => 3,
+            };
+            1 + usize::from(punctuation == b',') * 4 + precision_index
+        }
+    };
+    let format_index = offset.style * 18 + usize::from(separator == b' ') * 9 + fraction_index;
+    let hours = ISO_OFFSET_PATTERNS[format_index]
+        .get_or_init(|| Box::new(std::array::from_fn(|_| OnceLock::new())));
+    let minutes = hours[offset.hours + usize::from(offset.negative) * 24]
+        .get_or_init(|| Box::new(std::array::from_fn(|_| OnceLock::new())));
+    Ok(minutes[offset.minutes].get_or_init(|| {
+        let mut pattern = base[..base.len() - 1].to_owned();
+        pattern.push_str(r"\z{");
+        pattern.push_str(offset.source);
+        pattern.push_str("}\"");
+        pattern
+    }))
 }
 
 fn parse_date_digits(bytes: &[u8], start: usize, length: usize) -> Result<u32, JsonTimestampError> {
@@ -1172,6 +1273,115 @@ mod tests {
                 kind: JsonTimestampScalarKind::String,
             })
         ));
+    }
+
+    #[test]
+    fn iso_offsets_normalize_to_utc_and_round_trip_exactly() {
+        use crate::timestamp::{TimestampPattern, TimestampPatternLimits};
+        let resolver = JsonTimestampResolver::parse("t.$date").unwrap();
+        let cases = [
+            ("2023-03-21T23:34:54.576-04:00", 1_679_456_094_576_000_000),
+            ("2023-01-01T00:15:00+05:30", 1_672_512_300_000_000_000),
+            ("1969-12-31T23:30:00-00:45", 900_000_000_000),
+            ("2024-03-01T00:15:00+00:30", 1_709_250_300_000_000_000),
+            ("1970-01-01T00:00:00+00:00", 0),
+            ("1970-01-01T00:00:00-00:00", 0),
+            ("1970-01-01T00:00:00+23:59", -86_340_000_000_000),
+            ("1970-01-01T00:00:00-23:59", 86_340_000_000_000),
+            ("1970-01-01T04:00:00+04", 0),
+            ("1969-12-31T20:00:00-0400", 0),
+            ("1970-01-01 05:30:00,123456+0530", 123_456_000),
+            ("1970-01-01T00:00:00.123456789+00:00", 123_456_789),
+            ("1677-09-20T20:12:43.145224192-04:00", i64::MIN),
+            ("2262-04-12T03:47:16.854775807+04:00", i64::MAX),
+        ];
+        for (source, expected) in cases {
+            let raw = format!("\"{source}\"");
+            let timestamp = resolver
+                .resolve_string(JsonString::new(raw.as_bytes(), source))
+                .unwrap();
+            assert_eq!(expected, timestamp.epoch_nanoseconds(), "{source}");
+            let kv = KvIrTimestampResolver::resolve_string(source.as_bytes()).unwrap();
+            assert_eq!(expected, kv.epoch_nanoseconds, "{source}");
+            assert_eq!(timestamp.pattern(), kv.pattern);
+            let pattern =
+                TimestampPattern::compile(timestamp.pattern(), TimestampPatternLimits::default())
+                    .unwrap();
+            assert_eq!(
+                raw,
+                pattern.format_epoch_nanoseconds(expected).unwrap(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn iso_offset_pattern_slots_preserve_all_existing_fraction_formats() {
+        use crate::timestamp::{TimestampPattern, TimestampPatternLimits};
+        for separator in ['T', ' '] {
+            for fraction in [
+                "",
+                ".123",
+                ".123456",
+                ".123456789",
+                ".12",
+                ",123",
+                ",123456",
+                ",123456789",
+                ",12",
+            ] {
+                for offset in ["+04", "-04", "+0430", "-0430", "+04:30", "-04:30"] {
+                    let source = format!("2000-01-01{separator}00:00:00{fraction}{offset}");
+                    let (epoch, raw_pattern) = resolve_iso_date_time(&source).unwrap();
+                    let pattern =
+                        TimestampPattern::compile(raw_pattern, TimestampPatternLimits::default())
+                            .unwrap();
+                    assert_eq!(
+                        format!("\"{source}\""),
+                        pattern.format_epoch_nanoseconds(epoch).unwrap()
+                    );
+                    let (_, reused) = resolve_iso_date_time(&source).unwrap();
+                    assert!(std::ptr::eq(raw_pattern.as_ptr(), reused.as_ptr()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn iso_offsets_reject_malformed_and_out_of_range_values() {
+        for suffix in [
+            "+24:00",
+            "-24:00",
+            "+00:60",
+            "+4:00",
+            "+040",
+            "+040000",
+            "+04:",
+            "+04:0x",
+            "+04:00junk",
+            "Z-04:00",
+            "+04:00Z",
+            " +04:00",
+        ] {
+            let source = format!("2023-03-21T23:34:54.576{suffix}");
+            assert!(
+                matches!(
+                    resolve_iso_date_time(&source),
+                    Err(JsonTimestampError::UnsupportedLexeme { .. })
+                ),
+                "{source}"
+            );
+            assert!(KvIrTimestampResolver::resolve_string(source.as_bytes()).is_err());
+        }
+        for source in [
+            "1677-09-21T00:12:43.145224191+00:00",
+            "2262-04-11T23:47:16.854775808+00:00",
+        ] {
+            assert_eq!(
+                Err(JsonTimestampError::EpochNanosecondsOutOfRange),
+                resolve_iso_date_time(source)
+            );
+        }
     }
 
     #[test]

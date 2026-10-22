@@ -880,6 +880,67 @@ fn compressed_kv_ir_is_probed_after_wrapper_decoding() {
 }
 
 #[test]
+fn iso_offset_timestamp_key_round_trips_and_filters_in_utc() {
+    let temporary = TestDirectory::new("iso-offsets");
+    let input_path = temporary.path().join("input.json");
+    let archives_path = temporary.path().join("archives");
+    let source = concat!(
+        "{\"t\":{\"$date\":\"2023-03-21T23:34:54.576-04:00\"},\"id\":1}\n",
+        "{\"t\":{\"$date\":\"2023-03-22T09:04:54.576+05:30\"},\"id\":2}\n",
+        "{\"t\":{\"$date\":\"2023-03-22T03:34:55.576Z\"},\"id\":3}\n",
+    );
+    fs::write(&input_path, source).unwrap();
+    let result = clp_s(&[
+        "c".as_ref(),
+        "--single-file-archive".as_ref(),
+        "--timestamp-key".as_ref(),
+        "t.$date".as_ref(),
+        archives_path.as_os_str(),
+        input_path.as_os_str(),
+    ]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let archive_path = only_entry(&archives_path);
+    assert_timestamp_range(
+        &archive_path,
+        "t.$date",
+        1_679_456_094_576,
+        1_679_456_095_576,
+    );
+    let all = clp_s(&["s".as_ref(), archive_path.as_os_str(), "*".as_ref()]);
+    assert!(
+        all.status.success(),
+        "{}",
+        String::from_utf8_lossy(&all.stderr)
+    );
+    assert_eq!(
+        semantic_json_records(source.as_bytes()),
+        semantic_json_records(&all.stdout)
+    );
+    let bounded = clp_s(&[
+        "s".as_ref(),
+        archive_path.as_os_str(),
+        "*".as_ref(),
+        "--tge".as_ref(),
+        "1679456094576".as_ref(),
+        "--tle".as_ref(),
+        "1679456094576".as_ref(),
+    ]);
+    assert!(
+        bounded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bounded.stderr)
+    );
+    let records = semantic_json_records(&bounded.stdout);
+    assert_eq!(2, records.len());
+    assert_eq!(serde_json::json!(1), records[0]["id"]);
+    assert_eq!(serde_json::json!(2), records[1]["id"]);
+}
+
+#[test]
 fn timestamp_key_matches_the_deterministic_cpp_archive() {
     let temporary = TestDirectory::new("timestamps");
     let input_path = temporary.path().join("input.json");
