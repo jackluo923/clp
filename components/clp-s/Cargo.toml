@@ -37,5 +37,7 @@ serde_json = { version = "1.0.149", optional = true }
 sha2 = { version = "0.10.9", optional = true }
 smallvec = "1.15.1"
 time = { version = "0.3.47", optional = true }
+tz-rs = { version = "0.7.3", default-features = false }
+tzdb = { version = "0.7.3", default-features = false }
 uuid = { version = "1.20.0", features = ["v4"], optional = true }
 zstd = "0.13.3"

@@ -7,6 +7,8 @@
 //! and the C++ marshaller cannot format them either.
 //!
 //! The unrelated pre-v0.5 `clp_s::TimestampPattern` format is not supported here.
+//! The Rust named-zone extension uses `\z{offset_seconds|original_name}`. Older
+//! readers reject these patterns; legacy numeric timezone patterns are unchanged.
 
 use std::error::Error;
 use std::fmt;
@@ -70,7 +72,7 @@ pub struct TimestampPattern {
     raw: String,
     tokens: Vec<Token>,
     representation: TimestampRepresentation,
-    timezone_offset_minutes: i32,
+    timezone_offset_seconds: i32,
     quoted: bool,
     max_formatted_size: usize,
 }
@@ -113,7 +115,7 @@ impl TimestampPattern {
             raw: owned,
             tokens: compilation.tokens,
             representation: compilation.representation,
-            timezone_offset_minutes: compilation.timezone_offset_minutes,
+            timezone_offset_seconds: compilation.timezone_offset_seconds,
             quoted,
             max_formatted_size: compilation.max_formatted_size,
         })
@@ -137,10 +139,16 @@ impl TimestampPattern {
         self.representation
     }
 
-    /// Returns the fixed timezone offset applied to calendar fields, in minutes east of UTC.
+    /// Returns the fixed timezone offset applied to calendar fields, in seconds east of UTC.
+    #[must_use]
+    pub const fn timezone_offset_seconds(&self) -> i32 {
+        self.timezone_offset_seconds
+    }
+
+    /// Returns the offset in whole minutes, truncating historical sub-minute offsets.
     #[must_use]
     pub const fn timezone_offset_minutes(&self) -> i32 {
-        self.timezone_offset_minutes
+        self.timezone_offset_seconds / 60
     }
 
     /// Returns an upper bound on bytes appended for one timestamp.
@@ -203,7 +211,7 @@ impl TimestampPattern {
         let date_time = match self.representation {
             TimestampRepresentation::DateTime => Some(DateTimeParts::from_epoch_nanoseconds(
                 timestamp,
-                self.timezone_offset_minutes,
+                self.timezone_offset_seconds,
             )?),
             TimestampRepresentation::Numeric => None,
         };
@@ -344,7 +352,7 @@ struct PatternCompiler<'a> {
     tokens: Vec<Token>,
     seen: [bool; 256],
     directive_flags: u8,
-    timezone_offset_minutes: i32,
+    timezone_offset_seconds: i32,
 }
 
 const USES_DATE: u8 = 1 << 0;
@@ -355,7 +363,7 @@ const HAS_PART_OF_DAY: u8 = 1 << 3;
 struct CompiledPattern {
     tokens: Vec<Token>,
     representation: TimestampRepresentation,
-    timezone_offset_minutes: i32,
+    timezone_offset_seconds: i32,
     max_formatted_size: usize,
 }
 
@@ -383,7 +391,7 @@ impl<'a> PatternCompiler<'a> {
             tokens,
             seen: [false; 256],
             directive_flags: 0,
-            timezone_offset_minutes: 0,
+            timezone_offset_seconds: 0,
         })
     }
 
@@ -440,7 +448,7 @@ impl<'a> PatternCompiler<'a> {
         Ok(CompiledPattern {
             tokens: self.tokens,
             representation,
-            timezone_offset_minutes: self.timezone_offset_minutes,
+            timezone_offset_seconds: self.timezone_offset_seconds,
             max_formatted_size,
         })
     }
@@ -514,12 +522,25 @@ impl<'a> PatternCompiler<'a> {
             .checked_add(1)
             .ok_or(TimestampPatternError::PatternSizeOverflow)?;
         let (content, next) = extract_bracket_content(self.raw, bracket_start, self.content_end)?;
-        self.timezone_offset_minutes = parse_timezone_offset(self.raw, content.clone()).ok_or(
-            TimestampPatternError::InvalidTimezone {
-                index: directive_index,
-            },
-        )?;
-        self.tokens.push(Token::Timezone(content));
+        let invalid = || TimestampPatternError::InvalidTimezone { index: directive_index };
+        let zone = &self.raw[content.clone()];
+        let display = if let Some((seconds, label)) = zone.split_once('|') {
+            // Named-zone extension: resolved UTC offset seconds plus original label.
+            // The reader needs no timezone database to reconstruct the original text.
+            let offset = seconds.parse::<i32>().map_err(|_| invalid())?;
+            if !(-86_400..86_400).contains(&offset) || label.is_empty()
+                || !label.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_+-".contains(&b))
+            {
+                return Err(invalid());
+            }
+            self.timezone_offset_seconds = offset;
+            content.start + seconds.len() + 1..content.end
+        } else {
+            self.timezone_offset_seconds = parse_timezone_offset(self.raw, content.clone())
+                .ok_or_else(invalid)? * 60;
+            content
+        };
+        self.tokens.push(Token::Timezone(display));
         self.directive_flags |= USES_DATE;
         Ok(next)
     }
@@ -806,12 +827,12 @@ struct DateTimeParts {
 impl DateTimeParts {
     fn from_epoch_nanoseconds(
         timestamp: i64,
-        timezone_offset_minutes: i32,
+        timezone_offset_seconds: i32,
     ) -> Result<Self, TimestampFormatError> {
         let adjusted = i128::from(timestamp)
             .checked_add(
-                i128::from(timezone_offset_minutes)
-                    .checked_mul(60 * NANOSECONDS_PER_SECOND)
+                i128::from(timezone_offset_seconds)
+                    .checked_mul(NANOSECONDS_PER_SECOND)
                     .ok_or(TimestampFormatError::DateArithmeticOverflow)?,
             )
             .ok_or(TimestampFormatError::DateArithmeticOverflow)?;
@@ -1599,6 +1620,12 @@ mod tests {
             r"\z{+1}",
             r"\z{UTC}",
             r"\z{+010}",
+            r"\z{86400|EDT}",
+            r"\z{-86401|EDT}",
+            r"\z{abc|EDT}",
+            r"\z{0|}",
+            r"\z{0|EDT|junk}",
+            r"\z{0|EDT junk}",
         ] {
             assert!(matches!(
                 TimestampPattern::compile(raw, limits),
@@ -1608,6 +1635,20 @@ mod tests {
         for raw in [r"\z{+00}", r"\z{+23:59}", r"\z{-0130}", r"\z{−04}"] {
             assert!(TimestampPattern::compile(raw, limits).is_ok(), "{raw}");
         }
+    }
+
+    #[test]
+    fn named_zone_pattern_is_self_contained_and_preserves_subminute_offsets() {
+        let pattern = TimestampPattern::compile(
+            r"\Y-\m-\d \H:\M:\S \z{561|Europe/Paris}", TimestampPatternLimits::default(),
+        ).unwrap();
+        assert_eq!(561, pattern.timezone_offset_seconds());
+        assert_eq!("1970-01-01 00:09:21 Europe/Paris", pattern.format_epoch_nanoseconds(0).unwrap());
+        // A future/custom database label is still extractable without lookup.
+        let custom = TimestampPattern::compile(
+            r"\Y-\m-\d \H:\M:\S \z{-14400|Custom/Zone}", TimestampPatternLimits::default(),
+        ).unwrap();
+        assert_eq!("1969-12-31 20:00:00 Custom/Zone", custom.format_epoch_nanoseconds(0).unwrap());
     }
 
     #[test]

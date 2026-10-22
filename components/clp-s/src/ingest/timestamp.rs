@@ -314,6 +314,12 @@ pub enum JsonTimestampError {
     },
     /// Epoch scaling or calendar conversion exceeded signed epoch nanoseconds.
     EpochNanosecondsOutOfRange,
+    /// Named timezone is absent from the bundled IANA database.
+    UnknownTimezone,
+    /// Multiple UTC instants or offsets match the name and local timestamp.
+    AmbiguousTimezone,
+    /// Local calendar time falls in a timezone's daylight-saving gap.
+    NonexistentLocalTime,
 }
 
 impl Display for JsonTimestampError {
@@ -330,6 +336,13 @@ impl Display for JsonTimestampError {
             Self::EpochNanosecondsOutOfRange => {
                 formatter.write_str("timestamp does not fit signed epoch nanoseconds")
             }
+            Self::UnknownTimezone => formatter.write_str("unknown timestamp timezone name"),
+            Self::AmbiguousTimezone => formatter.write_str(
+                "ambiguous timestamp timezone or local time; use an explicit numeric offset",
+            ),
+            Self::NonexistentLocalTime => formatter.write_str(
+                "local timestamp does not exist in the named timezone",
+            ),
         }
     }
 }
@@ -897,6 +910,8 @@ const fn numeric_fraction_pattern(precision: FractionPrecision, quoted: bool) ->
     }
 }
 
+mod named_timezone;
+
 fn resolve_iso_date_time(source: &str) -> Result<(i64, &'static str), JsonTimestampError> {
     let bytes = source.as_bytes();
     if bytes.len() < 19
@@ -949,9 +964,14 @@ fn resolve_iso_date_time(source: &str) -> Result<(i64, &'static str), JsonTimest
     } else {
         false
     };
+    let zone_name = if !zulu && bytes.get(cursor) == Some(&b' ') {
+        Some(&source[cursor + 1..])
+    } else {
+        None
+    };
     let offset = if !zulu && matches!(bytes.get(cursor), Some(b'+' | b'-')) {
         Some(IsoOffset::parse(&source[cursor..])?)
-    } else if cursor == bytes.len() {
+    } else if cursor == bytes.len() || zone_name.is_some() {
         None
     } else {
         return Err(JsonTimestampError::UnsupportedLexeme {
@@ -965,9 +985,17 @@ fn resolve_iso_date_time(source: &str) -> Result<(i64, &'static str), JsonTimest
         .and_then(|value| value.checked_add(i128::from(hour) * 3_600))
         .and_then(|value| value.checked_add(i128::from(minute) * 60))
         .and_then(|value| value.checked_add(i128::from(source_second)))
-        .and_then(|value| {
-            value.checked_sub(i128::from(offset.map_or(0, IsoOffset::minutes_east)) * 60)
-        })
+        .ok_or(JsonTimestampError::EpochNanosecondsOutOfRange)?;
+    let named = zone_name.map(|name| {
+        let local = i64::try_from(seconds)
+            .map_err(|_| JsonTimestampError::EpochNanosecondsOutOfRange)?;
+        named_timezone::resolve(name, local)
+    }).transpose()?;
+    let offset_seconds = named.as_ref().map_or_else(
+        || offset.map_or(0, IsoOffset::minutes_east) * 60,
+        |zone| zone.offset_seconds,
+    );
+    let seconds = seconds.checked_sub(i128::from(offset_seconds))
         .ok_or(JsonTimestampError::EpochNanosecondsOutOfRange)?;
     let mut epoch = seconds
         .checked_mul(i128::from(NANOSECONDS_PER_SECOND))
@@ -983,9 +1011,12 @@ fn resolve_iso_date_time(source: &str) -> Result<(i64, &'static str), JsonTimest
             .ok_or(JsonTimestampError::EpochNanosecondsOutOfRange)?;
     }
     let epoch = i64::try_from(epoch).map_err(|_| JsonTimestampError::EpochNanosecondsOutOfRange)?;
-    let pattern = match offset {
-        Some(offset) => iso_offset_pattern(bytes[10], fraction, offset)?,
-        None => iso_date_time_pattern(bytes[10], fraction, zulu)?,
+    let pattern = match named {
+        Some(named) => named.pattern(bytes[10], fraction)?,
+        None => match offset {
+            Some(offset) => iso_offset_pattern(bytes[10], fraction, offset)?,
+            None => iso_date_time_pattern(bytes[10], fraction, zulu)?,
+        },
     };
     Ok((epoch, pattern))
 }
@@ -1267,12 +1298,7 @@ mod tests {
             br#""2026-01-01T12:34:56.789 UTC-05""#,
             "2026-01-01T12:34:56.789 UTC-05",
         );
-        assert!(matches!(
-            resolver.resolve_string(timezone),
-            Err(JsonTimestampError::UnsupportedLexeme {
-                kind: JsonTimestampScalarKind::String,
-            })
-        ));
+        assert_eq!(Err(JsonTimestampError::UnknownTimezone), resolver.resolve_string(timezone));
     }
 
     #[test]
@@ -1348,6 +1374,54 @@ mod tests {
     }
 
     #[test]
+    fn named_timezones_round_trip_and_normalize_json_and_kv_ir() {
+        use crate::timestamp::{TimestampPattern, TimestampPatternLimits};
+        for (source, expected) in [
+            ("1969-12-31 20:00:00 EDT", 0),
+            ("1969-12-31 19:00:00 EST", 0),
+            ("1970-01-01 00:00:00 UTC", 0),
+            ("1970-01-01 00:00:00 GMT", 0),
+            ("1970-01-01 09:00:00 JST", 0),
+            ("1970-01-01 01:00:00 CET", 0),
+            ("1970-01-01 02:00:00 CEST", 0),
+            ("1970-01-01 10:00:00 AEST", 0),
+            ("2023-03-27 00:26:35.719 EDT", 1_679_891_195_719_000_000),
+            ("2023-03-27 00:26:35.719 America/New_York", 1_679_891_195_719_000_000),
+            ("2023-03-27 00:26:35.719 Asia/Kolkata", 1_679_856_995_719_000_000),
+            ("2023-03-27 00:26:35.719 Australia/Adelaide", 1_679_838_995_719_000_000),
+            ("2023-03-27 00:26:35.719 Pacific/Chatham", 1_679_827_295_719_000_000),
+            ("1890-01-01 00:00:00 Europe/Paris", -2_524_522_161_000_000_000),
+        ] {
+            let (epoch, raw_pattern) = resolve_iso_date_time(source).unwrap();
+            assert_eq!(expected, epoch, "{source}");
+            let kv = KvIrTimestampResolver::resolve_string(source.as_bytes()).unwrap();
+            assert_eq!(epoch, kv.epoch_nanoseconds);
+            assert_eq!(raw_pattern, kv.pattern);
+            let pattern = TimestampPattern::compile(raw_pattern, TimestampPatternLimits::default()).unwrap();
+            assert_eq!(format!("\"{source}\""), pattern.format_epoch_nanoseconds(epoch).unwrap());
+            assert!(std::ptr::eq(raw_pattern.as_ptr(), resolve_iso_date_time(source).unwrap().1.as_ptr()));
+        }
+    }
+
+    #[test]
+    fn named_timezones_reject_unknown_ambiguous_and_nonexistent_local_times() {
+        for source in ["2023-03-27 00:00:00 CST", "2023-03-27 00:00:00 IST",
+                       "2023-11-05 01:30:00 America/New_York"] {
+            assert_eq!(Err(JsonTimestampError::AmbiguousTimezone), resolve_iso_date_time(source), "{source}");
+        }
+        assert_eq!(Err(JsonTimestampError::NonexistentLocalTime),
+            resolve_iso_date_time("2023-03-12 02:30:00 America/New_York"));
+        for source in ["2023-03-27 00:00:00 Fake/Zone", "2023-03-27 00:00:00 EDT trailing"] {
+            assert_eq!(Err(JsonTimestampError::UnknownTimezone), resolve_iso_date_time(source));
+        }
+        // A historically overloaded abbreviation is resolved using the event date.
+        assert_eq!(resolve_iso_date_time("2023-07-01 00:00:00-07:00").unwrap().0,
+            resolve_iso_date_time("2023-07-01 00:00:00 PDT").unwrap().0);
+        assert_eq!(resolve_iso_date_time("2023-07-01 00:00:00+03:00").unwrap().0,
+            resolve_iso_date_time("2023-07-01 00:00:00 MSK").unwrap().0);
+    }
+
+    #[test]
     fn iso_offsets_reject_malformed_and_out_of_range_values() {
         for suffix in [
             "+24:00",
@@ -1365,10 +1439,7 @@ mod tests {
         ] {
             let source = format!("2023-03-21T23:34:54.576{suffix}");
             assert!(
-                matches!(
-                    resolve_iso_date_time(&source),
-                    Err(JsonTimestampError::UnsupportedLexeme { .. })
-                ),
+                resolve_iso_date_time(&source).is_err(),
                 "{source}"
             );
             assert!(KvIrTimestampResolver::resolve_string(source.as_bytes()).is_err());

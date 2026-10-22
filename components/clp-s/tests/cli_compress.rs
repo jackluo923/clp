@@ -941,6 +941,34 @@ fn iso_offset_timestamp_key_round_trips_and_filters_in_utc() {
 }
 
 #[test]
+fn named_timezone_timestamp_key_round_trips_and_filters_in_utc() {
+    let temporary = TestDirectory::new("named-timezones");
+    let input_path = temporary.path().join("input.json");
+    let archives_path = temporary.path().join("archives");
+    let source = concat!(
+        "{\"timestamp\":\"2023-03-27 00:26:35.719 EDT\",\"id\":1}\n",
+        "{\"timestamp\":\"2023-03-26 23:26:35.719 EST\",\"id\":2}\n",
+        "{\"timestamp\":\"2023-03-27 09:56:35.719 Asia/Kolkata\",\"id\":3}\n",
+        "{\"timestamp\":\"2023-03-27 04:26:36.719 UTC\",\"id\":4}\n",
+    );
+    fs::write(&input_path, source).unwrap();
+    let result = clp_s(&["c".as_ref(), "--single-file-archive".as_ref(),
+        "--timestamp-key".as_ref(), "timestamp".as_ref(), archives_path.as_os_str(), input_path.as_os_str()]);
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    let archive_path = only_entry(&archives_path);
+    assert_timestamp_range(&archive_path, "timestamp", 1_679_891_195_719, 1_679_891_196_719);
+    assert_eq!(source.as_bytes(), extract_original(&archive_path, &temporary.path().join("extracted")).as_slice());
+    let bounded = clp_s(&["s".as_ref(), archive_path.as_os_str(), "*".as_ref(),
+        "--tge".as_ref(), "1679891195719".as_ref(), "--tle".as_ref(), "1679891195719".as_ref()]);
+    assert!(bounded.status.success(), "{}", String::from_utf8_lossy(&bounded.stderr));
+    let records = semantic_json_records(&bounded.stdout);
+    assert_eq!(3, records.len());
+    for (index, record) in records.iter().enumerate() {
+        assert_eq!(serde_json::json!(index + 1), record["id"]);
+    }
+}
+
+#[test]
 fn timestamp_key_matches_the_deterministic_cpp_archive() {
     let temporary = TestDirectory::new("timestamps");
     let input_path = temporary.path().join("input.json");
