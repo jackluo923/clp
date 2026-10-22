@@ -302,6 +302,33 @@ impl<'a> I64Column<'a> {
     }
 }
 
+/// A dictionary-ID column, kept in the compact layout it was stored in: constant, frame of
+/// reference, dictionary, or runs. A filter can then test each distinct ID or each run once
+/// instead of expanding every row first.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdColumn<'a> { data: NumericColumn<'a> }
+
+impl<'a> IdColumn<'a> {
+    #[must_use]
+    pub const fn len(self) -> usize { self.data.len() }
+    #[must_use]
+    pub const fn is_empty(self) -> bool { self.len() == 0 }
+    #[must_use]
+    pub fn get(self, index: usize) -> Option<u64> { self.data.get(index) }
+    pub fn iter(self) -> impl ExactSizeIterator<Item=u64> + DoubleEndedIterator + FusedIterator + 'a {
+        self.data.iter()
+    }
+    /// The fixed-stride little-endian IDs, or `None` for a compact layout.
+    #[must_use]
+    pub const fn canonical_bytes(self) -> Option<&'a [u8]> { self.data.canonical_bytes() }
+    /// ORs `truth` into the rows whose ID `matches` accepts, testing each distinct ID or run once.
+    /// Returns `false`, touching nothing, for the fixed-stride layout.
+    pub(crate) fn or_encoded_matches(self, skip: usize, bitmap: &mut [u8], truth: u8,
+        matches: impl FnMut(u64) -> bool) -> bool {
+        self.data.or_matches(skip, bitmap, truth, matches)
+    }
+}
+
 /// A zero-copy little-endian unsigned 64-bit column.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct U64Column<'a> {
@@ -686,7 +713,7 @@ impl<'a> BooleanColumn<'a> {
 /// A zero-copy variable-dictionary ID column.
 #[derive(Clone, Copy, Debug)]
 pub struct DictionaryIdColumn<'table, 'archive> {
-    ids: U64Column<'table>,
+    ids: IdColumn<'table>,
     dictionary: &'archive VariableDictionary,
 }
 
@@ -705,7 +732,7 @@ impl<'table, 'archive> DictionaryIdColumn<'table, 'archive> {
 
     /// Returns the zero-copy ID view.
     #[must_use]
-    pub const fn ids(self) -> U64Column<'table> {
+    pub const fn ids(self) -> IdColumn<'table> {
         self.ids
     }
 
@@ -727,6 +754,28 @@ impl<'table, 'archive> DictionaryIdColumn<'table, 'archive> {
     #[must_use]
     pub const fn dictionary(self) -> &'archive VariableDictionary {
         self.dictionary
+    }
+
+    /// A cursor for reading values in increasing row order, which a run-encoded column serves
+    /// without searching its runs for every row.
+    #[must_use]
+    pub const fn cursor(self) -> DictionaryValueCursor<'table, 'archive> {
+        DictionaryValueCursor { column: self, run: 0 }
+    }
+}
+
+/// Reads a dictionary-ID column's values, fastest in increasing row order.
+#[derive(Clone, Copy, Debug)]
+pub struct DictionaryValueCursor<'table, 'archive> {
+    column: DictionaryIdColumn<'table, 'archive>,
+    run: usize,
+}
+
+impl<'archive> DictionaryValueCursor<'_, 'archive> {
+    /// Returns one exact variable-dictionary byte string.
+    pub fn value(&mut self, index: usize) -> Option<&'archive [u8]> {
+        let id = self.column.ids.data.get_forward(&mut self.run, index)?;
+        self.column.dictionary.entry(id).map(VariableDictionaryEntry::value)
     }
 }
 
@@ -1155,6 +1204,12 @@ pub fn decode_schema_table<'table, 'archive>(
                     .map_err(|_| corrupt(context, None, ColumnCorruption::InvalidAdaptiveNumeric))?;
                 let data = match node_type {
                     NodeType::Integer => ColumnData::Integer(I64Column { data }),
+                    NodeType::VarString | NodeType::DictionaryFloat => {
+                        let float = node_type == NodeType::DictionaryFloat;
+                        let column = dictionary_id_column(IdColumn { data }, context, variable_dictionary,
+                            float, limits.validate_dictionary_references)?;
+                        if float { ColumnData::DictionaryFloat(column) } else { ColumnData::VarString(column) }
+                    }
                     NodeType::Float => {
                         let values = F64Column { data };
                         validate_finite_floats(values, context)?;
@@ -1431,29 +1486,52 @@ fn take_dictionary_id_column<'table, 'archive>(
     validate_references: bool,
 ) -> Result<DictionaryIdColumn<'table, 'archive>, ColumnError> {
     let ids = take_u64_column(cursor, context, count)?;
+    let ids = IdColumn { data: NumericColumn::plain(ids.encoded_bytes()) };
+    dictionary_id_column(ids, context, dictionary, validate_float, validate_references)
+}
+
+/// Checks that every ID names a dictionary entry (and, for dictionary floats, a finite number).
+/// A compact column is checked once per distinct ID or run, or from its bounds, not per row.
+fn dictionary_id_column<'table, 'archive>(
+    ids: IdColumn<'table>,
+    context: ColumnContext,
+    dictionary: &'archive VariableDictionary,
+    validate_float: bool,
+    validate_references: bool,
+) -> Result<DictionaryIdColumn<'table, 'archive>, ColumnError> {
     if !validate_references {
         return Ok(DictionaryIdColumn { ids, dictionary });
     }
+    let valid = |id: u64| match dictionary.entry(id) {
+        None => false,
+        Some(entry) => !validate_float || std::str::from_utf8(entry.value())
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .is_some_and(f64::is_finite),
+    };
+    // IDs are dense from zero, so an in-range upper bound proves every reference exists.
+    let proven = ids.data.encoded_values_all(valid).unwrap_or(false)
+        || (!validate_float
+            && ids.data.integer_bounds().is_some_and(|(low, high)| {
+                low >= 0 && u64::try_from(high).is_ok_and(|high| high < dictionary.len() as u64)
+            }));
+    if proven {
+        return Ok(DictionaryIdColumn { ids, dictionary });
+    }
     for (message_index, id) in ids.iter().enumerate() {
-        let entry = dictionary.entry(id).ok_or_else(|| {
-            corrupt(
+        if dictionary.entry(id).is_none() {
+            return Err(corrupt(
                 context,
                 Some(message_index),
                 ColumnCorruption::UnknownVariableDictionaryId { id },
-            )
-        })?;
-        if validate_float {
-            let finite = std::str::from_utf8(entry.value())
-                .ok()
-                .and_then(|value| value.parse::<f64>().ok())
-                .is_some_and(f64::is_finite);
-            if !finite {
-                return Err(corrupt(
-                    context,
-                    Some(message_index),
-                    ColumnCorruption::InvalidDictionaryFloat { id },
-                ));
-            }
+            ));
+        }
+        if validate_float && !valid(id) {
+            return Err(corrupt(
+                context,
+                Some(message_index),
+                ColumnCorruption::InvalidDictionaryFloat { id },
+            ));
         }
     }
     Ok(DictionaryIdColumn { ids, dictionary })
@@ -2504,6 +2582,82 @@ mod tests {
             &resources.timestamp,
             limits,
         )
+    }
+
+    /// Run-encoded wire bytes (adaptive scheme 4) for `(id, count)` runs, prepared into the
+    /// reader's compact layout, with the row count.
+    fn run_encoded_ids(runs: &[(u64, u32)]) -> (Vec<u8>, usize) {
+        let mut wire = vec![4];
+        wire.extend((runs.len() as u32).to_le_bytes());
+        let mut rows = 0;
+        for (id, count) in runs {
+            wire.extend(id.to_le_bytes());
+            wire.extend(count.to_le_bytes());
+            rows += *count as usize;
+        }
+        let mut prepared = Vec::new();
+        crate::encoded_numeric::prepare(&wire, rows, false, &mut prepared).expect("prepare runs");
+        (prepared, rows)
+    }
+
+    #[test]
+    fn run_encoded_ids_are_matched_once_per_run_without_expanding_rows() {
+        let runs = [(3_u64, 4_u32), (7, 2), (3, 5), (1, 3)];
+        let (bytes, rows) = run_encoded_ids(&runs);
+        let ids = IdColumn {
+            data: NumericColumn::encoded(&bytes, rows, crate::encoded_numeric::NumericEncoding::RunEnds)
+                .expect("valid runs"),
+        };
+        let expected: Vec<u64> =
+            runs.iter().flat_map(|(id, count)| std::iter::repeat_n(*id, *count as usize)).collect();
+        assert_eq!(expected, ids.iter().collect::<Vec<_>>());
+        for skip in [0, 3, 4, 6, 13] {
+            let mut calls = 0;
+            let mut bitmap = vec![0_u8; rows - skip];
+            assert!(ids.or_encoded_matches(skip, &mut bitmap, 1, |id| {
+                calls += 1;
+                id == 3
+            }));
+            let wanted: Vec<u8> = expected[skip..].iter().map(|id| u8::from(*id == 3)).collect();
+            assert_eq!(wanted, bitmap, "skip={skip}");
+            // One test per run the span touches, never one per row.
+            let mut end = 0;
+            let touched = runs
+                .iter()
+                .filter(|(_, count)| {
+                    end += *count as usize;
+                    end > skip
+                })
+                .count();
+            assert_eq!(touched, calls, "skip={skip}");
+        }
+        // The fixed-stride layout is left to the caller's row loop.
+        let plain: Vec<u8> = expected.iter().flat_map(|id| id.to_le_bytes()).collect();
+        let plain = IdColumn { data: NumericColumn::plain(&plain) };
+        assert!(!plain.or_encoded_matches(0, &mut vec![0; rows], 1, |_| true));
+    }
+
+    #[test]
+    fn compact_id_validation_accepts_known_runs_and_reports_the_first_unknown_row() {
+        let res = resources(&[b"a", b"b", b"c", b"d"], &[], &[], &[]);
+        let context = ColumnContext { column_index: 0, node_id: 0 };
+        let column = |runs: &[(u64, u32)]| {
+            let (bytes, rows) = run_encoded_ids(runs);
+            let ids = IdColumn {
+                data: NumericColumn::encoded(&bytes, rows, crate::encoded_numeric::NumericEncoding::RunEnds)
+                    .expect("valid runs"),
+            };
+            dictionary_id_column(ids, context, &res.variable, false, true).map(|column| column.len())
+        };
+        assert_eq!(6, column(&[(3, 4), (1, 2)]).expect("known IDs"));
+        assert!(matches!(
+            column(&[(3, 4), (9, 2)]),
+            Err(ColumnError::Corrupt {
+                message_index: Some(4),
+                reason: ColumnCorruption::UnknownVariableDictionaryId { id: 9 },
+                ..
+            })
+        ));
     }
 
     fn single_column(

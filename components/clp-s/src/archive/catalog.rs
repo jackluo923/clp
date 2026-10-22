@@ -459,6 +459,17 @@ impl ArchiveCatalog {
                     node_type == Some(NodeType::Float), &mut output).map_err(decode_err)?;
                 size = numeric_size;
                 changed = true;
+            } else if strings
+                && matches!(node_type, Some(NodeType::VarString | NodeType::DictionaryFloat))
+                && !stored.is_empty()
+                && crate::encoded_numeric::encoding(stored, false).is_some()
+            {
+                // Dictionary IDs keep their compact layout so filters test each distinct ID or
+                // run once rather than expanding every row first.
+                numeric_encoding = crate::encoded_numeric::prepare(stored, message_count, false, &mut output)
+                    .map_err(decode_err)?;
+                size = numeric_size;
+                changed = true;
             } else if (node_type == Some(NodeType::Integer)
                 || strings && matches!(node_type, Some(NodeType::VarString | NodeType::DictionaryFloat)))
                 && !stored.is_empty()

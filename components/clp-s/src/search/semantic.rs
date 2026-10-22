@@ -1787,6 +1787,30 @@ impl DictionaryIds {
 
     const fn is_empty(&self) -> bool { matches!(self, Self::Empty) }
 
+    fn contains(&self, value: u64) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::One(id) => value == *id,
+            Self::Small(ids) => ids.contains(&value),
+            Self::Sorted(ids) => ids.binary_search(&value).is_ok(),
+            Self::Dense { first_word, words } => (value / 64).checked_sub(*first_word)
+                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| words.get(index))
+                .is_some_and(|word| word & (1_u64 << (value % 64)) != 0),
+        }
+    }
+
+    /// ORs the rows whose ID is in the set. A compact column is tested once per distinct ID or
+    /// run; only the fixed-stride layout is walked row by row.
+    fn or_column_matches(&self, bitmap: &mut [u8], column: crate::archive::IdColumn<'_>, skip: usize) {
+        if self.is_empty() {
+            return;
+        }
+        if !column.or_encoded_matches(skip, bitmap, Tri::True as u8, |id| self.contains(id)) {
+            self.or_matches(bitmap, column.iter().skip(skip));
+        }
+    }
+
     fn or_matches(&self, bitmap: &mut [u8], values: impl Iterator<Item = u64>) {
         // Dispatch outside the row loop so each representation has a simple kernel.
         match self {
@@ -3428,7 +3452,7 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
                     filter.value.timestamp_nanoseconds);
             }
             ColumnData::DictionaryFloat(column) => {
-                filter.value.dictionary_float_ids.or_matches(bitmap, column.ids().iter().skip(skip));
+                filter.value.dictionary_float_ids.or_column_matches(bitmap, column.ids(), skip);
             }
             ColumnData::Boolean(column) => {
                 let expected = match filter.predicate.value() {
@@ -3438,7 +3462,7 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
                 or_matches(bitmap, column.iter().skip(skip), |value| value == expected);
             }
             ColumnData::VarString(column) => {
-                filter.value.variable_ids.or_matches(bitmap, column.ids().iter().skip(skip));
+                filter.value.variable_ids.or_column_matches(bitmap, column.ids(), skip);
             }
             ColumnData::ClpString(column) => {
                 self.scan_clp(filter.expression, filter.predicate, node_id, column, skip, bitmap)?;

@@ -810,6 +810,15 @@ impl ProjectedScanner {
                     ColumnView { kind, reserved: 0, data: buffer.numeric.as_ptr().cast() }
                 } else if data.is_none() {
                     ColumnView { kind: kind::ABSENT, reserved: 0, data: std::ptr::null() }
+                } else if let Some(ColumnData::VarString(values) | ColumnData::DictionaryFloat(values)) = data {
+                    // Matching rows ascend, so a cursor reads run-encoded IDs without searching.
+                    let mut values = values.cursor();
+                    for row in bitmap.matching_rows() {
+                        let cell = values.value(row)
+                            .map_or_else(Cell::absent, |bytes| push_text(kind::STRING, bytes, &mut self.text));
+                        buffer.cells.push(cell);
+                    }
+                    ColumnView { kind: kind::UNSUPPORTED, reserved: 0, data: buffer.cells.as_ptr().cast() }
                 } else {
                     let mut deltas = [data.and_then(ForwardDelta::from_column)];
                     for row in bitmap.matching_rows() {

@@ -51,6 +51,8 @@ pub use column::LogTypeSection;
 pub use column::SchemaTable;
 pub use column::TimestampColumn;
 pub use column::TimestampValue;
+pub use column::DictionaryValueCursor;
+pub use column::IdColumn;
 pub use column::U64Column;
 pub use column::decode_schema_table;
 pub use column::is_value_bearing;

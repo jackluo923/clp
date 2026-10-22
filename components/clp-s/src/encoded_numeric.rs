@@ -221,6 +221,27 @@ impl<'a> NumericColumn<'a> {
         let high = i64::try_from(i128::from(base) + max_offset).ok()?;
         Some((base, high))
     }
+    /// Returns the value at `row`, keeping `run` as a cursor into a run-encoded column so that
+    /// reads in increasing row order cost amortized O(1) rather than a search per row. Other
+    /// layouts ignore the cursor.
+    pub(crate) fn get_forward(self, run: &mut usize, row: usize) -> Option<u64> {
+        if self.encoding != Some(NumericEncoding::RunEnds) {
+            return self.get(row);
+        }
+        if row >= self.len {
+            return None;
+        }
+        let position = self.offset + row;
+        let runs = u32_at(self.bytes, 0).unwrap() as usize;
+        if *run >= runs || (*run > 0 && self.run_end(*run - 1) > position) {
+            *run = self.find_run(position);
+        }
+        // The last run ends at the row count, so this stops before running out of runs.
+        while self.run_end(*run) <= position {
+            *run += 1;
+        }
+        Some(self.run_value(*run))
+    }
     fn run_end(self, run: usize) -> usize { u32_at(self.bytes, 12 + run * 12).unwrap() as usize }
     fn run_value(self, run: usize) -> u64 { u64_at(self.bytes, 4 + run * 12).unwrap() }
     fn find_run(self, row: usize) -> usize {
@@ -509,6 +530,33 @@ mod tests {
             let mut expected = Vec::new();
             for (v, count) in runs { wire.extend(v.to_le_bytes()); wire.extend(count.to_le_bytes()); expected.extend(std::iter::repeat_n(v, count as usize)); }
             check(&wire, &expected, float);
+        }
+    }
+
+    #[test]
+    fn forward_reads_match_random_access_in_any_order() {
+        let runs = [(9u64, 3u32), (1, 1), (7, 6), (2, 2), (5, 4)];
+        let mut wire = vec![4];
+        wire.extend((runs.len() as u32).to_le_bytes());
+        for (value, count) in runs { wire.extend(value.to_le_bytes()); wire.extend(count.to_le_bytes()); }
+        let rows = runs.iter().map(|(_, count)| *count as usize).sum::<usize>();
+        let mut prepared = Vec::new();
+        prepare(&wire, rows, false, &mut prepared).unwrap();
+        let column = NumericColumn::encoded(&prepared, rows, NumericEncoding::RunEnds).unwrap();
+        for start in [0, 2, 5] {
+            let slice = column.slice(start, rows - start).unwrap();
+            let len = rows - start;
+            let orders: [Vec<usize>; 3] = [
+                (0..len).collect(),
+                (0..len).rev().collect(),
+                (0..len).step_by(3).chain([1, len - 1, 0, 4]).collect(),
+            ];
+            for order in orders {
+                let mut run = 0;
+                for row in order.iter().copied().chain([len, len + 7]) {
+                    assert_eq!(slice.get(row), slice.get_forward(&mut run, row), "start={start} row={row}");
+                }
+            }
         }
     }
 
