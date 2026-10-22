@@ -51,6 +51,8 @@ impl ArchiveVersion {
     pub const VERBATIM_TEXT: Self = Self::new(0, 9, 0);
     /// Mixed signed/unsigned integer columns with optional unsigned bitmaps.
     pub const MIXED_INTEGERS: Self = Self::new(0, 10, 0);
+    /// Float columns stored as decimal mantissas and a scale (0.10 plus that adaptive scheme).
+    pub const DECIMAL_FLOATS: Self = Self::new(0, 11, 0);
 
     /// Creates a version from its semantic components.
     #[must_use]
@@ -87,10 +89,11 @@ impl ArchiveVersion {
     /// every section byte-identical, so rejecting it would refuse archives this crate decodes
     /// correctly. The 0.6 line is also accepted: it is 0.5 plus optional adaptive-integer column
     /// encodings this crate's reader understands ([`Self::supports_adaptive_numeric`]), and 0.7 is
-    /// 0.6 plus a per-field `/log.dict` layout it also reads, 0.8 adds adaptive string columns and
-    /// 0.9 marks dictionary entries holding text whole. A differing major, or a minor outside
-    /// {5, 6, 7, 8, 9}, is still refused, because that is where unknown layout
-    /// changes land, and reading one as if it were 0.5 would misparse rather than fail.
+    /// 0.6 plus a per-field `/log.dict` layout it also reads, 0.8 adds adaptive string columns,
+    /// 0.9 marks dictionary entries holding text whole, 0.10 adds mixed integer columns and 0.11
+    /// decimal float columns. A differing major, or a minor outside {5, ..., 11}, is still refused,
+    /// because that is where unknown layout changes land, and reading one as if it were 0.5 would
+    /// misparse rather than fail.
     #[must_use]
     pub const fn is_readable(self) -> bool {
         self.major == Self::CURRENT.major
@@ -99,7 +102,8 @@ impl ArchiveVersion {
                 || self.minor == Self::FIELD_DICTIONARIES.minor
                 || self.minor == Self::ADAPTIVE_STRINGS.minor
                 || self.minor == Self::VERBATIM_TEXT.minor
-                || self.minor == Self::MIXED_INTEGERS.minor)
+                || self.minor == Self::MIXED_INTEGERS.minor
+                || self.minor == Self::DECIMAL_FLOATS.minor)
     }
 
     /// Whether a separate-column integer stream in an archive at this version may carry an adaptive
@@ -472,7 +476,8 @@ mod tests {
         assert!(ArchiveVersion::VERBATIM_TEXT.is_readable());
         assert!(ArchiveVersion::VERBATIM_TEXT.supports_adaptive_strings());
         assert!(ArchiveVersion::MIXED_INTEGERS.is_readable());
-        assert!(!ArchiveVersion::new(0, 11, 0).is_readable());
+        assert!(ArchiveVersion::DECIMAL_FLOATS.is_readable());
+        assert!(!ArchiveVersion::new(0, 12, 0).is_readable());
         assert!(!ArchiveVersion::new(1, 5, 0).is_readable());
     }
 

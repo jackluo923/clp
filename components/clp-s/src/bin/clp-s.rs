@@ -199,6 +199,11 @@ struct CompressArgs {
     /// output that the C++ reference reads.
     #[arg(long, default_value_t = false)]
     no_adaptive_numeric_columns: bool,
+    /// Never store float columns as decimal mantissas and a scale (allowed by default with
+    /// adaptive numeric columns). Such a column stamps archive version 0.11.0, which earlier
+    /// readers refuse.
+    #[arg(long, default_value_t = false)]
+    no_decimal_float_columns: bool,
     /// Omit the optional numeric summaries (count/sum/min/max) and timestamp chunk index from new
     /// archives.
     #[arg(long, default_value_t = false)]
@@ -707,6 +712,7 @@ fn run_compress(arguments: &CompressArgs) -> CliResult<()> {
         .with_minimum_packed_stream_size(arguments.min_table_size)
         .with_separate_columns_min_size(arguments.separate_columns_min_size)
         .with_adaptive_numeric_columns(!arguments.no_adaptive_numeric_columns)
+        .with_decimal_float_columns(!arguments.no_decimal_float_columns)
         .with_adaptive_string_columns(!arguments.no_adaptive_string_columns)
         .with_binary_uuids(!arguments.no_binary_uuids)
         .with_grouped_array_tables(!arguments.no_grouped_array_tables)

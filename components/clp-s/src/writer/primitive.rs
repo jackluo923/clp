@@ -1156,10 +1156,12 @@ impl PrimitiveArchive {
             .map_err(|source| WriterError::Io(std::io::Error::other(source)))
     }
 
+    /// The archive's sections, its timestamp dictionary, and whether a float column is stored as
+    /// decimals.
     pub(super) fn encode_sections(
         &self,
         options: WriterOptions,
-    ) -> Result<([Vec<u8>; 7], Vec<u8>), WriterError> {
+    ) -> Result<([Vec<u8>; 7], Vec<u8>, bool), WriterError> {
         let schema_tree = self.tree.encode(options.compression_level())?;
         let schema_map = self.tables.encode_schema_map(options.compression_level())?;
         // Per-field log-type dictionaries renumber each field's logtypes, so they are built first
@@ -1181,7 +1183,7 @@ impl PrimitiveArchive {
             );
             (self.log_type_dictionary.encode(options, false)?, None)
         };
-        let (table_metadata, tables) = self.tables.encode_tables(options, remap.as_ref())?;
+        let (table_metadata, tables, decimal_floats) = self.tables.encode_tables(options, remap.as_ref())?;
         let sections = [
             schema_tree,
             schema_map,
@@ -1193,7 +1195,7 @@ impl PrimitiveArchive {
             tables,
         ];
         check_section_limits(&sections, options.limits())?;
-        Ok((sections, self.timestamp_dictionary.encode()?))
+        Ok((sections, self.timestamp_dictionary.encode()?, decimal_floats))
     }
 }
 
@@ -4646,7 +4648,7 @@ impl TableSet {
         &self,
         options: WriterOptions,
         remap: Option<&LogTypeRemap>,
-    ) -> Result<(Vec<u8>, Vec<u8>), WriterError> {
+    ) -> Result<(Vec<u8>, Vec<u8>, bool), WriterError> {
         let mut order = Vec::new();
         order
             .try_reserve_exact(self.tables.len())
@@ -4666,7 +4668,7 @@ impl TableSet {
         });
         let packed = pack_tables(&self.tables, &order, options, remap)?;
         let metadata = encode_table_metadata(&packed, options.compression_level())?;
-        Ok((metadata, packed.compressed))
+        Ok((metadata, packed.compressed, packed.decimal_floats))
     }
 }
 
@@ -5012,6 +5014,8 @@ struct PackedTables {
     tables: Vec<SchemaTableWire>,
     separate: Vec<SeparateColumnWire>,
     grouped: Vec<GroupedStreamWire>,
+    /// Whether a float column is stored as decimals, which only version 0.11 readers decode.
+    decimal_floats: bool,
 }
 
 /// One packed stream holding several tables, with one frame per node across them.
@@ -5053,6 +5057,7 @@ fn pack_tables(
         tables: Vec::new(),
         separate: Vec::new(),
         grouped: Vec::new(),
+        decimal_floats: false,
     };
     packed
         .streams
@@ -5125,7 +5130,7 @@ fn pack_tables(
                 &mut packed,
             )?;
         } else {
-            encode_grouped_tables(tables, members, &mut column_compressor, remap, &mut packed)?;
+            encode_grouped_tables(tables, members, options, &mut column_compressor, remap, &mut packed)?;
         }
     }
     let order = grouped.as_slice();
@@ -5174,10 +5179,22 @@ fn write_best_candidate(
     raw_frames: bool,
     out: &mut Vec<u8>,
 ) -> Result<u64, WriterError> {
+    write_best_scheme(candidates, compressor, raw_frames, out).map(|(uncompressed, _)| uncompressed)
+}
+
+/// [`write_best_candidate`], also returning the chosen encoding's scheme byte.
+fn write_best_scheme(
+    candidates: impl IntoIterator<Item = Vec<u8>>,
+    compressor: &mut zstd::bulk::Compressor<'_>,
+    raw_frames: bool,
+    out: &mut Vec<u8>,
+) -> Result<(u64, Option<u8>), WriterError> {
     let mut best: Option<Vec<u8>> = None;
     let mut best_uncompressed = 0_usize;
+    let mut best_scheme = None;
     for candidate in candidates {
         let uncompressed = candidate.len();
+        let scheme = candidate.first().copied();
         let compressed = compressor.compress(&candidate).map_err(WriterError::Io)?;
         // We already own this candidate: a raw winner can be moved instead of copied.
         let frame = if raw_frames && compressed.len() >= uncompressed {
@@ -5192,11 +5209,12 @@ fn write_best_candidate(
         if better {
             best = Some(frame);
             best_uncompressed = uncompressed;
+            best_scheme = scheme;
         }
     }
     let frame = best.expect("candidates is never empty");
     out.extend_from_slice(&frame);
-    usize_u64(best_uncompressed)
+    Ok((usize_u64(best_uncompressed)?, best_scheme))
 }
 
 /// One column's stored frame: its zstd frame, or with `raw_frames` the column itself when zstd
@@ -5352,13 +5370,16 @@ fn encode_adaptive_clp_string_column(
 
 /// Encodes one float column with the smallest adaptive scheme (see [`adaptive_float::candidates`])
 /// and appends its zstd frame to `out`. Operates on the raw IEEE bit patterns so `NaN`/`inf`/`-0.0`
-/// round-trip exactly; the reader inverts it via [`adaptive_float::decode`].
+/// round-trip exactly; the reader inverts it via [`adaptive_float::decode`]. Notes in `packed`
+/// when the column is stored as decimals.
 fn encode_adaptive_float_column(
     column: &TableColumn,
+    options: WriterOptions,
     compressor: &mut zstd::bulk::Compressor<'_>,
     raw_frames: bool,
-    out: &mut Vec<u8>,
+    packed: &mut PackedTables,
 ) -> Result<u64, WriterError> {
+    let out = &mut packed.compressed;
     // Float columns are always `Fixed`; keep a defensive fallback to the standard path.
     let TableColumnData::Fixed(bytes) = &column.data else {
         return encode_plain_column(column, compressor, None, raw_frames, out);
@@ -5370,12 +5391,14 @@ fn encode_adaptive_float_column(
         .chunks_exact(size_of::<u64>())
         .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("8-byte chunk")))
         .collect();
-    write_best_candidate(
-        adaptive_float::candidates(&bits),
+    let (uncompressed, scheme) = write_best_scheme(
+        adaptive_float::candidates(&bits, options.decimal_float_columns()),
         compressor,
         raw_frames,
         out,
-    )
+    )?;
+    packed.decimal_floats |= scheme.is_some_and(|scheme| adaptive_float::is_decimal(&[scheme]));
+    Ok(uncompressed)
 }
 
 /// One node of a grouped stream: its ID, its type, and its columns with their tables' row counts.
@@ -5391,6 +5414,7 @@ type GroupedNode<'a> = (u32, NodeType, Vec<(&'a TableColumn, u64)>);
 fn encode_grouped_tables(
     tables: &[TableBuilder],
     members: &[usize],
+    options: WriterOptions,
     compressor: &mut zstd::bulk::Compressor<'_>,
     remap: Option<&LogTypeRemap>,
     packed: &mut PackedTables,
@@ -5459,10 +5483,12 @@ fn encode_grouped_tables(
                     .iter()
                     .map(|chunk| u64::from_le_bytes(*chunk))
                     .collect();
-                (
-                    GroupedFrameEncoding::Float,
-                    best_candidate(adaptive_float::candidates(&bits), compressor)?,
-                )
+                let payload = best_candidate(
+                    adaptive_float::candidates(&bits, options.decimal_float_columns()),
+                    compressor,
+                )?;
+                packed.decimal_floats |= adaptive_float::is_decimal(&payload);
+                (GroupedFrameEncoding::Float, payload)
             }
             NodeType::ClpString => (
                 GroupedFrameEncoding::ClpString,
@@ -5589,7 +5615,7 @@ fn encode_separate_table(
                 encode_adaptive_integer_column(column, compressor, strings, &mut packed.compressed)?
             }
             (true, NodeType::Float) => {
-                encode_adaptive_float_column(column, compressor, strings, &mut packed.compressed)?
+                encode_adaptive_float_column(column, options, compressor, strings, packed)?
             }
             (true, NodeType::VarString | NodeType::DictionaryFloat) if strings => {
                 encode_adaptive_integer_column(column, compressor, true, &mut packed.compressed)?
