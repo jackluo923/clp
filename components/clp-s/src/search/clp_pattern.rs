@@ -31,6 +31,95 @@ pub(super) struct ClpPattern {
     literal: Vec<u8>,
     ignore_case: bool,
     templates: Vec<Option<Template>>,
+    dictionary_plans: Vec<Option<DictionaryPlan>>,
+    dictionary_plan_bytes: usize,
+}
+
+struct DictionaryPlan {
+    index: usize,
+    len: usize,
+    matches: Vec<u64>,
+}
+
+impl DictionaryPlan {
+    fn build(
+        template: &Template,
+        literal: &[u8],
+        anchor: Anchor,
+        ignore_case: bool,
+        dictionary: &crate::archive::VariableDictionary,
+        budget: &mut usize,
+    ) -> Option<Self> {
+        let Template::Check { parts, consumed } = template else {
+            return None;
+        };
+        let mut variables = parts.iter().filter_map(|p| match p {
+            Part::Variable { index, kind } => Some((*index, *kind)),
+            _ => None,
+        });
+        let (index, 0x12) = variables.next()? else {
+            return None;
+        };
+        if variables.next().is_some() {
+            return None;
+        }
+        let words = dictionary.len().div_ceil(64);
+        let bytes = words.checked_mul(8)?;
+        // Bound optional per-template acceleration independently of archive dictionary limits.
+        if bytes > (8 << 20usize) - *budget {
+            return None;
+        }
+        let mut matches = Vec::new();
+        matches.try_reserve_exact(words).ok()?;
+        matches.resize(words, 0);
+        for entry in dictionary.entries() {
+            if single_variable_matches(
+                parts,
+                *consumed,
+                entry.value(),
+                literal,
+                anchor,
+                ignore_case,
+            ) {
+                let id = entry.id() as usize;
+                matches[id / 64] |= 1 << (id % 64);
+            }
+        }
+        *budget += bytes;
+        Some(Self {
+            index,
+            len: dictionary.len(),
+            matches,
+        })
+    }
+
+    fn contains(&self, id: u64) -> Option<bool> {
+        let id = usize::try_from(id).ok()?;
+        (id < self.len).then(|| self.matches[id / 64] & (1 << (id % 64)) != 0)
+    }
+}
+
+fn single_variable_matches(
+    parts: &[Part],
+    mut consumed: usize,
+    variable: &[u8],
+    literal: &[u8],
+    anchor: Anchor,
+    ignore_case: bool,
+) -> bool {
+    for part in parts {
+        let value = match part {
+            Part::Text(bytes) => bytes.as_slice(),
+            Part::Variable { .. } => variable,
+        };
+        if !consume(value, literal, &mut consumed, anchor, ignore_case) {
+            return false;
+        }
+        if consumed == literal.len() && anchor != Anchor::Exact {
+            return true;
+        }
+    }
+    consumed == literal.len()
 }
 
 impl ClpPattern {
@@ -64,6 +153,8 @@ impl ClpPattern {
             literal,
             ignore_case,
             templates,
+            dictionary_plans: (0..dictionary_size).map(|_| None).collect(),
+            dictionary_plan_bytes: 0,
         })
     }
 
@@ -101,6 +192,21 @@ impl ClpPattern {
                 self.anchor,
                 self.ignore_case,
             )?);
+            self.dictionary_plans[id] = DictionaryPlan::build(
+                slot.as_ref()?,
+                &self.literal,
+                self.anchor,
+                self.ignore_case,
+                column.variable_dictionary(),
+                &mut self.dictionary_plan_bytes,
+            );
+        }
+        if let Some(plan) = &self.dictionary_plans[id] {
+            let offset = usize::try_from(column.descriptor(row)?.encoded_variable_offset()).ok()?;
+            let value = column
+                .encoded_variables()
+                .get(offset.checked_add(plan.index)?)?;
+            return plan.contains(value as u64);
         }
         match slot.as_ref()? {
             Template::Constant(value) => Some(*value),
@@ -190,6 +296,18 @@ fn compile_template(
         return Some(Template::Constant(consumed == literal.len()));
     }
     parts.drain(..checked);
+    // A signed integer is never empty, ends in a decimal digit, and starts with a digit
+    // or '-'. Reject impossible boundaries once rather than formatting every row.
+    if matches!(parts.first(), Some(Part::Variable { kind: 0x11, .. })) {
+        let next = if anchor == Anchor::Suffix {
+            literal.get(literal.len() - consumed - 1)
+        } else {
+            literal.get(consumed)
+        };
+        if next.is_none_or(|b| !b.is_ascii_digit() && !(anchor != Anchor::Suffix && *b == b'-')) {
+            return Some(Template::Constant(false));
+        }
+    }
     Some(Template::Check { parts, consumed })
 }
 
@@ -329,6 +447,85 @@ mod tests {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dictionary_plans_match_reference_and_obey_memory_budget() {
+        use crate::archive::{ArchiveCatalogLimits, SingleFileArchiveReader};
+        use crate::writer::{FieldRef, OpenArchive, RecordRef, ValueRef, WriterOptions};
+        use std::io::Cursor;
+        let mut archive = OpenArchive::new(Cursor::new(Vec::new()), WriterOptions::default());
+        for i in 0..140 {
+            let message = format!("sendHeartbeat took {i}ms\n");
+            archive
+                .append_record(RecordRef::new(&[FieldRef::new(
+                    b"msg",
+                    ValueRef::String(message.as_bytes()),
+                )]))
+                .unwrap();
+        }
+        let bytes = archive.finish().unwrap().into_inner().into_inner();
+        let mut reader = SingleFileArchiveReader::open(Cursor::new(bytes)).unwrap();
+        let catalog = reader
+            .read_catalog(ArchiveCatalogLimits::default())
+            .unwrap();
+        let dictionary = catalog.variable_dictionary();
+        assert!(dictionary.len() > 128);
+        let template = b"sendHeartbeat took \x12\n";
+        for anchor in [Anchor::Prefix, Anchor::Suffix, Anchor::Exact] {
+            for needle in [
+                b"2ms\n".as_slice(),
+                b"sendHeartbeat took 2ms\n",
+                b"sendHeartbeat took 1",
+                b"MS\n",
+                b"absent",
+            ] {
+                for ignore_case in [false, true] {
+                    let compiled = compile_template(template, needle, anchor, ignore_case).unwrap();
+                    let mut budget = 0;
+                    let Some(plan) = DictionaryPlan::build(
+                        &compiled,
+                        needle,
+                        anchor,
+                        ignore_case,
+                        dictionary,
+                        &mut budget,
+                    ) else {
+                        continue;
+                    };
+                    for entry in dictionary.entries() {
+                        let mut message = b"sendHeartbeat took ".to_vec();
+                        message.extend_from_slice(entry.value());
+                        message.push(b'\n');
+                        let escaped = String::from_utf8(needle.to_vec()).unwrap();
+                        let pattern = match anchor {
+                            Anchor::Prefix => format!("{escaped}*"),
+                            Anchor::Suffix => format!("*{escaped}"),
+                            Anchor::Exact => escaped,
+                        };
+                        assert_eq!(
+                            plan.contains(entry.id()),
+                            Some(wildcard_match(&message, &pattern, ignore_case))
+                        );
+                    }
+                    assert_eq!(plan.contains(dictionary.len() as u64), None);
+                    assert_eq!(plan.contains(u64::MAX), None);
+                    assert!(budget > 0);
+                    budget = 8 << 20;
+                    assert!(
+                        DictionaryPlan::build(
+                            &compiled,
+                            needle,
+                            anchor,
+                            ignore_case,
+                            dictionary,
+                            &mut budget
+                        )
+                        .is_none()
+                    );
                 }
             }
         }
