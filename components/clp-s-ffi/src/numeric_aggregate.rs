@@ -1,6 +1,6 @@
 //! Whole-archive typed numeric partials. Summary misses scan inside Rust, never emit rows to C.
 use super::*;
-use clp_s::archive::{NodeType, SchemaEntry};
+use clp_s::archive::{NodeType, SchemaEntry, SchemaTableMetadata};
 use clp_s::numeric_summary::{FloatSummary, IntegerSummary, NumericSummaries, integer};
 
 #[derive(Default, Clone, Copy)]
@@ -88,12 +88,17 @@ impl<'a> SummaryContext<'a> {
         }))
     }
     fn field(&self, field: &str, typ: u32) -> Result<Option<ClpNumericSummary>, ApiError> {
+        let nodes = columnar::resolve_descriptor_path(self.catalog.schema_tree(), field);
+        self.field_tables(&nodes, typ, self.catalog.table_metadata().schema_tables())
+    }
+    fn field_tables<'b>(
+        &self, nodes: &[u32], typ: u32,
+        tables: impl IntoIterator<Item = &'b SchemaTableMetadata>,
+    ) -> Result<Option<ClpNumericSummary>, ApiError> {
         let catalog = self.catalog;
-        let parts: Vec<_> = field.split('.').collect();
-        let nodes = columnar::resolve_path(catalog.schema_tree(), &parts);
         let mut ints = IntegerSummary::default();
         let mut floats = FloatSummary::default();
-        for table in catalog.table_metadata().schema_tables() {
+        for table in tables {
             let schema = catalog
                 .schema_map()
                 .get(table.schema_id())

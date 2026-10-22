@@ -1,6 +1,9 @@
 //! Batched numeric summaries and fused filtered expression aggregation.
 use super::*;
 
+#[path = "numeric_window.rs"]
+mod window;
+
 #[repr(C)]
 pub struct Field {
     pub path: *const u8,
@@ -715,6 +718,7 @@ pub unsafe extern "C" fn clp_s_v6_numeric_aggregate(
             )?;
             check()?;
             let metadata = SummaryContext::from_catalog(&catalog)?;
+            let mut window_partials = None;
             if let Some(metadata) = &metadata {
                 if predicate >= 0
                     && !schema_may_match(metadata, &paths, fields, nodes, predicate as usize)
@@ -742,6 +746,23 @@ pub unsafe extern "C" fn clp_s_v6_numeric_aggregate(
                     if out.iter().all(|s| s.supported != 0) {
                         check()?;
                         return Ok(());
+                    }
+                }
+                if predicate >= 0 && force_scan == 0 {
+                    window_partials = window::partials(metadata, &paths, fields, nodes, outputs, sum_required, predicate)?;
+                    if let Some(partials) = &window_partials {
+                        let scan_tables = partials.scan_tables.iter().filter(|scan| **scan).count();
+                        if std::env::var_os("CLP_SCAN_PROFILE").is_some() {
+                            eprintln!("[clp aggregate] window_summary_tables={} window_rejected_tables={} window_scan_tables={scan_tables}",
+                                partials.covered_tables, partials.rejected_tables);
+                        }
+                        if scan_tables == 0 {
+                            for (i, root) in outputs.iter().enumerate() {
+                                out[i] = result(partials.ints[i].clone(), partials.floats[i].clone(), nodes[*root as usize].typ, true);
+                            }
+                            check()?;
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -785,10 +806,18 @@ pub unsafe extern "C" fn clp_s_v6_numeric_aggregate(
             let mut scanner =
                 columnar::ProjectedScanner::open_with_catalog(reader, catalog, parsed, &options, &paths)
                     .map_err(failure)?;
-            let mut ints = vec![IntegerSummary::default(); output_len];
-            let mut floats = vec![FloatSummary::default(); output_len];
+            let (mut ints, mut floats) = match window_partials {
+                Some(partials) => {
+                    scanner.restrict_tables(&partials.scan_tables).map_err(failure)?;
+                    (partials.ints, partials.floats)
+                }
+                None => (vec![IntegerSummary::default(); output_len], vec![FloatSummary::default(); output_len]),
+            };
             let mut values = vec![None; field_len];
             let mut cache = vec![None; node_len];
+            let window_scan = if force_scan == 0 {
+                window::ScanProgram::new(nodes, fields, outputs, predicate)
+            } else { None };
             let profile = std::env::var_os("CLP_SCAN_PROFILE").is_some();
             let mut evaluated_rows = 0u64;
             while let Some((columns, text, rows)) =
@@ -796,6 +825,11 @@ pub unsafe extern "C" fn clp_s_v6_numeric_aggregate(
             {
                 if profile {
                     evaluated_rows = evaluated_rows.saturating_add(rows as u64);
+                }
+                if let Some(window_scan) = &window_scan {
+                    window_scan.consume(&columns, text, rows, fields, sum_required,
+                        &mut ints, &mut floats, &check)?;
+                    continue;
                 }
                 for row in 0..rows {
                     if row % 8192 == 0 {

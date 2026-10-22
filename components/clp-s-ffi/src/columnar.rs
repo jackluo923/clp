@@ -283,6 +283,11 @@ fn split_descriptor(source: &str) -> Vec<String> {
     components
 }
 
+pub(crate) fn resolve_descriptor_path(tree: &SchemaTree, descriptor: &str) -> Vec<u32> {
+    let parts = split_descriptor(descriptor);
+    resolve_path(tree, &parts.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
 /// A pull-based projected scan over one archive.
 pub struct ProjectedScanner {
     reader: Box<dyn ArchiveReader>,
@@ -572,6 +577,20 @@ fn filter_nodes(parsed: &ParsedQuery, tree: &SchemaTree) -> Option<Vec<u32>> {
 }
 
 impl ProjectedScanner {
+    /// Restrict a newly opened scanner to physical tables not already answered by summaries.
+    /// Call before consuming any rows; false entries are skipped by every scan surface.
+    pub(crate) fn restrict_tables(&mut self, allowed: &[bool]) -> Result<(), ScanError> {
+        if allowed.len() != self.matchable_tables.len() || self.stream_index != 0
+            || self.stream.is_some() || self.table_cursor != 0 {
+            return Err(ScanError::Projection("invalid initial table selection".into()));
+        }
+        for (i, allowed) in allowed.iter().enumerate() {
+            self.matchable_tables[i] &= *allowed;
+            self.all_match_tables[i] &= *allowed;
+        }
+        Ok(())
+    }
+
     pub fn open(
         reader: Box<dyn ArchiveReader>,
         parsed: ParsedQuery,
@@ -822,6 +841,7 @@ impl ProjectedScanner {
         for decoded in tables {
             let decoded = decoded.map_err(|e| ScanError::Archive(e.to_string()))?;
             self.table_cursor = decoded.table_index() + 1;
+            if !self.matchable_tables[decoded.table_index()] { continue; }
             if !compiled.may_match_schema(decoded.schema())
                 .map_err(|e| ScanError::Archive(e.to_string()))? {
                 continue;
@@ -1378,6 +1398,10 @@ impl ProjectedScanner {
             let decoded = decoded.map_err(|source| {
                 ScanError::Archive(format!("failed to decode table: {source}"))
             })?;
+            if !self.matchable_tables[decoded.table_index()] {
+                table_cursor = decoded.table_index() + 1;
+                continue;
+            }
             // A table whose schema the query cannot match is passed over without evaluating it.
             if !compiled
                 .may_match_schema(decoded.schema())
