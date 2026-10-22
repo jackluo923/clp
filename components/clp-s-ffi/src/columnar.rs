@@ -812,13 +812,21 @@ impl ProjectedScanner {
                     ColumnView { kind: kind::ABSENT, reserved: 0, data: std::ptr::null() }
                 } else if let Some(ColumnData::ClpString(values)) = data
                     && self.field_shapes[field] == FieldForm::Value {
+                    let node = decoded.table().column(slot.unwrap()).unwrap().node_id();
+                    let dictionary_len = self.catalog.log_type_dictionary().for_field(node).len();
+                    let mut templates: Vec<Option<clp_s::archive::ClpMessageTemplate>> = (0..dictionary_len).map(|_| None).collect();
                     let mut cursor = values.cursor();
                     for row in bitmap.matching_rows() {
                         let record = cursor.record(row).ok_or_else(|| ScanError::Projection("invalid CLP descriptor".into()))?;
                         let start = self.text.len();
-                        append_clp_message_bounded(record.logtype(), values.variable_dictionary(),
-                            &record.encoded_variables(), &mut self.text, CLP_SCRATCH_LIMIT)
-                            .map_err(|e| ScanError::Projection(e.to_string()))?;
+                        let plan = templates.get_mut(record.descriptor().logtype_id() as usize)
+                            .ok_or_else(|| ScanError::Projection("invalid CLP template ID".into()))?;
+                        if plan.is_none() {
+                            *plan = Some(clp_s::archive::ClpMessageTemplate::compile(record.logtype())
+                                .map_err(|e| ScanError::Projection(e.to_string()))?);
+                        }
+                        plan.as_ref().unwrap().append(values.variable_dictionary(), &record.encoded_variables(),
+                            &mut self.text, CLP_SCRATCH_LIMIT).map_err(|e| ScanError::Projection(e.to_string()))?;
                         buffer.cells.push(Cell { kind: kind::STRING, integer: 0, real: 0.0,
                             text_offset: start, text_length: self.text.len() - start });
                     }

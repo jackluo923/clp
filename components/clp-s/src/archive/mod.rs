@@ -81,6 +81,7 @@ pub use directory::FsDirectoryArchiveSource;
 pub use encoded_variable::EncodedVariableError;
 pub use encoded_variable::EncodedVariableSource;
 pub use encoded_variable::append_clp_message;
+pub use encoded_variable::ClpMessageTemplate;
 pub use encoded_variable::append_clp_message_bounded;
 pub use encoded_variable::append_logtype_template;
 pub use encoded_variable::append_parsed_logtype_template;

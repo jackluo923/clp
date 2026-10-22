@@ -204,9 +204,10 @@ impl ClpPattern {
         }
         if let Some(plan) = &self.dictionary_plans[id] {
             let offset = usize::try_from(descriptor.encoded_variable_offset()).ok()?;
-            let end = next_descriptor
-                .map(|d| d.encoded_variable_offset() as usize)
-                .unwrap_or(column.encoded_variables().len());
+            let end = match next_descriptor {
+                Some(d) => usize::try_from(d.encoded_variable_offset()).ok()?,
+                None => column.encoded_variables().len(),
+            };
             let at = offset.checked_add(plan.index)?;
             if at >= end {
                 return None;

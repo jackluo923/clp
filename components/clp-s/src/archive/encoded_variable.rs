@@ -219,6 +219,142 @@ fn count_mismatch<V: EncodedVariableSource + ?Sized>(
     error
 }
 
+/// Reusable rendering instructions for one dictionary template. Literal escapes and
+/// variable positions are parsed once; dictionary values and custom floats are
+/// validated once per record before the output is changed.
+#[derive(Debug)]
+pub struct ClpMessageTemplate {
+    literals: Vec<Vec<u8>>,
+    kinds: Vec<u8>,
+    literal_bytes: usize,
+}
+
+enum PreparedVariable<'a> {
+    Integer(i64),
+    Dictionary(&'a [u8]),
+    Float(DecodedEncodedFloat),
+}
+
+impl ClpMessageTemplate {
+    pub fn compile(logtype: LogTypeDictionaryEntry<'_>) -> Result<Self, EncodedVariableError> {
+        let bytes = logtype.escaped_value();
+        let mut literals = vec![Vec::new()];
+        let mut kinds = Vec::new();
+        let mut position = 0;
+        let mut literal_bytes = 0;
+        while position < bytes.len() {
+            let byte = bytes[position];
+            match byte {
+                ESCAPE_MARKER => {
+                    let escaped = *bytes.get(position + 1).ok_or(
+                        EncodedVariableError::InvalidLogTypeEscape {
+                            byte_offset: position,
+                        },
+                    )?;
+                    literals.last_mut().unwrap().push(escaped);
+                    literal_bytes += 1;
+                    position += 2;
+                }
+                INTEGER_PLACEHOLDER | DICTIONARY_PLACEHOLDER | FLOAT_PLACEHOLDER => {
+                    kinds.push(byte);
+                    literals.push(Vec::new());
+                    position += 1;
+                }
+                byte => {
+                    literals.last_mut().unwrap().push(byte);
+                    literal_bytes += 1;
+                    position += 1;
+                }
+            }
+        }
+        Ok(Self {
+            literals,
+            kinds,
+            literal_bytes,
+        })
+    }
+
+    /// Validates before allocating or appending. On error the destination and its
+    /// capacity are unchanged, just as for `append_clp_message_bounded`.
+    pub fn append<V: EncodedVariableSource + ?Sized>(
+        &self,
+        dictionary: &VariableDictionary,
+        variables: &V,
+        output: &mut Vec<u8>,
+        limit: usize,
+    ) -> Result<(), EncodedVariableError> {
+        if variables.len() != self.kinds.len() {
+            return Err(EncodedVariableError::VariableCountMismatch {
+                expected: self.kinds.len() as u64,
+                actual: variables.len(),
+            });
+        }
+        let mut prepared = smallvec::SmallVec::<[PreparedVariable<'_>; 16]>::new();
+        let mut length = self.literal_bytes;
+        for (index, &kind) in self.kinds.iter().enumerate() {
+            let value =
+                variables
+                    .get(index)
+                    .ok_or(EncodedVariableError::MissingEncodedVariable {
+                        encoded_variable_index: index,
+                    })?;
+            let (part, size) = match kind {
+                INTEGER_PLACEHOLDER => (PreparedVariable::Integer(value), i64_string_len(value)),
+                DICTIONARY_PLACEHOLDER => {
+                    let bytes = dictionary
+                        .entry(bit_cast_dictionary_id(value))
+                        .ok_or_else(|| missing_dictionary_entry(index, value))?
+                        .value();
+                    (PreparedVariable::Dictionary(bytes), bytes.len())
+                }
+                FLOAT_PLACEHOLDER => {
+                    let decoded = decode_encoded_float(value).map_err(|reason| {
+                        EncodedVariableError::InvalidEncodedFloat {
+                            encoded_variable_index: index,
+                            reason,
+                        }
+                    })?;
+                    (PreparedVariable::Float(decoded), decoded.output_len())
+                }
+                _ => unreachable!("compiled variable kind"),
+            };
+            length = length
+                .checked_add(size)
+                .ok_or(EncodedVariableError::OutputSizeOverflow)?;
+            prepared.push(part);
+        }
+        if length > limit {
+            return Err(EncodedVariableError::OutputLimitExceeded {
+                required: length,
+                limit,
+            });
+        }
+        output
+            .len()
+            .checked_add(length)
+            .ok_or(EncodedVariableError::OutputSizeOverflow)?;
+        // Amortized growth avoids asking the allocator to extend the batch on every row.
+        output
+            .try_reserve(length)
+            .map_err(|_| EncodedVariableError::AllocationFailed {
+                requested_additional: length,
+            })?;
+        output.extend_from_slice(&self.literals[0]);
+        let mut integer = itoa::Buffer::new();
+        for (part, literal) in prepared.into_iter().zip(&self.literals[1..]) {
+            match part {
+                PreparedVariable::Integer(value) => {
+                    output.extend_from_slice(integer.format(value).as_bytes())
+                }
+                PreparedVariable::Dictionary(bytes) => output.extend_from_slice(bytes),
+                PreparedVariable::Float(value) => value.append_to(output),
+            }
+            output.extend_from_slice(literal);
+        }
+        Ok(())
+    }
+}
+
 fn analyze_message<V: EncodedVariableSource + ?Sized>(
     logtype: LogTypeDictionaryEntry<'_>,
     variable_dictionary: &VariableDictionary,
@@ -304,7 +440,8 @@ fn walk_logtype<V, F>(
 ) -> Result<(), EncodedVariableError>
 where
     V: EncodedVariableSource + ?Sized,
-    F: FnMut(LogTypeToken<'_>) -> Result<(), EncodedVariableError>, {
+    F: FnMut(LogTypeToken<'_>) -> Result<(), EncodedVariableError>,
+{
     let bytes = logtype.escaped_value();
     let mut byte_offset = 0_usize;
     let mut variable_index = 0_usize;
@@ -648,6 +785,103 @@ mod tests {
             | (u64::from(digit_count - 1) << 4)
             | u64::from(decimal_position - 1);
         i64::from_le_bytes(bits.to_le_bytes())
+    }
+
+    #[test]
+    fn compiled_renderer_handles_more_than_inline_variable_capacity() {
+        let template = vec![INTEGER_PLACEHOLDER; 33];
+        let logtypes = logtype_dictionary(&[&template]);
+        let entry = logtypes.entry(0).unwrap();
+        let plan = ClpMessageTemplate::compile(entry).unwrap();
+        let values = [i64::MIN; 33];
+        let dictionary = variable_dictionary(&[]);
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        plan.append(&dictionary, values.as_slice(), &mut actual, 1024)
+            .unwrap();
+        append_clp_message_bounded(entry, &dictionary, values.as_slice(), &mut expected, 1024)
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn compiled_templates_match_interpreter_and_preserve_error_atomicity() {
+        let dictionary = variable_dictionary(&[b"", b"abc\n\xff", b"2ms", b"literal\\\x11"]);
+        let templates: &[&[u8]] = &[
+            b"",
+            b"literal",
+            b"\x11",
+            b"\x12",
+            b"\x13",
+            b"head \x11 / \x12 / \x13 tail\n",
+            b"\\\x11\\\\\x12\x11",
+            b"\x12\x12",
+        ];
+        let logtypes = logtype_dictionary(templates);
+        for entry in logtypes.entries() {
+            let plan = ClpMessageTemplate::compile(entry).unwrap();
+            for seed in 0..24 {
+                let integers = [i64::MIN, i64::MAX, 0, -1, 12, -123456789];
+                let variables: Vec<i64> = plan
+                    .kinds
+                    .iter()
+                    .map(|kind| match *kind {
+                        INTEGER_PLACEHOLDER => integers[seed % integers.len()],
+                        DICTIONARY_PLACEHOLDER => (seed % 4) as i64,
+                        _ => encoded_float(seed % 2 == 0, 12340, 5, 3),
+                    })
+                    .collect();
+                for limit in [0, 1, 10, 100, usize::MAX] {
+                    let mut reference = b"existing".to_vec();
+                    let mut actual = reference.clone();
+                    let capacity = actual.capacity();
+                    let expected = append_clp_message_bounded(
+                        entry,
+                        &dictionary,
+                        variables.as_slice(),
+                        &mut reference,
+                        limit,
+                    );
+                    let result = plan.append(&dictionary, variables.as_slice(), &mut actual, limit);
+                    assert_eq!(result, expected);
+                    assert_eq!(actual, reference);
+                    if result.is_err() {
+                        assert_eq!(actual.capacity(), capacity);
+                    }
+                }
+                let mut invalid = variables.clone();
+                invalid.push(0);
+                let mut output = b"unchanged".to_vec();
+                let capacity = output.capacity();
+                assert!(
+                    plan.append(&dictionary, invalid.as_slice(), &mut output, 1024)
+                        .is_err()
+                );
+                assert_eq!(output, b"unchanged");
+                assert_eq!(output.capacity(), capacity);
+                for (index, kind) in plan.kinds.iter().enumerate() {
+                    if *kind == INTEGER_PLACEHOLDER {
+                        continue;
+                    }
+                    let mut invalid = variables.clone();
+                    invalid[index] = -1;
+                    let mut reference = output.clone();
+                    let expected = append_clp_message_bounded(
+                        entry,
+                        &dictionary,
+                        invalid.as_slice(),
+                        &mut reference,
+                        1024,
+                    );
+                    assert_eq!(
+                        plan.append(&dictionary, invalid.as_slice(), &mut output, 1024),
+                        expected
+                    );
+                    assert_eq!(output, b"unchanged");
+                    assert_eq!(output.capacity(), capacity);
+                }
+            }
+        }
     }
 
     #[test]
