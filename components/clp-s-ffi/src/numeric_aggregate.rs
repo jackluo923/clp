@@ -48,17 +48,25 @@ fn combine(a: &mut IntegerSummary, b: &IntegerSummary, lo: i128, hi: i128) -> Op
     a.merge(b)?;
     Some(true)
 }
-struct SummaryContext {
-    catalog: clp_s::archive::ArchiveCatalog,
+/// Summary lookup and fallback scanning share the same opened source and catalog.
+/// Directory archive contents must remain immutable for the operation's lifetime.
+fn open_numeric_archive(
+    path: &str,
+) -> Result<(Box<dyn ArchiveReader>, clp_s::archive::ArchiveCatalog), ApiError> {
+    let mut reader = ClpSArchive::locate(PathBuf::from(path))?.open_reader()?;
+    let catalog = reader
+        .read_catalog(ArchiveCatalogLimits::default().with_skip_dictionaries(true))
+        .map_err(failure)?;
+    Ok((reader, catalog))
+}
+
+struct SummaryContext<'a> {
+    catalog: &'a clp_s::archive::ArchiveCatalog,
     summaries: NumericSummaries,
     index: std::collections::HashMap<(i32, u32), usize>,
 }
-impl SummaryContext {
-    fn open(archive: &ClpSArchive) -> Result<Option<Self>, ApiError> {
-        let catalog = archive
-            .open_reader()?
-            .read_catalog(ArchiveCatalogLimits::default().with_skip_dictionaries(true))
-            .map_err(failure)?;
+impl<'a> SummaryContext<'a> {
+    fn from_catalog(catalog: &'a clp_s::archive::ArchiveCatalog) -> Result<Option<Self>, ApiError> {
         let summaries = catalog
             .metadata()
             .numeric_summaries()
@@ -80,7 +88,7 @@ impl SummaryContext {
         }))
     }
     fn field(&self, field: &str, typ: u32) -> Result<Option<ClpNumericSummary>, ApiError> {
-        let catalog = &self.catalog;
+        let catalog = self.catalog;
         let parts: Vec<_> = field.split('.').collect();
         let nodes = columnar::resolve_path(catalog.schema_tree(), &parts);
         let mut ints = IntegerSummary::default();
@@ -154,11 +162,11 @@ impl SummaryContext {
     }
 }
 fn metadata_summary(
-    archive: &ClpSArchive,
+    catalog: &clp_s::archive::ArchiveCatalog,
     field: &str,
     typ: u32,
 ) -> Result<Option<ClpNumericSummary>, ApiError> {
-    match SummaryContext::open(archive)? {
+    match SummaryContext::from_catalog(catalog)? {
         Some(ctx) => ctx.field(field, typ),
         None => Ok(None),
     }
@@ -222,9 +230,10 @@ pub unsafe extern "C" fn clp_s_v5_numeric_summary(
                 }
             };
             check()?;
-            let archive = ClpSArchive::validate(PathBuf::from(path))?;
+            let (reader, catalog) = open_numeric_archive(path)?;
+            check()?;
             if force_scan == 0 {
-                if let Some(summary) = metadata_summary(&archive, field, typ)? {
+                if let Some(summary) = metadata_summary(&catalog, field, typ)? {
                     check()?;
                     out.write(summary);
                     return Ok(());
@@ -245,8 +254,9 @@ pub unsafe extern "C" fn clp_s_v5_numeric_summary(
                 },
             ));
             let parsed = parse_kql("*", KqlLimits::default()).map_err(failure)?;
-            let mut scanner = columnar::ProjectedScanner::open(
-                archive.open_reader()?,
+            let mut scanner = columnar::ProjectedScanner::open_with_catalog(
+                reader,
+                catalog,
                 parsed,
                 &options,
                 &[field.to_owned()],

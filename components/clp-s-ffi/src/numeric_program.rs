@@ -463,6 +463,155 @@ fn field_existence_kql(paths: &[String], nodes: &[Node], outputs: &[u32], predic
     })
 }
 
+// A prefilter must not hide errors from another predicate operand. The SQL
+// compiler already rejects throwing predicates; retain that guard for C callers.
+fn nonthrowing_predicate(root: usize, nodes: &[Node], fields: &[Field]) -> bool {
+    let n = nodes[root];
+    match n.op {
+        0 => n.typ == fields[n.left as usize].typ,
+        1 => {
+            n.right != 0
+                || n.typ == 3
+                || n.typ == 7
+                || range(n.typ).is_some_and(|(lo, hi)| (lo..=hi).contains(&integer(n.bits)))
+        }
+        2 => {
+            let child = nodes[n.left as usize];
+            let widening = match (range(child.typ), range(n.typ)) {
+                (Some((lo, hi)), Some((dest_lo, dest_hi))) => dest_lo <= lo && hi <= dest_hi,
+                _ => n.typ == child.typ || (n.typ == 3 && range(child.typ).is_some()),
+            };
+            widening && nonthrowing_predicate(n.left as usize, nodes, fields)
+        }
+        7..=12 => {
+            let a = nodes[n.left as usize].typ;
+            let b = nodes[n.right as usize].typ;
+            n.typ == 7
+                && (a == b || (range(a).is_some() && range(b).is_some()))
+                && nonthrowing_predicate(n.left as usize, nodes, fields)
+                && nonthrowing_predicate(n.right as usize, nodes, fields)
+        }
+        13 | 14 => {
+            n.typ == 7
+                && nodes[n.left as usize].typ == 7
+                && nodes[n.right as usize].typ == 7
+                && nonthrowing_predicate(n.left as usize, nodes, fields)
+                && nonthrowing_predicate(n.right as usize, nodes, fields)
+        }
+        15 | 16 => n.typ == 7 && nonthrowing_predicate(n.left as usize, nodes, fields),
+        _ => false,
+    }
+}
+
+fn integer_operand(mut root: usize, nodes: &[Node]) -> Option<Node> {
+    loop {
+        let n = nodes[root];
+        range(n.typ)?;
+        if n.op != 2 {
+            return Some(n);
+        }
+        root = n.left as usize;
+    }
+}
+
+// Integer timestamp formatting truncates epoch_ns / scale toward zero. Expand
+// the entire source-unit bucket, including sub-unit epochs and negative/zero
+// timestamps, just as the SQL bridge's SourceUnitTimestampKql does.
+fn source_time_kql(path: &str, op: u32, value: i64, scale: i64) -> String {
+    let (v, scale) = (i128::from(value), i128::from(scale));
+    let (min, max) = (i128::from(i64::MIN), i128::from(i64::MAX));
+    let first = |x: i128| x * scale - if x <= 0 { scale - 1 } else { 0 };
+    let last = |x: i128| x * scale + if x >= 0 { scale - 1 } else { 0 };
+    let (lo, hi) = match op {
+        7 => (first(v), last(v)),
+        9 => (min, last(v - 1)),
+        10 => (min, last(v)),
+        11 => (first(v + 1), max),
+        12 => (first(v), max),
+        _ => unreachable!("only equality and ordered comparisons are extracted"),
+    };
+    let descriptor = format!("\"{}\"", path.replace('\\', "\\\\").replace('"', "\\\""));
+    if lo > max || hi < min || lo > hi {
+        format!("{descriptor} > {max}")
+    } else {
+        let (lo, hi) = (lo.max(min), hi.min(max));
+        if lo == min && hi == max {
+            format!("{descriptor}: *")
+        } else if lo == min {
+            format!("{descriptor} <= {hi}")
+        } else if hi == max {
+            format!("{descriptor} >= {lo}")
+        } else {
+            format!("{descriptor} >= {lo} AND {descriptor} <= {hi}")
+        }
+    }
+}
+
+/// Safe necessary time conditions from the WHERE predicate. Per-aggregate FILTER,
+/// OR branches, arithmetic, floating conversions, and uncertified source units
+/// remain with the numeric evaluator. Its original predicate is always retained.
+fn timestamp_prefilters(
+    catalog: &clp_s::archive::ArchiveCatalog,
+    paths: &[String],
+    fields: &[Field],
+    nodes: &[Node],
+    predicate: i32,
+) -> Vec<String> {
+    if predicate < 0 || !nonthrowing_predicate(predicate as usize, nodes, fields) {
+        return Vec::new();
+    }
+    let scale = timestamp_integer_scale(catalog.metadata().timestamp_dictionary().patterns());
+    if scale <= 0 {
+        return Vec::new();
+    }
+    let types = columnar::archive_field_types(catalog.schema_tree());
+    let mut filters = Vec::new();
+    let mut pending = vec![predicate as usize];
+    while let Some(root) = pending.pop() {
+        let n = nodes[root];
+        if n.op == 13 {
+            pending.extend([n.left as usize, n.right as usize]);
+            continue;
+        }
+        if !matches!(n.op, 7 | 9..=12) {
+            continue;
+        }
+        let (Some(mut left), Some(mut right)) = (
+            integer_operand(n.left as usize, nodes),
+            integer_operand(n.right as usize, nodes),
+        ) else {
+            continue;
+        };
+        let mut op = n.op;
+        if left.op == 1 && right.op == 0 {
+            std::mem::swap(&mut left, &mut right);
+            op = match op {
+                9 => 11,
+                10 => 12,
+                11 => 9,
+                12 => 10,
+                other => other,
+            };
+        }
+        if left.op != 0 || right.op != 1 || right.right != 0 {
+            continue;
+        }
+        let Ok(value) = i64::try_from(integer(right.bits)) else {
+            continue;
+        };
+        let path = &paths[left.left as usize];
+        let mut timestamp = false;
+        let certified = types.iter().filter(|t| t.path == path.as_bytes()).all(|t| {
+            timestamp |= t.node_type == NodeType::Timestamp;
+            matches!(t.node_type, NodeType::Timestamp | NodeType::Null)
+        });
+        if certified && timestamp {
+            filters.push(source_time_kql(path, op, value, scale));
+        }
+    }
+    filters
+}
+
 /// All pointer ranges must be valid for this synchronous call. Output has output_len entries.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clp_s_v6_numeric_aggregate(
@@ -561,10 +710,11 @@ pub unsafe extern "C" fn clp_s_v6_numeric_aggregate(
                 }
             };
             check()?;
-            let archive = ClpSArchive::validate(PathBuf::from(
+            let (reader, catalog) = open_numeric_archive(
                 str::from_utf8(borrowed_bytes(path, path_len, "path")?).map_err(failure)?,
-            ))?;
-            let metadata = SummaryContext::open(&archive)?;
+            )?;
+            check()?;
+            let metadata = SummaryContext::from_catalog(&catalog)?;
             if let Some(metadata) = &metadata {
                 if predicate >= 0
                     && !schema_may_match(metadata, &paths, fields, nodes, predicate as usize)
@@ -612,22 +762,41 @@ pub unsafe extern "C" fn clp_s_v6_numeric_aggregate(
             ));
             // Rows that hold none of the fields an aggregate or the predicate needs cannot
             // contribute, so the scan matches only rows that can; see field_existence_kql.
-            let parsed = match field_existence_kql(&paths, nodes, outputs, predicate) {
-                Some(kql) => parse_kql(&kql, KqlLimits::default())
-                    .or_else(|_| parse_kql("*", KqlLimits::default())),
-                None => parse_kql("*", KqlLimits::default()),
-            }
-            .map_err(failure)?;
+            let mut prefilters: Vec<_> = field_existence_kql(&paths, nodes, outputs, predicate)
+                .into_iter()
+                .collect();
+            let time_filters = timestamp_prefilters(&catalog, &paths, fields, nodes, predicate);
+            let time_filter_count = time_filters.len();
+            prefilters.extend(time_filters);
+            let kql = if prefilters.is_empty() {
+                "*".to_owned()
+            } else {
+                prefilters.iter().map(|p| format!("({p})")).collect::<Vec<_>>().join(" AND ")
+            };
+            let parsed = match parse_kql(&kql, KqlLimits::default()) {
+                Ok(parsed) => {
+                    if std::env::var_os("CLP_SCAN_PROFILE").is_some() && time_filter_count > 0 {
+                        eprintln!("[clp aggregate] timestamp_prefilters={time_filter_count}");
+                    }
+                    parsed
+                }
+                Err(_) => parse_kql("*", KqlLimits::default()).map_err(failure)?,
+            };
             let mut scanner =
-                columnar::ProjectedScanner::open(archive.open_reader()?, parsed, &options, &paths)
+                columnar::ProjectedScanner::open_with_catalog(reader, catalog, parsed, &options, &paths)
                     .map_err(failure)?;
             let mut ints = vec![IntegerSummary::default(); output_len];
             let mut floats = vec![FloatSummary::default(); output_len];
             let mut values = vec![None; field_len];
             let mut cache = vec![None; node_len];
+            let profile = std::env::var_os("CLP_SCAN_PROFILE").is_some();
+            let mut evaluated_rows = 0u64;
             while let Some((columns, text, rows)) =
                 scanner.next_columns_with_constants(true).map_err(failure)?
             {
+                if profile {
+                    evaluated_rows = evaluated_rows.saturating_add(rows as u64);
+                }
                 for row in 0..rows {
                     if row % 8192 == 0 {
                         check()?;
@@ -669,6 +838,9 @@ pub unsafe extern "C" fn clp_s_v6_numeric_aggregate(
                     }
                 }
             }
+            if profile {
+                eprintln!("[clp aggregate] evaluated_rows={evaluated_rows}");
+            }
             for (i, root) in outputs.iter().enumerate() {
                 if out[i].supported == 0 {
                     out[i] = result(
@@ -684,6 +856,10 @@ pub unsafe extern "C" fn clp_s_v6_numeric_aggregate(
         })
     }
 }
+
+#[cfg(test)]
+#[path = "numeric_program_tests.rs"]
+mod pushdown_tests;
 
 #[cfg(test)]
 mod tests {
