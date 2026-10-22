@@ -566,11 +566,14 @@ clp_s_status clp_s_v3_scanner_next_columns(
         clp_s_error_buffer *error
 );
 
-/** v4 adds constant numeric columns. data contains ONE native-endian 8-byte
- * value repeated out_row_count times. The v3 function still emits dense values.
+/** v4 adds constant columns. Numeric data contains ONE native-endian 8-byte
+ * value repeated out_row_count times. Constant string data contains ONE
+ * clp_s_v2_cell whose text span is repeated out_row_count times.
+ * The v3 function still emits dense values.
  * All other layouts, lifetime and exclusive-consumption rules are the same. */
 #define CLP_S_V4_COLUMN_CONSTANT_INTEGER 7
 #define CLP_S_V4_COLUMN_CONSTANT_FLOAT 8
+#define CLP_S_V4_COLUMN_CONSTANT_STRING 10
 /* Unsigned scalar cell: integer payload contains the exact UInt64 bits. */
 #define CLP_S_V2_VALUE_UNSIGNED 9
 clp_s_status clp_s_v4_scanner_next_columns(

@@ -1008,6 +1008,7 @@ dependencies = [
  "rmp-serde",
  "ryu",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sha2 0.10.9",
  "smallvec",

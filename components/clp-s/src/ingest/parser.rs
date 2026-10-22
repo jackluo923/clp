@@ -523,11 +523,11 @@ impl Parser<'_, '_> {
 
     fn parse_string(&mut self) -> Result<(Span, Option<Span>), ParseFailure> {
         let raw_start = self.offset;
-        let (raw_end, contains_escape, contains_non_ascii) = self.find_string_end(raw_start)?;
+        let (raw_end, first_escape, contains_non_ascii) = self.find_string_end(raw_start)?;
         self.check_scalar_token(raw_start, raw_end)?;
-        let decoded = if contains_escape {
+        let decoded = if let Some(first_escape) = first_escape {
             let decoded_start = self.decoded.len();
-            self.decode_string(raw_start + 1, raw_end - 1)?;
+            self.decode_string(raw_start + 1, raw_end - 1, first_escape)?;
             Some(Span::new(decoded_start, self.decoded.len()))
         } else {
             if contains_non_ascii {
@@ -539,9 +539,9 @@ impl Parser<'_, '_> {
         Ok((Span::new(raw_start, raw_end), decoded))
     }
 
-    fn find_string_end(&self, start: usize) -> Result<(usize, bool, bool), ParseFailure> {
+    fn find_string_end(&self, start: usize) -> Result<(usize, Option<usize>, bool), ParseFailure> {
         let mut cursor = start.checked_add(1).ok_or(ParseFailure::SizeOverflow)?;
-        let mut contains_escape = false;
+        let mut first_escape = None;
         let mut contains_non_ascii = false;
         while self.source.get(cursor).is_some() {
             if cursor
@@ -565,10 +565,10 @@ impl Parser<'_, '_> {
             match byte {
                 b'"' => {
                     let end = cursor.checked_add(1).ok_or(ParseFailure::SizeOverflow)?;
-                    return Ok((end, contains_escape, contains_non_ascii));
+                    return Ok((end, first_escape, contains_non_ascii));
                 }
                 b'\\' => {
-                    contains_escape = true;
+                    first_escape.get_or_insert(cursor);
                     cursor = cursor.checked_add(2).ok_or(ParseFailure::SizeOverflow)?;
                 }
                 0x00..=0x1f => {
@@ -589,8 +589,11 @@ impl Parser<'_, '_> {
         ))
     }
 
-    fn decode_string(&mut self, start: usize, end: usize) -> Result<(), ParseFailure> {
-        let mut cursor = start;
+    fn decode_string(&mut self, start: usize, end: usize, first_escape: usize) -> Result<(), ParseFailure> {
+        // The word scanner already established that this prefix has no escapes.
+        // append_utf8_run still validates it before copying, including when an
+        // invalid UTF-8 sequence appears before the first escape.
+        let mut cursor = first_escape;
         let mut run_start = start;
         while cursor < end {
             if self.source[cursor] != b'\\' {
@@ -979,6 +982,28 @@ mod tests {
             };
             assert_eq!(JsonSyntaxErrorKind::InvalidUtf8, error.kind());
             assert_eq!(invalid_offset, error.byte_offset());
+        }
+    }
+
+    #[test]
+    fn remembered_first_escape_preserves_prefix_validation_and_later_escapes() {
+        for prefix_length in [0, 1, 7, 8, 9, 1024, 4097] {
+            let prefix = "a".repeat(prefix_length) + "é";
+            let source = format!("\"{prefix}\\ntext\\uD83D\\uDE00\\\\end\\t\"");
+            let mut decoded = String::new();
+            parse_document(source.as_bytes(), NdjsonLimits::DEFAULT, &mut decoded,
+                &mut Vec::new(), &mut Vec::new()).unwrap();
+            assert_eq!(decoded, format!("{prefix}\ntext😀\\end\t"));
+
+            let mut invalid = source.into_bytes();
+            invalid[prefix_length + 1] = 0xff;
+            let error = parse_document(&invalid, NdjsonLimits::DEFAULT, &mut String::new(),
+                &mut Vec::new(), &mut Vec::new()).unwrap_err();
+            let ParseFailure::Invalid(NdjsonInvalidRecordKind::Syntax(error)) = error else {
+                panic!("unexpected parse error: {error:?}");
+            };
+            assert_eq!(error.kind(), JsonSyntaxErrorKind::InvalidUtf8);
+            assert_eq!(error.byte_offset(), prefix_length + 1);
         }
     }
 

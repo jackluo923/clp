@@ -196,6 +196,8 @@ pub const CLP_S_V2_VALUE_UNSUPPORTED: u32 = columnar::kind::UNSUPPORTED;
 pub const CLP_S_V4_COLUMN_CONSTANT_INTEGER: u32 = columnar::kind::CONSTANT_INTEGER;
 /// v4 column layout: one repeated native-endian binary64 value.
 pub const CLP_S_V4_COLUMN_CONSTANT_FLOAT: u32 = columnar::kind::CONSTANT_FLOAT;
+/// A v4 column holding one string Cell for all rows; its offset addresses the batch text buffer.
+pub const CLP_S_V4_COLUMN_CONSTANT_STRING: u32 = columnar::kind::CONSTANT_STRING;
 
 
 /// Use the ABI's default KV-IR encoding (four-byte in ABI v1).

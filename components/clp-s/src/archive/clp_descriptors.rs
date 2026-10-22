@@ -50,6 +50,15 @@ impl<'a> Descriptors<'a> {
     pub(crate) fn is_empty(self) -> bool {
         self.len() == 0
     }
+    pub(crate) fn linear(self) -> Option<(u64, u64)> {
+        let (first, step) = match self {
+            Self::Numeric(n) => (n.constant()?, 0),
+            Self::Delta(d) if d.width == 0 => (d.first, d.minimum),
+            _ => return None,
+        };
+        first.checked_add(step.checked_mul(self.len().checked_sub(1)? as u64)?)?;
+        Some((first, step))
+    }
     pub(crate) fn get(self, row: usize) -> Option<u64> {
         match self {
             Self::Numeric(n) => n.get(row),

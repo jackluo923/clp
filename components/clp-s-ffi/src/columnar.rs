@@ -69,6 +69,7 @@ pub mod kind {
     pub const CONSTANT_INTEGER: u32 = 7;
     pub const CONSTANT_FLOAT: u32 = 8;
     pub const UNSIGNED: u32 = 9;
+    pub const CONSTANT_STRING: u32 = 10;
 }
 
 /// One projected value, with text held as a span into the batch's arena.
@@ -304,6 +305,8 @@ pub struct ProjectedScanner {
     dictionary_matches: DictionaryMatches,
     /// Metadata-only table decisions made once per archive, before stream I/O.
     matchable_tables: Vec<bool>,
+    /// Tables with an exact positive template proof; used only for empty projections.
+    all_match_tables: Vec<bool>,
     /// Log-event ranges the query's range-index selector accepts, when one governs every match.
     ///
     /// A row outside them cannot match, and rows are written in log order, so a column needs
@@ -432,9 +435,11 @@ fn load_dictionaries(
 fn nodes_of_matchable_tables(
     catalog: &ArchiveCatalog,
     compiled: &clp_s::search::CompiledQuery<'_, '_>,
-) -> Result<(Vec<bool>, Vec<bool>), ScanError> {
+    count_only: bool,
+) -> Result<(Vec<bool>, Vec<bool>, Vec<bool>), ScanError> {
     let mut held = vec![false; catalog.schema_tree().len()];
     let mut matchable = vec![false; catalog.table_metadata().schema_tables().len()];
+    let mut all_match = vec![false; matchable.len()];
     for (index, table) in catalog.table_metadata().schema_tables().iter().enumerate() {
         // A schema the map lacks is left to the table decoder to report; until then, any column
         // may be written.
@@ -454,6 +459,7 @@ fn nodes_of_matchable_tables(
             continue;
         }
         matchable[index] = true;
+        all_match[index] = count_only && compiled.schema_matches_all(schema);
         for entry in schema.entries() {
             if let SchemaEntry::Node(node) = *entry
                 && let Some(slot) = held.get_mut(node as usize)
@@ -462,7 +468,7 @@ fn nodes_of_matchable_tables(
             }
         }
     }
-    Ok((held, matchable))
+    Ok((held, matchable, all_match))
 }
 
 /// The dictionaries the columns behind `nodes` are read through. A string is a variable ID, a CLP
@@ -630,7 +636,7 @@ impl ProjectedScanner {
         // Compiling here answers which source files the selector accepts once, rather than once
         // per stream, and the answer outlives the compiled query it came from.
         let mut dictionary_matches = DictionaryMatches::new();
-        let (accepted_ranges, (held, matchable_tables)) = {
+        let (accepted_ranges, (held, matchable_tables, all_match_tables)) = {
             let compiled = parsed
                 .compile_for_archive_reusing(&catalog, options.search(), &mut dictionary_matches)
                 .map_err(|source| {
@@ -641,7 +647,7 @@ impl ProjectedScanner {
             })?;
             (
                 accepted_ranges,
-                nodes_of_matchable_tables(&catalog, &compiled)?,
+                nodes_of_matchable_tables(&catalog, &compiled, fields.is_empty())?,
             )
         };
         let shaped: Vec<u32> = field_nodes
@@ -691,6 +697,7 @@ impl ProjectedScanner {
             wanted_nodes,
             dictionary_matches,
             matchable_tables,
+            all_match_tables,
             accepted_ranges,
             stream_index: 0,
             stream_count,
@@ -724,6 +731,26 @@ impl ProjectedScanner {
             if self.stream.is_none() {
                 if self.stream_index >= self.stream_count {
                     return Ok(None);
+                }
+                // An empty projection needs only the match cardinality. Skip data
+                // streams only when every table is rejected or proven all-match.
+                if self.field_count == 0 {
+                    let (first, end) = self.stream_table_range(self.stream_index as u64);
+                    if (first..end).all(|i| !self.matchable_tables[i] || self.all_match_tables[i]) {
+                        let mut rows = 0usize;
+                        for i in first..end {
+                            if self.all_match_tables[i] {
+                                let count = usize::try_from(self.catalog.table_metadata().schema_tables()[i].message_count())
+                                    .map_err(|_| ScanError::Archive("table count exceeds address space".into()))?;
+                                rows = rows.checked_add(count)
+                                    .ok_or_else(|| ScanError::Archive("table count overflow".into()))?;
+                            }
+                        }
+                        self.table_cursor = end;
+                        self.stream_index += 1;
+                        if rows != 0 { return Ok(Some((&self.column_views, &self.text, rows))); }
+                        continue;
+                    }
                 }
                 if !self.load_next_stream()? {
                     continue;
@@ -826,6 +853,51 @@ impl ProjectedScanner {
                     ColumnView { kind: kind::ABSENT, reserved: 0, data: std::ptr::null() }
                 } else if let Some(ColumnData::ClpString(values)) = data
                     && self.field_shapes[field] == FieldForm::Value {
+                    if let Some((template, variables)) = values.single_variable_records() {
+                        let template = clp_s::archive::ClpMessageTemplate::compile(template)
+                            .map_err(|e| ScanError::Projection(e.to_string()))?;
+                        // Bounded direct-mapped cache: identical encoded values
+                        // render once, even when the selected rows are sparse.
+                        let mut cache: [Option<(i64, Cell)>; 64] = [None; 64];
+                        let mut constant_cell: Option<Cell> = None;
+                        for (output_row, row) in bitmap.matching_rows().enumerate() {
+                            let value = variables.get(row).ok_or_else(|| ScanError::Projection("invalid CLP variable row".into()))?;
+                            let slot = ((value as u64).wrapping_mul(0x9e3779b97f4a7c15) >> 58) as usize;
+                            let cell = match cache[slot] {
+                                Some((key, cell)) if key == value => cell,
+                                _ => {
+                                    let start = self.text.len();
+                                    template.append(values.variable_dictionary(), &[value][..], &mut self.text, CLP_SCRATCH_LIMIT)
+                                        .map_err(|e| ScanError::Projection(e.to_string()))?;
+                                    let cell = Cell { kind: kind::STRING, integer: 0, real: 0.0,
+                                        text_offset: start, text_length: self.text.len() - start };
+                                    cache[slot] = Some((value, cell));
+                                    cell
+                                }
+                            };
+                            if constants && buffer.cells.is_empty() {
+                                if let Some(first) = constant_cell {
+                                    if first.text_offset == cell.text_offset && first.text_length == cell.text_length {
+                                        continue;
+                                    }
+                                    // Materialize the prefix only once a second
+                                    // value proves the batch is not constant.
+                                    buffer.cells.resize(output_row, first);
+                                } else {
+                                    constant_cell = Some(cell);
+                                    continue;
+                                }
+                            }
+                            buffer.cells.push(cell);
+                        }
+                        let constant = constants && buffer.cells.is_empty();
+                        if constant { buffer.cells.push(constant_cell.expect("nonempty matching table")); }
+                        self.column_views.push(ColumnView {
+                            kind: if constant { kind::CONSTANT_STRING } else { kind::UNSUPPORTED },
+                            reserved: 0, data: buffer.cells.as_ptr().cast(),
+                        });
+                        continue;
+                    }
                     let node = decoded.table().column(slot.unwrap()).unwrap().node_id();
                     let dictionary_len = self.catalog.log_type_dictionary().for_field(node).len();
                     let mut templates: Vec<Option<clp_s::archive::ClpMessageTemplate>> = (0..dictionary_len).map(|_| None).collect();
@@ -1683,6 +1755,88 @@ mod prefilter_reuse_tests {
             self.reads.borrow_mut().push((id, wanted.to_vec()));
             if self.whole_projection { self.inner.read_packed_stream(m, t, id, l) }
             else { self.inner.read_packed_stream_projected(m, t, id, wanted, truncate, l) }
+        }
+    }
+
+    #[test]
+    fn exact_template_counts_skip_streams_but_not_partial_or_negated_matches() {
+        use clp_s::writer::{FieldRef, OpenArchive, RecordRef, TemplateKeys, TimestampRef, ValueRef, WriterOptions};
+        use clp_s::search::{AuthoritativeTimestampRange, SearchOptions};
+        let mut writer = OpenArchive::new_with_template_keys(Cursor::new(Vec::new()),
+            WriterOptions::default().with_adaptive_numeric_columns(true).with_separate_columns_min_size(1),
+            TemplateKeys::parse_csv("message").unwrap());
+        for (index, message) in ["alpha value 1", "alpha value 2", "beta value 3"].iter().enumerate() {
+            let epoch = index as i64 * 1_000_000;
+            let lexeme = epoch.to_string();
+            writer.append_record(RecordRef::new(&[
+                FieldRef::new(b"message", ValueRef::String(message.as_bytes())),
+                FieldRef::new(b"ts", ValueRef::Timestamp(TimestampRef::new(epoch, &lexeme, r"\N", "ts"))),
+            ])).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner().into_inner();
+        // An out-of-band authoritative time bound is an additional row filter,
+        // even when the KQL text itself has only an all-matching prefix.
+        let mut reader = SingleFileArchiveReader::open(Cursor::new(bytes.clone())).unwrap();
+        let catalog = reader.read_catalog(ArchiveCatalogLimits::default()).unwrap();
+        let query = parse_kql("message:alpha*", KqlLimits::default()).unwrap();
+        for bounded in [false, true] {
+            let options = if bounded { SearchOptions::default().with_authoritative_timestamp_range(
+                AuthoritativeTimestampRange::new(Some(1), Some(1))) } else { SearchOptions::default() };
+            let compiled = query.compile_for_archive(&catalog, options).unwrap();
+            assert_eq!(catalog.schema_map().schemas().iter().any(|schema| compiled.schema_matches_all(schema)), !bounded);
+        }
+        for (query, expected, skip) in [("message:alpha*", 2, true),
+            ("message:absent*", 0, true), ("message:*1", 1, false),
+            ("NOT message:alpha*", 1, false),
+            ("message:alpha* OR message:beta*", 3, false),
+            ("message:alpha* AND message:*2", 1, false)] {
+            let reads = Rc::new(RefCell::new(Vec::new()));
+            let reader = RecordingReader { inner: SingleFileArchiveReader::open(Cursor::new(bytes.clone())).unwrap(),
+                reads: reads.clone(), whole_projection: false };
+            let mut scan = ProjectedScanner::open(Box::new(reader), parse_kql(query, KqlLimits::default()).unwrap(),
+                &Default::default(), &[]).unwrap();
+            let mut count = 0;
+            while let Some((columns, text, rows)) = scan.next_columns_with_constants(true).unwrap() {
+                assert!(columns.is_empty() && text.is_empty());
+                count += rows;
+            }
+            assert_eq!(count, expected, "{query}");
+            assert_eq!(reads.borrow().is_empty(), skip, "{query}");
+        }
+    }
+
+    #[test]
+    fn repeated_single_variable_strings_share_text_and_v4_can_be_constant() {
+        use clp_s::writer::{FieldRef, OpenArchive, RecordRef, TemplateKeys, ValueRef, WriterOptions};
+        let mut writer = OpenArchive::new_with_template_keys(Cursor::new(Vec::new()),
+            WriterOptions::default().with_adaptive_numeric_columns(true).with_separate_columns_min_size(1),
+            TemplateKeys::parse_csv("message").unwrap());
+        for n in 0..10003 {
+            let message = if n % 3 == 0 { "sendHeartbeat took 2ms\n" } else { "sendHeartbeat took 1ms\n" };
+            writer.append_record(RecordRef::new(&[FieldRef::new(b"message", ValueRef::String(message.as_bytes()))])).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner().into_inner();
+        for constants in [false, true] {
+            for (query, filtered) in [("*", false), ("message:\"*1ms\\n\"", true)] {
+                let reader = SingleFileArchiveReader::open(Cursor::new(bytes.clone())).unwrap();
+                let mut scan = ProjectedScanner::open(Box::new(reader), parse_kql(query, KqlLimits::default()).unwrap(),
+                    &Default::default(), &["message".to_owned()]).unwrap();
+                let mut total = 0;
+                while let Some((columns, text, rows)) = scan.next_columns_with_constants(constants).unwrap() {
+                    let constant = constants && filtered;
+                    assert_eq!(columns[0].kind, if constant { kind::CONSTANT_STRING } else { kind::UNSUPPORTED });
+                    assert!(text.len() <= 2 * "sendHeartbeat took 1ms\n".len(), "rendered duplicates");
+                    for row in 0..rows {
+                        // SAFETY: cells are borrowed until the next scanner call.
+                        let cell = unsafe { columns[0].data.cast::<Cell>().add(if constant { 0 } else { row }).read_unaligned() };
+                        let message = &text[cell.text_offset..cell.text_offset + cell.text_length];
+                        let expected = if !filtered && (total + row) % 3 == 0 { b"sendHeartbeat took 2ms\n" } else { b"sendHeartbeat took 1ms\n" };
+                        assert_eq!(message, expected);
+                    }
+                    total += rows;
+                }
+                assert_eq!(total, if filtered { 6668 } else { 10003 });
+            }
         }
     }
 

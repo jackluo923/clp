@@ -10,6 +10,9 @@ pub struct TemplateIndex {
 pub struct TemplateColumn {
     pub schema: i32,
     pub node: u32,
+    // MessagePack binary avoids a deserialize call for every template byte.
+    // serde_bytes also accepts the byte arrays emitted by earlier writers.
+    #[serde(with = "serde_bytes")]
     pub template: Vec<u8>,
 }
 impl TemplateIndex {
@@ -46,6 +49,20 @@ mod tests {
     use crate::search::{KqlLimits, SearchOptions, parse_kql};
     use crate::writer::{FieldRef, OpenArchive, RecordRef, ValueRef, WriterOptions};
     use std::io::Cursor;
+
+    #[test]
+    fn binary_templates_and_legacy_byte_arrays_decode_identically() {
+        let index = TemplateIndex { version: 1, columns: vec![TemplateColumn {
+            schema: 0, node: 1, template: b"a long literal boundary with \x12 and \xff".to_vec(),
+        }] };
+        let binary = rmp_serde::to_vec(&index).unwrap();
+        // Tuples have the same positional layout without the byte-string annotation.
+        let array = rmp_serde::to_vec(&(1u32, vec![(0i32, 1u32, &index.columns[0].template)])).unwrap();
+        assert_eq!(TemplateIndex::decode(&binary), Some(index.clone()));
+        assert_eq!(TemplateIndex::decode(&array), Some(index));
+        assert!(binary.len() < array.len());
+        assert!(TemplateIndex::decode(&binary[..binary.len() - 1]).is_none());
+    }
 
     fn archive(enabled: bool) -> Vec<u8> {
         let mut writer = OpenArchive::new_with_template_keys(
@@ -215,6 +232,58 @@ mod tests {
                 .map(|line| serde_json::from_str(line).unwrap())
                 .collect();
             assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn variable_dictionary_proofs_prune_before_reading_tables() {
+        let mut writer = OpenArchive::new_with_template_keys(
+            Cursor::new(Vec::new()),
+            WriterOptions::default(),
+            crate::writer::TemplateKeys::parse_csv("body").unwrap(),
+        );
+        for message in ["alpha took 1ms\n", "beta took 2ms\n"] {
+            writer
+                .append_record(RecordRef::new(&[FieldRef::new(
+                    b"body",
+                    ValueRef::String(message.as_bytes()),
+                )]))
+                .unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner().into_inner();
+        let mut reader = SingleFileArchiveReader::open(Cursor::new(bytes)).unwrap();
+        let catalog = reader
+            .read_catalog(ArchiveCatalogLimits::default())
+            .unwrap();
+        assert_eq!(
+            catalog.metadata().template_index().unwrap().columns.len(),
+            2
+        );
+        for (query, expected) in [
+            (r#"body:"*took 3ms\n""#, 0),
+            // The archive-wide dictionary cannot prove which table owns 1ms: keep both.
+            (r#"body:"*took 1ms\n""#, 2),
+            (r#"NOT body:"*took 3ms\n""#, 2),
+            (r#"body:"*took 3ms\n" OR body:alpha*"#, 1),
+            (r#"body:"*took 3ms\n" AND body:alpha*"#, 0),
+        ] {
+            let parsed = parse_kql(query, KqlLimits::default()).unwrap();
+            let mut cache = crate::search::DictionaryMatches::new();
+            for _ in 0..2 {
+                let compiled = parsed
+                    .compile_for_archive_reusing(&catalog, SearchOptions::default(), &mut cache)
+                    .unwrap();
+                assert_eq!(
+                    catalog
+                        .schema_map()
+                        .schemas()
+                        .iter()
+                        .filter(|schema| compiled.may_match_schema(schema).unwrap())
+                        .count(),
+                    expected,
+                    "{query}"
+                );
+            }
         }
     }
 

@@ -619,6 +619,7 @@ pub struct CompiledQuery<'query, 'archive> {
     lists: Vec<CompiledList>,
     authoritative_timestamp_range: Option<CompiledAuthoritativeTimestampRange>,
     archive_may_match: bool,
+    pattern_cache: super::clp_pattern::SharedPatternCache,
     /// Inclusive epoch-nanosecond windows every match must satisfy, one per timestamp column.
     timestamp_windows: Vec<(u32, i64, i64)>,
     /// The archive's timestamp chunk index, decoded only when a window can use it.
@@ -666,7 +667,7 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
         query: &'query ParsedQuery,
         catalog: &'archive ArchiveCatalog,
         options: SearchOptions,
-        matches: Option<&mut DictionaryMatches>,
+        mut matches: Option<&mut DictionaryMatches>,
     ) -> Result<Self, SearchError> {
         let limits = options.limits();
         check_limit(
@@ -678,6 +679,9 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
         validate_archive_tables(catalog, limits)?;
         let authoritative_timestamp_range =
             compile_authoritative_timestamp_range(catalog, options)?;
+        let pattern_cache = matches.as_deref_mut().map(|matches|
+            matches.pattern_cache.get_or_insert_with(Default::default).clone())
+            .unwrap_or_default();
         let mut builder = Compiler::new(query, catalog, options, schema_index, matches)?;
         builder.compile_nodes()?;
         let mut compiled = Self {
@@ -689,6 +693,7 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
             lists: builder.lists,
             authoritative_timestamp_range,
             archive_may_match: true,
+            pattern_cache,
             timestamp_windows: Vec::new(),
             timestamp_chunks: None,
         };
@@ -1377,7 +1382,8 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
                             .and_then(|index| index.template(schema.id(), node_id)) {
                             let plan = variable_pattern(predicate).or_else(|| clp_pattern(predicate))
                                 .and_then(|pattern| super::clp_pattern::ClpPattern::new(pattern, self.options.ignore_case(), 0));
-                            if plan.is_some_and(|plan| !plan.template_may_match(template)) { return false; }
+                            if plan.is_some_and(|plan| !plan.with_cache(&self.pattern_cache)
+                                .template_may_match_with_variables(template, self.catalog.variable_dictionary())) { return false; }
                         }
                     }
                     if is_exists(predicate) || negated && matches!(predicate.value(), Literal::Null)
@@ -1443,6 +1449,32 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
         schema: &crate::archive::SchemaDefinition,
     ) -> Result<bool, SearchError> {
         Ok(Tri::False != self.evaluate_schema_program(schema)? && self.may_match_archive())
+    }
+
+    /// A positive, single string predicate whose literal template proves every row matches.
+    /// Unknown patterns, arrays, negations and compound/member predicates keep row evaluation.
+    pub fn schema_matches_all(&self, schema: &crate::archive::SchemaDefinition) -> bool {
+        if !self.options.authoritative_timestamp_range().is_unbounded() {
+            return false;
+        }
+        let [CompiledNode::Predicate(index)] = self.nodes.as_slice() else { return false; };
+        let Some(compiled) = self.predicates.get(*index) else { return false; };
+        if compiled.negated { return false; }
+        let ResolvedPath::Schema(resolved) = &compiled.resolved else { return false; };
+        if !resolved.arrays.is_empty() { return false; }
+        let Ok(predicate) = self.predicate_ref(compiled) else { return false; };
+        if predicate.operator() != ComparisonOperator::Equal { return false; }
+        let Some(plan) = variable_pattern(predicate).or_else(|| clp_pattern(predicate))
+            .and_then(|p| super::clp_pattern::ClpPattern::new(p, self.options.ignore_case(), 0))
+        else { return false; };
+        resolved.nodes.iter().copied().any(|node| {
+            schema_contains_node(schema, node)
+                && self.catalog.schema_tree().get(node as usize)
+                    .is_some_and(|n| n.node_type() == NodeType::ClpString)
+                && self.catalog.metadata().template_index()
+                    .and_then(|index| index.template(schema.id(), node))
+                    .is_some_and(|template| plan.template_matches_all(template))
+        })
     }
 
     /// Returns whether the compiled root might match at least one physical archive row.
@@ -1531,7 +1563,8 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
                     .and_then(|pattern| super::clp_pattern::ClpPattern::new(
                         pattern, self.options.ignore_case(), 0,
                     ));
-                if anchored.is_some_and(|plan| !plan.dictionary_may_match(dictionary)) {
+                if anchored.is_some_and(|plan| !plan.with_cache(&self.pattern_cache)
+                    .dictionary_may_match(dictionary, self.catalog.variable_dictionary())) {
                     return false;
                 }
             }
@@ -2470,6 +2503,7 @@ enum DictionaryMatchKind {
 #[derive(Debug, Default)]
 pub struct DictionaryMatches {
     entries: Vec<(usize, usize, DictionaryMatchKind, DictionaryIds)>,
+    pattern_cache: Option<super::clp_pattern::SharedPatternCache>,
 }
 
 impl DictionaryMatches {
@@ -2478,6 +2512,7 @@ impl DictionaryMatches {
     pub const fn new() -> Self {
         Self {
             entries: Vec::new(),
+            pattern_cache: None,
         }
     }
 
@@ -3633,7 +3668,9 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
         let mut anchored = variable_pattern(predicate).or_else(|| clp_pattern(predicate))
             .and_then(|pattern| super::clp_pattern::ClpPattern::new(
                 pattern, self.compiled.options.ignore_case(), dictionary.len(),
-            ));
+            )).map(|plan| plan.with_cache(&self.compiled.pattern_cache));
+        if anchored.as_mut().is_some_and(|plan| plan.match_single_variable_column(
+            column, dictionary, row_offset, bitmap, Tri::True as u8)) { return Ok(()); }
         let mut descriptors = column.descriptors().skip(row_offset).peekable();
         for (offset, destination) in bitmap.iter_mut().enumerate() {
             let descriptor = descriptors.next().ok_or(SearchError::SizeOverflow)?;

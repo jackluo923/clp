@@ -5,7 +5,27 @@
 //! patterns and custom floats fall back to the general reconstructed-message evaluator.
 
 use super::wildcard::exact_pattern;
-use crate::archive::{ClpStringColumn, LogTypeDictionary};
+use crate::archive::{ClpStringColumn, LogTypeDictionary, VariableDictionary};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+const PLAN_BUDGET: usize = 8 << 20;
+
+/// Shared only by compilations of the same query against the same archive. The dictionary
+/// length is part of the key because projection may load dictionaries after the first compile.
+#[derive(Debug, Default)]
+pub(super) struct PatternCache {
+    entries: HashMap<(String, bool, usize), HashMap<Vec<u8>, Arc<PreparedTemplate>>>,
+    bytes: usize,
+}
+
+pub(super) type SharedPatternCache = Arc<Mutex<PatternCache>>;
+
+#[derive(Debug)]
+struct PreparedTemplate {
+    template: Template,
+    dictionary: Option<DictionaryPlan>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Anchor {
@@ -30,15 +50,21 @@ pub(super) struct ClpPattern {
     anchor: Anchor,
     literal: Vec<u8>,
     ignore_case: bool,
-    templates: Vec<Option<Template>>,
-    dictionary_plans: Vec<Option<DictionaryPlan>>,
+    templates: Vec<Option<Arc<PreparedTemplate>>>,
+    cache: Option<SharedPatternCache>,
+    cache_key: (String, bool, usize),
     dictionary_plan_bytes: usize,
 }
 
+#[derive(Debug)]
 struct DictionaryPlan {
     index: usize,
     len: usize,
     matches: Vec<u64>,
+    any_match: bool,
+    /// False means the mask only rejects impossible boundary values; survivors
+    /// still need the remaining variables checked.
+    complete: bool,
 }
 
 impl DictionaryPlan {
@@ -60,9 +86,7 @@ impl DictionaryPlan {
         let (index, 0x12) = variables.next()? else {
             return None;
         };
-        if variables.next().is_some() {
-            return None;
-        }
+        let complete = variables.next().is_none();
         let words = dictionary.len().div_ceil(64);
         let bytes = words.checked_mul(8)?;
         // Bound optional per-template acceleration independently of archive dictionary limits.
@@ -72,6 +96,7 @@ impl DictionaryPlan {
         let mut matches = Vec::new();
         matches.try_reserve_exact(words).ok()?;
         matches.resize(words, 0);
+        let mut any_match = false;
         for entry in dictionary.entries() {
             if single_variable_matches(
                 parts,
@@ -81,6 +106,7 @@ impl DictionaryPlan {
                 anchor,
                 ignore_case,
             ) {
+                any_match = true;
                 let id = entry.id() as usize;
                 matches[id / 64] |= 1 << (id % 64);
             }
@@ -90,6 +116,8 @@ impl DictionaryPlan {
             index,
             len: dictionary.len(),
             matches,
+            any_match,
+            complete,
         })
     }
 
@@ -107,10 +135,12 @@ fn single_variable_matches(
     anchor: Anchor,
     ignore_case: bool,
 ) -> bool {
+    let mut seen_variable = false;
     for part in parts {
         let value = match part {
             Part::Text(bytes) => bytes.as_slice(),
-            Part::Variable { .. } => variable,
+            Part::Variable { .. } if seen_variable => return true,
+            Part::Variable { .. } => { seen_variable = true; variable },
         };
         if !consume(value, literal, &mut consumed, anchor, ignore_case) {
             return false;
@@ -153,32 +183,133 @@ impl ClpPattern {
             literal,
             ignore_case,
             templates,
-            dictionary_plans: (0..dictionary_size).map(|_| None).collect(),
+            cache: None,
+            cache_key: (pattern.to_owned(), ignore_case, 0),
             dictionary_plan_bytes: 0,
         })
     }
 
-    /// A rejection is a proof for every row using this dictionary. Variables are left unknown;
-    /// only literal template mismatches can reject an entry. Empty/unloaded dictionaries keep
-    /// the ordinary reader path, including its archive validation errors.
-    pub(super) fn dictionary_may_match(&self, dictionary: &LogTypeDictionary) -> bool {
+    pub(super) fn with_cache(mut self, cache: &SharedPatternCache) -> Self {
+        self.cache = Some(Arc::clone(cache));
+        self
+    }
+
+    fn prepare(
+        &mut self,
+        bytes: &[u8],
+        dictionary: &VariableDictionary,
+    ) -> Option<Arc<PreparedTemplate>> {
+        // Most logtypes are rejected by a short boundary comparison. Do not allocate cache keys
+        // or hold a lock for these, or for constant true templates.
+        if let Some(value) = boundary_match(bytes, &self.literal, self.anchor, self.ignore_case) {
+            return Some(Arc::new(PreparedTemplate {
+                template: Template::Constant(value),
+                dictionary: None,
+            }));
+        }
+        self.cache_key.2 = dictionary.len();
+        if let Some(hit) = self.cache.as_ref().and_then(|cache| {
+            cache.lock().ok().and_then(|cache| {
+                cache
+                    .entries
+                    .get(&self.cache_key)
+                    .and_then(|entries| entries.get(bytes))
+                    .cloned()
+            })
+        }) {
+            return Some(hit);
+        }
+        let template = compile_template(bytes, &self.literal, self.anchor, self.ignore_case)?;
+        // An empty dictionary can mean it has not been loaded yet. Never use it as a rejection.
+        let plan = if dictionary.is_empty() {
+            None
+        } else {
+            DictionaryPlan::build(
+                &template,
+                &self.literal,
+                self.anchor,
+                self.ignore_case,
+                dictionary,
+                &mut self.dictionary_plan_bytes,
+            )
+        };
+        let cost = bytes.len()
+            + self.cache_key.0.len()
+            + 256
+            + match &template {
+                Template::Check { parts, .. } => {
+                    parts.capacity() * size_of::<Part>()
+                        + parts
+                            .iter()
+                            .map(|p| match p {
+                                Part::Text(t) => t.capacity(),
+                                _ => 0,
+                            })
+                            .sum::<usize>()
+                }
+                _ => 0,
+            }
+            + plan.as_ref().map_or(0, |p| p.matches.len() * 8);
+        let prepared = Arc::new(PreparedTemplate {
+            template,
+            dictionary: plan,
+        });
+        if let Some(cache) = &self.cache {
+            if let Ok(mut cache) = cache.lock() {
+                if cost <= PLAN_BUDGET.saturating_sub(cache.bytes) {
+                    cache
+                        .entries
+                        .entry(self.cache_key.clone())
+                        .or_default()
+                        .insert(bytes.to_vec(), Arc::clone(&prepared));
+                    cache.bytes += cost;
+                }
+            }
+        }
+        Some(prepared)
+    }
+
+    /// False proves no row using this template can match. A boundary-variable
+    /// mask is a necessary condition even when other variables remain unknown.
+    pub(super) fn template_may_match_with_variables(
+        &mut self,
+        bytes: &[u8],
+        variables: &VariableDictionary,
+    ) -> bool {
+        if variables.is_empty() {
+            return self.template_may_match(bytes);
+        }
+        if let Some(value) = boundary_match(bytes, &self.literal, self.anchor, self.ignore_case) {
+            return value;
+        }
+        self.prepare(bytes, variables).is_none_or(|p| {
+            !matches!(p.template, Template::Constant(false))
+                && p.dictionary.as_ref().is_none_or(|d| d.any_match)
+        })
+    }
+
+    /// Empty/unloaded dictionaries retain the ordinary reader and its validation errors.
+    pub(super) fn dictionary_may_match(
+        &mut self,
+        dictionary: &LogTypeDictionary,
+        variables: &VariableDictionary,
+    ) -> bool {
         dictionary.is_empty()
             || dictionary.entries().any(|entry| {
-                !matches!(
-                    compile_template(
-                        entry.escaped_value(),
-                        &self.literal,
-                        self.anchor,
-                        self.ignore_case
-                    ),
-                    Some(Template::Constant(false))
-                )
+                self.template_may_match_with_variables(entry.escaped_value(), variables)
             })
     }
 
     /// False proves this escaped template cannot satisfy the anchored pattern, for any variables.
     pub(super) fn template_may_match(&self, template: &[u8]) -> bool {
-        !matches!(compile_template(template, &self.literal, self.anchor, self.ignore_case), Some(Template::Constant(false)))
+        !matches!(
+            compile_template(template, &self.literal, self.anchor, self.ignore_case),
+            Some(Template::Constant(false))
+        )
+    }
+
+    pub(super) fn template_matches_all(&self, template: &[u8]) -> bool {
+        boundary_match(template, &self.literal, self.anchor, self.ignore_case) == Some(true)
     }
 
     /// None means the original evaluator must decide (unsupported variable representation).
@@ -190,24 +321,15 @@ impl ClpPattern {
         dictionary: &LogTypeDictionary,
     ) -> Option<bool> {
         let id = descriptor.logtype_id() as usize;
-        let slot = self.templates.get_mut(id)?;
-        if slot.is_none() {
-            *slot = Some(compile_template(
+        if self.templates.get(id)?.is_none() {
+            let plan = self.prepare(
                 dictionary.entry(id as u64)?.escaped_value(),
-                &self.literal,
-                self.anchor,
-                self.ignore_case,
-            )?);
-            self.dictionary_plans[id] = DictionaryPlan::build(
-                slot.as_ref()?,
-                &self.literal,
-                self.anchor,
-                self.ignore_case,
                 column.variable_dictionary(),
-                &mut self.dictionary_plan_bytes,
-            );
+            )?;
+            self.templates[id] = Some(plan);
         }
-        if let Some(plan) = &self.dictionary_plans[id] {
+        let prepared = self.templates[id].as_ref()?;
+        if let Some(plan) = &prepared.dictionary {
             let offset = usize::try_from(descriptor.encoded_variable_offset()).ok()?;
             let end = match next_descriptor {
                 Some(d) => usize::try_from(d.encoded_variable_offset()).ok()?,
@@ -218,9 +340,10 @@ impl ClpPattern {
                 return None;
             }
             let value = column.encoded_variables().get(at)?;
-            return plan.contains(value as u64);
+            let eligible = plan.contains(value as u64)?;
+            if !eligible || plan.complete { return Some(eligible); }
         }
-        match slot.as_ref()? {
+        match &prepared.template {
             Template::Constant(value) => Some(*value),
             Template::Check { parts, consumed } => {
                 let record = column.record_from_descriptors(descriptor, next_descriptor)?;
@@ -256,6 +379,106 @@ impl ClpPattern {
             }
         }
     }
+
+    /// Filter a constant-template, one-variable column directly over its packed
+    /// IDs. Dictionary/run codecs test distinct IDs/runs instead of each record.
+    pub(super) fn match_single_variable_column(
+        &mut self, column: ClpStringColumn<'_, '_>, dictionary: &LogTypeDictionary,
+        skip: usize, bitmap: &mut [u8], truth: u8,
+    ) -> bool {
+        let Some(id) = column.single_variable_logtype() else { return false; };
+        let Some(entry) = dictionary.entry(u64::from(id)) else { return false; };
+        let Some(prepared) = self.prepare(entry.escaped_value(), column.variable_dictionary()) else { return false; };
+        if let Template::Constant(value) = prepared.template {
+            if value { bitmap.fill(truth); }
+            return true;
+        }
+        let Some(plan) = &prepared.dictionary else { return false; };
+        if !plan.complete || plan.index != 0 { return false; }
+        let values = column.encoded_variables();
+        // Keep malformed-ID errors on the established evaluator path, even
+        // when unrelated unloaded dictionaries disabled full column validation.
+        if values.data.max_u64().is_none_or(|id| id >= plan.len as u64) { return false; }
+        values.or_encoded_matches(skip, bitmap, truth, |id| plan.contains(id as u64) == Some(true))
+    }
+}
+
+/// Decide from the anchored literal boundary without allocating a parsed template. Stop at
+/// the first real placeholder; escaped placeholders and backslashes remain literal bytes.
+fn boundary_match(bytes: &[u8], literal: &[u8], anchor: Anchor, ignore_case: bool) -> Option<bool> {
+    // Most hinted log templates have long, ordinary literal boundaries. Compare
+    // those as byte spans before walking escape runs and placeholders.
+    let length = bytes.len().min(literal.len());
+    let (boundary, expected, escaped_start) = if anchor == Anchor::Suffix {
+        let start = bytes.len() - length;
+        (&bytes[start..], &literal[literal.len() - length..],
+            start != 0 && bytes[start - 1] == b'\\')
+    } else {
+        (&bytes[..length], &literal[..length], false)
+    };
+    if !escaped_start && !boundary.iter().any(|b| matches!(b, b'\\' | 0x11 | 0x12 | 0x13)) {
+        let equal = if ignore_case { boundary.eq_ignore_ascii_case(expected) } else { boundary == expected };
+        if !equal || bytes.len() < literal.len() {
+            return Some(false);
+        }
+        if anchor != Anchor::Exact || bytes.len() == literal.len() {
+            return Some(true);
+        }
+    }
+    let mut start = 0;
+    let mut end = bytes.len();
+    let mut consumed = 0;
+    let mut pending_slashes = 0;
+    while start < end || pending_slashes != 0 {
+        if consumed == literal.len() && anchor != Anchor::Exact {
+            return Some(true);
+        }
+        let (byte, escaped) = if anchor == Anchor::Suffix {
+            if pending_slashes != 0 {
+                pending_slashes -= 1;
+                (b'\\', true)
+            } else {
+                end -= 1;
+                let byte = bytes[end];
+                let slashes = bytes[..end]
+                    .iter()
+                    .rev()
+                    .take_while(|&&b| b == b'\\')
+                    .count();
+                end -= slashes;
+                // Consume an entire escape run once; revisiting it for every decoded slash
+                // would make suffix checks quadratic on long backslash sequences.
+                pending_slashes = slashes / 2;
+                (byte, slashes % 2 != 0)
+            }
+        } else {
+            let byte = bytes[start];
+            start += 1;
+            if byte == b'\\' {
+                let byte = *bytes.get(start)?;
+                start += 1;
+                (byte, true)
+            } else {
+                (byte, false)
+            }
+        };
+        if !escaped && matches!(byte, 0x11 | 0x12 | 0x13) {
+            return None;
+        }
+        let expected = if anchor == Anchor::Suffix {
+            literal.get(literal.len().checked_sub(consumed + 1)?)
+        } else {
+            literal.get(consumed)
+        };
+        let Some(&expected) = expected else {
+            return Some(false);
+        };
+        if byte != expected && !(ignore_case && byte.eq_ignore_ascii_case(&expected)) {
+            return Some(false);
+        }
+        consumed += 1;
+    }
+    Some(consumed == literal.len())
 }
 
 fn compile_template(
@@ -264,6 +487,9 @@ fn compile_template(
     anchor: Anchor,
     ignore_case: bool,
 ) -> Option<Template> {
+    if let Some(matched) = boundary_match(bytes, literal, anchor, ignore_case) {
+        return Some(Template::Constant(matched));
+    }
     let mut parts = Vec::new();
     let mut text = Vec::new();
     let mut variables = 0;
@@ -538,6 +764,158 @@ mod tests {
                         )
                         .is_none()
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_dictionary_proofs_are_exact_and_bounded() {
+        use crate::archive::{ArchiveCatalogLimits, SingleFileArchiveReader};
+        use crate::writer::{FieldRef, OpenArchive, RecordRef, ValueRef, WriterOptions};
+        use std::io::Cursor;
+        let mut archive = OpenArchive::new(Cursor::new(Vec::new()), WriterOptions::default());
+        for message in [b"took 1ms\n".as_slice(), b"took 2ms\n"] {
+            archive
+                .append_record(RecordRef::new(&[FieldRef::new(
+                    b"msg",
+                    ValueRef::String(message),
+                )]))
+                .unwrap();
+        }
+        let bytes = archive.finish().unwrap().into_inner().into_inner();
+        let mut reader = SingleFileArchiveReader::open(Cursor::new(bytes)).unwrap();
+        let catalog = reader
+            .read_catalog(ArchiveCatalogLimits::default())
+            .unwrap();
+        let dictionary = catalog.variable_dictionary();
+        let cache = SharedPatternCache::default();
+        let template = b"took \x12\n";
+        let mut unloaded = ClpPattern::new("*3ms\n", false, 0)
+            .unwrap()
+            .with_cache(&cache);
+        assert!(unloaded.template_may_match_with_variables(template, &VariableDictionary::empty()));
+        assert!(!unloaded.template_may_match_with_variables(template, dictionary));
+        for (pattern, ignore_case, expected) in [
+            ("*3ms\n", false, false),
+            ("*2ms\n", false, true),
+            ("*2MS\n", false, false),
+            ("*2MS\n", true, true),
+        ] {
+            let mut first = ClpPattern::new(pattern, ignore_case, 0)
+                .unwrap()
+                .with_cache(&cache);
+            assert_eq!(
+                first.template_may_match_with_variables(template, dictionary),
+                expected
+            );
+            let cached_bytes = cache.lock().unwrap().bytes;
+            let mut second = ClpPattern::new(pattern, ignore_case, 0)
+                .unwrap()
+                .with_cache(&cache);
+            assert_eq!(
+                second.template_may_match_with_variables(template, dictionary),
+                expected
+            );
+            assert_eq!(cached_bytes, cache.lock().unwrap().bytes);
+            assert_eq!(
+                0, second.dictionary_plan_bytes,
+                "reuse rather than rescan dictionary"
+            );
+        }
+        // Floats remain conservative. Multiple variables can now be rejected
+        // when their boundary variable has no eligible dictionary value.
+        for (template, expected) in [(b"took \x13\n".as_slice(), true), (b"took \x12\x12\n", false)] {
+            assert_eq!(
+                ClpPattern::new("*3ms\n", false, 0)
+                    .unwrap()
+                    .with_cache(&cache)
+                    .template_may_match_with_variables(template, dictionary), expected
+            );
+        }
+        let mut locked = cache.lock().unwrap();
+        locked.entries.clear();
+        locked.bytes = PLAN_BUDGET;
+        drop(locked);
+        let mut plan = ClpPattern::new("*3ms\n", false, 0)
+            .unwrap()
+            .with_cache(&cache);
+        assert!(!plan.template_may_match_with_variables(template, dictionary));
+        assert!(cache.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn multi_variable_masks_are_necessary_not_sufficient() {
+        use crate::archive::{ArchiveCatalogLimits, SingleFileArchiveReader};
+        use crate::writer::{FieldRef, OpenArchive, RecordRef, ValueRef, WriterOptions};
+        use std::io::Cursor;
+        let mut archive = OpenArchive::new(Cursor::new(Vec::new()), WriterOptions::default());
+        for value in [b"ab".as_slice(), b"", b"bar", b"foo", b"1ms", b"2ms", b"\xc3\xa9"] {
+            archive.append_record(RecordRef::new(&[FieldRef::new(b"tag", ValueRef::String(value))])).unwrap();
+        }
+        let mut reader = SingleFileArchiveReader::open(Cursor::new(archive.finish().unwrap().into_inner().into_inner())).unwrap();
+        let catalog = reader.read_catalog(ArchiveCatalogLimits::default()).unwrap();
+        let dictionary = catalog.variable_dictionary();
+        for anchor in [Anchor::Prefix, Anchor::Suffix, Anchor::Exact] {
+            for needle in [b"ab|bar".as_slice(), b"foo|bar", b"bar", b"|", b"ms", b"\xc3\xa9"] {
+                let template = compile_template(b"\x12|\x12", needle, anchor, false).unwrap();
+                let plan = DictionaryPlan::build(&template, needle, anchor, false, dictionary, &mut 0).unwrap();
+                assert!(!plan.complete);
+                for left in dictionary.entries() {
+                    for right in dictionary.entries() {
+                        let mut message = left.value().to_vec(); message.push(b'|'); message.extend_from_slice(right.value());
+                        let matches = match anchor {
+                            Anchor::Prefix => message.starts_with(needle),
+                            Anchor::Suffix => message.ends_with(needle),
+                            Anchor::Exact => message == needle,
+                        };
+                        let boundary = if anchor == Anchor::Suffix { right.id() } else { left.id() };
+                        assert!(!matches || plan.contains(boundary) == Some(true), "false negative: {message:?}, {needle:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn boundary_proofs_preserve_escaped_bytes() {
+        let long = vec![b'\\'; 2048];
+        assert_eq!(
+            boundary_match(&long, &vec![b'\\'; 1024], Anchor::Suffix, false),
+            Some(true)
+        );
+        // Include runs of backslashes, literal placeholders, UTF-8, empty needles, and every
+        // byte boundary. A fast proof must agree with the independently decoded literal text.
+        for text in [
+            b"".as_slice(),
+            b"a\\\\b\\",
+            b"\x11\x12\x13",
+            "É😀".as_bytes(),
+        ] {
+            let encoded: Vec<u8> = text
+                .iter()
+                .flat_map(|&b| {
+                    if matches!(b, b'\\' | 0x11 | 0x12 | 0x13) {
+                        vec![b'\\', b]
+                    } else {
+                        vec![b]
+                    }
+                })
+                .collect();
+            for start in 0..=text.len() {
+                for end in start..=text.len() {
+                    let needle = &text[start..end];
+                    for (anchor, expected) in [
+                        (Anchor::Prefix, text.starts_with(needle)),
+                        (Anchor::Suffix, text.ends_with(needle)),
+                        (Anchor::Exact, text == needle),
+                    ] {
+                        assert_eq!(
+                            boundary_match(&encoded, needle, anchor, false),
+                            Some(expected),
+                            "{text:?} {needle:?} {anchor:?}"
+                        );
+                    }
                 }
             }
         }

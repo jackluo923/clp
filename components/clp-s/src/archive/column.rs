@@ -866,6 +866,18 @@ pub struct ClpStringColumn<'table, 'archive> {
 }
 
 impl<'table, 'archive> ClpStringColumn<'table, 'archive> {
+    pub(crate) fn single_variable_logtype(self) -> Option<u32> {
+        let (first, step) = self.descriptors.linear()?;
+        if first >> LOGTYPE_OFFSET_SHIFT != 0 || step != (1 << LOGTYPE_OFFSET_SHIFT)
+            || self.encoded_variables.len() != self.len() { return None; }
+        Some((first & LOGTYPE_ID_MASK) as u32)
+    }
+    /// A physically proven constant-template column with exactly one encoded
+    /// variable per row. The returned variable column has the same row domain.
+    pub fn single_variable_records(self) -> Option<(LogTypeDictionaryEntry<'archive>, I64Column<'table>)> {
+        let id = self.single_variable_logtype()?;
+        Some((self.logtype_dictionary.entry(u64::from(id))?, self.encoded_variables))
+    }
     /// Returns the number of records.
     #[must_use]
     pub fn len(self) -> usize {
