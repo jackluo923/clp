@@ -78,6 +78,24 @@ pub struct Cell {
     pub text_length: usize,
 }
 
+/// A v3 projected column. Numeric data is native-endian, potentially unaligned;
+/// consumers must copy bytes rather than dereference an aligned typed pointer.
+/// `kind` is INTEGER/FLOAT for compact 8-byte values, ABSENT for an all-null
+/// column, or UNSUPPORTED for a column of legacy Cells (including text).
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct ColumnView {
+    pub kind: u32,
+    pub reserved: u32,
+    pub data: *const u8,
+}
+
+#[derive(Default)]
+struct ColumnBuffer {
+    numeric: Vec<u64>,
+    cells: Vec<Cell>,
+}
+
 impl Cell {
     const fn absent() -> Self {
         Self {
@@ -290,6 +308,8 @@ pub struct ProjectedScanner {
     emit_cursor: usize,
     buffered_rows: usize,
     finished: bool,
+    column_buffers: Vec<ColumnBuffer>,
+    column_views: Vec<ColumnView>,
 }
 
 /// Which of the three dictionaries a scan reads through: variable, log-type, array. `log_type`
@@ -645,7 +665,106 @@ impl ProjectedScanner {
             emit_cursor: 0,
             buffered_rows: 0,
             finished: false,
+            column_buffers: (0..fields.len()).map(|_| ColumnBuffer::default()).collect(),
+            column_views: Vec::with_capacity(fields.len()),
         })
+    }
+
+    /// Returns one schema table's matching rows as compact columns.
+    ///
+    /// Views borrow the scanner until the next call or free. Unfiltered numeric
+    /// columns borrow the decoded stream directly; filtered columns gather only
+    /// matches. Other types keep the v2 projection semantics. Must not be mixed
+    /// with `next_row` or `next_batch` on the same scanner.
+    pub fn next_columns(&mut self) -> Result<Option<(&[ColumnView], &[u8], usize)>, ScanError> {
+        self.column_views.clear();
+        self.text.clear();
+        loop {
+            if self.stream.is_none() {
+                if self.stream_index >= self.stream_count {
+                    return Ok(None);
+                }
+                if !self.load_next_stream()? {
+                    continue;
+                }
+            }
+            if let Some(rows) = self.project_next_table_columns()? {
+                return Ok(Some((&self.column_views, &self.text, rows)));
+            }
+            self.stream = None;
+            self.stream_index += 1;
+        }
+    }
+
+    fn project_next_table_columns(&mut self) -> Result<Option<usize>, ScanError> {
+        let stream = self.stream.as_ref().expect("stream is loaded");
+        let compiled = self.parsed.compile_for_archive_reusing(
+            &self.catalog, self.options.search(), &mut self.dictionary_matches,
+        ).map_err(|e| ScanError::Archive(e.to_string()))?;
+        let mut tables = self.catalog.schema_tables(
+            self.stream_index as u64, stream, self.options.columns(),
+        ).map_err(|e| ScanError::Archive(e.to_string()))?;
+        if !tables.seek_to_table(self.table_cursor) {
+            return Ok(None);
+        }
+        for decoded in tables {
+            let decoded = decoded.map_err(|e| ScanError::Archive(e.to_string()))?;
+            self.table_cursor = decoded.table_index() + 1;
+            if !compiled.may_match_schema(decoded.schema())
+                .map_err(|e| ScanError::Archive(e.to_string()))? {
+                continue;
+            }
+            let bitmap = compiled.match_table(&decoded)
+                .map_err(|e| ScanError::Archive(e.to_string()))?;
+            let rows = bitmap.match_count();
+            if rows == 0 {
+                continue;
+            }
+            // Resolve fields without borrowing all of self: compiled borrows
+            // the reusable dictionary matches for this table.
+            let columns: Vec<Option<usize>> = self.field_nodes.iter().map(|nodes| {
+                decoded.table().columns().iter().position(|c| nodes.contains(&c.node_id()))
+            }).collect();
+            for (field, slot) in columns.iter().enumerate() {
+                let buffer = &mut self.column_buffers[field];
+                buffer.numeric.clear();
+                buffer.cells.clear();
+                let data = slot.and_then(|i| decoded.table().column(i)).map(|c| c.data());
+                let (kind, bytes) = match data {
+                    Some(ColumnData::Integer(values)) => (kind::INTEGER, Some(values.encoded_bytes())),
+                    Some(ColumnData::Float(values)) => (kind::FLOAT, Some(values.encoded_bytes())),
+                    _ => (kind::UNSUPPORTED, None),
+                };
+                let view = if let Some(bytes) = bytes {
+                    // A projected member may have a truncated column. Only
+                    // borrow when it covers the complete physical row domain.
+                    if cfg!(target_endian = "little")
+                        && rows == bitmap.len() && bytes.len() / 8 == bitmap.len() {
+                        ColumnView { kind, reserved: 0, data: bytes.as_ptr() }
+                    } else {
+                        for row in bitmap.matching_rows() {
+                            let start = row.checked_mul(8).ok_or_else(|| ScanError::Projection("row offset overflow".into()))?;
+                            let value = bytes.get(start..start + 8).ok_or_else(|| ScanError::Projection("selected row outside numeric column".into()))?;
+                            buffer.numeric.push(u64::from_le_bytes(value.try_into().expect("8 bytes")));
+                        }
+                        ColumnView { kind, reserved: 0, data: buffer.numeric.as_ptr().cast() }
+                    }
+                } else if data.is_none() {
+                    ColumnView { kind: kind::ABSENT, reserved: 0, data: std::ptr::null() }
+                } else {
+                    for row in bitmap.matching_rows() {
+                        project_row(
+                            &decoded, &[*slot], &self.field_shapes[field..field + 1],
+                            self.catalog.timestamp_patterns(), row, &mut buffer.cells, &mut self.text,
+                        )?;
+                    }
+                    ColumnView { kind: kind::UNSUPPORTED, reserved: 0, data: buffer.cells.as_ptr().cast() }
+                };
+                self.column_views.push(view);
+            }
+            return Ok(Some(rows));
+        }
+        Ok(None)
     }
 
     /// Returns every buffered row not yet emitted, refilling first if none remain.

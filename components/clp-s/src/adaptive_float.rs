@@ -242,6 +242,37 @@ pub fn decode(bytes: &[u8], row_count: usize) -> Result<Vec<u64>, AdaptiveDecode
     }
 }
 
+/// Appends bit-exact canonical bytes without an intermediate vector of float bits.
+/// The destination must be discarded on error.
+pub(crate) fn decode_to_le(
+    bytes: &[u8], row_count: usize, out: &mut Vec<u8>,
+) -> Result<(), AdaptiveDecodeError> {
+    let (&scheme, rest) = bytes.split_first().ok_or(AdaptiveDecodeError::Truncated)?;
+    let size = row_count.checked_mul(8).ok_or(AdaptiveDecodeError::Malformed)?;
+    match scheme {
+        PLAIN => out.extend_from_slice(rest.get(..size).ok_or(AdaptiveDecodeError::Truncated)?),
+        BYTE_STREAM_SPLIT => {
+            if rest.len() < size { return Err(AdaptiveDecodeError::Truncated); }
+            let start = out.len();
+            out.resize(start.checked_add(size).ok_or(AdaptiveDecodeError::Malformed)?, 0);
+            for plane in 0..8 {
+                for row in 0..row_count {
+                    out[start + row * 8 + plane] = rest[plane * row_count + row];
+                }
+            }
+        }
+        CONSTANT => {
+            let value = read_u64(rest, 0)?.to_le_bytes();
+            out.reserve(size);
+            for _ in 0..row_count { out.extend_from_slice(&value); }
+        }
+        DICT => crate::adaptive_int::decode_dictionary_to_le(rest, row_count, out)?,
+        RLE => crate::adaptive_int::decode_runs_to_le(rest, row_count, out)?,
+        other => return Err(AdaptiveDecodeError::UnknownScheme(other)),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,6 +282,16 @@ mod tests {
             let decoded = decode(&candidate, bits.len())
                 .unwrap_or_else(|e| panic!("decode failed ({e}) for scheme {}", candidate[0]));
             assert_eq!(decoded, bits, "scheme {} mismatch", candidate[0]);
+            let mut bytes = vec![0xab; 3];
+            decode_to_le(&candidate, bits.len(), &mut bytes).unwrap();
+            let expected: Vec<u8> = bits.iter().flat_map(|v| v.to_le_bytes()).collect();
+            assert_eq!(&bytes[..3], &[0xab; 3]);
+            assert_eq!(&bytes[3..], expected);
+            for end in (0..candidate.len()).filter(|&i| i < 32 || i + 1 == candidate.len() || i % 997 == 0) {
+                let old = decode(&candidate[..end], bits.len());
+                let new = decode_to_le(&candidate[..end], bits.len(), &mut Vec::new());
+                assert_eq!(old.map(|_| ()), new, "truncation {end}, scheme {}", candidate[0]);
+            }
         }
     }
 

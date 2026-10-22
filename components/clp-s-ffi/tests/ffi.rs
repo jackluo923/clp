@@ -2549,3 +2549,119 @@ const fn hex_nibble(value: u8) -> u8 {
         _ => panic!("non-hex byte"),
     }
 }
+
+// Copy every borrowed value before advancing the scanner. This compares the old row ABI
+// with the compact ABI across stream/table boundaries and sparse selections.
+type OwnedProjectedCell = (u32, i64, u64, Vec<u8>);
+fn projected_rows(path: &Path, query: &str, names: &[&str], columns: bool) -> Vec<Vec<OwnedProjectedCell>> {
+    let query = compile_query(query, 0);
+    let path = path.to_str().unwrap().as_bytes();
+    let fields: Vec<_> = names.iter().map(|name| ClpSV2ProjectedField {
+        path: name.as_ptr(), path_length: name.len(),
+    }).collect();
+    let mut scanner = ptr::null_mut();
+    let mut message = [0u8; 512];
+    let mut error = error_buffer(&mut message);
+    let mut result = Vec::new();
+    // SAFETY: All inputs and output storage live through each call; returned views are
+    // copied before the next call, and the scanner is freed exactly once.
+    unsafe {
+        assert_eq!(CLP_S_STATUS_OK, clp_s_v2_scanner_open(path.as_ptr(), path.len(), query.0,
+            fields.as_ptr(), fields.len(), &raw mut scanner, &raw mut error), "{}", error_text(&message));
+        loop {
+            if !columns {
+                let mut values: Vec<ClpSV2Value> = (0..names.len()).map(|_| std::mem::zeroed()).collect();
+                let mut has_row = 0;
+                assert_eq!(CLP_S_STATUS_OK, clp_s_v2_scanner_next_row(scanner, values.as_mut_ptr(),
+                    &raw mut has_row, &raw mut error), "{}", error_text(&message));
+                if has_row == 0 { break; }
+                result.push(values.iter().map(|v| (v.kind, v.integer, v.real.to_bits(),
+                    if v.text_length == 0 { Vec::new() } else { slice::from_raw_parts(v.text, v.text_length).to_vec() })).collect());
+            } else {
+                let mut views = ptr::null();
+                let mut text = ptr::null();
+                let mut text_len = 0;
+                let mut rows = 0;
+                assert_eq!(CLP_S_STATUS_OK, clp_s_v3_scanner_next_columns(scanner, &raw mut views,
+                    &raw mut text, &raw mut text_len, &raw mut rows, &raw mut error), "{}", error_text(&message));
+                if rows == 0 {
+                    assert!(views.is_null());
+                    assert!(text.is_null());
+                    assert_eq!(0, text_len);
+                    // EOF is stable and clears all outputs.
+                    assert_eq!(CLP_S_STATUS_OK, clp_s_v3_scanner_next_columns(scanner, &raw mut views,
+                        &raw mut text, &raw mut text_len, &raw mut rows, &raw mut error));
+                    assert_eq!(0, rows);
+                    break;
+                }
+                let views = slice::from_raw_parts(views, names.len());
+                for row in 0..rows {
+                    result.push(views.iter().map(|v| {
+                        assert_eq!(0, v.reserved);
+                        match v.kind {
+                            CLP_S_V2_VALUE_ABSENT => (v.kind, 0, 0, Vec::new()),
+                            CLP_S_V2_VALUE_INTEGER => (v.kind, v.data.add(row * 8).cast::<i64>().read_unaligned(), 0, Vec::new()),
+                            CLP_S_V2_VALUE_FLOAT => (v.kind, 0, v.data.add(row * 8).cast::<u64>().read_unaligned(), Vec::new()),
+                            CLP_S_V2_VALUE_UNSUPPORTED => {
+                                let c = v.data.cast::<ClpSV2Cell>().add(row).read_unaligned();
+                                assert!(c.text_offset + c.text_length <= text_len);
+                                (c.kind, c.integer, c.real.to_bits(), if c.text_length == 0 { Vec::new() }
+                                    else { slice::from_raw_parts(text.add(c.text_offset), c.text_length).to_vec() })
+                            }
+                            other => panic!("unexpected column layout {other}"),
+                        }
+                    }).collect());
+                }
+            }
+        }
+        clp_s_v2_scanner_free(scanner);
+    }
+    result
+}
+
+#[test]
+fn compact_columns_match_row_abi() {
+    let mut source = String::new();
+    for i in 0..5003 {
+        use std::fmt::Write;
+        // Several schemas: present, absent and mixed integer/float/string. Include
+        // strings and booleans to exercise the cell fallback beside numeric views.
+        let extra = match i % 4 { 0 => ",\"mixed\":42", 1 => ",\"mixed\":2.5", 2 => ",\"mixed\":\"hello\"", _ => "" };
+        writeln!(source, "{{\"i\":{i},\"f\":{}.25,\"flag\":{},\"text\":\"row {i}\"{extra}}}", i % 101, i % 2 == 0).unwrap();
+    }
+    let path = std::env::temp_dir().join(format!("clp-compact-columns-{}.clps", std::process::id()));
+    std::fs::write(&path, adaptive_archive(source.as_bytes(), false)).unwrap();
+    for query in ["*", "i >= 0", "i >= 2047 AND i < 4099", "flag: true", "i > 99999"] {
+        for fields in [&["i", "f", "flag", "text", "mixed", "absent"][..], &[][..]] {
+            let old = projected_rows(&path, query, fields, false);
+            let new = projected_rows(&path, query, fields, true);
+            assert_eq!(old, new, "query {query}, fields {fields:?}");
+            if query == "*" { assert_eq!(5003, new.len()); }
+        }
+    }
+    std::fs::remove_file(path).unwrap();
+    // Also retain compatibility with C++ 0.5 archives (shared frames, delta/timestamps).
+    for name in [MINIMAL_ARCHIVE, AGGREGATIONS_ARCHIVE, LOG_ORDER_ARCHIVE] {
+        let path = fixture(name);
+        let fields = ["timestamp", "level", "message", "value", "absent"];
+        assert_eq!(projected_rows(&path, "*", &fields, false), projected_rows(&path, "*", &fields, true));
+    }
+}
+
+#[test]
+fn compact_columns_reject_null_arguments() {
+    let mut views = ptr::dangling();
+    let mut text = ptr::dangling();
+    let mut text_len = 123;
+    let mut rows = 123;
+    // SAFETY: Null handles are explicitly rejected; output pointers name live storage.
+    unsafe {
+        assert_eq!(CLP_S_STATUS_INVALID_ARGUMENT, clp_s_v3_scanner_next_columns(ptr::null_mut(),
+            &raw mut views, &raw mut text, &raw mut text_len, &raw mut rows, ptr::null_mut()));
+        assert!(views.is_null());
+        assert!(text.is_null());
+        assert_eq!((0, 0), (text_len, rows));
+        assert_eq!(CLP_S_STATUS_INVALID_ARGUMENT, clp_s_v3_scanner_next_columns(ptr::null_mut(),
+            ptr::null_mut(), &raw mut text, &raw mut text_len, &raw mut rows, ptr::null_mut()));
+    }
+}

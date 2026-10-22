@@ -539,6 +539,33 @@ clp_s_status clp_s_v2_scanner_next_batch(
 void clp_s_v2_scanner_free(clp_s_v2_scanner *scanner);
 
 /**
+ * Compact projected column. kind INTEGER/FLOAT: row_count native-endian
+ * 8-byte values (possibly unaligned; use memcpy). ABSENT: no data.
+ * UNSUPPORTED: row_count clp_s_v2_cell entries, preserving each cell's kind.
+ * reserved is zero. Text cells index the batch text arena.
+ */
+typedef struct clp_s_v3_column {
+    uint32_t kind;
+    uint32_t reserved;
+    const uint8_t *data;
+} clp_s_v3_column;
+
+/**
+ * Borrows one schema table's matches, valid until the next scanner call/free.
+ * Exactly field_count columns; row_count zero denotes EOF, including when
+ * field_count is zero. Do not mix this with v2 next_row/next_batch.
+ * On error no returned view is usable.
+ */
+clp_s_status clp_s_v3_scanner_next_columns(
+        clp_s_v2_scanner *scanner,
+        clp_s_v3_column const **out_columns,
+        uint8_t const **out_text,
+        size_t *out_text_length,
+        size_t *out_row_count,
+        clp_s_error_buffer *error
+);
+
+/**
  * Opens a projected scan over the first stream in a local zstd-framed KV-IR file. `query` and every
  * field descriptor are borrowed only for this call. `fields` may be NULL only when `field_count`
  * is zero; `out_scanner` is initialized to NULL before validation. Missing, explicit-null, and

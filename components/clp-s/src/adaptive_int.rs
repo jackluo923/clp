@@ -102,39 +102,36 @@ pub(crate) fn packed_len(count: usize, width: u8) -> usize {
 
 /// Inverse of [`pack_bits`]: unpack `count` values of `width` bits from the front of `bytes`.
 pub(crate) fn unpack_bits(bytes: &[u8], width: u8, count: usize) -> Result<Vec<u64>, AdaptiveDecodeError> {
-    // A value cannot span more than 64 bits; a larger width byte is corruption, and passing it to
-    // the shifts below would overflow (panic in debug, mask silently in release).
+    Ok(unpack_bits_iter(bytes, width, count)?.collect())
+}
+
+/// Validates a packed column once and yields offsets without an intermediate vector.
+pub(crate) fn unpack_bits_iter(
+    bytes: &[u8], width: u8, count: usize,
+) -> Result<impl Iterator<Item = u64> + '_, AdaptiveDecodeError> {
     if width > 64 {
         return Err(AdaptiveDecodeError::Malformed);
     }
-    let mut out = Vec::with_capacity(count);
-    if width == 0 {
-        out.resize(count, 0);
-        return Ok(out);
-    }
-    if bytes.len() < packed_len(count, width) {
+    let bits = count.checked_mul(usize::from(width)).ok_or(AdaptiveDecodeError::Malformed)?;
+    if bytes.len() < bits.div_ceil(8) {
         return Err(AdaptiveDecodeError::Truncated);
     }
     let w = u32::from(width);
-    let mask: u128 = if width < 64 {
-        (1u128 << width) - 1
-    } else {
-        u128::from(u64::MAX)
-    };
-    let mut acc: u128 = 0;
-    let mut nbits: u32 = 0;
-    let mut iter = bytes.iter();
-    for _ in 0..count {
+    let mask = (1u128 << w) - 1;
+    let mut acc = 0u128;
+    let mut nbits = 0u32;
+    let mut input = bytes.iter();
+    Ok((0..count).map(move |_| {
         while nbits < w {
-            let byte = *iter.next().ok_or(AdaptiveDecodeError::Truncated)?;
-            acc |= u128::from(byte) << nbits;
+            // The complete packed length was validated above.
+            acc |= u128::from(*input.next().expect("validated packed length")) << nbits;
             nbits += 8;
         }
-        out.push((acc & mask) as u64);
+        let value = (acc & mask) as u64;
         acc >>= w;
         nbits -= w;
-    }
-    Ok(out)
+        value
+    }))
 }
 
 fn read_i64(bytes: &[u8], offset: usize) -> Result<i64, AdaptiveDecodeError> {
@@ -437,6 +434,83 @@ pub fn decode(bytes: &[u8], row_count: usize) -> Result<Vec<i64>, AdaptiveDecode
     }
 }
 
+/// Appends canonical little-endian values directly to the reader's destination.
+/// The destination must be discarded on error (it can contain a partial column).
+pub(crate) fn decode_to_le(
+    bytes: &[u8], row_count: usize, out: &mut Vec<u8>,
+) -> Result<(), AdaptiveDecodeError> {
+    let (&scheme, rest) = bytes.split_first().ok_or(AdaptiveDecodeError::Truncated)?;
+    let size = row_count.checked_mul(8).ok_or(AdaptiveDecodeError::Malformed)?;
+    match scheme {
+        PLAIN => out.extend_from_slice(rest.get(..size).ok_or(AdaptiveDecodeError::Truncated)?),
+        CONSTANT => {
+            let value = read_i64(rest, 0)?.to_le_bytes();
+            out.reserve(size);
+            for _ in 0..row_count { out.extend_from_slice(&value); }
+        }
+        FOR => {
+            let min = read_i64(rest, 0)? as u64;
+            let width = *rest.get(8).ok_or(AdaptiveDecodeError::Truncated)?;
+            let offsets = unpack_bits_iter(&rest[9..], width, row_count)?;
+            out.reserve(size);
+            for offset in offsets { out.extend_from_slice(&min.wrapping_add(offset).to_le_bytes()); }
+        }
+        DELTA => {
+            if row_count == 0 { return Ok(()); }
+            let mut running = read_i64(rest, 0)? as u64;
+            let min_delta = read_i64(rest, 8)? as u64;
+            let width = *rest.get(16).ok_or(AdaptiveDecodeError::Truncated)?;
+            let offsets = unpack_bits_iter(&rest[17..], width, row_count - 1)?;
+            out.reserve(size);
+            out.extend_from_slice(&running.to_le_bytes());
+            for offset in offsets {
+                running = running.wrapping_add(min_delta.wrapping_add(offset));
+                out.extend_from_slice(&running.to_le_bytes());
+            }
+        }
+        DICT => decode_dictionary_to_le(rest, row_count, out)?,
+        RLE => decode_runs_to_le(rest, row_count, out)?,
+        other => return Err(AdaptiveDecodeError::UnknownScheme(other)),
+    }
+    Ok(())
+}
+
+/// Dictionary entries are raw 64-bit patterns for both integer and float columns.
+pub(crate) fn decode_dictionary_to_le(
+    rest: &[u8], row_count: usize, out: &mut Vec<u8>,
+) -> Result<(), AdaptiveDecodeError> {
+    let table_len = read_u32(rest, 0)? as usize;
+    let dict_end = table_len.checked_mul(8).and_then(|n| n.checked_add(4))
+        .ok_or(AdaptiveDecodeError::Malformed)?;
+    let table = rest.get(4..dict_end).ok_or(AdaptiveDecodeError::Truncated)?;
+    let width = *rest.get(dict_end).ok_or(AdaptiveDecodeError::Truncated)?;
+    let indices = unpack_bits_iter(&rest[dict_end + 1..], width, row_count)?;
+    for index in indices {
+        let index = usize::try_from(index).ok().filter(|&i| i < table_len)
+            .ok_or(AdaptiveDecodeError::Truncated)?;
+        out.extend_from_slice(&table[index * 8..index * 8 + 8]);
+    }
+    Ok(())
+}
+
+pub(crate) fn decode_runs_to_le(
+    rest: &[u8], row_count: usize, out: &mut Vec<u8>,
+) -> Result<(), AdaptiveDecodeError> {
+    let runs = read_u32(rest, 0)? as usize;
+    let mut remaining = row_count;
+    let mut offset = 4;
+    for _ in 0..runs {
+        let value = read_i64(rest, offset)?.to_le_bytes();
+        let count = read_u32(rest, offset + 8)? as usize;
+        if count > remaining { return Err(AdaptiveDecodeError::Malformed); }
+        remaining -= count;
+        for _ in 0..count { out.extend_from_slice(&value); }
+        offset += 12;
+    }
+    if remaining != 0 { return Err(AdaptiveDecodeError::Malformed); }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,6 +520,16 @@ mod tests {
             let decoded = decode(&candidate, values.len())
                 .unwrap_or_else(|e| panic!("decode failed ({e}) for scheme {}", candidate[0]));
             assert_eq!(decoded, values, "scheme {} mismatch", candidate[0]);
+            let mut bytes = vec![0xab; 3]; // Appending at an unaligned offset is supported.
+            decode_to_le(&candidate, values.len(), &mut bytes).unwrap();
+            let expected: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            assert_eq!(&bytes[..3], &[0xab; 3]);
+            assert_eq!(&bytes[3..], expected);
+            for end in (0..candidate.len()).filter(|&i| i < 32 || i + 1 == candidate.len() || i % 997 == 0) {
+                let old = decode(&candidate[..end], values.len());
+                let new = decode_to_le(&candidate[..end], values.len(), &mut Vec::new());
+                assert_eq!(old.map(|_| ()), new, "truncation {end}, scheme {}", candidate[0]);
+            }
         }
     }
 

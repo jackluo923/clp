@@ -16,7 +16,7 @@ use super::dictionary::VariableDictionary;
 use super::metadata::ArchiveMetadata;
 use super::metadata::MetadataError;
 use super::metadata::MetadataLimits;
-use super::packed_stream::DecodedPackedStream;
+use super::packed_stream::{ColumnSlot, DecodedPackedStream};
 use super::range_index::RangeIndexError;
 use super::reader::SingleFileArchiveReader;
 use super::schema::NodeType;
@@ -392,62 +392,50 @@ impl ArchiveCatalog {
         // Walk the concatenated per-column bytes, decoding each loaded numeric (integer or float)
         // column back to raw 8-byte values and copying every other column verbatim.
         let bytes = stream.as_bytes();
-        let mut columns: Vec<Option<Vec<u8>>> = Vec::with_capacity(layout.len());
-        let mut sizes: Vec<usize> = Vec::with_capacity(layout.len());
-        let mut offset = 0_usize;
+        let numeric_size = message_count.checked_mul(8).ok_or(TableStreamError::SizeOverflow)?;
+        // Reserve canonical space once. CLP strings can vary in size and grow this buffer.
+        let capacity = layout.iter().enumerate().try_fold(0usize, |sum, (index, slot)| {
+            let numeric = matches!(node_types.get(index), Some(NodeType::Integer | NodeType::Float))
+                || strings && matches!(node_types.get(index), Some(NodeType::VarString | NodeType::DictionaryFloat));
+            let size = if !slot.loaded { 0 } else if numeric && slot.stored != 0 { numeric_size } else { slot.stored };
+            sum.checked_add(size).ok_or(TableStreamError::SizeOverflow)
+        })?;
+        let mut output = Vec::with_capacity(capacity);
+        let mut output_layout = Vec::with_capacity(layout.len());
+        let mut offset = 0usize;
         let mut changed = false;
         for (column_index, slot) in layout.iter().enumerate() {
             let stored = &bytes[offset..offset + slot.stored];
             offset += slot.stored;
             let node_type = node_types.get(column_index).copied();
-            let decode_err = |source| TableStreamError::AdaptiveNumeric {
-                schema_id,
-                column_index,
-                source,
-            };
+            let decode_err = |source| TableStreamError::AdaptiveNumeric { schema_id, column_index, source };
+            let start = output.len();
+            let mut size = slot.size;
             if !slot.loaded {
-                columns.push(None);
-                sizes.push(slot.size);
+                // A projected-out column occupies no bytes.
             } else if (node_type == Some(NodeType::Integer)
-                || strings
-                    && matches!(
-                        node_type,
-                        Some(NodeType::VarString | NodeType::DictionaryFloat)
-                    ))
+                || strings && matches!(node_type, Some(NodeType::VarString | NodeType::DictionaryFloat)))
                 && !stored.is_empty()
             {
-                let values = crate::adaptive_int::decode(stored, message_count).map_err(decode_err)?;
-                let mut raw = Vec::with_capacity(values.len() * 8);
-                for value in values {
-                    raw.extend_from_slice(&value.to_le_bytes());
-                }
-                sizes.push(raw.len());
-                columns.push(Some(raw));
+                crate::adaptive_int::decode_to_le(stored, message_count, &mut output).map_err(decode_err)?;
+                size = output.len() - start;
                 changed = true;
             } else if strings && node_type == Some(NodeType::ClpString) && !stored.is_empty() {
-                let raw = decode_adaptive_clp_string(stored, message_count, limits)
-                    .map_err(decode_err)?;
-                sizes.push(raw.len());
-                columns.push(Some(raw));
+                let raw = decode_adaptive_clp_string(stored, message_count, limits).map_err(decode_err)?;
+                output.extend_from_slice(&raw);
+                size = raw.len();
                 changed = true;
             } else if node_type == Some(NodeType::Float) && !stored.is_empty() {
-                let bits = crate::adaptive_float::decode(stored, message_count).map_err(decode_err)?;
-                let mut raw = Vec::with_capacity(bits.len() * 8);
-                for value in bits {
-                    raw.extend_from_slice(&value.to_le_bytes());
-                }
-                sizes.push(raw.len());
-                columns.push(Some(raw));
+                crate::adaptive_float::decode_to_le(stored, message_count, &mut output).map_err(decode_err)?;
+                size = output.len() - start;
                 changed = true;
             } else {
-                columns.push(Some(stored.to_vec()));
-                sizes.push(slot.size);
+                output.extend_from_slice(stored);
             }
+            output_layout.push(ColumnSlot { size, stored: output.len() - start, loaded: slot.loaded });
         }
-        if !changed {
-            return Ok(stream);
-        }
-        Ok(DecodedPackedStream::from_columns(columns, &sizes))
+        if !changed { return Ok(stream); }
+        Ok(DecodedPackedStream::from_column_buffer(output, output_layout))
     }
 }
 

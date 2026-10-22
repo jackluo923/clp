@@ -644,6 +644,12 @@ impl DecodedPackedStream {
         }
     }
 
+    /// Takes already assembled canonical columns without concatenating them again.
+    pub(crate) fn from_column_buffer(bytes: Vec<u8>, layout: Vec<ColumnSlot>) -> Self {
+        debug_assert_eq!(bytes.len(), layout.iter().map(|slot| slot.stored).sum::<usize>());
+        Self { bytes, column_layout: Some(layout) }
+    }
+
     /// A whole stream of tables laid out back to back, as a shared frame decodes to.
     #[must_use]
     pub(crate) const fn from_tables(bytes: Vec<u8>) -> Self {

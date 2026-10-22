@@ -47,6 +47,13 @@
 mod columnar;
 mod kv_ir_columnar;
 
+pub use columnar::ColumnView as ClpSV3Column;
+
+const _: () = {
+    assert!(std::mem::offset_of!(ClpSV3Column, data) == 8);
+    assert!(std::mem::size_of::<ClpSV3Column>() == 8 + std::mem::size_of::<*const u8>());
+};
+
 use std::ffi::c_void;
 use std::fs;
 use std::fs::File;
@@ -2416,6 +2423,54 @@ pub unsafe extern "C" fn clp_s_v2_scanner_next_batch(
             out_text.write(arena.as_ptr());
             out_text_length.write(arena.len());
             out_row_count.write(row_count);
+            Ok(())
+        })
+    }
+}
+
+/// Returns compact, column-major projected data from an existing v2 scanner.
+///
+/// INTEGER and FLOAT columns contain `out_row_count` native-endian 8-byte
+/// values, possibly unaligned. ABSENT columns contain no data. UNSUPPORTED is
+/// a layout tag here: data contains `out_row_count` v2 Cells, whose individual
+/// kinds retain the v2 semantics. Text offsets address `out_text`.
+/// All views expire on the next scanner call or free. Choose exactly one of
+/// the row, cell-batch, and column-batch interfaces for a scanner.
+///
+/// # Safety
+///
+/// The scanner must be live and exclusively borrowed; every out-pointer must
+/// name writable storage. Returned pointers are read-only borrowed views.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clp_s_v3_scanner_next_columns(
+    scanner: *mut ClpSV2Scanner,
+    out_columns: *mut *const ClpSV3Column,
+    out_text: *mut *const u8,
+    out_text_length: *mut usize,
+    out_row_count: *mut usize,
+    error: *mut ClpSErrorBuffer,
+) -> ClpSStatus {
+    // SAFETY: The caller provides live storage under this function's contract.
+    unsafe {
+        ffi_entry(error, || {
+            if out_columns.is_null() || out_text.is_null()
+                || out_text_length.is_null() || out_row_count.is_null() {
+                return Err(ApiError::InvalidArgument("column batch out-pointers must not be null".into()));
+            }
+            out_columns.write(ptr::null());
+            out_text.write(ptr::null());
+            out_text_length.write(0);
+            out_row_count.write(0);
+            let scanner = scanner.as_mut().ok_or_else(|| {
+                ApiError::InvalidArgument("scanner handle must not be null".into())
+            })?;
+            if let Some((columns, arena, rows)) = scanner.inner.next_columns()
+                .map_err(|e| ApiError::Archive(e.to_string()))? {
+                out_columns.write(columns.as_ptr());
+                out_text.write(arena.as_ptr());
+                out_text_length.write(arena.len());
+                out_row_count.write(rows);
+            }
             Ok(())
         })
     }
