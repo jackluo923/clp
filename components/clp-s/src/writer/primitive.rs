@@ -63,6 +63,8 @@ const OLDER_FIXED_DICTIONARY_HINT_LIMIT: usize = 2;
 const LINEAR_DUPLICATE_FIELD_LIMIT: usize = 16;
 const COMMON_OBJECT_NESTING_CAPACITY: usize = 4;
 const COMMON_RECORD_FIELD_CAPACITY: usize = 16;
+/// Retain at most 64 KiB per planning vector (192 KiB total), independently of record width.
+const MAX_RECORD_PLAN_SCRATCH_BYTES: usize = 64 * 1024;
 /// Bytes of the length that precedes each dictionary value on the wire.
 const DICTIONARY_ENTRY_LENGTH_SIZE: u64 = 8;
 /// The 128 MiB window zstd's own `--long` uses. Pledging the source size caps it at the dictionary.
@@ -636,20 +638,40 @@ impl Error for AppendError {
 struct RecordPlanScratch {
     entries: RecordEntries,
     values: PlannedRecordValues,
+    // Always empty: input references must never survive a record append.
+    borrowed_values: BorrowedRecordValues<'static>,
 }
 
 impl RecordPlanScratch {
     fn recycle(mut entries: RecordEntries, mut values: PlannedRecordValues) -> Self {
         entries.clear();
         values.clear();
-        if entries.capacity() > COMMON_RECORD_FIELD_CAPACITY {
-            entries = RecordEntries::new();
+        retain_bounded_capacity(&mut entries);
+        retain_bounded_capacity(&mut values);
+        Self {
+            entries,
+            values,
+            borrowed_values: Vec::new(),
         }
-        if values.capacity() > COMMON_RECORD_FIELD_CAPACITY {
-            values = PlannedRecordValues::new();
-        }
-        Self { entries, values }
     }
+}
+
+fn retain_bounded_capacity<T>(values: &mut Vec<T>) {
+    if values.capacity() > MAX_RECORD_PLAN_SCRATCH_BYTES / size_of::<T>().max(1) {
+        *values = Vec::new();
+    }
+}
+
+/// Drop all input references before changing the empty vector's element lifetime. Collecting
+/// this same-layout owning iterator reuses its allocation in the supported Rust toolchain;
+/// correctness does not depend on that optimization and requires no unsafe lifetime cast.
+fn recycle_borrowed_values(mut values: BorrowedRecordValues<'_>) -> BorrowedRecordValues<'static> {
+    values.clear();
+    retain_bounded_capacity(&mut values);
+    values
+        .into_iter()
+        .map(|_| unreachable!("cleared record values"))
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -879,6 +901,7 @@ impl PrimitiveArchive {
         self.timestamp_dictionary
             .commit(plan.timestamp_dictionary, reservations.timestamp_dictionary);
         self.record_plan_scratch = self.tables.commit(plan.table, reservations.table);
+        self.record_plan_scratch.borrowed_values = plan.borrowed_values_scratch;
         if let Some(record_layout_cache) = plan.record_layout_cache {
             self.record_layout_cache = Some(record_layout_cache);
         }
@@ -1874,6 +1897,7 @@ impl EncodedValue {
 
 #[derive(Debug)]
 struct RecordPlan {
+    borrowed_values_scratch: BorrowedRecordValues<'static>,
     nodes: Vec<SchemaNodeRecord>,
     node_path_cache: Option<Vec<u32>>,
     record_layout_cache: Option<RecordLayoutCache>,
@@ -2537,6 +2561,7 @@ impl<'archive, 'record, 'scratch> RecordPlanBuilder<'archive, 'record, 'scratch>
         let RecordPlanScratch {
             mut entries,
             values: encoded_values,
+            borrowed_values: mut values,
         } = record_plan_scratch;
         debug_assert_eq!(0, entries.len());
         debug_assert_eq!(0, encoded_values.len());
@@ -2545,7 +2570,7 @@ impl<'archive, 'record, 'scratch> RecordPlanBuilder<'archive, 'record, 'scratch>
             .map_err(|_| {
                 append_allocation(AppendResource::Columns, COMMON_RECORD_FIELD_CAPACITY)
             })?;
-        let mut values = BorrowedRecordValues::new();
+        debug_assert!(values.is_empty());
         values
             .try_reserve_exact(COMMON_RECORD_FIELD_CAPACITY)
             .map_err(|_| {
@@ -3121,6 +3146,7 @@ impl<'archive, 'record, 'scratch> RecordPlanBuilder<'archive, 'record, 'scratch>
             })
         };
         Ok(RecordPlan {
+            borrowed_values_scratch: recycle_borrowed_values(self.values),
             nodes: self.nodes,
             node_path_cache,
             record_layout_cache,
@@ -6296,7 +6322,7 @@ mod tests {
     }
 
     #[test]
-    fn record_plan_scratch_discards_capacity_beyond_the_common_record_bound() {
+    fn wide_record_plan_scratch_reuses_all_three_vectors() {
         let keys: Vec<String> = (0..=COMMON_RECORD_FIELD_CAPACITY)
             .map(|index| format!("field-{index}"))
             .collect();
@@ -6317,9 +6343,62 @@ mod tests {
                     .expect("append wider stable record");
             }
             assert!(archive.last_record_layout_cache_hit);
-            assert_eq!(0, archive.record_plan_scratch.entries.capacity());
-            assert_eq!(0, archive.record_plan_scratch.values.capacity());
+            let pointers = (
+                archive.record_plan_scratch.entries.as_ptr(),
+                archive.record_plan_scratch.values.as_ptr(),
+                archive.record_plan_scratch.borrowed_values.as_ptr(),
+            );
+            assert!(archive.record_plan_scratch.entries.capacity() >= fields.len());
+            assert!(archive.record_plan_scratch.values.capacity() >= fields.len());
+            assert!(archive.record_plan_scratch.borrowed_values.capacity() >= fields.len());
+            archive
+                .append(
+                    RecordRef::new(&fields),
+                    WriterLimits::DEFAULT,
+                    record_log_order,
+                )
+                .expect("reuse wide record scratch");
+            assert_eq!(
+                pointers,
+                (
+                    archive.record_plan_scratch.entries.as_ptr(),
+                    archive.record_plan_scratch.values.as_ptr(),
+                    archive.record_plan_scratch.borrowed_values.as_ptr(),
+                )
+            );
+            assert!(archive.record_plan_scratch.borrowed_values.is_empty());
         }
+    }
+
+    #[test]
+    fn record_plan_scratch_discards_oversized_buffers_and_input_references() {
+        let entries = Vec::with_capacity(MAX_RECORD_PLAN_SCRATCH_BYTES / size_of::<u32>() + 1);
+        let values =
+            Vec::with_capacity(MAX_RECORD_PLAN_SCRATCH_BYTES / size_of::<PlannedValue>() + 1);
+        let scratch = RecordPlanScratch::recycle(entries, values);
+        assert_eq!(0, scratch.entries.capacity());
+        assert_eq!(0, scratch.values.capacity());
+        let recycled = {
+            let input = vec![b'x'; 32];
+            let mut values = Vec::with_capacity(32);
+            let pointer = values.as_ptr();
+            values.push(BorrowedPlannedValue {
+                node_id: 0,
+                value: BorrowedScalarValue::String {
+                    value: &input,
+                    node_type: NodeType::VarString,
+                },
+            });
+            let recycled = recycle_borrowed_values(values);
+            assert_eq!(pointer, recycled.as_ptr());
+            recycled
+        };
+        assert!(recycled.is_empty());
+        assert_eq!(32, recycled.capacity());
+        let oversized = Vec::with_capacity(
+            MAX_RECORD_PLAN_SCRATCH_BYTES / size_of::<BorrowedPlannedValue<'_>>() + 1,
+        );
+        assert_eq!(0, recycle_borrowed_values(oversized).capacity());
     }
 
     #[test]
