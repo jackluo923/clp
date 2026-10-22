@@ -2706,3 +2706,35 @@ fn wildcard_projection_preserves_full_search_semantics() {
         std::fs::remove_file(path).unwrap();
     }
 }
+
+#[test]
+fn timestamp_source_scalars_and_search_surfaces_agree() {
+    let path = fixture("sfa-v0.5.0-timestamps-cpp.bin");
+    let epochs = [1422752523004000000_i64, 1700000000123000000,
+                  1422752524004000000, 1700000001123000000];
+    let raw = [r#""2015-02-01T01:02:03.004""#, "1700000000123",
+               r#""2015-02-01T01:02:04.004""#, "1700000001123"];
+    for (query, ids) in [
+        ("*", vec![1, 2, 3, 4]),
+        ("ts >= 1700000000123000000 AND ts <= 1700000001123000000", vec![2, 4]),
+        ("NOT (ts >= 1700000000123000000 AND ts <= 1700000001123000000)", vec![1, 3]),
+        ("ts:1700000000123000000", vec![2]),
+        ("ts < 1422752523004000001", vec![1]),
+        ("ts > 1700000001123000000", vec![]),
+    ] {
+        let mut docs = CallbackState::default();
+        let (status, count, error) = search(&open_archive(&path), &compile_query(query, 0), &mut docs);
+        assert_eq!(CLP_S_STATUS_OK, status, "{query}: {error}");
+        assert_eq!(ids.len() as u64, count, "{query}");
+        for version in [2, 3, 4] {
+            let rows = projected_rows_version(&path, query, &["ts", "kind"], version);
+            assert_eq!(ids, rows.iter().map(|r| r[1].1).collect::<Vec<_>>(), "{query}");
+            for row in rows {
+                let i = row[1].1 as usize - 1;
+                assert_eq!(CLP_S_V2_VALUE_TIMESTAMP, row[0].0);
+                assert_eq!(epochs[i], row[0].1);
+                assert_eq!(raw[i].as_bytes(), row[0].3);
+            }
+        }
+    }
+}

@@ -469,7 +469,8 @@ typedef struct clp_s_v2_projected_field {
  * One projected value.
  *
  * ABSENT covers both a path this archive does not carry and an explicit null, matching how a
- * missing value reaches SQL. Booleans use 0/1 in `integer`, timestamps epoch nanoseconds. `text`
+ * missing value reaches SQL. Booleans use 0/1 in `integer`. Timestamps carry epoch nanoseconds
+ * in `integer` and their original JSON scalar (including string quotes) in `text`. `text`
  * borrows the scanner's batch arena and is valid only until the next next-row call on, or
  * destruction of, the owning scanner.
  */

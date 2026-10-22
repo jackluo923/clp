@@ -188,7 +188,7 @@ pub const CLP_S_V2_VALUE_UNSIGNED: u32 = columnar::kind::UNSIGNED;
 pub const CLP_S_V2_VALUE_FLOAT: u32 = columnar::kind::FLOAT;
 /// A projected byte string borrowed from the scanner.
 pub const CLP_S_V2_VALUE_STRING: u32 = columnar::kind::STRING;
-/// A projected timestamp represented as epoch nanoseconds in `integer`.
+/// A projected timestamp: epoch nanoseconds in `integer`, original JSON scalar in `text`.
 pub const CLP_S_V2_VALUE_TIMESTAMP: u32 = columnar::kind::TIMESTAMP;
 /// A present value kind that this ABI cannot represent directly.
 pub const CLP_S_V2_VALUE_UNSUPPORTED: u32 = columnar::kind::UNSUPPORTED;

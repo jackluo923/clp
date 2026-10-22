@@ -1375,9 +1375,22 @@ fn project_row(
                     None => Cell::absent(),
                 }
             }
-            ColumnData::Timestamp(values) => values.get(row).map_or_else(Cell::absent, |value| {
-                Cell::scalar(kind::TIMESTAMP, value.epoch_nanoseconds(), 0.0)
-            }),
+            ColumnData::Timestamp(values) => match values.get(row) {
+                Some(value) => {
+                    // The epoch is search metadata, not the source JSON value. Carry both:
+                    // SQL projections must preserve the original unit and scalar type.
+                    let mut formatted = String::new();
+                    timestamps.append_epoch_nanoseconds(
+                        value.pattern_id(), value.epoch_nanoseconds(), &mut formatted,
+                    ).map_err(|source| ScanError::Projection(format!(
+                        "failed to format timestamp: {source}"
+                    )))?;
+                    let mut cell = push_text(kind::TIMESTAMP, formatted.as_bytes(), text);
+                    cell.integer = value.epoch_nanoseconds();
+                    cell
+                }
+                None => Cell::absent(),
+            },
             ColumnData::VarString(values) | ColumnData::DictionaryFloat(values) => values
                 .value(row)
                 .map_or_else(Cell::absent, |bytes| push_text(kind::STRING, bytes, text)),

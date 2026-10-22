@@ -1040,6 +1040,17 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
         let ResolvedPath::Schema(schema) = resolved else {
             return Tri::Unknown;
         };
+        // Timestamp columns compare their decoded epoch nanoseconds, whereas the
+        // archive bounds may be milliseconds or floating-point seconds. Those
+        // bounds also lose sub-unit precision. Until their scale and rounding are
+        // translated conservatively, they cannot prove a timestamp predicate
+        // true or false (including under NOT). Let the column evaluator decide.
+        if schema.nodes.iter().any(|id| {
+            self.catalog.schema_tree().get(*id as usize)
+                .is_some_and(|node| node.node_type() == NodeType::Timestamp)
+        }) {
+            return Tri::Unknown;
+        }
         if predicate
             .path()
             .components()
