@@ -1335,6 +1335,13 @@ const fn empty_kv_ir_event_view() -> ClpSKvIrEventView {
 
 impl ClpSArchive {
     fn validate(path: PathBuf) -> Result<Self, ApiError> {
+        let archive = Self::locate(path)?;
+        drop(archive.open_reader()?);
+        Ok(archive)
+    }
+
+    /// Locate the source without opening a reader that the caller immediately replaces.
+    fn locate(path: PathBuf) -> Result<Self, ApiError> {
         let metadata = fs::metadata(&path).map_err(|source| {
             ApiError::Io(format!(
                 "failed to inspect archive path {}: {source}",
@@ -1351,9 +1358,7 @@ impl ClpSArchive {
                 path.display()
             )));
         };
-        let archive = Self { path, kind };
-        drop(archive.open_reader()?);
-        Ok(archive)
+        Ok(Self { path, kind })
     }
 
     fn open_reader(&self) -> Result<Box<dyn ArchiveReader>, ApiError> {
@@ -1869,7 +1874,7 @@ pub unsafe extern "C" fn clp_s_v2_scanner_open(
                 })?;
                 paths.push(text.to_owned());
             }
-            let archive = ClpSArchive::validate(PathBuf::from(path_text))?;
+            let archive = ClpSArchive::locate(PathBuf::from(path_text))?;
             let reader = archive.open_reader()?;
             let inner = columnar::ProjectedScanner::open(
                 reader,
@@ -2280,6 +2285,120 @@ pub struct ClpSV2ArchiveFieldTypeList {
     timestamp_integer_scale: i64,
 }
 
+fn archive_field_type_list(catalog: &clp_s::archive::ArchiveCatalog) -> ClpSV2ArchiveFieldTypeList {
+    let mut fields = columnar::archive_field_types(catalog.schema_tree());
+    narrow_signed_mixed_integers(catalog, &mut fields);
+    let entries = fields.iter().map(|field| ClpSV2ArchiveFieldType {
+        path: field.path.as_ptr(), path_length: field.path.len(), node_type: field.node_type as u8,
+    }).collect();
+    ClpSV2ArchiveFieldTypeList {
+        _fields: fields, entries,
+        timestamp_integer_scale: timestamp_integer_scale(catalog.metadata().timestamp_dictionary().patterns()),
+    }
+}
+
+/// Single-use owner of a reader and its dictionary-free catalog. Certification and scanning
+/// use the same opened file; this is not a path-based cache and cannot outlive file replacement
+/// by silently reopening the path. Directory archives must remain immutable while scanning.
+pub struct ClpSV7PreparedArchive {
+    inner: Option<(Box<dyn ArchiveReader>, clp_s::archive::ArchiveCatalog)>,
+    limits: ArchiveCatalogLimits,
+}
+
+/// Opens one reader, reads its catalog once, and returns an independently owned type listing.
+/// The query supplies catalog limits; its predicate is not evaluated during preparation.
+///
+/// # Safety
+/// The path is readable for its length, query is live, and all output pointers are writable.
+/// Both returned owners must be freed, including when the caller decides not to scan.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clp_s_v7_archive_prepare(
+    path: *const u8, path_length: usize, query: *const ClpSQuery,
+    out_prepared: *mut *mut ClpSV7PreparedArchive,
+    out_list: *mut *mut ClpSV2ArchiveFieldTypeList,
+    out_entries: *mut *const ClpSV2ArchiveFieldType, out_count: *mut usize,
+    error: *mut ClpSErrorBuffer,
+) -> ClpSStatus {
+    // SAFETY: Output storage and borrowed inputs follow the function contract.
+    unsafe {
+        if !out_prepared.is_null() { out_prepared.write(ptr::null_mut()); }
+        if !out_list.is_null() { out_list.write(ptr::null_mut()); }
+        if !out_entries.is_null() { out_entries.write(ptr::null()); }
+        if !out_count.is_null() { out_count.write(0); }
+        ffi_entry(error, || {
+            if out_prepared.is_null() || out_list.is_null() || out_entries.is_null() || out_count.is_null() {
+                return Err(ApiError::InvalidArgument("prepared archive outputs must not be null".into()));
+            }
+            let query = query.as_ref().ok_or_else(|| ApiError::InvalidArgument("query must not be null".into()))?;
+            let path = str::from_utf8(borrowed_bytes(path, path_length, "archive_path")?)
+                .map_err(|e| ApiError::InvalidArgument(format!("archive path is not UTF-8: {e}")))?;
+            let mut reader = ClpSArchive::locate(PathBuf::from(path))?.open_reader()?;
+            let limits = query.options.catalog().with_skip_dictionaries(true);
+            let catalog = reader.read_catalog(limits)
+                .map_err(|e| ApiError::Archive(format!("failed to read archive catalog: {e}")))?;
+            let list = Box::new(archive_field_type_list(&catalog));
+            let prepared = Box::new(ClpSV7PreparedArchive { inner: Some((reader, catalog)), limits });
+            out_entries.write(list.entries.as_ptr());
+            out_count.write(list.entries.len());
+            out_list.write(Box::into_raw(list));
+            out_prepared.write(Box::into_raw(prepared));
+            Ok(())
+        })
+    }
+}
+
+/// Consumes a prepared reader/catalog to open a projected scanner. A second call is an error.
+/// The final predicate may differ from preparation (for example after timestamp rescaling),
+/// but its catalog limits must agree. The prepared handle still needs to be freed after use.
+///
+/// # Safety
+/// Prepared/query handles must be live; fields and outputs follow `clp_s_v2_scanner_open`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clp_s_v7_scanner_open_prepared(
+    prepared: *mut ClpSV7PreparedArchive, query: *const ClpSQuery,
+    fields: *const ClpSV2ProjectedField, field_count: usize,
+    out_scanner: *mut *mut ClpSV2Scanner, error: *mut ClpSErrorBuffer,
+) -> ClpSStatus {
+    // SAFETY: All raw arguments follow the function contract.
+    unsafe {
+        if !out_scanner.is_null() { out_scanner.write(ptr::null_mut()); }
+        ffi_entry(error, || {
+            if out_scanner.is_null() || (field_count != 0 && fields.is_null()) {
+                return Err(ApiError::InvalidArgument("scanner output/fields must not be null".into()));
+            }
+            let prepared = prepared.as_mut().ok_or_else(|| ApiError::InvalidArgument("prepared archive must not be null".into()))?;
+            let query = query.as_ref().ok_or_else(|| ApiError::InvalidArgument("query must not be null".into()))?;
+            if prepared.limits != query.options.catalog().with_skip_dictionaries(true) {
+                return Err(ApiError::InvalidArgument("prepared and scanner catalog limits differ".into()));
+            }
+            let mut paths = Vec::with_capacity(field_count);
+            for index in 0..field_count {
+                let field = *fields.add(index);
+                paths.push(str::from_utf8(borrowed_bytes(field.path, field.path_length, "field path")?)
+                    .map_err(|e| ApiError::InvalidArgument(format!("field path is not UTF-8: {e}")))?.to_owned());
+            }
+            let (reader, catalog) = prepared.inner.take()
+                .ok_or_else(|| ApiError::InvalidArgument("prepared archive already consumed".into()))?;
+            let inner = columnar::ProjectedScanner::open_with_catalog(reader, catalog, query.parsed.clone(), &query.options, &paths)
+                .map_err(|e| ApiError::Archive(e.to_string()))?;
+            let values = vec![ClpSV2Value { kind: 0, reserved: 0, integer: 0, real: 0.0,
+                text: ptr::null(), text_length: 0 }; field_count];
+            out_scanner.write(Box::into_raw(Box::new(ClpSV2Scanner { inner, values })));
+            Ok(())
+        })
+    }
+}
+
+/// # Safety
+/// A non-null pointer must be a live, exclusively owned handle from `clp_s_v7_archive_prepare`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clp_s_v7_prepared_archive_free(prepared: *mut ClpSV7PreparedArchive) {
+    if !prepared.is_null() {
+        // SAFETY: The caller transfers exclusive ownership back to Rust.
+        drop(unsafe { Box::from_raw(prepared) });
+    }
+}
+
 // An archive-wide proof is deliberately conservative: no table decoding is
 // needed, but every pattern must describe the same unquoted integer epoch.
 fn timestamp_integer_scale(patterns: &[clp_s::archive::TimestampPatternEntry]) -> i64 {
@@ -2364,23 +2483,7 @@ pub unsafe extern "C" fn clp_s_v2_archive_field_types(
                 .map_err(|source| {
                     ApiError::Archive(format!("failed to read archive catalog: {source}"))
                 })?;
-            let mut fields = columnar::archive_field_types(catalog.schema_tree());
-            narrow_signed_mixed_integers(&catalog, &mut fields);
-            let entries = fields
-                .iter()
-                .map(|field| ClpSV2ArchiveFieldType {
-                    path: field.path.as_ptr(),
-                    path_length: field.path.len(),
-                    node_type: field.node_type as u8,
-                })
-                .collect::<Vec<_>>();
-            let handle = Box::new(ClpSV2ArchiveFieldTypeList {
-                _fields: fields,
-                entries,
-                timestamp_integer_scale: timestamp_integer_scale(
-                    catalog.metadata().timestamp_dictionary().patterns(),
-                ),
-            });
+            let handle = Box::new(archive_field_type_list(&catalog));
             out_entries.write(handle.entries.as_ptr());
             out_count.write(handle.entries.len());
             out_list.write(Box::into_raw(handle));

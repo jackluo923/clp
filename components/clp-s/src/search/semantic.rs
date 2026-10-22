@@ -660,6 +660,40 @@ impl ParsedQuery {
     ) -> Result<CompiledQuery<'query, 'archive>, SearchError> {
         CompiledQuery::compile(self, catalog, options, Some(matches))
     }
+
+    /// Per-table template proofs for a single positive anchored string predicate.
+    /// `Some(false)` rejects a table, `Some(true)` proves all its rows match, and
+    /// `None` requires normal evaluation. Dictionaries may be unloaded: an empty
+    /// one must never be used as an archive-wide absence proof in this pass.
+    /// Unsupported query shapes return no preflight, retaining ordinary scanning.
+    pub fn template_preflight(
+        &self, catalog: &ArchiveCatalog, options: SearchOptions,
+    ) -> Result<Option<Vec<Option<bool>>>, SearchError> {
+        if catalog.metadata().template_index().is_none() { return Ok(None); }
+        let [node] = self.nodes() else { return Ok(None); };
+        let ExpressionKind::Predicate(predicate) = node.kind() else { return Ok(None); };
+        let predicate = PredicateRef::from_predicate(predicate);
+        if predicate.operator() != ComparisonOperator::Equal
+            || variable_pattern(predicate).or_else(|| clp_pattern(predicate))
+                .and_then(|p| super::clp_pattern::ClpPattern::new(p, options.ignore_case(), 0)).is_none()
+        { return Ok(None); }
+        // Do not share dictionary-match caches from this metadata-only pass.
+        let mut compiled = self.compile_for_archive(catalog, options)?;
+        compiled.archive_may_match = true;
+        let mut proofs = Vec::with_capacity(catalog.table_metadata().schema_tables().len());
+        for table in catalog.table_metadata().schema_tables() {
+            let Some(schema) = catalog.schema_map().get(table.schema_id()) else {
+                proofs.push(None);
+                continue;
+            };
+            let rows = usize::try_from(table.message_count()).unwrap_or(usize::MAX);
+            proofs.push(if !compiled.may_match_schema(schema)?
+                || compiled.table_row_span(table.schema_id(), rows) == crate::timestamp_chunks::RowSpan::Empty {
+                Some(false)
+            } else if compiled.schema_matches_all(schema) { Some(true) } else { None });
+        }
+        Ok(Some(proofs))
+    }
 }
 
 impl<'query, 'archive> CompiledQuery<'query, 'archive> {

@@ -436,11 +436,14 @@ fn nodes_of_matchable_tables(
     catalog: &ArchiveCatalog,
     compiled: &clp_s::search::CompiledQuery<'_, '_>,
     count_only: bool,
+    preflight: Option<&[Option<bool>]>,
 ) -> Result<(Vec<bool>, Vec<bool>, Vec<bool>), ScanError> {
     let mut held = vec![false; catalog.schema_tree().len()];
     let mut matchable = vec![false; catalog.table_metadata().schema_tables().len()];
     let mut all_match = vec![false; matchable.len()];
     for (index, table) in catalog.table_metadata().schema_tables().iter().enumerate() {
+        let proof = preflight.and_then(|proofs| proofs[index]);
+        if proof == Some(false) { continue; }
         // A schema the map lacks is left to the table decoder to report; until then, any column
         // may be written.
         let Some(schema) = catalog.schema_map().get(table.schema_id()) else {
@@ -448,7 +451,7 @@ fn nodes_of_matchable_tables(
             matchable.fill(true);
             break;
         };
-        if !compiled
+        if proof != Some(true) && !compiled
             .may_match_schema(schema)
             .map_err(|source| ScanError::Archive(format!("failed to compile query: {source}")))?
         {
@@ -459,7 +462,7 @@ fn nodes_of_matchable_tables(
             continue;
         }
         matchable[index] = true;
-        all_match[index] = count_only && compiled.schema_matches_all(schema);
+        all_match[index] = count_only && (proof == Some(true) || compiled.schema_matches_all(schema));
         for entry in schema.entries() {
             if let SchemaEntry::Node(node) = *entry
                 && let Some(slot) = held.get_mut(node as usize)
@@ -579,9 +582,20 @@ impl ProjectedScanner {
         // Read everything but the dictionaries first: whether they are needed depends on the
         // schema tree, which is only known once the catalog is open.
         let catalog_limits = options.catalog().with_skip_dictionaries(true);
-        let mut catalog = reader
+        let catalog = reader
             .read_catalog(catalog_limits)
             .map_err(|source| ScanError::Archive(format!("failed to read catalog: {source}")))?;
+        Self::open_with_catalog(reader, catalog, parsed, options, fields)
+    }
+
+    /// Continue from the same reader/catalog used to certify the projected scan's types.
+    pub(crate) fn open_with_catalog(
+        mut reader: Box<dyn ArchiveReader>,
+        mut catalog: ArchiveCatalog,
+        parsed: ParsedQuery,
+        options: &ArchiveSearchOptions,
+        fields: &[String],
+    ) -> Result<Self, ScanError> {
         let parsed_fields = fields
             .iter()
             .enumerate()
@@ -621,7 +635,31 @@ impl ProjectedScanner {
         // variable dictionary. The filter's load first; the fields' then only for the tables the
         // filter can match, since a column no such table holds is never written.
         let mut loaded = Dictionaries::default();
-        let filter_needed = match filter_nodes.as_deref() {
+        let preflight = if force_eager { None } else {
+            parsed.template_preflight(&catalog, options.search())
+                .map_err(|e| ScanError::Archive(format!("template preflight failed: {e}")))?
+        };
+        let unresolved_nodes = preflight.as_ref().map(|proofs| {
+            let mut needed = vec![false; catalog.schema_tree().len()];
+            for (table, proof) in catalog.table_metadata().schema_tables().iter().zip(proofs) {
+                // Projected rows still run their predicate. Only count-only scans
+                // can answer all-match tables without decoding the filter column.
+                if *proof == Some(false) || (fields.is_empty() && *proof == Some(true)) { continue; }
+                let Some(schema) = catalog.schema_map().get(table.schema_id()) else {
+                    needed.fill(true); break;
+                };
+                for entry in schema.entries() {
+                    if let SchemaEntry::Node(node) = *entry {
+                        if let Some(slot) = needed.get_mut(node as usize) { *slot = true; }
+                    }
+                }
+            }
+            needed
+        });
+        let unresolved_filter = filter_nodes.as_ref().map(|nodes| nodes.iter().copied()
+            .filter(|node| unresolved_nodes.as_ref().is_none_or(|needed|
+                needed.get(*node as usize).copied().unwrap_or(true))).collect::<Vec<_>>());
+        let filter_needed = match unresolved_filter.as_deref() {
             _ if force_eager => Dictionaries::ALL,
             None => Dictionaries::ALL,
             Some(nodes) => dictionaries_read_by(catalog.schema_tree(), nodes, &[]),
@@ -647,7 +685,7 @@ impl ProjectedScanner {
             })?;
             (
                 accepted_ranges,
-                nodes_of_matchable_tables(&catalog, &compiled, fields.is_empty())?,
+                nodes_of_matchable_tables(&catalog, &compiled, fields.is_empty(), preflight.as_deref())?,
             )
         };
         let shaped: Vec<u32> = field_nodes
@@ -672,6 +710,7 @@ impl ProjectedScanner {
         } else {
             dictionaries_read_by(catalog.schema_tree(), &plain, &shaped)
         };
+        let had_variable = loaded.variable;
         load_dictionaries(
             &mut *reader,
             &mut catalog,
@@ -679,6 +718,11 @@ impl ProjectedScanner {
             &field_needed,
             &mut loaded,
         )?;
+        if loaded.variable && !had_variable {
+            // The first compile saw an intentionally unloaded variable dictionary.
+            // Its empty ID sets cannot certify a later row-level predicate.
+            dictionary_matches = DictionaryMatches::new();
+        }
         if !loaded.all() {
             // A column whose dictionary was left unloaded is never read, so decoding must not
             // check its IDs against the empty one.
@@ -1795,6 +1839,11 @@ mod prefilter_reuse_tests {
                 reads: reads.clone(), whole_projection: false };
             let mut scan = ProjectedScanner::open(Box::new(reader), parse_kql(query, KqlLimits::default()).unwrap(),
                 &Default::default(), &[]).unwrap();
+            if skip {
+                assert!(scan.catalog.variable_dictionary().is_empty(), "{query}");
+                assert!(scan.catalog.log_type_dictionary().is_empty(), "{query}");
+                assert!(scan.catalog.array_dictionary().is_empty(), "{query}");
+            }
             let mut count = 0;
             while let Some((columns, text, rows)) = scan.next_columns_with_constants(true).unwrap() {
                 assert!(columns.is_empty() && text.is_empty());
@@ -1802,6 +1851,77 @@ mod prefilter_reuse_tests {
             }
             assert_eq!(count, expected, "{query}");
             assert_eq!(reads.borrow().is_empty(), skip, "{query}");
+        }
+    }
+
+    #[test]
+    fn template_preflight_preserves_unknowns_and_late_dictionary_projection() {
+        use clp_s::writer::{FieldRef, OpenArchive, RecordRef, TemplateKeys, ValueRef, WriterOptions};
+        let messages = ["alpha token abc1", "alpha token def2", "beta token ghi3", "standalone123"];
+        for hints in [false, true] {
+            let mut writer = OpenArchive::new_with_template_keys(Cursor::new(Vec::new()),
+                WriterOptions::default().with_adaptive_numeric_columns(true).with_separate_columns_min_size(1),
+                if hints { TemplateKeys::parse_csv("message").unwrap() } else { TemplateKeys::default() });
+            for message in messages {
+                writer.append_record(RecordRef::new(&[FieldRef::new(b"message", ValueRef::String(message.as_bytes()))])).unwrap();
+            }
+            let bytes = writer.finish().unwrap().into_inner().into_inner();
+            for (query, indices) in [("message:alpha*", vec![0, 1]), ("message:*3", vec![2, 3]),
+                ("message:absent*", vec![]), ("message:standalone*", vec![3]),
+                ("NOT message:alpha*", vec![2, 3]), ("message:alpha* OR message:*3", vec![0, 1, 2, 3])] {
+                for columns in [false, true] {
+                    let reader = SingleFileArchiveReader::open(Cursor::new(bytes.clone())).unwrap();
+                    let mut scan = ProjectedScanner::open(Box::new(reader), parse_kql(query, KqlLimits::default()).unwrap(),
+                        &Default::default(), &["message".into()]).unwrap();
+                    let mut actual = Vec::new();
+                    if columns {
+                        while let Some((values, text, rows)) = scan.next_columns_with_constants(true).unwrap() {
+                            for row in 0..rows {
+                                // SAFETY: The borrowed cell views stay live until the next call.
+                                let cell = unsafe { values[0].data.cast::<Cell>().add(
+                                    if values[0].kind == kind::CONSTANT_STRING { 0 } else { row }).read_unaligned() };
+                                actual.push(String::from_utf8(text[cell.text_offset..cell.text_offset+cell.text_length].to_vec()).unwrap());
+                            }
+                        }
+                    } else {
+                        while let Some((cells, text)) = scan.next_row().unwrap() {
+                            let cell = cells[0];
+                            actual.push(String::from_utf8(text[cell.text_offset..cell.text_offset+cell.text_length].to_vec()).unwrap());
+                        }
+                    }
+                    let mut expected: Vec<_> = indices.iter().map(|&i| messages[i].to_owned()).collect();
+                    actual.sort(); expected.sort();
+                    assert_eq!(actual, expected, "{query}, hints={hints}, columns={columns}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn template_proof_keeps_filter_dictionaries_for_unrelated_projection() {
+        use clp_s::writer::{FieldRef, OpenArchive, RecordRef, TemplateKeys, ValueRef, WriterOptions};
+        let mut writer = OpenArchive::new_with_template_keys(Cursor::new(Vec::new()),
+            WriterOptions::default().with_separate_columns_min_size(1), TemplateKeys::parse_csv("message").unwrap());
+        for (id, message) in ["alpha token abc1", "alpha token def2"].iter().enumerate() {
+            writer.append_record(RecordRef::new(&[
+                FieldRef::new(b"message", ValueRef::String(message.as_bytes())),
+                FieldRef::new(b"id", ValueRef::I64(id as i64)),
+            ])).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner().into_inner();
+        for fields in [vec!["id".into()], vec!["missing".into()]] {
+            for columns in [false, true] {
+                let reader = SingleFileArchiveReader::open(Cursor::new(bytes.clone())).unwrap();
+                let mut scan = ProjectedScanner::open(Box::new(reader), parse_kql("message:alpha*", KqlLimits::default()).unwrap(),
+                    &Default::default(), &fields).unwrap();
+                let mut count = 0;
+                if columns {
+                    while let Some((_, _, rows)) = scan.next_columns_with_constants(true).unwrap() { count += rows; }
+                } else {
+                    while scan.next_row().unwrap().is_some() { count += 1; }
+                }
+                assert_eq!(count, 2, "{fields:?}, columns={columns}");
+            }
         }
     }
 

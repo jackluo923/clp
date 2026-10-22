@@ -705,6 +705,27 @@ void clp_s_v2_archive_field_type_list_free(clp_s_v2_archive_field_type_list *lis
  * A null list returns zero; a non-null list must be live. */
 int64_t clp_s_v3_archive_timestamp_integer_scale(const clp_s_v2_archive_field_type_list *list);
 
+/* v7: inspect and scan the same open reader/catalog, without reopening the path.
+ * Preparation uses query's catalog limits and leaves dictionaries unloaded. The
+ * returned field list has independent ownership and uses the v2 list free API.
+ * open_prepared consumes the reader once, even if scanner construction fails;
+ * the prepared handle itself must still be freed. The final predicate may change
+ * after certification, but catalog limits must agree. Handles are not concurrent.
+ * Directory archive contents must remain immutable for the operation's lifetime.
+ */
+typedef struct clp_s_v7_prepared_archive clp_s_v7_prepared_archive;
+clp_s_status clp_s_v7_archive_prepare(
+        const uint8_t *path, size_t path_length, const clp_s_query *query,
+        clp_s_v7_prepared_archive **out_prepared,
+        clp_s_v2_archive_field_type_list **out_list,
+        const clp_s_v2_archive_field_type **out_entries, size_t *out_count,
+        clp_s_error_buffer *error);
+clp_s_status clp_s_v7_scanner_open_prepared(
+        clp_s_v7_prepared_archive *prepared, const clp_s_query *query,
+        const clp_s_v2_projected_field *fields, size_t field_count,
+        clp_s_v2_scanner **out_scanner, clp_s_error_buffer *error);
+void clp_s_v7_prepared_archive_free(clp_s_v7_prepared_archive *prepared);
+
 #if defined(__cplusplus)
 #define CLP_S_ABI_STATIC_ASSERT(condition, message) static_assert((condition), message)
 #elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L

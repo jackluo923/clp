@@ -1315,6 +1315,59 @@ fn adaptive_archive(source: &[u8], structurize_arrays: bool) -> Vec<u8> {
 }
 
 #[test]
+fn prepared_scan_keeps_the_certified_reader_and_consumes_it_once() {
+    let path = std::env::temp_dir().join(format!("clp-prepared-{}.clps", std::process::id()));
+    let replacement = path.with_extension("replacement");
+    std::fs::write(&path, adaptive_archive(b"{\"id\":1}\n{\"id\":2}\n", true)).unwrap();
+    let prepare_query = compile_query("*", 0);
+    let scan_query = compile_query("id:2", 0);
+    let bytes = path.to_str().unwrap().as_bytes();
+    let (mut prepared, mut list, mut entries, mut count) = (ptr::null_mut(), ptr::null_mut(), ptr::null(), 0);
+    let mut text = [0; 512];
+    let mut error = error_buffer(&mut text);
+    // SAFETY: Every pointer refers to live disjoint storage; handles are freed below.
+    unsafe {
+        assert_eq!(CLP_S_STATUS_OK, clp_s_v7_archive_prepare(bytes.as_ptr(), bytes.len(), prepare_query.0,
+            &mut prepared, &mut list, &mut entries, &mut count, &mut error), "{}", error_text(&text));
+        assert!(count > 0 && !entries.is_null());
+        clp_s_v2_archive_field_type_list_free(list);
+        // Replacing the path must not change the data underlying the already certified reader.
+        std::fs::write(&replacement, adaptive_archive(b"{\"id\":\"changed\"}\n", true)).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let mut scanner = ptr::null_mut();
+        assert_eq!(CLP_S_STATUS_OK, clp_s_v7_scanner_open_prepared(prepared, scan_query.0,
+            ptr::null(), 0, &mut scanner, &mut error), "{}", error_text(&text));
+        let mut duplicate = scanner;
+        assert_eq!(CLP_S_STATUS_INVALID_ARGUMENT, clp_s_v7_scanner_open_prepared(prepared, scan_query.0,
+            ptr::null(), 0, &mut duplicate, &mut error));
+        assert!(duplicate.is_null());
+        clp_s_v7_prepared_archive_free(prepared);
+        drop(prepare_query);
+        drop(scan_query);
+        let mut rows = 0;
+        loop {
+            let mut has_row = 0;
+            assert_eq!(CLP_S_STATUS_OK, clp_s_v2_scanner_next_row(scanner, ptr::null_mut(), &mut has_row, &mut error),
+                "{}", error_text(&text));
+            if has_row == 0 { break; }
+            rows += 1;
+        }
+        assert_eq!(rows, 1);
+        clp_s_v2_scanner_free(scanner);
+        // Failing preparation resets every output, and unconsumed handles can be freed.
+        let mut bad_list = ptr::dangling_mut();
+        let mut bad_prepared = ptr::dangling_mut();
+        entries = ptr::dangling(); count = 99;
+        assert_eq!(CLP_S_STATUS_INVALID_ARGUMENT, clp_s_v7_archive_prepare(bytes.as_ptr(), bytes.len(), ptr::null(),
+            &mut bad_prepared, &mut bad_list, &mut entries, &mut count, &mut error));
+        assert!(bad_prepared.is_null() && bad_list.is_null() && entries.is_null());
+        assert_eq!(count, 0);
+        clp_s_v7_prepared_archive_free(ptr::null_mut());
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn projected_scan_matches_predicates_inside_arrays() {
     let temporary = |name: &str, bytes: Vec<u8>| {
         let path =
