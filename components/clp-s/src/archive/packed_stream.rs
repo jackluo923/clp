@@ -655,8 +655,37 @@ impl DecodedPackedStream {
     /// The caller must supply projections from the same physical stream, at the same
     /// decoding stage. Loaded slots retain their representation and logical size.
     /// Returns `None` for missing/inconsistent layouts or overlapping loaded columns.
+    ///
+    /// When the larger side's bytes are one run of columns, that buffer grows in place around
+    /// the smaller side's bytes, so a filter-only read of a large message column gains the few
+    /// remaining columns without copying its bytes into a new buffer.
     #[must_use]
     pub fn merge_disjoint_columns(self, other: Self) -> Option<Self> {
+        let (host, guest) =
+            if self.bytes.len() >= other.bytes.len() { (self, other) } else { (other, self) };
+        let Some(prefix) = host.guest_prefix(&guest) else {
+            return host.merge_by_copy(guest);
+        };
+        let layout = host
+            .column_layout?
+            .into_iter()
+            .zip(guest.column_layout?)
+            .map(|(host, guest)| if host.loaded { host } else { guest })
+            .collect();
+        let (before, after) = guest.bytes.split_at(prefix);
+        let mut bytes = host.bytes;
+        let host_len = bytes.len();
+        bytes.reserve(guest.bytes.len());
+        // Bulk moves: append the prefix as space, shift the host's run up, then fill the space.
+        bytes.extend_from_slice(before);
+        bytes.copy_within(0..host_len, before.len());
+        bytes[..before.len()].copy_from_slice(before);
+        bytes.extend_from_slice(after);
+        Some(Self::from_column_buffer(bytes, layout))
+    }
+
+    /// Merges disjoint projections by copying both into a new buffer, in column order.
+    fn merge_by_copy(self, other: Self) -> Option<Self> {
         let left = self.column_layout.as_ref()?;
         let right = other.column_layout.as_ref()?;
         if left.len() != right.len() { return None; }
@@ -681,6 +710,30 @@ impl DecodedPackedStream {
         }
         if left_offset != self.bytes.len() || right_offset != other.bytes.len() { return None; }
         Some(Self::from_column_buffer(bytes, layout))
+    }
+
+    /// When `guest` can be merged into this stream by placing its bytes before and after this
+    /// stream's, returns how many of its bytes go before. `None` when the layouts are not
+    /// disjoint projections, or when this stream's bytes are not one contiguous run of columns.
+    fn guest_prefix(&self, guest: &Self) -> Option<usize> {
+        let host_layout = self.column_layout.as_ref()?;
+        let guest_layout = guest.column_layout.as_ref()?;
+        if host_layout.len() != guest_layout.len() { return None; }
+        // 0: before the host's bytes, 1: inside them, 2: after them.
+        let (mut phase, mut prefix, mut host_total, mut guest_total) = (0u8, 0usize, 0usize, 0usize);
+        for (host, guest) in host_layout.iter().zip(guest_layout) {
+            if (host.loaded && guest.loaded) || (!host.loaded && host.stored != 0)
+                || (!guest.loaded && guest.stored != 0) { return None; }
+            if host.loaded && host.stored != 0 {
+                if phase == 2 { return None; }
+                phase = 1;
+                host_total = host_total.checked_add(host.stored)?;
+            } else if guest.loaded && guest.stored != 0 {
+                if phase == 0 { prefix = prefix.checked_add(guest.stored)?; } else { phase = 2; }
+                guest_total = guest_total.checked_add(guest.stored)?;
+            }
+        }
+        (host_total == self.bytes.len() && guest_total == guest.bytes.len()).then_some(prefix)
     }
 
     /// Takes already assembled canonical columns without concatenating them again.
@@ -1345,5 +1398,31 @@ mod projected_merge_tests {
         assert!(loaded().merge_disjoint_columns(corrupt).is_none());
         let merged = skipped().merge_disjoint_columns(loaded()).unwrap();
         assert_eq!(merged.as_bytes(), &[1]);
+    }
+
+    #[test]
+    fn merge_grows_the_larger_run_in_place_around_the_smaller_side() {
+        // The large middle column is the host; the small side's columns go before and after it.
+        let large = DecodedPackedStream::from_columns(vec![None, Some(vec![5; 64]), None], &[2, 64, 1]);
+        let small = DecodedPackedStream::from_columns(vec![Some(vec![1, 2]), None, Some(vec![9])], &[2, 64, 1]);
+        let merged = small.merge_disjoint_columns(large).unwrap();
+        let mut expected = vec![1, 2];
+        expected.extend([5; 64]);
+        expected.push(9);
+        assert_eq!(merged.as_bytes(), expected.as_slice());
+        let layout = merged.column_layout().unwrap();
+        assert!(layout.iter().all(|slot| slot.loaded));
+        assert_eq!(layout.iter().map(|slot| slot.stored).collect::<Vec<_>>(), [2, 64, 1]);
+    }
+
+    #[test]
+    fn merge_copies_when_the_larger_side_is_not_one_run() {
+        let split = DecodedPackedStream::from_columns(vec![Some(vec![1; 8]), None, Some(vec![3; 8])], &[8, 1, 8]);
+        let middle = DecodedPackedStream::from_columns(vec![None, Some(vec![2]), None], &[8, 1, 8]);
+        let merged = middle.merge_disjoint_columns(split).unwrap();
+        let mut expected = vec![1; 8];
+        expected.push(2);
+        expected.extend([3; 8]);
+        assert_eq!(merged.as_bytes(), expected.as_slice());
     }
 }

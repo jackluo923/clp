@@ -545,17 +545,30 @@ struct ScanSettings<'a> {
     all_dictionaries_loaded: bool,
 }
 
+/// What matching a separate-column stream's table from its filter columns alone found.
+enum Prefilter {
+    /// No row matched; the stream is recorded as scanned and the position moved past it.
+    Unmatched,
+    /// Rows matched. The filter-only stream and its bitmap are kept, so the whole read inflates
+    /// only the columns still missing and does not evaluate the filter again.
+    Matched {
+        stream: crate::archive::DecodedPackedStream,
+        bitmap: MatchBitmap,
+    },
+    /// The table was not the one expected; the whole read reports it.
+    Unexpected,
+}
+
 /// Matches the one table of the stream at `position` from the columns `mask` selects, and when
-/// no row matches, records the stream as scanned and moves past it. Returns whether it did; on
-/// `false` the stream is left for a whole read.
-fn unmatched_by_columns<A: ArchiveReader + ?Sized>(
+/// no row matches, records the stream as scanned and moves past it.
+fn prefilter_by_columns<A: ArchiveReader + ?Sized>(
     reader: &mut A,
     catalog: &ArchiveCatalog,
     compiled: &CompiledQuery<'_, '_>,
     options: &ArchiveSearchOptions,
     mask: &[bool],
     position: &mut ScanPosition,
-) -> Result<bool, ArchiveSearchError> {
+) -> Result<Prefilter, ArchiveSearchError> {
     let stream_index = position.stream_index;
     let stream_id = u64::try_from(stream_index).map_err(|_| ArchiveSearchError::SizeOverflow)?;
     let stream = read_stream(reader, catalog, stream_index, Some(mask), options)?;
@@ -569,7 +582,7 @@ fn unmatched_by_columns<A: ArchiveReader + ?Sized>(
     let Some(decoded) =
         decoded.filter(|decoded| decoded.table_index() == position.expected_table_index)
     else {
-        return Ok(false);
+        return Ok(Prefilter::Unexpected);
     };
     let bitmap =
         compiled
@@ -580,8 +593,9 @@ fn unmatched_by_columns<A: ArchiveReader + ?Sized>(
                 schema_id: decoded.schema().id(),
                 source,
             })?;
+    drop(decoded);
     if 0 != bitmap.match_count() {
-        return Ok(false);
+        return Ok(Prefilter::Matched { stream, bitmap });
     }
     position.stats.add_stream(stream.len())?;
     position.stats.add_table(bitmap.len(), 0)?;
@@ -590,7 +604,29 @@ fn unmatched_by_columns<A: ArchiveReader + ?Sized>(
         .checked_add(1)
         .ok_or(ArchiveSearchError::SizeOverflow)?;
     position.stream_index += 1;
-    Ok(true)
+    Ok(Prefilter::Unmatched)
+}
+
+/// Completes a filter-only stream with the columns it did not load, or `None` when its layout
+/// cannot be completed that way and the stream must be read whole.
+fn complete_stream<A: ArchiveReader + ?Sized>(
+    reader: &mut A,
+    catalog: &ArchiveCatalog,
+    stream_index: usize,
+    filtered: crate::archive::DecodedPackedStream,
+    options: &ArchiveSearchOptions,
+) -> Result<Option<crate::archive::DecodedPackedStream>, ArchiveSearchError> {
+    let Some(missing) = filtered
+        .column_layout()
+        .map(|layout| layout.iter().map(|slot| !slot.loaded).collect::<Vec<_>>())
+    else {
+        return Ok(None);
+    };
+    if !missing.contains(&true) {
+        return Ok(Some(filtered));
+    }
+    let rest = read_stream(reader, catalog, stream_index, Some(&missing), options)?;
+    Ok(filtered.merge_disjoint_columns(rest))
 }
 
 fn scan_streams<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
@@ -632,15 +668,28 @@ fn scan_streams<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
         }
 
         // A separate-column stream holds one table. The columns its filter reads are read alone
-        // first, so a stream without a match costs only those; one with a match is read whole.
+        // first, so a stream without a match costs only those. One with a match keeps them and
+        // its bitmap, and reads only the remaining columns.
+        let mut prefiltered = None;
         if let [table] = tables
             && let Some(mask) = scan.columns.matching_mask(catalog, table)
-            && unmatched_by_columns(reader, catalog, compiled, options, &mask, position)?
         {
-            continue;
+            match prefilter_by_columns(reader, catalog, compiled, options, &mask, position)? {
+                Prefilter::Unmatched => continue,
+                Prefilter::Matched { stream, bitmap } => prefiltered = Some((stream, bitmap)),
+                Prefilter::Unexpected => {}
+            }
         }
 
-        let stream = read_stream(reader, catalog, stream_index, None, options)?;
+        let (stream, mut cached_bitmap) = match prefiltered {
+            Some((filtered, bitmap)) => {
+                match complete_stream(reader, catalog, stream_index, filtered, options)? {
+                    Some(stream) => (stream, Some(bitmap)),
+                    None => (read_stream(reader, catalog, stream_index, None, options)?, None),
+                }
+            }
+            None => (read_stream(reader, catalog, stream_index, None, options)?, None),
+        };
         position.stats.add_stream(stream.len())?;
         let decoded_tables = catalog
             .schema_tables(stream_id, &stream, options.columns)
@@ -657,14 +706,17 @@ fn scan_streams<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
             let table_index = decoded.table_index();
             let schema_id = decoded.schema().id();
             if schema_may_match(catalog, compiled, schema_id)? {
-                let bitmap = compiled.match_table(&decoded).map_err(|source| {
-                    ArchiveSearchError::TableMatch {
-                        stream_id,
-                        table_index,
-                        schema_id,
-                        source,
-                    }
-                })?;
+                let bitmap = match cached_bitmap.take() {
+                    Some(bitmap) => bitmap,
+                    None => compiled.match_table(&decoded).map_err(|source| {
+                        ArchiveSearchError::TableMatch {
+                            stream_id,
+                            table_index,
+                            schema_id,
+                            source,
+                        }
+                    })?,
+                };
                 if 0 != bitmap.match_count() {
                     if !scan.all_dictionaries_loaded {
                         *position = stream_start;

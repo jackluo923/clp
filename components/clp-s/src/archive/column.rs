@@ -1537,9 +1537,10 @@ fn take_deprecated_date_string_column<'table, 'archive>(
 ) -> Result<DeprecatedDateStringColumn<'table, 'archive>, ColumnError> {
     let epochs = take_i64_column(cursor, context, message_count)?;
     let pattern_ids = take_i64_column(cursor, context, message_count)?;
+    let mut validated = None;
     for (message_index, signed_id) in pattern_ids.iter().enumerate() {
         let id = u64::from_le_bytes(signed_id.to_le_bytes());
-        validate_timestamp_pattern(dictionary, context, message_index, id)?;
+        validate_timestamp_pattern(dictionary, context, message_index, id, &mut validated)?;
     }
     Ok(DeprecatedDateStringColumn {
         epochs,
@@ -1556,8 +1557,9 @@ fn take_timestamp_column<'table, 'archive>(
 ) -> Result<TimestampColumn<'table, 'archive>, ColumnError> {
     let epochs = take_delta_column(cursor, context, message_count)?;
     let pattern_ids = take_u64_column(cursor, context, message_count)?;
+    let mut validated = None;
     for (message_index, id) in pattern_ids.iter().enumerate() {
-        validate_timestamp_pattern(dictionary, context, message_index, id)?;
+        validate_timestamp_pattern(dictionary, context, message_index, id, &mut validated)?;
     }
     Ok(TimestampColumn {
         epochs,
@@ -1566,13 +1568,21 @@ fn take_timestamp_column<'table, 'archive>(
     })
 }
 
+/// Checks that `id` names a pattern in `dictionary`. Consecutive rows nearly always share a
+/// pattern, so the last ID found, kept in `validated`, is accepted without another lookup.
 fn validate_timestamp_pattern(
     dictionary: &TimestampDictionary,
     context: ColumnContext,
     message_index: usize,
     id: u64,
+    validated: &mut Option<u64>,
 ) -> Result<(), ColumnError> {
-    if dictionary.pattern(id).is_none() {
+    if *validated == Some(id) {
+        return Ok(());
+    }
+    if dictionary.pattern(id).is_some() {
+        *validated = Some(id);
+    } else {
         return Err(corrupt(
             context,
             Some(message_index),
