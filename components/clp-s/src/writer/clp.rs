@@ -159,13 +159,8 @@ where
     let mut previous_end = 0_usize;
     let mut scan_end = 0_usize;
     let mut constant_escapes = 0_usize;
-    let contains_markers = contains_marker(message);
     loop {
-        let variable = if contains_markers {
-            next_variable_with_markers(message, scan_end, &mut constant_escapes)
-        } else {
-            next_variable_without_markers(message, scan_end)
-        };
+        let variable = next_variable(message, scan_end, &mut constant_escapes);
         let Some(variable) = variable else {
             break;
         };
@@ -522,6 +517,74 @@ struct VariableSpan {
     end: usize,
 }
 
+const TOKEN_DELIMITER: u8 = 1;
+const TOKEN_DIGIT: u8 = 2;
+const TOKEN_ALPHA: u8 = 4;
+const TOKEN_NON_HEX: u8 = 8;
+const TOKEN_MARKER: u8 = 16;
+
+// Classify bytes once rather than repeating the digit/alphabet/delimiter checks and then
+// rescanning tokens for hexadecimal digits. Marker counting shares the same traversal, so
+// encoding no longer needs a preliminary scan of the whole message for marker bytes.
+const TOKEN_CLASSES: [u8; 256] = {
+    let mut classes = [0; 256];
+    let mut index = 0;
+    while index < classes.len() {
+        let byte = index as u8;
+        classes[index] = if is_delimiter(byte) { TOKEN_DELIMITER } else { 0 }
+            | if byte.is_ascii_digit() { TOKEN_DIGIT } else { 0 }
+            | if byte.is_ascii_alphabetic() { TOKEN_ALPHA } else { 0 }
+            | if byte.is_ascii_hexdigit() { 0 } else { TOKEN_NON_HEX }
+            | if is_marker(byte) { TOKEN_MARKER } else { 0 };
+        index += 1;
+    }
+    classes
+};
+
+fn next_variable(
+    message: &[u8],
+    mut end: usize,
+    constant_escapes: &mut usize,
+) -> Option<VariableSpan> {
+    while end < message.len() {
+        let mut begin = end;
+        while begin < message.len() {
+            let class = TOKEN_CLASSES[usize::from(message[begin])];
+            if class & TOKEN_DELIMITER == 0 {
+                break;
+            }
+            *constant_escapes += usize::from(class & TOKEN_MARKER != 0);
+            begin += 1;
+        }
+        if begin == message.len() {
+            return None;
+        }
+        let mut flags = 0;
+        let mut token_escapes = 0;
+        end = begin;
+        while end < message.len() {
+            let class = TOKEN_CLASSES[usize::from(message[end])];
+            if class & TOKEN_DELIMITER != 0 {
+                break;
+            }
+            flags |= class;
+            token_escapes += usize::from(class & TOKEN_MARKER != 0);
+            end += 1;
+        }
+        if flags & TOKEN_DIGIT != 0
+            || (begin > 0 && message[begin - 1] == b'=' && flags & TOKEN_ALPHA != 0)
+            || (end - begin >= 2 && flags & TOKEN_NON_HEX == 0)
+        {
+            return Some(VariableSpan { begin, end });
+        }
+        *constant_escapes += token_escapes;
+    }
+    None
+}
+
+// Preserve the original scalar scanners as independent test oracles for byte classification,
+// variable boundaries, and marker counts. They are excluded from production builds.
+#[cfg(test)]
 fn next_variable_with_markers(
     message: &[u8],
     mut end: usize,
@@ -566,6 +629,7 @@ fn next_variable_with_markers(
     None
 }
 
+#[cfg(test)]
 fn next_variable_without_markers(message: &[u8], mut end: usize) -> Option<VariableSpan> {
     while end < message.len() {
         let mut begin = end;
@@ -600,6 +664,7 @@ fn next_variable_without_markers(message: &[u8], mut end: usize) -> Option<Varia
     None
 }
 
+#[cfg(test)]
 fn could_be_multi_digit_hex_value(value: &[u8]) -> bool {
     if value.len() < 2 {
         return false;
@@ -707,6 +772,61 @@ const fn allocation_failed(resource: AppendResource, requested: usize) -> Append
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_fused_scanner_matches_reference(message: &[u8]) {
+        let mut end = 0;
+        loop {
+            let mut expected_escapes = 0;
+            let mut actual_escapes = 0;
+            let expected = next_variable_with_markers(message, end, &mut expected_escapes);
+            let actual = next_variable(message, end, &mut actual_escapes);
+            assert_eq!(
+                expected.map(|span| (span.begin, span.end)),
+                actual.map(|span| (span.begin, span.end)),
+                "variable spans for {message:?} from {end}"
+            );
+            assert_eq!(
+                expected_escapes, actual_escapes,
+                "escapes for {message:?} from {end}"
+            );
+            let Some(span) = actual else {
+                break;
+            };
+            end = span.end;
+        }
+    }
+
+    #[test]
+    fn fused_scanner_preserves_variables_and_constant_escapes() {
+        // Include markers, delimiters and non-ASCII bytes, both in ordinary tokens and after '='.
+        for first in u8::MIN..=u8::MAX {
+            for second in u8::MIN..=u8::MAX {
+                assert_fused_scanner_matches_reference(&[first, second]);
+                assert_fused_scanner_matches_reference(&[b'=', first, second, b' ', b'1']);
+                assert_fused_scanner_matches_reference(&[b'a', first, second, b'z', b'\\']);
+            }
+        }
+        for message in [
+            b"id=alice count -42 ratio 001.2300 hex abcdef nothex abcdefg".as_slice(),
+            b"\\\\ no\\digits var\\123 \x11 x=path\\file \x12 trailing\\ \x13",
+            b"0 00 -0 +1 9223372036854775808 18446744073709551615 1.2.3",
+        ] {
+            assert_fused_scanner_matches_reference(message);
+        }
+        // Longer deterministic inputs exercise repeated calls and markers inside constant and
+        // variable tokens, including runs crossing word/vector boundaries.
+        let alphabet = b"abcdefgz019= .-_+\\\x11\x12\x13\n\xff";
+        let mut state = 0x1234_5678_u32;
+        for length in 0..512 {
+            let message: Vec<_> = (0..length)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    alphabet[(state >> 16) as usize % alphabet.len()]
+                })
+                .collect();
+            assert_fused_scanner_matches_reference(&message);
+        }
+    }
 
     fn encode(message: &[u8]) -> EncodedClpString {
         encode_clp_string(message, u64::MAX, u64::MAX, |_| Ok(7)).expect("encode CLP string")
