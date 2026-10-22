@@ -650,6 +650,39 @@ impl DecodedPackedStream {
         }
     }
 
+    /// Combines disjoint projections of the same separate-column stream.
+    ///
+    /// The caller must supply projections from the same physical stream, at the same
+    /// decoding stage. Loaded slots retain their representation and logical size.
+    /// Returns `None` for missing/inconsistent layouts or overlapping loaded columns.
+    #[must_use]
+    pub fn merge_disjoint_columns(self, other: Self) -> Option<Self> {
+        let left = self.column_layout.as_ref()?;
+        let right = other.column_layout.as_ref()?;
+        if left.len() != right.len() { return None; }
+        for (a, b) in left.iter().zip(right) {
+            if (a.loaded && b.loaded) || (!a.loaded && a.stored != 0)
+                || (!b.loaded && b.stored != 0) { return None; }
+        }
+        let total = self.bytes.len().checked_add(other.bytes.len())?;
+        let mut bytes = Vec::with_capacity(total);
+        let mut layout = Vec::with_capacity(left.len());
+        let (mut left_offset, mut right_offset) = (0usize, 0usize);
+        for (a, b) in left.iter().zip(right) {
+            let left_end = left_offset.checked_add(a.stored)?;
+            let right_end = right_offset.checked_add(b.stored)?;
+            let left_bytes = self.bytes.get(left_offset..left_end)?;
+            let right_bytes = other.bytes.get(right_offset..right_end)?;
+            let (slot, data) = if a.loaded { (*a, left_bytes) } else { (*b, right_bytes) };
+            bytes.extend_from_slice(data);
+            layout.push(slot);
+            left_offset = left_end;
+            right_offset = right_end;
+        }
+        if left_offset != self.bytes.len() || right_offset != other.bytes.len() { return None; }
+        Some(Self::from_column_buffer(bytes, layout))
+    }
+
     /// Takes already assembled canonical columns without concatenating them again.
     pub(crate) fn from_column_buffer(bytes: Vec<u8>, layout: Vec<ColumnSlot>) -> Self {
         debug_assert_eq!(bytes.len(), layout.iter().map(|slot| slot.stored).sum::<usize>());
@@ -1254,5 +1287,43 @@ mod tests {
             let read_size = output.len().min(self.max_read_size);
             self.inner.read(&mut output[..read_size])
         }
+    }
+}
+
+#[cfg(test)]
+mod projected_merge_tests {
+    use super::*;
+    use crate::archive::NumericEncoding;
+
+    #[test]
+    fn merge_keeps_compact_layouts_and_interleaved_columns() {
+        let compact = ColumnSlot { size: 800, stored: 8, loaded: true,
+            numeric_encoding: Some(NumericEncoding::Constant) };
+        let skipped = ColumnSlot { size: 9, stored: 0, loaded: false, numeric_encoding: None };
+        let left = DecodedPackedStream::from_column_buffer(42i64.to_le_bytes().to_vec(),
+            vec![compact, skipped, skipped]);
+        let right = DecodedPackedStream::from_columns(vec![None, Some(vec![1, 2, 3]), None], &[9, 3, 9]);
+        let merged = left.merge_disjoint_columns(right).unwrap();
+        assert_eq!(&merged.as_bytes()[..8], &42i64.to_le_bytes());
+        assert_eq!(&merged.as_bytes()[8..], &[1, 2, 3]);
+        let layout = merged.column_layout().unwrap();
+        assert_eq!(layout[0], compact);
+        assert_eq!(layout[0].stored_rows(100), 100);
+        assert_eq!((layout[1].stored, layout[1].loaded), (3, true));
+        assert!(!layout[2].loaded);
+    }
+
+    #[test]
+    fn merge_rejects_overlap_and_invalid_layouts() {
+        let loaded = || DecodedPackedStream::from_columns(vec![Some(vec![1])], &[1]);
+        let skipped = || DecodedPackedStream::from_columns(vec![None], &[1]);
+        assert!(loaded().merge_disjoint_columns(loaded()).is_none());
+        assert!(loaded().merge_disjoint_columns(DecodedPackedStream::from_tables(vec![])).is_none());
+        assert!(loaded().merge_disjoint_columns(DecodedPackedStream::from_columns(vec![], &[])).is_none());
+        let mut corrupt = skipped();
+        corrupt.column_layout.as_mut().unwrap()[0].stored = usize::MAX;
+        assert!(loaded().merge_disjoint_columns(corrupt).is_none());
+        let merged = skipped().merge_disjoint_columns(loaded()).unwrap();
+        assert_eq!(merged.as_bytes(), &[1]);
     }
 }

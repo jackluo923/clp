@@ -29,6 +29,7 @@ use clp_s::archive::append_logtype_template;
 use clp_s::archive::append_parsed_logtype_template;
 use clp_s::search::ArchiveSearchOptions;
 use clp_s::search::DictionaryMatches;
+use clp_s::search::MatchBitmap;
 use clp_s::search::ColumnNamespace;
 use clp_s::search::{ComparisonOperator, Literal};
 use clp_s::search::ExpressionKind;
@@ -305,6 +306,8 @@ pub struct ProjectedScanner {
     stream_index: usize,
     stream_count: usize,
     stream: Option<DecodedPackedStream>,
+    /// Table-local matches retained from the filter-only read.
+    prefilter_matches: Option<(usize, MatchBitmap)>,
     /// Physical table index to resume from, archive-wide.
     table_cursor: usize,
     cells: Vec<Cell>,
@@ -676,6 +679,7 @@ impl ProjectedScanner {
             stream_index: 0,
             stream_count,
             stream: None,
+            prefilter_matches: None,
             table_cursor: 0,
             cells: Vec::new(),
             text: Vec::new(),
@@ -735,8 +739,11 @@ impl ProjectedScanner {
                 .map_err(|e| ScanError::Archive(e.to_string()))? {
                 continue;
             }
-            let bitmap = compiled.match_table(&decoded)
-                .map_err(|e| ScanError::Archive(e.to_string()))?;
+            let bitmap = match self.prefilter_matches.take() {
+                Some((table, bitmap)) if table == decoded.table_index() => bitmap,
+                _ => compiled.match_table(&decoded)
+                    .map_err(|e| ScanError::Archive(e.to_string()))?,
+            };
             let rows = bitmap.match_count();
             if rows == 0 {
                 continue;
@@ -883,6 +890,7 @@ impl ProjectedScanner {
     /// orders differ as soon as an archive holds more than one schema. Deciding without reading
     /// would need each row's `log_event_idx`, which is inside the stream being skipped.
     fn load_next_stream(&mut self) -> Result<bool, ScanError> {
+        self.prefilter_matches = None;
         let stream_id = self.stream_index as u64;
         // A stream none of whose tables has a schema the query can match holds no result row, so it
         // is skipped unread. The cursor moves past its tables, since resuming before a stream's
@@ -898,23 +906,41 @@ impl ProjectedScanner {
             Some(wanted) => self.plan_truncation(stream_id, wanted),
             None => None,
         };
-        // The columns the filter reads are read alone first when the fields add others, so a
-        // stream without a match costs only those.
+        // Keep the filter-only read and bitmap. A successful prefilter must not make
+        // the full scan read/decode those columns or evaluate the predicate again.
+        let mut prefiltered = None;
+        let mut remaining = None;
         if truncate.is_none()
             && let Some(wanted) = mask.as_deref()
             && let Some(matching) = self.filter_mask(stream_id)
             && matching != wanted
-            && !self.matches_from_columns(stream_id, first_table, &matching)?
+            && let Some((stream, bitmap)) = self.prefilter_columns(stream_id, first_table, &matching)?
         {
-            self.table_cursor = end_table;
-            self.stream_index += 1;
-            return Ok(false);
+            if bitmap.match_count() == 0 {
+                self.table_cursor = end_table;
+                self.stream_index += 1;
+                return Ok(false);
+            }
+            let missing = match stream.column_layout() {
+                Some(layout) if layout.len() == wanted.len() => wanted.iter().zip(layout)
+                    .map(|(wanted, slot)| *wanted && !slot.loaded).collect::<Vec<_>>(),
+                // A reader may use the trait's whole-stream projection fallback.
+                None => vec![false; wanted.len()],
+                Some(_) => return Err(ScanError::Archive("prefilter column layout mismatch".into())),
+            };
+            self.prefilter_matches = Some((first_table, bitmap));
+            if !missing.iter().any(|wanted| *wanted) {
+                self.stream = Some(stream);
+                return Ok(true);
+            }
+            remaining = Some(missing);
+            prefiltered = Some(stream);
         }
         let total_rows = self
             .stream_table(stream_id)
             .and_then(|table| usize::try_from(table.message_count()).ok())
             .unwrap_or(0);
-        let stream = match mask.as_deref() {
+        let stream = match remaining.as_deref().or(mask.as_deref()) {
             Some(wanted) => self.reader.read_packed_stream_projected(
                 self.catalog.metadata(),
                 self.catalog.table_metadata(),
@@ -942,8 +968,7 @@ impl ProjectedScanner {
                 "failed to read packed stream {stream_id}: {source}"
             ))
         })?;
-        // Rewrite adaptive integer columns back to plain 8-byte values so the fixed-stride table
-        // decoder and random-access cell reader are unchanged (a no-op for 0.5.x archives).
+        // Prepare only the newly read columns, preserving compact numeric layouts.
         let stream = self
             .catalog
             .materialize_adaptive_numerics(stream_id, stream, self.options.columns())
@@ -952,6 +977,11 @@ impl ProjectedScanner {
                     "failed to materialize adaptive columns in stream {stream_id}: {source}"
                 ))
             })?;
+        let stream = match prefiltered {
+            Some(filter_columns) => filter_columns.merge_disjoint_columns(stream)
+                .ok_or_else(|| ScanError::Archive("incompatible prefilter/output column layouts".into()))?,
+            None => stream,
+        };
         self.stream = Some(stream);
         Ok(true)
     }
@@ -1021,15 +1051,14 @@ impl ProjectedScanner {
         })
     }
 
-    /// Whether any row of the one table in a separate-column stream matches, judged from the
-    /// columns `mask` selects. A table out of place answers `true`, leaving the whole read to
-    /// report it.
-    fn matches_from_columns(
+    /// Retains the filter-only stream and its matches. An unexpected table returns
+    /// `None`, leaving the original full-read path to report the metadata error.
+    fn prefilter_columns(
         &mut self,
         stream_id: u64,
         table_index: usize,
         mask: &[bool],
-    ) -> Result<bool, ScanError> {
+    ) -> Result<Option<(DecodedPackedStream, MatchBitmap)>, ScanError> {
         let stream = self
             .reader
             .read_packed_stream_projected(
@@ -1072,12 +1101,12 @@ impl ProjectedScanner {
             .map_err(|source| ScanError::Archive(format!("failed to decode table: {source}")))?
             .filter(|decoded| decoded.table_index() == table_index)
         else {
-            return Ok(true);
+            return Ok(None);
         };
         let bitmap = compiled
             .match_table(&decoded)
             .map_err(|source| ScanError::Archive(format!("failed to match table: {source}")))?;
-        Ok(0 != bitmap.match_count())
+        Ok(Some((stream, bitmap)))
     }
 
     fn projection_mask(&self, stream_id: u64) -> Option<Vec<bool>> {
@@ -1211,9 +1240,11 @@ impl ProjectedScanner {
                 table_cursor = decoded.table_index() + 1;
                 continue;
             }
-            let bitmap = compiled
-                .match_table(&decoded)
-                .map_err(|source| ScanError::Archive(format!("failed to match table: {source}")))?;
+            let bitmap = match self.prefilter_matches.take() {
+                Some((table, bitmap)) if table == decoded.table_index() => bitmap,
+                _ => compiled.match_table(&decoded)
+                    .map_err(|source| ScanError::Archive(format!("failed to match table: {source}")))?,
+            };
             if 0 == bitmap.match_count() {
                 table_cursor = decoded.table_index() + 1;
                 continue;
@@ -1514,6 +1545,105 @@ mod encoded_numeric_tests {
                 assert!(stream.column_layout().unwrap().iter().filter(|slot| slot.loaded)
                     .all(|slot| slot.numeric_encoding == Some(NumericEncoding::Constant)));
                 for buffer in &scan.column_buffers { assert_eq!(if constants { 1 } else { rows }, buffer.numeric.len()); }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod prefilter_reuse_tests {
+    use super::*;
+    use clp_s::archive::*;
+    use clp_s::search::{parse_kql, KqlLimits};
+    use std::{cell::RefCell, io::Cursor, rc::Rc};
+
+    type Reads = Rc<RefCell<Vec<(usize, Vec<bool>)>>>;
+    struct RecordingReader {
+        inner: SingleFileArchiveReader<Cursor<Vec<u8>>>,
+        reads: Reads,
+        whole_projection: bool,
+    }
+    impl ArchiveReader for RecordingReader {
+        fn read_catalog(&mut self, limits: ArchiveCatalogLimits) -> Result<ArchiveCatalog, ArchiveCatalogError> {
+            self.inner.read_catalog(limits)
+        }
+        fn read_variable_dictionary(&mut self, m: &ArchiveMetadata, l: DictionaryLimits) -> Result<VariableDictionary, DictionaryError> {
+            self.inner.read_variable_dictionary(m, l)
+        }
+        fn read_log_type_dictionary(&mut self, m: &ArchiveMetadata, l: DictionaryLimits) -> Result<LogTypeDictionary, DictionaryError> {
+            self.inner.read_log_type_dictionary(m, l)
+        }
+        fn read_log_type_dictionary_fields(&mut self, m: &ArchiveMetadata, l: DictionaryLimits, fields: &[u32]) -> Result<LogTypeDictionary, DictionaryError> {
+            self.inner.read_log_type_dictionary_fields(m, l, fields)
+        }
+        fn read_array_dictionary(&mut self, m: &ArchiveMetadata, l: DictionaryLimits) -> Result<ArrayDictionary, DictionaryError> {
+            self.inner.read_array_dictionary(m, l)
+        }
+        fn read_packed_stream(&mut self, m: &ArchiveMetadata, t: &TableMetadata, id: usize, l: PackedStreamLimits) -> Result<DecodedPackedStream, PackedStreamError> {
+            self.inner.read_packed_stream(m, t, id, l)
+        }
+        fn read_packed_stream_projected(&mut self, m: &ArchiveMetadata, t: &TableMetadata, id: usize,
+            wanted: &[bool], truncate: Option<ColumnTruncation<'_>>, l: PackedStreamLimits) -> Result<DecodedPackedStream, PackedStreamError> {
+            self.reads.borrow_mut().push((id, wanted.to_vec()));
+            if self.whole_projection { self.inner.read_packed_stream(m, t, id, l) }
+            else { self.inner.read_packed_stream_projected(m, t, id, wanted, truncate, l) }
+        }
+    }
+
+    #[test]
+    fn successful_prefilters_never_reread_columns_and_empty_ones_skip_output() {
+        use std::fmt::Write;
+        let mut source = String::new();
+        for n in 0..10003 {
+            let extra = if n % 2 == 0 { ",\"optional\":1" } else { "" };
+            writeln!(source, "{{\"n\":{n},\"ci\":42,\"cf\":2.5,\"text\":\"hello {n}\"{extra}}}").unwrap();
+        }
+        let mut writer = clp_s::writer::OpenArchive::new(Cursor::new(Vec::new()),
+            clp_s::writer::WriterOptions::default().with_separate_columns_min_size(1)
+                .with_adaptive_numeric_columns(true));
+        let mut parser = clp_s::ingest::ParseManyReader::new(source.as_bytes(), Default::default());
+        parser.read_to_end(&mut clp_s::ingest::JsonArchiveSink::new(&mut writer,
+            clp_s::ingest::JsonArchiveOptions::default().with_retain_float_format(false))).unwrap();
+        let bytes = writer.finish().unwrap().into_inner().into_inner();
+        for whole_projection in [false, true] {
+            for mode in [2, 3, 4] {
+                for (query, expected) in [("n >= 0", (0..10003).collect::<Vec<i64>>()),
+                    ("n >= 2047 AND n < 4099", (2047..4099).collect()),
+                    ("n > 20000", Vec::new())] {
+                    let reads = Rc::new(RefCell::new(Vec::new()));
+                    let reader = RecordingReader { inner: SingleFileArchiveReader::open(Cursor::new(bytes.clone())).unwrap(),
+                        reads: reads.clone(), whole_projection };
+                    let mut scan = ProjectedScanner::open(Box::new(reader), parse_kql(query, KqlLimits::default()).unwrap(),
+                        &Default::default(), &["n".into(), "ci".into(), "cf".into(), "text".into()]).unwrap();
+                    let mut actual = Vec::new();
+                    if mode == 2 {
+                        while let Some((cells, _)) = scan.next_row().unwrap() {
+                            actual.push(cells[0].integer);
+                            assert_eq!(cells[1].integer, 42);
+                            assert_eq!(cells[2].real, 2.5);
+                        }
+                    } else {
+                        while let Some((columns, _, rows)) = scan.next_columns_with_constants(mode == 4).unwrap() {
+                            assert_eq!(columns[0].kind, kind::INTEGER);
+                            // SAFETY: Copy from live numeric column views before advancing.
+                            unsafe {
+                                for row in 0..rows { actual.push(columns[0].data.cast::<i64>().add(row).read_unaligned()); }
+                            }
+                            assert!(scan.prefilter_matches.is_none(), "cached bitmap consumed");
+                        }
+                    }
+                    actual.sort_unstable();
+                    assert_eq!(actual, expected, "{query}, mode={mode}, whole={whole_projection}");
+                    let reads = reads.borrow();
+                    assert_eq!(reads.len(), if expected.is_empty() || whole_projection { 2 } else { 4 });
+                    if !whole_projection && !expected.is_empty() {
+                        for pair in reads.chunks_exact(2) {
+                            assert_eq!(pair[0].0, pair[1].0);
+                            assert!(pair[0].1.iter().zip(&pair[1].1).all(|(a, b)| !(*a && *b)),
+                                "a column was decompressed twice: {pair:?}");
+                        }
+                    }
+                }
             }
         }
     }
