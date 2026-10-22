@@ -2763,3 +2763,59 @@ fn invalid_preflight_does_not_create_the_output_root() {
     assert!(!archives_path.exists());
     assert_eq!(b"", result.stdout.as_slice());
 }
+
+
+#[test]
+fn frame_of_reference_filters_match_plain_archives_and_preserve_complete_records() {
+    use clp_s::archive::{ArchiveCatalogLimits, ColumnLimits, PackedStreamLimits};
+    let temporary = TestDirectory::new("for-predicate-bounds");
+    let input_path = temporary.path().join("input.jsonl");
+    let mut input = String::new();
+    let mut state = 17_u64;
+    for row in 0..4097 {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let offset = (state >> 61) as i64;
+        input.push_str(&format!(
+            "{{\"id\":{},\"big\":{},\"neg\":{},\"top\":{},\"msg\":\"row {row}\"}}\n",
+            22412 + offset, (1_i64 << 53) + offset, -5 + offset, i64::MAX - 7 + offset,
+        ));
+    }
+    input.push_str("{\"id\":null,\"msg\":\"null\"}\n{\"msg\":\"missing\"}\n{\"id\":\"22419\",\"msg\":\"string\"}\n");
+    fs::write(&input_path, input).unwrap();
+    let compress = |name: &str, extra: &[&str]| {
+        let output = temporary.path().join(name);
+        let mut args: Vec<&OsStr> = vec!["c".as_ref(), "--single-file-archive".as_ref()];
+        args.extend(extra.iter().map(OsStr::new));
+        args.extend([output.as_os_str(), input_path.as_os_str()]);
+        let result = clp_s(&args);
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        only_entry(&output)
+    };
+    let adaptive = compress("adaptive", &[]);
+    let plain = compress("plain", &["--no-adaptive-numeric-columns", "--separate-columns-min-size", "0"]);
+    // Verify that the adaptive writer actually selected FOR in this fixture.
+    let mut reader = SingleFileArchiveReader::open(File::open(&adaptive).unwrap()).unwrap();
+    let catalog = reader.read_catalog(ArchiveCatalogLimits::default()).unwrap();
+    let mut found = false;
+    for stream_id in 0..catalog.table_metadata().packed_streams().len() {
+        let stream = reader.read_packed_stream(catalog.metadata(), catalog.table_metadata(), stream_id,
+            PackedStreamLimits::default()).unwrap();
+        let stream = catalog.materialize_adaptive_numerics(stream_id as u64, stream, ColumnLimits::default()).unwrap();
+        found |= stream.column_layout().unwrap_or(&[]).iter().any(|slot|
+            slot.numeric_encoding == Some(clp_s::archive::NumericEncoding::FrameOfReference));
+    }
+    assert!(found, "fixture must exercise compact FOR");
+    for query in ["*", "id:22419", "id:22420", "id > 22419", "id >= 22412", "id < 22412",
+        "NOT id:22420", "id:22420 OR id:22412", "id:22420 AND id:22412",
+        "id:22412 OR NOT id:22419", "id > 22412.5", "id < 22412.5", "id:22412.5",
+        "big:9007199254740993", "big:9007199254740992.0", "big > 9007199254740992.0",
+        "neg < -0.5", "top:9223372036854775807", "top < 9223372036854775808.0"] {
+        let search = |path: &Path| {
+            let output = clp_s(&["s".as_ref(), path.as_os_str(), query.as_ref()]);
+            assert!(output.status.success(), "{query}: {}", String::from_utf8_lossy(&output.stderr));
+            let mut lines: Vec<String> = String::from_utf8(output.stdout).unwrap().lines().map(str::to_owned).collect();
+            lines.sort(); lines
+        };
+        assert_eq!(search(&plain), search(&adaptive), "{query}");
+    }
+}

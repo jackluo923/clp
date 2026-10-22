@@ -7,6 +7,8 @@ use crate::adaptive_int::{AdaptiveDecodeError as Error, unpack_bits_iter};
 pub enum NumericEncoding {
     /// One little-endian 64-bit value.
     Constant,
+    /// Signed base, bit width, and packed unsigned offsets (integer columns only).
+    FrameOfReference,
     /// A value table followed by packed row indices.
     Dictionary,
     /// Value/end pairs; cumulative ends replace the wire run lengths.
@@ -16,6 +18,7 @@ pub enum NumericEncoding {
 pub(crate) fn encoding(bytes: &[u8], float: bool) -> Option<NumericEncoding> {
     match (bytes.first().copied()?, float) {
         (5, false) | (3, true) => Some(NumericEncoding::Constant),
+        (1, false) => Some(NumericEncoding::FrameOfReference),
         (3, false) | (2, true) => Some(NumericEncoding::Dictionary),
         (4, _) => Some(NumericEncoding::RunEnds),
         _ => None,
@@ -37,6 +40,16 @@ fn dictionary(bytes: &[u8]) -> Result<(usize, &[u8], u8, &[u8]), Error> {
     let width = *bytes.get(end).ok_or(Error::Truncated)?;
     let codes = &bytes[end + 1..];
     Ok((count, values, width, codes))
+}
+
+/// Validate the complete packed span without decoding values. Wrapping addition
+/// remains legal, as in the established adaptive integer decoder.
+fn frame_of_reference(bytes: &[u8], rows: usize) -> Result<(u64, u8, &[u8]), Error> {
+    let base = u64_at(bytes, 0)?;
+    let width = *bytes.get(8).ok_or(Error::Truncated)?;
+    let offsets = &bytes[9..];
+    let _ = unpack_bits_iter(offsets, width, rows)?;
+    Ok((base, width, offsets))
 }
 
 /// Validate the span even when every representable code is a valid index. Small
@@ -113,6 +126,12 @@ pub(crate) fn prepare(bytes: &[u8], rows: usize, float: bool, out: &mut Vec<u8>)
     let rest = &bytes[1..];
     match encoding {
         NumericEncoding::Constant => out.extend_from_slice(rest.get(..8).ok_or(Error::Truncated)?),
+        NumericEncoding::FrameOfReference => {
+            let (_, width, _) = frame_of_reference(rest, rows)?;
+            let length = rows.checked_mul(usize::from(width)).ok_or(Error::Malformed)?
+                .div_ceil(8).checked_add(9).ok_or(Error::Malformed)?;
+            out.extend_from_slice(rest.get(..length).ok_or(Error::Truncated)?);
+        }
         NumericEncoding::Dictionary => {
             let (_, _, width, _) = dictionary(rest)?;
             let count = u32_at(rest, 0)? as usize;
@@ -162,6 +181,7 @@ impl<'a> NumericColumn<'a> {
     pub(crate) fn encoded(bytes: &'a [u8], rows: usize, encoding: NumericEncoding) -> Result<Self, Error> {
         match encoding {
             NumericEncoding::Constant => { u64_at(bytes, 0)?; }
+            NumericEncoding::FrameOfReference => { frame_of_reference(bytes, rows)?; }
             NumericEncoding::Dictionary => {
                 let (count, _, width, codes) = dictionary(bytes)?;
                 validate_dictionary_codes(codes, width, rows, count)?;
@@ -190,6 +210,17 @@ impl<'a> NumericColumn<'a> {
         (self.len != 0 && self.encoding == Some(NumericEncoding::Constant))
             .then(|| u64_at(self.bytes, 0).unwrap())
     }
+    /// Conservative signed bounds, only when the representable offset range
+    /// cannot wrap across i64::MAX. A slice can safely use its parent's bounds.
+    pub(crate) fn integer_bounds(self) -> Option<(i64, i64)> {
+        if self.len == 0 || self.encoding != Some(NumericEncoding::FrameOfReference) {
+            return None;
+        }
+        let base = u64_at(self.bytes, 0).unwrap() as i64;
+        let max_offset = (1_i128 << self.bytes[8]) - 1;
+        let high = i64::try_from(i128::from(base) + max_offset).ok()?;
+        Some((base, high))
+    }
     fn run_end(self, run: usize) -> usize { u32_at(self.bytes, 12 + run * 12).unwrap() as usize }
     fn run_value(self, run: usize) -> u64 { u64_at(self.bytes, 4 + run * 12).unwrap() }
     fn find_run(self, row: usize) -> usize {
@@ -201,7 +232,7 @@ impl<'a> NumericColumn<'a> {
         }
         low
     }
-    fn code(codes: &[u8], width: u8, row: usize) -> usize {
+    fn code(codes: &[u8], width: u8, row: usize) -> u64 {
         if width == 0 { return 0; }
         let bit = row * usize::from(width);
         let start = bit / 8;
@@ -211,7 +242,7 @@ impl<'a> NumericColumn<'a> {
         for (i, &byte) in codes[start..start + length].iter().enumerate() {
             word |= u128::from(byte) << (i * 8);
         }
-        ((word >> shift) & ((1u128 << width) - 1)) as usize
+        ((word >> shift) & ((1u128 << width) - 1)) as u64
     }
     /// Iterate a validated packed span, starting at any row without walking skipped rows.
     fn codes(codes: &[u8], width: u8, start: usize, count: usize) -> impl Iterator<Item = u64> + '_ {
@@ -240,9 +271,11 @@ impl<'a> NumericColumn<'a> {
         Some(match self.encoding {
             None => u64_at(self.bytes, row * 8).unwrap(),
             Some(NumericEncoding::Constant) => u64_at(self.bytes, 0).unwrap(),
+            Some(NumericEncoding::FrameOfReference) => u64_at(self.bytes, 0).unwrap()
+                .wrapping_add(Self::code(&self.bytes[9..], self.bytes[8], row)),
             Some(NumericEncoding::Dictionary) => {
                 let (_, values, width, codes) = dictionary(self.bytes).unwrap();
-                u64_at(values, Self::code(codes, width, row) * 8).unwrap()
+                u64_at(values, Self::code(codes, width, row) as usize * 8).unwrap()
             }
             Some(NumericEncoding::RunEnds) => self.run_value(self.find_run(row)),
         })
@@ -251,6 +284,8 @@ impl<'a> NumericColumn<'a> {
     pub(crate) fn encoded_values_all(self, mut check: impl FnMut(u64) -> bool) -> Option<bool> {
         Some(match self.encoding? {
             NumericEncoding::Constant => check(u64_at(self.bytes, 0).unwrap()),
+            // Arbitrary validators are not monotone; endpoints cannot prove them.
+            NumericEncoding::FrameOfReference => return None,
             NumericEncoding::Dictionary => {
                 let (_, values, _, _) = dictionary(self.bytes).unwrap();
                 values.chunks_exact(8).all(|v| check(u64::from_le_bytes(v.try_into().unwrap())))
@@ -272,6 +307,11 @@ impl<'a> NumericColumn<'a> {
         match self.encoding {
             None => output.extend(self.bytes.as_chunks::<8>().0.iter().copied().map(u64::from_le_bytes)),
             Some(NumericEncoding::Constant) => output.resize(output.len() + self.len, u64_at(self.bytes, 0).unwrap()),
+            Some(NumericEncoding::FrameOfReference) => {
+                let base = u64_at(self.bytes, 0).unwrap();
+                output.extend(Self::codes(&self.bytes[9..], self.bytes[8], self.offset, self.len)
+                    .map(|offset| base.wrapping_add(offset)));
+            }
             Some(NumericEncoding::Dictionary) => {
                 let (_, values, width, codes) = dictionary(self.bytes).unwrap();
                 let values = values.as_chunks::<8>().0;
@@ -313,6 +353,13 @@ impl<'a> NumericColumn<'a> {
         match encoding {
             NumericEncoding::Constant => {
                 if matches(u64_at(self.bytes, 0).unwrap()) { bitmap.fill(truth); }
+            }
+            NumericEncoding::FrameOfReference => {
+                let base = u64_at(self.bytes, 0).unwrap();
+                for (dest, offset) in bitmap.iter_mut()
+                    .zip(Self::codes(&self.bytes[9..], self.bytes[8], start, count)) {
+                    if matches(base.wrapping_add(offset)) { *dest = truth; }
+                }
             }
             NumericEncoding::Dictionary => {
                 let (_, values, width, codes) = dictionary(self.bytes).unwrap();
@@ -463,6 +510,66 @@ mod tests {
             for (v, count) in runs { wire.extend(v.to_le_bytes()); wire.extend(count.to_le_bytes()); expected.extend(std::iter::repeat_n(v, count as usize)); }
             check(&wire, &expected, float);
         }
+    }
+
+    #[test]
+    fn frame_of_reference_views_preserve_packed_values_slices_and_wraparound() {
+        for width in [0u8, 1, 2, 3, 4, 7, 8, 9, 16, 31, 32, 63, 64] {
+            let mask = ((1u128 << width) - 1) as u64;
+            let offsets: Vec<u64> = (0..39u64).map(|i| match i % 4 {
+                0 => 0, 1 => mask, _ => i.wrapping_mul(6364136223846793005) & mask,
+            }).collect();
+            for base in [i64::MIN, -100, -1, 0, 22412, (1i64 << 53) + 1, i64::MAX - 1] {
+                let mut wire = vec![1];
+                wire.extend(base.to_le_bytes()); wire.push(width);
+                adaptive_int::pack_bits(&offsets, width, &mut wire);
+                let expected: Vec<u64> = offsets.iter().map(|v| (base as u64).wrapping_add(*v)).collect();
+                check(&wire, &expected, false);
+                let mut bytes = Vec::new();
+                let kind = prepare(&wire, expected.len(), false, &mut bytes).unwrap().unwrap();
+                assert_eq!(kind, NumericEncoding::FrameOfReference);
+                assert_eq!(bytes.len(), 9 + (expected.len() * usize::from(width)).div_ceil(8));
+                let column = NumericColumn::encoded(&bytes, expected.len(), kind).unwrap();
+                assert_eq!(column.encoded_values_all(|_| true), None);
+                let high = i64::try_from(i128::from(base) + i128::from(mask)).ok();
+                assert_eq!(column.integer_bounds(), high.map(|h| (base, h)));
+                if let Some((low, high)) = column.integer_bounds() {
+                    assert!(expected.iter().all(|v| low <= *v as i64 && *v as i64 <= high));
+                    assert_eq!(column.slice(7, 13).unwrap().integer_bounds(), Some((low, high)));
+                }
+                assert_eq!(column.slice(column.len(), 0).unwrap().integer_bounds(), None);
+            }
+            let mut empty = vec![1]; empty.extend(0i64.to_le_bytes()); empty.push(width);
+            check(&empty, &[], false);
+        }
+    }
+
+    #[test]
+    fn frame_of_reference_validation_rejects_bad_headers_and_spans_without_expansion() {
+        let mut wire = vec![1]; wire.extend(22412i64.to_le_bytes()); wire.push(1);
+        adaptive_int::pack_bits(&[0, 1, 0, 1, 1, 0, 0, 1, 0], 1, &mut wire);
+        for end in 1..wire.len() {
+            assert!(prepare(&wire[..end], 9, false, &mut Vec::new()).is_err());
+            assert!(NumericColumn::encoded(&wire[1..end], 9, NumericEncoding::FrameOfReference).is_err());
+        }
+        // Padding bits are not values and must not affect the final partial byte.
+        *wire.last_mut().unwrap() |= 0xfe;
+        check(&wire, &[22412, 22413, 22412, 22413, 22413, 22412, 22412, 22413, 22412], false);
+        wire[9] = 65;
+        assert!(prepare(&wire, 0, false, &mut Vec::new()).is_err());
+        assert!(NumericColumn::encoded(&wire[1..], 0, NumericEncoding::FrameOfReference).is_err());
+        wire[9] = 64;
+        assert!(prepare(&wire, usize::MAX, false, &mut Vec::new()).is_err());
+        let mut untouched = vec![7];
+        assert_eq!(prepare(&wire, 1, true, &mut untouched).unwrap(), None);
+        assert_eq!(untouched, [7]); // float tag 1 is a different codec
+        // A zero-bit integer column needs no storage proportional to its row count.
+        wire.truncate(10); wire[9] = 0;
+        let mut compact = Vec::new();
+        let kind = prepare(&wire, 10_000_000, false, &mut compact).unwrap().unwrap();
+        assert_eq!(compact.len(), 9);
+        let column = NumericColumn::encoded(&compact, 10_000_000, kind).unwrap();
+        assert_eq!(column.get(9_999_999), Some(22412));
     }
 
     #[test]

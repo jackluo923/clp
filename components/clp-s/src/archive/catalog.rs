@@ -318,7 +318,7 @@ impl ArchiveCatalog {
     }
 
     /// Prepares adaptive numeric columns for [`Self::schema_tables`]. Constants, dictionaries,
-    /// and runs retain compact reader-only layouts; other codecs decode to canonical 8-byte
+    /// frame-of-reference integers, and runs retain compact reader-only layouts; other codecs decode to canonical 8-byte
     /// little-endian values. Archive bytes and writer encodings are unchanged.
     ///
     /// Call this after [`SingleFileArchiveReader::read_packed_stream`] only for archives whose

@@ -289,6 +289,7 @@ impl<'a> I64Column<'a> {
     pub fn append_bits(self, output: &mut Vec<u64>) { self.data.append_bits(output); }
     #[must_use]
     pub fn constant_value(self) -> Option<i64> { self.data.constant().map(|v| v as i64) }
+    pub(crate) fn integer_bounds(self) -> Option<(i64, i64)> { self.data.integer_bounds() }
     pub(crate) fn or_encoded_matches(self, skip: usize, bitmap: &mut [u8], truth: u8,
         mut matches: impl FnMut(i64) -> bool) -> bool {
         self.data.or_matches(skip, bitmap, truth, |v| matches(v as i64))

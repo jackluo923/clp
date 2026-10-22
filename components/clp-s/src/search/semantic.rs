@@ -3275,6 +3275,15 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
         };
         match column {
             ColumnData::Integer(column) => {
+                if let Some(result) = column.integer_bounds().and_then(|bounds| {
+                    uniform_i64_range_match(bounds, filter.predicate, filter.value.timestamp_nanoseconds)
+                }) {
+                    if result {
+                        let count = bitmap.len().min(column.len().saturating_sub(skip));
+                        bitmap[..count].fill(Tri::True as u8);
+                    }
+                    return Ok(());
+                }
                 if !column.or_encoded_matches(skip, bitmap, Tri::True as u8, |value| {
                     scalar_i64_matches(value, filter.predicate, filter.value.timestamp_nanoseconds)
                 }) {
@@ -4141,6 +4150,35 @@ fn scalar_i64_matches(
     )
 }
 
+/// Prove a numeric predicate uniform over a conservative signed interval. Use
+/// the scalar comparison rules, including exact mixed integer/float semantics.
+/// None means the column still needs evaluation; false leaves existing OR bits alone.
+fn uniform_i64_range_match(
+    (low, high): (i64, i64), predicate: PredicateRef<'_>, timestamp_nanoseconds: Option<i64>,
+) -> Option<bool> {
+    if timestamp_nanoseconds.is_none() && numeric_literal(predicate.value()).is_none() {
+        return None;
+    }
+    let first = scalar_i64_matches(low, predicate, timestamp_nanoseconds);
+    let last = scalar_i64_matches(high, predicate, timestamp_nanoseconds);
+    if predicate.operator() == ComparisonOperator::Equal {
+        if low == high { return Some(first); }
+        let above = PredicateRef { operator: ComparisonOperator::Greater, ..predicate };
+        let below = PredicateRef { operator: ComparisonOperator::Less, ..predicate };
+        if scalar_i64_matches(low, above, timestamp_nanoseconds)
+            || scalar_i64_matches(high, below, timestamp_nanoseconds) {
+            return Some(false);
+        }
+        None
+    } else if first == last {
+        // Ordered comparisons are monotone over signed integers. NaN operands
+        // are false at both endpoints and everywhere in between.
+        Some(first)
+    } else {
+        None
+    }
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn numeric_value_matches_f64(value: f64, predicate: PredicateRef<'_>) -> bool {
     let operand = match numeric_literal(predicate.value()) {
@@ -4577,6 +4615,48 @@ mod tests {
                 println!("MEMBERSHIP {name} {method} median_ns={}", (times[4] + times[5]) / 2);
             }
         }
+    }
+
+    #[test]
+    fn integer_range_proofs_preserve_scalar_semantics_at_numeric_boundaries() {
+        let parsed = parse_kql("x:0", KqlLimits::default()).unwrap();
+        let ExpressionKind::Predicate(base) = parsed.node(parsed.root()).unwrap().kind() else { panic!("predicate") };
+        let bounds = [(i64::MIN, i64::MIN + 8), (-8, -1), (-2, 3), (0, 0), (22412, 22413),
+            ((1i64 << 53) - 2, (1i64 << 53) + 3), (i64::MAX - 8, i64::MAX), (i64::MIN, i64::MAX)];
+        let mut literals = Vec::new();
+        for &(lo, hi) in &bounds {
+            for value in [lo, lo.saturating_sub(1), lo.saturating_add(1), hi, hi.saturating_add(1)] {
+                literals.push(Literal::Integer { value, source: value.to_string() });
+                for value in [value as f64, value as f64 + 0.5, value as f64 - 0.5] {
+                    literals.push(Literal::Float { value, source: value.to_string() });
+                }
+            }
+        }
+        for value in [f64::NAN, f64::NEG_INFINITY, f64::INFINITY, -0.0, f64::from_bits(1)] {
+            literals.push(Literal::Float { value, source: value.to_string() });
+        }
+        let operators = [ComparisonOperator::Equal, ComparisonOperator::Less,
+            ComparisonOperator::LessOrEqual, ComparisonOperator::Greater, ComparisonOperator::GreaterOrEqual];
+        for &(lo, hi) in &bounds {
+            let values: Vec<i64> = if i128::from(hi) - i128::from(lo) <= 16 { (lo..=hi).collect() }
+                else { vec![lo, lo + 1, -(1i64 << 53) - 1, -1, 0, 1, (1i64 << 53) + 1, hi - 1, hi] };
+            for literal in &literals {
+                for operator in operators {
+                    let predicate = PredicateRef { path: base.path(), operator, value: literal };
+                    for timestamp in [None, Some(i64::MIN), Some(0), Some(i64::MAX)] {
+                        if let Some(proof) = uniform_i64_range_match((lo, hi), predicate, timestamp) {
+                            assert!(values.iter().all(|&v| scalar_i64_matches(v, predicate, timestamp) == proof),
+                                "bounds={lo}..{hi}, literal={literal:?}, operator={operator:?}, timestamp={timestamp:?}");
+                        }
+                    }
+                }
+            }
+        }
+        let missing = Literal::Integer { value: 22419, source: "22419".to_owned() };
+        let predicate = PredicateRef { path: base.path(), operator: ComparisonOperator::Equal, value: &missing };
+        assert_eq!(uniform_i64_range_match((22412, 22413), predicate, None), Some(false));
+        assert_eq!(uniform_i64_range_match((22412, 22420), predicate, None), None);
+        assert_eq!(uniform_i64_range_match((22419, 22419), predicate, None), Some(true));
     }
 
     #[test]
