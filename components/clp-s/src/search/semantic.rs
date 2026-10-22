@@ -1459,7 +1459,7 @@ fn timestamp_bounds_filter(
             let operand = compiled.timestamp_nanoseconds.map_or_else(
                 || match numeric_literal(predicate.value()) {
                     Some(NumericLiteral::Integer(value)) => Some(value),
-                    Some(NumericLiteral::Float(_)) | None => None,
+                    Some(NumericLiteral::Unsigned(_)) | Some(NumericLiteral::Float(_)) | None => None,
                 },
                 |nanoseconds| Some(nanoseconds / 1_000_000),
             );
@@ -1471,6 +1471,7 @@ fn timestamp_bounds_filter(
             let operand = compiled.timestamp_nanoseconds.map_or_else(
                 || match numeric_literal(predicate.value()) {
                     Some(NumericLiteral::Integer(value)) => Some(value as f64),
+                    Some(NumericLiteral::Unsigned(_)) => None,
                     Some(NumericLiteral::Float(value)) => Some(value),
                     None => None,
                 },
@@ -3256,7 +3257,10 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
                 .ok_or(SearchError::SizeOverflow)?;
             self.scan_column(filter, column.data(), bitmap)?;
         }
-        Ok(true)
+        // Mixed/type-restricted columns resolve eligibility per row. Leave their
+        // ineligible rows Unknown so NOT/!= cannot turn them into matches.
+        Ok(node_type != NodeType::MixedInteger && !(matches!(filter.predicate.value(), Literal::Unsigned { .. })
+            && matches!(node_type, NodeType::Integer | NodeType::DeltaInteger)))
     }
 
     fn scan_column(
@@ -3265,6 +3269,16 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
         column: ColumnData<'table, 'archive>,
         bitmap: &mut [u8],
     ) -> Result<(), SearchError> {
+        if let ColumnData::MixedInteger(mixed) = column
+            && let Some(signed) = mixed.signed_column()
+            && !matches!(filter.predicate.value(), Literal::Unsigned { .. }) {
+            // Preserve existing encoded scans when no large UInt64 is present.
+            self.scan_column(filter, ColumnData::Integer(signed), bitmap)?;
+            for value in bitmap {
+                if *value == Tri::Unknown as u8 { *value = Tri::False as u8; }
+            }
+            return Ok(());
+        }
         // Rows outside the guarded range-index run cannot match, so they are neither read nor
         // written and keep this leaf's default.
         let rows = bitmap.len();
@@ -3274,7 +3288,14 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
             None => (0, bitmap),
         };
         match column {
+            ColumnData::MixedInteger(column) => {
+                or_mixed_integer_matches(bitmap, column.iter().skip(skip), filter.predicate);
+            }
             ColumnData::Integer(column) => {
+                if matches!(filter.predicate.value(), Literal::Unsigned { .. }) {
+                    or_mixed_integer_matches(bitmap, column.iter().skip(skip).map(crate::integer::IntegerValue::Signed), filter.predicate);
+                    return Ok(());
+                }
                 if let Some(result) = column.integer_bounds().and_then(|bounds| {
                     uniform_i64_range_match(bounds, filter.predicate, filter.value.timestamp_nanoseconds)
                 }) {
@@ -3295,6 +3316,10 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
                 }
             }
             ColumnData::DeltaInteger(column) => {
+                if matches!(filter.predicate.value(), Literal::Unsigned { .. }) {
+                    or_mixed_integer_matches(bitmap, column.values().skip(skip).map(crate::integer::IntegerValue::Signed), filter.predicate);
+                    return Ok(());
+                }
                 or_i64_matches(
                     bitmap,
                     column.values().skip(skip),
@@ -3757,6 +3782,7 @@ fn or_i64_matches(
         match numeric_literal(predicate.value()) {
             Some(NumericLiteral::Integer(operand)) =>
                 or_comparison_matches(bitmap, values, operand, predicate.operator()),
+            Some(NumericLiteral::Unsigned(_)) => or_mixed_integer_matches(bitmap, values.map(crate::integer::IntegerValue::Signed), predicate),
             Some(NumericLiteral::Float(operand)) =>
                 or_i64_float_matches(bitmap, values, operand, predicate.operator()),
             None => {},
@@ -3818,6 +3844,10 @@ fn or_f64_matches(
     } else {
         match numeric_literal(predicate.value()) {
             Some(NumericLiteral::Integer(value)) => value as f64,
+            Some(NumericLiteral::Unsigned(value)) => {
+                or_matches(bitmap, values, |v| crate::integer::IntegerValue::Unsigned(value).compare_float(v).is_some_and(|order| compare(std::cmp::Ordering::Equal, order, predicate.operator())));
+                return;
+            }
             Some(NumericLiteral::Float(value)) => value,
             None => return,
         }
@@ -3833,7 +3863,7 @@ fn make_array_predicate<'query>(
     let equality = ComparisonOperator::Equal == filter.predicate.operator();
     let string_pattern = if equality {
         match filter.predicate.value() {
-            Literal::Integer { source, .. } | Literal::Float { source, .. } => {
+            Literal::Integer { source, .. } | Literal::Unsigned { source, .. } | Literal::Float { source, .. } => {
                 Some(source.as_str())
             }
             Literal::Boolean(true) => Some("true"),
@@ -3849,6 +3879,7 @@ fn make_array_predicate<'query>(
         filter.value.timestamp_nanoseconds.map_or_else(
             || match numeric_literal(filter.predicate.value()) {
                 Some(NumericLiteral::Integer(value)) => Some(ArrayNumber::Integer(value)),
+                Some(NumericLiteral::Unsigned(value)) => Some(ArrayNumber::Unsigned(value)),
                 Some(NumericLiteral::Float(value)) => Some(ArrayNumber::Float(value)),
                 None => None,
             },
@@ -3920,6 +3951,10 @@ fn scan_authoritative_column(
             or_matches(bitmap, column.epochs().values(), |value| {
                 timestamp_in_range(value, begin_nanoseconds, end_nanoseconds)
             });
+        }
+        ColumnData::MixedInteger(column) => {
+            or_matches(bitmap, column.iter(), |value| value.as_i64().is_some_and(|value|
+                timestamp_in_range(value, begin_nanoseconds, end_nanoseconds)));
         }
         ColumnData::Integer(column) => {
             or_matches(bitmap, column.iter(), |value| {
@@ -4076,7 +4111,7 @@ const fn is_search_value_node(node_type: NodeType) -> bool {
 
 fn node_compatible(node_type: NodeType, predicate: PredicateRef<'_>) -> bool {
     match node_type {
-        NodeType::Integer
+        NodeType::Integer | NodeType::MixedInteger
         | NodeType::DeltaInteger
         | NodeType::Float
         | NodeType::FormattedFloat
@@ -4091,7 +4126,7 @@ fn node_compatible(node_type: NodeType, predicate: PredicateRef<'_>) -> bool {
         NodeType::Null => matches!(predicate.value(), Literal::Null),
         NodeType::UnstructuredArray => matches!(
             predicate.value(),
-            Literal::Integer { .. }
+            Literal::Integer { .. } | Literal::Unsigned { .. }
                 | Literal::Float { .. }
                 | Literal::Boolean(_)
                 | Literal::Null
@@ -4118,20 +4153,45 @@ fn opposite_string_class(node_type: NodeType, predicate: PredicateRef<'_>) -> bo
 #[derive(Clone, Copy)]
 enum NumericLiteral {
     Integer(i64),
+    Unsigned(u64),
     Float(f64),
 }
 
 const fn numeric_literal(literal: &Literal) -> Option<NumericLiteral> {
     match literal {
         Literal::Integer { value, .. } => Some(NumericLiteral::Integer(*value)),
+        Literal::Unsigned { value, .. } => Some(NumericLiteral::Unsigned(*value)),
         Literal::Float { value, .. } => Some(NumericLiteral::Float(*value)),
         _ => None,
     }
 }
 
+fn or_mixed_integer_matches(bitmap: &mut [u8], values: impl Iterator<Item = crate::integer::IntegerValue>, predicate: PredicateRef<'_>) {
+    for (slot, value) in bitmap.iter_mut().zip(values) {
+        let eligible = match predicate.value() {
+            Literal::Integer { .. } => value.as_i64().is_some(),
+            Literal::Unsigned { .. } => value.as_u64().is_some(),
+            Literal::Float { .. } => true,
+            _ => false,
+        };
+        if eligible {
+            if mixed_integer_matches(value, predicate) { *slot = Tri::True as u8; }
+            else if *slot == Tri::Unknown as u8 { *slot = Tri::False as u8; }
+        }
+    }
+}
+fn mixed_integer_matches(value: crate::integer::IntegerValue, predicate: PredicateRef<'_>) -> bool {
+    match predicate.value() {
+        Literal::Integer { value: operand, .. } => value.as_i64().is_some_and(|value| compare(value, *operand, predicate.operator())),
+        Literal::Unsigned { value: operand, .. } => value.as_u64().is_some_and(|value| compare(value, *operand, predicate.operator())),
+        Literal::Float { value: operand, .. } => value.compare_float(*operand).is_some_and(|order| compare(order, std::cmp::Ordering::Equal, predicate.operator())),
+        _ => false,
+    }
+}
 fn numeric_value_matches_i64(value: i64, predicate: PredicateRef<'_>) -> bool {
     match numeric_literal(predicate.value()) {
         Some(NumericLiteral::Integer(operand)) => compare(value, operand, predicate.operator()),
+        Some(NumericLiteral::Unsigned(operand)) => u64::try_from(value).is_ok_and(|value| compare(value, operand, predicate.operator())),
         Some(NumericLiteral::Float(operand)) => {
             compare_i64_float(value, operand, predicate.operator())
         }
@@ -4182,6 +4242,8 @@ fn uniform_i64_range_match(
 #[allow(clippy::cast_precision_loss)]
 fn numeric_value_matches_f64(value: f64, predicate: PredicateRef<'_>) -> bool {
     let operand = match numeric_literal(predicate.value()) {
+        Some(NumericLiteral::Unsigned(operand)) => return crate::integer::IntegerValue::Unsigned(operand).compare_float(value)
+            .is_some_and(|order| compare(std::cmp::Ordering::Equal, order, predicate.operator())),
         Some(NumericLiteral::Integer(value)) => value as f64,
         Some(NumericLiteral::Float(value)) => value,
         None => return false,
@@ -4251,7 +4313,7 @@ fn variable_pattern(predicate: PredicateRef<'_>) -> Option<&str> {
         return None;
     }
     match predicate.value() {
-        Literal::Integer { source, .. } | Literal::Float { source, .. } => Some(source),
+        Literal::Integer { source, .. } | Literal::Unsigned { source, .. } | Literal::Float { source, .. } => Some(source),
         Literal::Boolean(true) => Some("true"),
         Literal::Boolean(false) => Some("false"),
         Literal::Null => Some("null"),

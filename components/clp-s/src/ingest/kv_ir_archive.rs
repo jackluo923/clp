@@ -3241,7 +3241,7 @@ mod tests {
                 Some(0),
                 current.selected_pair_index(adapter.selection_epoch)
             );
-            assert_eq!(adapter.active_auto.as_slice(), &[]);
+            assert!(adapter.active_auto.is_empty());
             assert_eq!(
                 [0, u32::try_from(SCHEMA_NODE_COUNT).unwrap()],
                 adapter.active_user.as_slice()
@@ -3708,7 +3708,7 @@ mod tests {
                 .expect("deep shared paths bridge into the archive set");
 
             let active_count = usize::from(DEPTH) + 3;
-            assert_eq!(adapter.active_auto.as_slice(), &[]);
+            assert!(adapter.active_auto.is_empty());
             assert_eq!(active_count, adapter.active_user.len());
             assert_eq!(active_count, adapter.sparse_links.len());
             assert_eq!(2 * usize::from(DEPTH) + 2, adapter.plan.len());

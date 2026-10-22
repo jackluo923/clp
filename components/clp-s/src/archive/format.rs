@@ -49,6 +49,8 @@ impl ArchiveVersion {
     /// rather than its template (0.8 plus those entries). Stamped when the writer may store text
     /// whole.
     pub const VERBATIM_TEXT: Self = Self::new(0, 9, 0);
+    /// Mixed signed/unsigned integer columns with optional unsigned bitmaps.
+    pub const MIXED_INTEGERS: Self = Self::new(0, 10, 0);
 
     /// Creates a version from its semantic components.
     #[must_use]
@@ -96,7 +98,8 @@ impl ArchiveVersion {
                 || self.minor == Self::ADAPTIVE_NUMERIC.minor
                 || self.minor == Self::FIELD_DICTIONARIES.minor
                 || self.minor == Self::ADAPTIVE_STRINGS.minor
-                || self.minor == Self::VERBATIM_TEXT.minor)
+                || self.minor == Self::VERBATIM_TEXT.minor
+                || self.minor == Self::MIXED_INTEGERS.minor)
     }
 
     /// Whether a separate-column integer stream in an archive at this version may carry an adaptive
@@ -468,7 +471,8 @@ mod tests {
         // 0.9 marks log-type dictionary entries that hold a string whole.
         assert!(ArchiveVersion::VERBATIM_TEXT.is_readable());
         assert!(ArchiveVersion::VERBATIM_TEXT.supports_adaptive_strings());
-        assert!(!ArchiveVersion::new(0, 10, 0).is_readable());
+        assert!(ArchiveVersion::MIXED_INTEGERS.is_readable());
+        assert!(!ArchiveVersion::new(0, 11, 0).is_readable());
         assert!(!ArchiveVersion::new(1, 5, 0).is_readable());
     }
 

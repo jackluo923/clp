@@ -310,6 +310,8 @@ pub enum Literal {
         /// Original spelling after KQL unescaping.
         source: String,
     },
+    /// Exact unsigned integer literal, including explicitly suffixed small values.
+    Unsigned { value: u64, source: String },
     /// Finite binary64 value plus its unescaped source spelling.
     Float {
         /// Parsed finite value.

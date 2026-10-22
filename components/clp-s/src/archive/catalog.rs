@@ -421,6 +421,10 @@ impl ArchiveCatalog {
             let mut numeric_encoding = None;
             if !slot.loaded {
                 // A projected-out column occupies no bytes.
+            } else if node_type == Some(NodeType::MixedInteger) {
+                numeric_encoding = crate::integer::prepare(stored, message_count, &mut output).map_err(decode_err)?;
+                size = output.len() - start;
+                changed = true;
             } else if matches!(node_type, Some(NodeType::Integer | NodeType::Float))
                 && !stored.is_empty()
                 && crate::encoded_numeric::encoding(stored, node_type == Some(NodeType::Float)).is_some()
@@ -509,6 +513,26 @@ impl ArchiveCatalog {
             offset += slot.stored;
             let rows = node_rows.get(&frame.node_id()).copied().unwrap_or(0);
             let decoded = match frame.encoding() {
+                GroupedFrameEncoding::MixedInteger => {
+                    let mut prepared = Vec::new();
+                    let encoding = crate::integer::prepare(stored, rows, &mut prepared).map_err(malformed)?;
+                    let column = crate::integer::MixedIntegerColumn::new(&prepared, rows, encoding).map_err(malformed)?;
+                    let mut values = column.iter();
+                    let mut output = Vec::new();
+                    for (count, columns) in &members {
+                        for (node_id, _) in columns {
+                            if *node_id != frame.node_id() { continue; }
+                            let mut member = crate::integer::IntegerBuffer::default();
+                            for _ in 0..*count {
+                                member.append(values.next().ok_or_else(|| malformed(AdaptiveDecodeError::Truncated))?);
+                            }
+                            output.push(u8::from(!member.bitmap.is_empty()));
+                            output.extend_from_slice(&member.bits);
+                            output.extend_from_slice(&member.bitmap);
+                        }
+                    }
+                    output
+                }
                 GroupedFrameEncoding::Plain => stored.to_vec(),
                 GroupedFrameEncoding::Integer => crate::adaptive_int::decode(stored, rows)
                     .map_err(malformed)?
@@ -618,6 +642,11 @@ type GroupedMember = (usize, Vec<(u32, NodeType)>);
 /// fixed width per row, or for a CLP string its descriptors, its variable count and its variables.
 fn plain_column_size(node_type: NodeType, rows: usize, bytes: &[u8]) -> Option<usize> {
     let size = match node_type {
+        NodeType::MixedInteger => {
+            let flag = *bytes.first()?;
+            if flag > 1 { return None; }
+            rows.checked_mul(8)?.checked_add(1)?.checked_add(if flag == 1 { rows.div_ceil(8) } else { 0 })?
+        }
         NodeType::Integer
         | NodeType::DeltaInteger
         | NodeType::Float

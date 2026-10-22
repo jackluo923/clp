@@ -616,6 +616,8 @@ enum AggregationState {
 pub enum AggregationNumber {
     /// Signed 64-bit JSON integer.
     Integer(i64),
+    /// Exact unsigned 64-bit JSON integer.
+    Unsigned(u64),
     /// Finite binary64 JSON number.
     Float(f64),
 }
@@ -624,6 +626,7 @@ impl Serialize for AggregationNumber {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Integer(value) => serializer.serialize_i64(*value),
+            Self::Unsigned(value) => serializer.serialize_u64(*value),
             Self::Float(value) => serializer.serialize_f64(*value),
         }
     }
@@ -635,6 +638,8 @@ impl Serialize for AggregationNumber {
 pub enum AggregationValueRef<'a> {
     /// Signed 64-bit JSON integer.
     Integer(i64),
+    /// Exact unsigned 64-bit JSON integer.
+    Unsigned(u64),
     /// Finite binary64 JSON number.
     Float(f64),
     /// UTF-8 JSON string value.
@@ -647,6 +652,7 @@ impl Serialize for AggregationValueRef<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Integer(value) => serializer.serialize_i64(*value),
+            Self::Unsigned(value) => serializer.serialize_u64(*value),
             Self::Float(value) => serializer.serialize_f64(*value),
             Self::String(value) => serializer.serialize_str(value),
             Self::Boolean(value) => serializer.serialize_bool(*value),
@@ -840,6 +846,7 @@ fn append_value(
 ) -> Result<(), AggregationJsonError> {
     match value {
         AggregationValueRef::Integer(value) => append_i64(destination, value),
+        AggregationValueRef::Unsigned(value) => append_literal(destination, itoa::Buffer::new().format(value)),
         AggregationValueRef::Float(value) => append_f64(destination, value),
         AggregationValueRef::String(value) => {
             append_json_string(value, destination, JsonEscapeLimits::default())?;
@@ -856,6 +863,7 @@ fn append_number(
 ) -> Result<(), AggregationJsonError> {
     match value {
         AggregationNumber::Integer(value) => append_i64(destination, value),
+        AggregationNumber::Unsigned(value) => append_literal(destination, itoa::Buffer::new().format(value)),
         AggregationNumber::Float(value) => append_f64(destination, value),
     }
 }
@@ -974,6 +982,7 @@ impl Ord for FiniteFloat {
 #[derive(Debug, Default)]
 struct UniqueValues {
     integers: BTreeSet<i64>,
+    unsigned: BTreeSet<u64>,
     floats: BTreeSet<FiniteFloat>,
     strings: BTreeSet<String>,
     booleans: u8,
@@ -982,7 +991,7 @@ struct UniqueValues {
 
 impl UniqueValues {
     fn len(&self) -> usize {
-        self.integers.len()
+        self.integers.len() + self.unsigned.len()
             + self.floats.len()
             + self.strings.len()
             + usize::from(0 != self.booleans & 1)
@@ -1004,6 +1013,13 @@ impl UniqueValues {
         Ok(())
     }
 
+    fn insert_unsigned(&mut self, value: u64, limits: AggregationLimits) -> Result<(), AggregationError> {
+        if let Ok(value) = i64::try_from(value) { return self.insert_integer(value, limits); }
+        if self.unsigned.contains(&value) { return Ok(()); }
+        self.check_new_value(limits)?;
+        self.unsigned.insert(value);
+        Ok(())
+    }
     fn insert_integer(
         &mut self,
         value: i64,
@@ -1082,6 +1098,7 @@ impl UniqueValues {
 struct UniqueResults<'a> {
     field: &'a str,
     integers: std::collections::btree_set::Iter<'a, i64>,
+    unsigned: std::collections::btree_set::Iter<'a, u64>,
     floats: std::collections::btree_set::Iter<'a, FiniteFloat>,
     strings: std::collections::btree_set::Iter<'a, String>,
     booleans: u8,
@@ -1092,6 +1109,7 @@ impl<'a> UniqueResults<'a> {
         Self {
             field,
             integers: values.integers.iter(),
+            unsigned: values.unsigned.iter(),
             floats: values.floats.iter(),
             strings: values.strings.iter(),
             booleans: values.booleans,
@@ -1099,7 +1117,7 @@ impl<'a> UniqueResults<'a> {
     }
 
     fn len(&self) -> usize {
-        self.integers.len()
+        self.integers.len() + self.unsigned.len()
             + self.floats.len()
             + self.strings.len()
             + usize::from(0 != self.booleans & 1)
@@ -1109,6 +1127,8 @@ impl<'a> UniqueResults<'a> {
     fn next(&mut self) -> Option<AggregationResultRef<'a>> {
         let value = if let Some(&value) = self.integers.next() {
             AggregationValueRef::Integer(value)
+        } else if let Some(&value) = self.unsigned.next() {
+            AggregationValueRef::Unsigned(value)
         } else if let Some(value) = self.floats.next() {
             AggregationValueRef::Float(value.0)
         } else if let Some(value) = self.strings.next() {
@@ -1160,6 +1180,14 @@ fn count_by_time(
         ColumnData::DeprecatedDateString(values) => {
             for (row, (value, matched)) in values.epochs().iter().zip(bitmap).enumerate() {
                 if 0 != *matched {
+                    add_timestamp(counts, value, bucket_size, limits, row)?;
+                }
+            }
+        }
+        ColumnData::MixedInteger(values) => {
+            for (row, (value, matched)) in values.iter().zip(bitmap).enumerate() {
+                if *matched != 0 {
+                    let value = value.as_i64().ok_or(AggregationError::InvalidTimestampColumn { node_id: column.node_id() })?;
                     add_timestamp(counts, value, bucket_size, limits, row)?;
                 }
             }
@@ -1270,6 +1298,15 @@ fn scan_extreme(
     let bitmap = matches.bitmap().as_bytes();
     for column in target_columns(matches, nodes) {
         match column.data() {
+            ColumnData::MixedInteger(values) => {
+                for (value, matched) in values.iter().zip(bitmap) {
+                    if *matched != 0 {
+                        let value = match value { crate::integer::IntegerValue::Signed(v) => AggregationNumber::Integer(v),
+                            crate::integer::IntegerValue::Unsigned(v) => AggregationNumber::Unsigned(v) };
+                        update_extreme(extreme, value, find_maximum);
+                    }
+                }
+            }
             ColumnData::Integer(values) => {
                 for (value, matched) in values.iter().zip(bitmap) {
                     if 0 != *matched {
@@ -1366,6 +1403,11 @@ fn update_extreme(
 
 fn number_is_less(left: AggregationNumber, right: AggregationNumber) -> bool {
     match (left, right) {
+        (AggregationNumber::Unsigned(a), AggregationNumber::Unsigned(b)) => a < b,
+        (AggregationNumber::Unsigned(a), AggregationNumber::Integer(b)) => (a as i128) < b as i128,
+        (AggregationNumber::Integer(a), AggregationNumber::Unsigned(b)) => (a as i128) < b as i128,
+        (AggregationNumber::Unsigned(a), AggregationNumber::Float(b)) => crate::integer::IntegerValue::Unsigned(a).compare_float(b) == Some(Ordering::Less),
+        (AggregationNumber::Float(a), AggregationNumber::Unsigned(b)) => crate::integer::IntegerValue::Unsigned(b).compare_float(a) == Some(Ordering::Greater),
         (AggregationNumber::Integer(left), AggregationNumber::Integer(right)) => left < right,
         (AggregationNumber::Float(left), AggregationNumber::Float(right)) => left < right,
         (AggregationNumber::Integer(left), AggregationNumber::Float(right)) => {
@@ -1431,6 +1473,14 @@ fn scan_unique(
     let bitmap = matches.bitmap().as_bytes();
     for column in target_columns(matches, nodes) {
         match column.data() {
+            ColumnData::MixedInteger(column_values) => {
+                for (value, matched) in column_values.iter().zip(bitmap) {
+                    if *matched != 0 { match value {
+                        crate::integer::IntegerValue::Signed(v) => values.insert_integer(v, limits)?,
+                        crate::integer::IntegerValue::Unsigned(v) => values.insert_unsigned(v, limits)?,
+                    } }
+                }
+            }
             ColumnData::Integer(column_values) => {
                 for (value, matched) in column_values.iter().zip(bitmap) {
                     if 0 != *matched {
@@ -1634,6 +1684,7 @@ fn scan_unique_timestamp(
             )?;
             match value {
                 AggregationNumber::Integer(value) => values.insert_integer(value, limits)?,
+                AggregationNumber::Unsigned(value) => values.insert_unsigned(value, limits)?,
                 AggregationNumber::Float(value) => values.insert_float(value, limits)?,
             }
         }
@@ -1669,6 +1720,7 @@ fn parse_dictionary_float(
 fn classify_number(value: &[u8]) -> Option<AggregationNumber> {
     match classify_json_number(value).ok()? {
         ClassifiedJsonNumber::Integer(value) => Some(AggregationNumber::Integer(value)),
+        ClassifiedJsonNumber::Unsigned(value) => Some(AggregationNumber::Unsigned(value)),
         ClassifiedJsonNumber::Float { value, .. } => Some(AggregationNumber::Float(value)),
     }
 }

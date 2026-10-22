@@ -1156,8 +1156,15 @@ fn encode_records(
     if 0 == records.record_count() {
         EncodedEmptyArchive::new(options)
     } else {
+        let mixed = records.has_mixed_integers();
+        let options = if mixed { options.with_adaptive_numeric_columns(true).with_adaptive_string_columns(true) } else { options };
         let (sections, timestamp_dictionary) = records.encode_sections(options)?;
-        EncodedEmptyArchive::from_sections_with_timestamp(options, sections, &timestamp_dictionary)
+        let mut encoded = EncodedEmptyArchive::from_sections_with_timestamp(options, sections, &timestamp_dictionary)?;
+        if mixed {
+            encoded.header = ArchiveHeader::new_with_version(crate::archive::ArchiveVersion::MIXED_INTEGERS,
+                options.uncompressed_size, encoded.archive_size, u32::try_from(encoded.metadata.len()).map_err(|_| WriterError::SizeOverflow)?);
+        }
+        Ok(encoded)
     }
 }
 

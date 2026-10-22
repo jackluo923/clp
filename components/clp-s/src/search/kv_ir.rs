@@ -937,7 +937,7 @@ const fn string_is_star(value: &str) -> bool {
 fn literal_types(operator: ComparisonOperator, literal: &Literal) -> u16 {
     let equality = matches!(operator, ComparisonOperator::Equal);
     match literal {
-        Literal::Integer { .. } | Literal::Float { .. } => {
+        Literal::Integer { .. } | Literal::Unsigned { .. } | Literal::Float { .. } => {
             TYPE_INTEGER
                 | TYPE_FLOAT
                 | if equality {
@@ -1670,7 +1670,12 @@ fn evaluate_pair(
     }
 
     let matched = match pair.value().kind() {
-        KvIrValueKind::Integer(value) => integer_matches(value.value(), leaf),
+        KvIrValueKind::Integer(value) => {
+            if value.value() < 0 && matches!(leaf.literal, Literal::Unsigned { .. }) {
+                return Ok(Tri::Pruned);
+            }
+            integer_matches(value.value(), leaf)
+        },
         KvIrValueKind::Float { bits } => float_matches(f64::from_bits(bits), leaf),
         KvIrValueKind::Boolean(value) => {
             matches!(leaf.literal, Literal::Boolean(expected) if value == *expected)
@@ -1696,12 +1701,14 @@ fn evaluate_pair(
 #[derive(Clone, Copy)]
 enum NumericLiteral {
     Integer(i64),
+    Unsigned(u64),
     Float(f64),
 }
 
 const fn numeric_literal(literal: &Literal) -> Option<NumericLiteral> {
     match literal {
         Literal::Integer { value, .. } => Some(NumericLiteral::Integer(*value)),
+        Literal::Unsigned { value, .. } => Some(NumericLiteral::Unsigned(*value)),
         Literal::Float { value, .. } => Some(NumericLiteral::Float(*value)),
         _ => None,
     }
@@ -1713,6 +1720,7 @@ fn integer_matches(value: i64, leaf: &CompiledLeaf<'_>) -> bool {
     }
     match numeric_literal(leaf.literal) {
         Some(NumericLiteral::Integer(operand)) => compare(value, operand, leaf.operator),
+        Some(NumericLiteral::Unsigned(operand)) => u64::try_from(value).is_ok_and(|v| compare(v, operand, leaf.operator)),
         Some(NumericLiteral::Float(operand)) => compare_i64_float(value, operand, leaf.operator),
         None => false,
     }
@@ -1725,6 +1733,7 @@ fn float_matches(value: f64, leaf: &CompiledLeaf<'_>) -> bool {
     } else {
         match numeric_literal(leaf.literal) {
             Some(NumericLiteral::Integer(value)) => value as f64,
+            Some(NumericLiteral::Unsigned(operand)) => return crate::integer::IntegerValue::Unsigned(operand).compare_float(value).is_some_and(|order| compare(std::cmp::Ordering::Equal, order, leaf.operator)),
             Some(NumericLiteral::Float(value)) => value,
             None => return false,
         }
@@ -1738,7 +1747,7 @@ fn string_pattern<'leaf>(leaf: &'leaf CompiledLeaf<'_>) -> Option<&'leaf str> {
         return None;
     }
     match leaf.literal {
-        Literal::Integer { source, .. } | Literal::Float { source, .. } => Some(source),
+        Literal::Integer { source, .. } | Literal::Unsigned { source, .. } | Literal::Float { source, .. } => Some(source),
         Literal::Boolean(true) => Some("true"),
         Literal::Boolean(false) => Some("false"),
         Literal::Null => Some("null"),

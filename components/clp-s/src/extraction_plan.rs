@@ -1727,7 +1727,7 @@ fn checked_body_range(
 const fn is_value_bearing(node_type: NodeType) -> bool {
     matches!(
         node_type,
-        NodeType::Integer
+        NodeType::Integer | NodeType::MixedInteger
             | NodeType::DeltaInteger
             | NodeType::Float
             | NodeType::FormattedFloat
@@ -1744,7 +1744,7 @@ const fn is_value_bearing(node_type: NodeType) -> bool {
 const fn is_supported_unordered_value(node_type: NodeType) -> bool {
     matches!(
         node_type,
-        NodeType::Integer
+        NodeType::Integer | NodeType::MixedInteger
             | NodeType::DeltaInteger
             | NodeType::Float
             | NodeType::FormattedFloat

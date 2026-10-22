@@ -1419,6 +1419,7 @@ mod tests {
     #[derive(Clone, Debug, PartialEq)]
     enum CapturedValue {
         Integer(i64),
+        Unsigned(u64),
         Float(f64),
         String(String),
         Boolean(bool),
@@ -1428,6 +1429,7 @@ mod tests {
         fn from(value: AggregationValueRef<'_>) -> Self {
             match value {
                 AggregationValueRef::Integer(value) => Self::Integer(value),
+                AggregationValueRef::Unsigned(value) => Self::Unsigned(value),
                 AggregationValueRef::Float(value) => Self::Float(value),
                 AggregationValueRef::String(value) => Self::String(value.to_owned()),
                 AggregationValueRef::Boolean(value) => Self::Boolean(value),

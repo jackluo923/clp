@@ -225,6 +225,8 @@ impl<'table, 'archive> Column<'table, 'archive> {
 pub enum ColumnData<'table, 'archive> {
     /// Raw signed 64-bit integers.
     Integer(I64Column<'table>),
+    /// Exact mixed signed and unsigned integers.
+    MixedInteger(crate::integer::MixedIntegerColumn<'table>),
     /// Delta-encoded signed 64-bit integers.
     DeltaInteger(DeltaI64Column<'table>),
     /// Finite binary64 values.
@@ -253,6 +255,7 @@ impl ColumnData<'_, '_> {
     pub const fn node_type(self) -> NodeType {
         match self {
             Self::Integer(_) => NodeType::Integer,
+            Self::MixedInteger(_) => NodeType::MixedInteger,
             Self::DeltaInteger(_) => NodeType::DeltaInteger,
             Self::Float(_) => NodeType::Float,
             Self::FormattedFloat(_) => NodeType::FormattedFloat,
@@ -269,7 +272,7 @@ impl ColumnData<'_, '_> {
 
 /// A borrowed signed 64-bit column, either canonical or compact numeric data.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct I64Column<'a> { data: NumericColumn<'a> }
+pub struct I64Column<'a> { pub(crate) data: NumericColumn<'a> }
 impl<'a> I64Column<'a> {
     #[must_use]
     pub const fn len(self) -> usize { self.data.len() }
@@ -1121,6 +1124,13 @@ pub fn decode_schema_table<'table, 'archive>(
                 projected = true;
                 continue;
             }
+            if node_type == NodeType::MixedInteger {
+                let bytes = cursor.take(context, slot.stored)?;
+                let data = crate::integer::MixedIntegerColumn::new(bytes, message_count, slot.numeric_encoding)
+                    .map_err(|_| corrupt(context, None, ColumnCorruption::InvalidAdaptiveNumeric))?;
+                columns.push(Column { schema_entry_index, node_id, data: ColumnData::MixedInteger(data) });
+                continue;
+            }
             if let Some(encoding) = slot.numeric_encoding {
                 let bytes = cursor.take(context, slot.stored)?;
                 let data = NumericColumn::encoded(bytes, message_count, encoding)
@@ -1195,6 +1205,18 @@ fn decode_column<'table, 'archive>(
     total_encoded_variables: &mut u64,
 ) -> Result<ColumnData<'table, 'archive>, ColumnError> {
     match node_type {
+        NodeType::MixedInteger => {
+            let flag = cursor.take(context, 1)?[0];
+            if flag > 1 { return Err(corrupt(context, None, ColumnCorruption::InvalidAdaptiveNumeric)); }
+            let size = message_count.checked_mul(8).and_then(|n| n.checked_add(if flag == 1 { message_count.div_ceil(8) } else { 0 }))
+                .ok_or(ColumnError::SizeOverflow)?;
+            // Include the already consumed header in the borrowed view.
+            let start = cursor.position - 1;
+            cursor.take(context, size)?;
+            let raw = &cursor.bytes[start..cursor.position];
+            Ok(ColumnData::MixedInteger(crate::integer::MixedIntegerColumn::new(raw, message_count, None)
+                .map_err(|_| corrupt(context, None, ColumnCorruption::InvalidAdaptiveNumeric))?))
+        }
         NodeType::Integer => Ok(ColumnData::Integer(take_i64_column(
             cursor,
             context,

@@ -437,6 +437,7 @@ impl JsonTimestampResolver {
     ) -> Result<(TimestampRef<'a>, bool), JsonTimestampError> {
         let (epoch, pattern) = match classified {
             ClassifiedJsonNumber::Integer(value) => resolve_integer(value, false)?,
+            ClassifiedJsonNumber::Unsigned(_) => return Err(JsonTimestampError::EpochNanosecondsOutOfRange),
             ClassifiedJsonNumber::Float { .. } => resolve_fractional_epoch(source, false)?,
         };
         Ok((
@@ -491,7 +492,7 @@ fn is_exact_canonical_integer(source: &[u8], classified: ClassifiedJsonNumber<'_
         ClassifiedJsonNumber::Integer(value) => {
             source != b"-0" && (source.first() == Some(&b'-') || value >= 0)
         }
-        ClassifiedJsonNumber::Float { .. } => false,
+        ClassifiedJsonNumber::Float { .. } | ClassifiedJsonNumber::Unsigned(_) => false,
     }
 }
 

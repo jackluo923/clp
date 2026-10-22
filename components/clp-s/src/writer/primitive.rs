@@ -184,6 +184,7 @@ pub enum ValueRef<'a> {
     Null,
     /// A signed 64-bit integer.
     I64(i64),
+    MixedInteger(crate::integer::IntegerValue),
     /// A finite binary64 value stored in an ordinary `Float` column without source spelling.
     F64(f64),
     /// A finite binary64 value paired with its exact JSON number token.
@@ -747,6 +748,9 @@ impl PrimitiveArchive {
         archive
     }
 
+    pub(super) fn has_mixed_integers(&self) -> bool {
+        self.tables.tables.iter().any(|table| table.columns.iter().any(|col| col.node_type == NodeType::MixedInteger))
+    }
     pub(super) const fn record_count(&self) -> u64 {
         self.record_count
     }
@@ -1781,6 +1785,7 @@ struct BorrowedPlannedValue<'a> {
 #[derive(Clone, Copy, Debug)]
 enum BorrowedScalarValue<'a> {
     I64(i64),
+    MixedInteger(crate::integer::IntegerValue),
     DeltaI64(i64),
     F64(f64),
     FormattedFloat {
@@ -1806,6 +1811,7 @@ impl BorrowedScalarValue<'_> {
     const fn node_type(self) -> NodeType {
         match self {
             Self::I64(_) => NodeType::Integer,
+            Self::MixedInteger(_) => NodeType::MixedInteger,
             Self::DeltaI64(_) => NodeType::DeltaInteger,
             Self::F64(_) => NodeType::Float,
             Self::FormattedFloat { .. } => NodeType::FormattedFloat,
@@ -1828,6 +1834,7 @@ struct PlannedValue {
 #[derive(Debug)]
 enum EncodedValue {
     I64(i64),
+    MixedInteger(crate::integer::IntegerValue),
     DeltaI64 {
         value: i64,
         delta: i64,
@@ -1857,6 +1864,7 @@ impl EncodedValue {
     const fn node_type(&self) -> NodeType {
         match self {
             Self::I64(_) => NodeType::Integer,
+            Self::MixedInteger(_) => NodeType::MixedInteger,
             Self::DeltaI64 { .. } => NodeType::DeltaInteger,
             Self::F64(_) => NodeType::Float,
             Self::FormattedFloat { .. } => NodeType::FormattedFloat,
@@ -1875,6 +1883,7 @@ impl EncodedValue {
             | Self::F64(_)
             | Self::DictionaryFloat(_)
             | Self::VarString(_) => Ok(8),
+            Self::MixedInteger(_) => Ok(8),
             Self::FormattedFloat { .. } => Ok(10),
             Self::Timestamp { .. } => Ok(16),
             Self::Bool(_) => Ok(1),
@@ -1886,6 +1895,7 @@ impl EncodedValue {
     }
 
     fn new_column_size(&self) -> Result<u64, AppendError> {
+        if let Self::MixedInteger(value) = self { return Ok(9 + u64::from(value.is_large())); }
         let appended = self.appended_size()?;
         if matches!(self, Self::ClpString { .. }) {
             appended.checked_add(8).ok_or(AppendError::SizeOverflow)
@@ -2910,6 +2920,7 @@ impl<'archive, 'record, 'scratch> RecordPlanBuilder<'archive, 'record, 'scratch>
         let (node_type, scalar) = match value {
             ValueRef::Null => (NodeType::Null, None),
             ValueRef::I64(value) => (NodeType::Integer, Some(BorrowedScalarValue::I64(value))),
+            ValueRef::MixedInteger(value) => (NodeType::MixedInteger, Some(BorrowedScalarValue::MixedInteger(value))),
             ValueRef::F64(value) => (NodeType::Float, Some(BorrowedScalarValue::F64(value))),
             ValueRef::RetainedFloat(retained) => {
                 match retained_float::classify(retained, self.retained_float_scratch)
@@ -3449,6 +3460,7 @@ fn encode_values(
         let dictionary_hint = table.and_then(|table| table.columns.get(value_index));
         let encoded_value = match value.value {
             BorrowedScalarValue::I64(value) => EncodedValue::I64(value),
+            BorrowedScalarValue::MixedInteger(value) => EncodedValue::MixedInteger(value),
             BorrowedScalarValue::DeltaI64(value) => EncodedValue::DeltaI64 {
                 value,
                 delta: value,
@@ -3699,6 +3711,7 @@ struct TableColumn {
 
 #[derive(Debug)]
 enum TableColumnData {
+    MixedInteger(crate::integer::IntegerBuffer),
     Fixed(Vec<u8>),
     DeltaI64 {
         deltas: Vec<u8>,
@@ -3755,6 +3768,12 @@ impl TableColumn {
         let node_id = value.node_id;
         let node_type = value.value.node_type();
         let data = match value.value {
+            EncodedValue::MixedInteger(value) => {
+                let mut buffer = crate::integer::IntegerBuffer::default();
+                buffer.reserve(value).map_err(|_| append_allocation(AppendResource::ResidentBytes, 10))?;
+                buffer.append(value);
+                TableColumnData::MixedInteger(buffer)
+            }
             EncodedValue::DeltaI64 { value, delta } => {
                 let mut deltas = Vec::new();
                 deltas.try_reserve_exact(size_of::<i64>()).map_err(|_| {
@@ -3844,7 +3863,7 @@ impl TableColumn {
 
     const fn encoded_variable_count(&self) -> u64 {
         match &self.data {
-            TableColumnData::Fixed(_)
+            TableColumnData::MixedInteger(_) | TableColumnData::Fixed(_)
             | TableColumnData::DeltaI64 { .. }
             | TableColumnData::Timestamp { .. }
             | TableColumnData::FormattedFloat { .. } => 0,
@@ -3857,6 +3876,10 @@ impl TableColumn {
 
     fn reserve_append(&mut self, value: &EncodedValue) -> Result<(), AppendError> {
         match (&mut self.data, value) {
+            (TableColumnData::MixedInteger(buffer), EncodedValue::MixedInteger(value)) => {
+                buffer.reserve(*value).map_err(|_| append_allocation(AppendResource::ResidentBytes, buffer.additional_len(*value)))
+            }
+            (TableColumnData::MixedInteger(_), _) => unreachable!("mixed integer schema"),
             (TableColumnData::DeltaI64 { deltas, .. }, EncodedValue::DeltaI64 { .. }) => deltas
                 .try_reserve(size_of::<i64>())
                 .map_err(|_| append_allocation(AppendResource::ResidentBytes, size_of::<i64>())),
@@ -3932,6 +3955,8 @@ impl TableColumn {
 
     fn append(&mut self, value: EncodedValue) {
         match (&mut self.data, value) {
+            (TableColumnData::MixedInteger(buffer), EncodedValue::MixedInteger(value)) => buffer.append(value),
+            (TableColumnData::MixedInteger(_), _) => unreachable!("mixed integer schema"),
             (
                 TableColumnData::DeltaI64 { deltas, current },
                 EncodedValue::DeltaI64 { value, delta },
@@ -4007,6 +4032,7 @@ impl TableColumn {
     /// The number of bytes `write_to` emits.
     fn encoded_len(&self) -> usize {
         match &self.data {
+            TableColumnData::MixedInteger(buffer) => buffer.wire_len(),
             TableColumnData::Fixed(bytes) => bytes.len(),
             TableColumnData::DeltaI64 { deltas, .. } => deltas.len(),
             TableColumnData::Timestamp {
@@ -4050,6 +4076,11 @@ impl TableColumn {
             return output.write_all(encoded_variables).map_err(WriterError::Io);
         }
         match &self.data {
+            TableColumnData::MixedInteger(buffer) => {
+                output.write_all(&[u8::from(!buffer.bitmap.is_empty())]).map_err(WriterError::Io)?;
+                output.write_all(&buffer.bits).map_err(WriterError::Io)?;
+                output.write_all(&buffer.bitmap).map_err(WriterError::Io)
+            }
             TableColumnData::Fixed(bytes) => output.write_all(bytes).map_err(WriterError::Io),
             TableColumnData::DeltaI64 { deltas, .. } => {
                 output.write_all(deltas).map_err(WriterError::Io)
@@ -4189,6 +4220,7 @@ fn timestamp_column_data(
 
 fn append_fixed_value(value: &EncodedValue, output: &mut Vec<u8>) {
     match value {
+        EncodedValue::MixedInteger(_) => unreachable!("mixed integer buffer"),
         EncodedValue::I64(value) => output.extend_from_slice(&value.to_le_bytes()),
         EncodedValue::F64(value) => output.extend_from_slice(&value.to_le_bytes()),
         EncodedValue::DictionaryFloat(id) | EncodedValue::VarString(id) => {
@@ -4305,8 +4337,12 @@ impl TableSet {
             .ok_or(AppendError::SizeOverflow)?;
         prepare_delta_values(table, &mut values)?;
         let added_encoded_variables = prepare_clp_offsets(table, &mut values, limits)?;
-        let added_payload_bytes = values.iter().try_fold(0_u64, |size, value| {
-            size.checked_add(value.value.appended_size()?)
+        let added_payload_bytes = table.columns.iter().zip(&values).try_fold(0_u64, |size, (column, value)| {
+            let added = match (&column.data, &value.value) {
+                (TableColumnData::MixedInteger(buffer), EncodedValue::MixedInteger(value)) => usize_u64_append(buffer.additional_len(*value))?,
+                _ => value.value.appended_size()?,
+            };
+            size.checked_add(added)
                 .ok_or(AppendError::SizeOverflow)
         })?;
         validate_total_encoded_variables(
@@ -4965,7 +5001,7 @@ fn table_has_numeric_column(table: &TableBuilder) -> bool {
     table
         .columns
         .iter()
-        .any(|column| matches!(column.node_type, NodeType::Integer | NodeType::Float))
+        .any(|column| matches!(column.node_type, NodeType::Integer | NodeType::MixedInteger | NodeType::Float))
 }
 
 /// Runs the per-column bake-off: zstd-compress each candidate encoding on its own and append the
@@ -5240,6 +5276,17 @@ fn encode_grouped_tables(
                 .collect()
         };
         let (encoding, payload) = match node_type {
+            NodeType::MixedInteger => {
+                let mut combined = crate::integer::IntegerBuffer::default();
+                for (column, rows) in columns {
+                    let mut raw = Vec::new();
+                    column.write_remapped(&mut raw, remap)?;
+                    let decoded = crate::integer::MixedIntegerColumn::new(&raw, *rows as usize, None)
+                        .expect("writer produced valid mixed integers");
+                    for value in decoded.iter() { combined.append(value); }
+                }
+                (GroupedFrameEncoding::MixedInteger, best_candidate(combined.candidates(), compressor)?)
+            }
             NodeType::Integer | NodeType::VarString | NodeType::DictionaryFloat => (
                 GroupedFrameEncoding::Integer,
                 best_candidate(adaptive_int::candidates(&values(&plain)), compressor)?,
@@ -5373,6 +5420,10 @@ fn encode_separate_table(
         let start = packed.compressed.len();
         let strings = options.adaptive_string_columns();
         let uncompressed = match (options.adaptive_numeric_columns(), column.node_type) {
+            (_, NodeType::MixedInteger) => {
+                let TableColumnData::MixedInteger(buffer) = &column.data else { unreachable!() };
+                write_best_candidate(buffer.candidates(), compressor, strings, &mut packed.compressed)?
+            }
             (true, NodeType::Integer) => {
                 encode_adaptive_integer_column(column, compressor, strings, &mut packed.compressed)?
             }

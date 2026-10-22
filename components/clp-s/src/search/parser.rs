@@ -402,7 +402,11 @@ impl<'input, 'tokens> Parser<'input, 'tokens> {
                 source: decoded,
             });
         }
+        if let Ok(value) = decoded.strip_suffix("u64").unwrap_or(&decoded).parse::<u64>() {
+            return Ok(Literal::Unsigned { value, source: value.to_string() });
+        }
         if let Ok(value) = decoded.parse::<f64>()
+            && decoded.contains(['.', 'e', 'E'])
             && value.is_finite()
         {
             return Ok(Literal::Float {
@@ -1320,6 +1324,7 @@ mod tests {
             };
             let actual = match predicate.value() {
                 Literal::Integer { .. } => "integer",
+                Literal::Unsigned { .. } => "unsigned",
                 Literal::Float { .. } => "float",
                 Literal::Boolean(_) => "boolean",
                 Literal::Null => "null",

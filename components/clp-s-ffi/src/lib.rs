@@ -182,6 +182,8 @@ pub const CLP_S_V2_VALUE_ABSENT: u32 = columnar::kind::ABSENT;
 pub const CLP_S_V2_VALUE_BOOLEAN: u32 = columnar::kind::BOOLEAN;
 /// A projected signed 64-bit integer.
 pub const CLP_S_V2_VALUE_INTEGER: u32 = columnar::kind::INTEGER;
+/// Exact unsigned 64-bit integer bits in the integer payload.
+pub const CLP_S_V2_VALUE_UNSIGNED: u32 = columnar::kind::UNSIGNED;
 /// A projected IEEE-754 double.
 pub const CLP_S_V2_VALUE_FLOAT: u32 = columnar::kind::FLOAT;
 /// A projected byte string borrowed from the scanner.

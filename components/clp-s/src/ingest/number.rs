@@ -1,11 +1,5 @@
-//! C++-compatible classification of syntactically valid JSON number tokens.
-//!
-//! `simdjson::ondemand::number`, which the C++ CLP-S compressor uses, distinguishes signed
-//! integers, unsigned integers, and binary64 values. CLP-S then reinterprets an unsigned integer
-//! as signed two's-complement bits. Consequently `9223372036854775808` becomes `i64::MIN` and
-//! `18446744073709551615` becomes `-1`; an integer outside the combined signed/unsigned 64-bit
-//! domain is rejected instead of being rounded through binary64. This module preserves that
-//! compatibility boundary without allocating.
+//! Exact classification of JSON numbers in the signed-negative/unsigned-positive 64-bit domain.
+//! Large unsigned integers retain their positive value; out-of-domain integers are rejected.
 
 use std::error::Error;
 use std::fmt;
@@ -13,12 +7,14 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 use std::str;
 
-/// A JSON number after applying the C++ CLP-S numeric-domain rules.
+/// A JSON number in the supported exact numeric domain.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum ClassifiedJsonNumber<'a> {
-    /// A signed integer, including the two's-complement reinterpretation of a JSON `u64`.
+    /// A signed integer.
     Integer(i64),
+    /// An exact integer above Int64::MAX.
+    Unsigned(u64),
     /// A finite binary64 value and its exact source token.
     Float {
         /// Parsed binary64 value.
@@ -34,7 +30,7 @@ impl<'a> ClassifiedJsonNumber<'a> {
     pub const fn integer(self) -> Option<i64> {
         match self {
             Self::Integer(value) => Some(value),
-            Self::Float { .. } => None,
+            Self::Float { .. } | Self::Unsigned(_) => None,
         }
     }
 
@@ -42,7 +38,7 @@ impl<'a> ClassifiedJsonNumber<'a> {
     #[must_use]
     pub const fn float(self) -> Option<(f64, &'a [u8])> {
         match self {
-            Self::Integer(_) => None,
+            Self::Integer(_) | Self::Unsigned(_) => None,
             Self::Float { value, source } => Some((value, source)),
         }
     }
@@ -174,12 +170,11 @@ pub(super) fn classify_validated_json_number_text(
                 domain: JsonNumberDomain::Integer,
             })?
     } else {
-        source
-            .parse::<u64>()
-            .map_err(|_| JsonNumberClassificationError::OutOfRange {
-                domain: JsonNumberDomain::Integer,
-            })?
-            .cast_signed()
+        let unsigned = source.parse::<u64>().map_err(|_| JsonNumberClassificationError::OutOfRange {
+            domain: JsonNumberDomain::Integer,
+        })?;
+        if unsigned > i64::MAX as u64 { return Ok(ClassifiedJsonNumber::Unsigned(unsigned)); }
+        unsigned as i64
     };
     Ok(ClassifiedJsonNumber::Integer(value))
 }
@@ -300,17 +295,17 @@ mod tests {
     use super::validate_number;
 
     #[test]
-    fn matches_cpp_integer_boundaries_and_unsigned_reinterpretation() {
+    fn preserves_signed_and_unsigned_integer_boundaries() {
         assert_eq!(
             ClassifiedJsonNumber::Integer(i64::MAX),
             classify_json_number(b"9223372036854775807").expect("i64 maximum")
         );
         assert_eq!(
-            ClassifiedJsonNumber::Integer(i64::MIN),
+            ClassifiedJsonNumber::Unsigned(1 << 63),
             classify_json_number(b"9223372036854775808").expect("i64 maximum plus one")
         );
         assert_eq!(
-            ClassifiedJsonNumber::Integer(-1),
+            ClassifiedJsonNumber::Unsigned(u64::MAX),
             classify_json_number(b"18446744073709551615").expect("u64 maximum")
         );
         assert_eq!(

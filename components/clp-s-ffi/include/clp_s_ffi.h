@@ -570,6 +570,8 @@ clp_s_status clp_s_v3_scanner_next_columns(
  * All other layouts, lifetime and exclusive-consumption rules are the same. */
 #define CLP_S_V4_COLUMN_CONSTANT_INTEGER 7
 #define CLP_S_V4_COLUMN_CONSTANT_FLOAT 8
+/* Unsigned scalar cell: integer payload contains the exact UInt64 bits. */
+#define CLP_S_V2_VALUE_UNSIGNED 9
 clp_s_status clp_s_v4_scanner_next_columns(
         clp_s_v2_scanner *scanner,
         const clp_s_v3_column **out_columns,
@@ -661,6 +663,7 @@ clp_s_status clp_s_v2_kv_ir_scanner_field_types(
 #define CLP_S_V2_ARCHIVE_NODE_FORMATTED_FLOAT 12u
 #define CLP_S_V2_ARCHIVE_NODE_DICTIONARY_FLOAT 13u
 #define CLP_S_V2_ARCHIVE_NODE_TIMESTAMP 14u
+#define CLP_S_V2_ARCHIVE_NODE_MIXED_INTEGER 15u
 
 typedef struct clp_s_v2_archive_field_type_list clp_s_v2_archive_field_type_list;
 

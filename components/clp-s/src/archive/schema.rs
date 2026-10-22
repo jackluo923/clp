@@ -25,6 +25,7 @@ pub enum NodeType {
     FormattedFloat = 12,
     DictionaryFloat = 13,
     Timestamp = 14,
+    MixedInteger = 15,
 }
 
 impl TryFrom<u8> for NodeType {
@@ -47,6 +48,7 @@ impl TryFrom<u8> for NodeType {
             12 => Ok(Self::FormattedFloat),
             13 => Ok(Self::DictionaryFloat),
             14 => Ok(Self::Timestamp),
+            15 => Ok(Self::MixedInteger),
             _ => Err(UnknownNodeType(value)),
         }
     }
@@ -104,7 +106,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_discriminants() {
-        assert_eq!(Err(UnknownNodeType(15)), NodeType::try_from(15));
+        assert_eq!(Err(UnknownNodeType(16)), NodeType::try_from(16));
         assert_eq!(Err(UnknownNodeType(u8::MAX)), NodeType::try_from(u8::MAX));
     }
 }

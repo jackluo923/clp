@@ -532,6 +532,7 @@ impl RecordWriter<'_, '_, '_, '_> {
 enum ColumnCursor<'table, 'archive> {
     Unused,
     Integer(I64Column<'table>),
+    MixedInteger(crate::integer::MixedIntegerColumn<'table>),
     DeltaInteger(DeltaI64Values<'table>),
     Float(F64Column<'table>),
     FormattedFloat(FormattedFloatColumn<'table>),
@@ -683,6 +684,11 @@ fn append_dynamic_value(
     output: &mut BoundedRecordOutput<'_>,
 ) -> Result<(), RecordError> {
     match cursor {
+        ColumnCursor::MixedInteger(column) => {
+            let value = column.get(row_index).ok_or_else(|| missing(step, row_index))?;
+            let mut buffer = itoa::Buffer::new();
+            output.append(buffer.format(value.exact()).as_bytes())
+        }
         ColumnCursor::Integer(column) => {
             let value = column
                 .get(row_index)
@@ -1086,6 +1092,7 @@ fn bind_column<'table, 'archive>(
         });
     }
     match data {
+        ColumnData::MixedInteger(column) => Ok(ColumnCursor::MixedInteger(column)),
         ColumnData::Integer(column) => Ok(ColumnCursor::Integer(column)),
         ColumnData::DeltaInteger(column) => Ok(ColumnCursor::DeltaInteger(column.values())),
         ColumnData::Float(column) => Ok(ColumnCursor::Float(column)),
@@ -1547,7 +1554,7 @@ fn require_node(
 const fn is_value_node(node_type: NodeType) -> bool {
     matches!(
         node_type,
-        NodeType::Integer
+        NodeType::Integer | NodeType::MixedInteger
             | NodeType::Float
             | NodeType::ClpString
             | NodeType::VarString

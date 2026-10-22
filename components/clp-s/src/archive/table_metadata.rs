@@ -247,6 +247,8 @@ pub enum GroupedFrameEncoding {
     /// The member CLP-string columns: their variable counts, then all their descriptors and all
     /// their variables, each run in an adaptive integer scheme.
     ClpString,
+    /// Mixed signed/unsigned integers with one bitmap across member columns.
+    MixedInteger,
 }
 
 impl GroupedFrameEncoding {
@@ -256,6 +258,7 @@ impl GroupedFrameEncoding {
             1 => Some(Self::Integer),
             2 => Some(Self::Float),
             3 => Some(Self::ClpString),
+            4 => Some(Self::MixedInteger),
             _ => None,
         }
     }
@@ -268,6 +271,7 @@ impl GroupedFrameEncoding {
             Self::Integer => 1,
             Self::Float => 2,
             Self::ClpString => 3,
+            Self::MixedInteger => 4,
         }
     }
 }

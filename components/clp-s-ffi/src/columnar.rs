@@ -67,6 +67,7 @@ pub mod kind {
     // v4 column layouts only, never v2 cell kinds or v3 dense columns.
     pub const CONSTANT_INTEGER: u32 = 7;
     pub const CONSTANT_FLOAT: u32 = 8;
+    pub const UNSIGNED: u32 = 9;
 }
 
 /// One projected value, with text held as a span into the batch's arena.
@@ -759,6 +760,7 @@ impl ProjectedScanner {
                 buffer.cells.clear();
                 let data = slot.and_then(|i| decoded.table().column(i)).map(|c| c.data());
                 let (kind, bytes, constant) = match data {
+                    Some(ColumnData::MixedInteger(values)) if !values.has_large_uint64() => (kind::INTEGER, values.canonical_signed_bytes(), values.signed_constant()),
                     Some(ColumnData::Integer(values)) => (kind::INTEGER, values.canonical_bytes(), values.constant_value().map(|v| v as u64)),
                     Some(ColumnData::Float(values)) => (kind::FLOAT, values.canonical_bytes(), values.constant_value().map(f64::to_bits)),
                     _ => (kind::UNSUPPORTED, None, None),
@@ -788,6 +790,7 @@ impl ProjectedScanner {
                     // also gets dense constants, preserving that API's original contract.
                     if rows == bitmap.len() {
                         match data {
+                            Some(ColumnData::MixedInteger(values)) => values.append_bits(&mut buffer.numeric),
                             Some(ColumnData::Integer(values)) => values.append_bits(&mut buffer.numeric),
                             Some(ColumnData::Float(values)) => values.append_bits(&mut buffer.numeric),
                             _ => unreachable!(),
@@ -795,6 +798,7 @@ impl ProjectedScanner {
                     } else {
                         for row in bitmap.matching_rows() {
                             let bits = match data {
+                                Some(ColumnData::MixedInteger(values)) => values.get(row).map(|v| v.bits()),
                                 Some(ColumnData::Integer(values)) => values.get(row).map(|v| v as u64),
                                 Some(ColumnData::Float(values)) => values.get(row).map(f64::to_bits),
                                 _ => unreachable!(),
@@ -1315,6 +1319,9 @@ fn project_row(
             continue;
         };
         let cell = match column.data() {
+            ColumnData::MixedInteger(values) => values.get(row).map_or_else(Cell::absent, |value| {
+                Cell::scalar(if value.is_large() { kind::UNSIGNED } else { kind::INTEGER }, value.bits() as i64, 0.0)
+            }),
             ColumnData::Integer(values) => values.get(row).map_or_else(Cell::absent, |value| {
                 Cell::scalar(kind::INTEGER, value, 0.0)
             }),
@@ -1498,7 +1505,11 @@ mod wildcard_projection_tests {
             assert_eq!(2, rows);
             let layout = scan.stream.as_ref().unwrap().column_layout().unwrap();
             assert_eq!(fields.len(), layout.iter().filter(|slot| slot.loaded).count());
-            assert_eq!(fields.len() * rows * 8, scan.stream.as_ref().unwrap().len());
+            // The signed-only mixed column adds one flag byte, while adaptive
+            // preparation may retain a smaller FOR payload.
+            let retained = scan.stream.as_ref().unwrap().len();
+            assert!(retained <= fields.len() * (rows * 8 + 1));
+            assert_eq!(fields.is_empty(), retained == 0);
             // Value-search wildcards still require their payloads.
             let parsed = parse_kql("*:alpha", KqlLimits::default()).unwrap();
             assert!(filter_nodes(&parsed, scan.catalog.schema_tree()).is_none());
@@ -1541,7 +1552,7 @@ mod encoded_numeric_tests {
                     }
                 }
                 let stream = scan.stream.as_ref().unwrap();
-                assert_eq!(16, stream.len());
+                assert_eq!(17, stream.len()); // two 8-byte constants plus the mixed-column flag
                 assert!(stream.column_layout().unwrap().iter().filter(|slot| slot.loaded)
                     .all(|slot| slot.numeric_encoding == Some(NumericEncoding::Constant)));
                 for buffer in &scan.column_buffers { assert_eq!(if constants { 1 } else { rows }, buffer.numeric.len()); }

@@ -56,6 +56,18 @@ const EXPECTED_KV_TIMESTAMP_JSONL: &[u8] = concat!(
 )
 .as_bytes();
 
+fn assert_same_archive_records(expected: &[u8], actual: &[u8]) {
+    fn records(bytes: &[u8]) -> Vec<String> {
+        let mut reader = SingleFileArchiveReader::open(std::io::Cursor::new(bytes)).unwrap();
+        let mut output = Vec::new();
+        clp_s::extract_jsonl(&mut reader, &mut output, clp_s::ExtractionOptions::default()).unwrap();
+        let mut rows: Vec<_> = std::str::from_utf8(&output).unwrap().lines().map(str::to_owned).collect();
+        rows.sort();
+        rows
+    }
+    assert_eq!(records(expected), records(actual));
+}
+
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 struct TestDirectory(PathBuf);
@@ -494,7 +506,7 @@ fn non_utf8_transformed_metadata_fails_before_output_creation() {
 }
 
 #[test]
-fn both_layouts_match_the_deterministic_cpp_archive_and_extract() {
+fn both_layouts_preserve_cpp_records_and_extract() {
     let expected_archive = decode_hex(EXPECTED_SFA_HEX);
     assert_eq!(387, expected_archive.len());
 
@@ -504,9 +516,8 @@ fn both_layouts_match_the_deterministic_cpp_archive_and_extract() {
         let archives_path = temporary.path().join("archives");
         fs::write(&input_path, INPUT).expect("write parse-many fixture");
 
-        // Byte-exactness is validated against the C++ 0.5.0 reference, so opt out of the CLI's
-        // default adaptive numeric encoding (which would produce a 0.6.0 archive), and compress the
-        // dictionaries the way C++ does: at the archive's level, without long-distance matching.
+        // Mixed integer archives use version 0.10. Compare reconstructed records
+        // with the C++ 0.5.0 oracle while retaining its compression options.
         let mut arguments = vec![
             "c".as_ref(),
             "--no-adaptive-numeric-columns".as_ref(),
@@ -535,11 +546,12 @@ fn both_layouts_match_the_deterministic_cpp_archive_and_extract() {
         let archive_id = archive_path.file_name().expect("archive UUID filename");
         Uuid::parse_str(&archive_id.to_string_lossy()).expect("archive filename is UUIDv4");
         assert_eq!(single_file, archive_path.is_file());
-        assert_eq!(expected_archive, archive_bytes(&archive_path, single_file));
+        let actual_bytes = archive_bytes(&archive_path, single_file);
+        assert_same_archive_records(&expected_archive, &actual_bytes);
         let expected_stats = format!(
             "{{\"begin_timestamp\":0,\"end_timestamp\":0,\"id\":\"{}\",\"is_split\":false,\"\
-             range_index\":[],\"size\":387,\"uncompressed_size\":66}}\n",
-            archive_id.to_string_lossy()
+             range_index\":[],\"size\":{},\"uncompressed_size\":66}}\n",
+            archive_id.to_string_lossy(), actual_bytes.len()
         );
         assert_eq!(expected_stats.as_bytes(), result.stdout);
 
@@ -969,7 +981,7 @@ fn named_timezone_timestamp_key_round_trips_and_filters_in_utc() {
 }
 
 #[test]
-fn timestamp_key_matches_the_deterministic_cpp_archive() {
+fn timestamp_key_preserves_cpp_records() {
     let temporary = TestDirectory::new("timestamps");
     let input_path = temporary.path().join("input.json");
     let archives_path = temporary.path().join("archives");
@@ -992,12 +1004,7 @@ fn timestamp_key_matches_the_deterministic_cpp_archive() {
     );
     assert_eq!(b"", result.stdout.as_slice());
     assert_eq!(b"", result.stderr.as_slice());
-    assert_eq!(
-        TIMESTAMP_SFA,
-        fs::read(only_entry(&archives_path))
-            .expect("read timestamp SFA")
-            .as_slice()
-    );
+    assert_same_archive_records(TIMESTAMP_SFA, &fs::read(only_entry(&archives_path)).unwrap());
 }
 
 #[test]
@@ -1627,7 +1634,7 @@ fn auto_namespace_timestamp_is_a_json_noop_in_either_mixed_input_order() {
 }
 
 #[test]
-fn structurize_arrays_matches_the_exact_cpp_single_file_archive() {
+fn structurize_arrays_preserves_cpp_records() {
     let temporary = TestDirectory::new("structured-arrays");
     let input_path = temporary.path().join("input.jsonl");
     let archives_path = temporary.path().join("archives");
@@ -1654,10 +1661,7 @@ fn structurize_arrays_matches_the_exact_cpp_single_file_archive() {
     assert_eq!(b"", result.stderr.as_slice());
 
     let archive_path = only_entry(&archives_path);
-    assert_eq!(
-        decode_hex(STRUCTURED_ARRAY_SFA_HEX),
-        fs::read(archive_path).expect("read structured-array SFA")
-    );
+    assert_same_archive_records(&decode_hex(STRUCTURED_ARRAY_SFA_HEX), &fs::read(archive_path).unwrap());
 }
 
 #[test]
@@ -1945,8 +1949,8 @@ fn adaptive_string_columns_read_back_exactly_and_answer_searches_the_same() {
         );
     }
     let version = |archive: &Path| fs::read(archive).expect("read archive")[4..8].to_vec();
-    // Text may be stored whole by default, which stamps 0.9.0.
-    assert_eq!(vec![0, 0, 9, 0], version(&adaptive));
+    // Mixed JSON integers require archive version 0.10.
+    assert_eq!(vec![0, 0, 10, 0], version(&adaptive));
 }
 
 #[test]
@@ -2504,21 +2508,20 @@ fn field_logtype_dictionaries_read_back_exactly_and_answer_searches_the_same() {
             "{query} {projection:?}"
         );
     }
-    // Per-field dictionaries stamp 0.7.0, 0.8.0 with the default adaptive string columns, or
-    // 0.9.0 when text may also be stored whole, as it may by default. Without adaptive numeric
-    // columns neither layout is used, so such an archive stays at the 0.5.0 every reader accepts.
+    // JSON integer columns require the version 0.10 mixed representation regardless
+    // of the other selected compression options.
     // The header's version is bytes 4 to 8.
     let version = |archive: &Path| fs::read(archive).expect("read archive")[4..8].to_vec();
-    assert_eq!(vec![0, 0, 9, 0], version(&fields));
+    assert_eq!(vec![0, 0, 10, 0], version(&fields));
     assert_eq!(
-        vec![0, 0, 7, 0],
+        vec![0, 0, 10, 0],
         version(&compress(
             "plain-strings",
             &["--no-adaptive-string-columns"]
         ))
     );
     assert_eq!(
-        vec![0, 0, 5, 0],
+        vec![0, 0, 10, 0],
         version(&compress("no-adaptive", &["--no-adaptive-numeric-columns"]))
     );
 }

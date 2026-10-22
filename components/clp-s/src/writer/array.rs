@@ -1273,6 +1273,7 @@ mod tests {
             let node_type = match value {
                 ValueRef::Null => NodeType::Null,
                 ValueRef::I64(_) => NodeType::Integer,
+                ValueRef::MixedInteger(_) => NodeType::MixedInteger,
                 ValueRef::F64(_) => NodeType::Float,
                 ValueRef::RetainedFloat(_) => NodeType::FormattedFloat,
                 ValueRef::Bool(_) => NodeType::Boolean,

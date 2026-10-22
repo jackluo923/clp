@@ -125,6 +125,7 @@ pub(super) enum ArrayFailure {
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ArrayNumber {
     Integer(i64),
+    Unsigned(u64),
     Float(f64),
 }
 
@@ -711,9 +712,14 @@ impl Parser<'_, '_, '_> {
             return false;
         };
         let equal = match (value, operand) {
+            (JsonNumber::Signed(value), ArrayNumber::Unsigned(operand)) => {
+                let Ok(value) = u64::try_from(value) else { return false }; value == operand
+            }
+            (JsonNumber::Unsigned(value), ArrayNumber::Unsigned(operand)) => value == operand,
+            (JsonNumber::Float(value), ArrayNumber::Unsigned(operand)) => unsigned_equals_float(operand, value),
             (JsonNumber::Signed(value), ArrayNumber::Integer(operand)) => value == operand,
             (JsonNumber::Unsigned(value), ArrayNumber::Integer(operand)) => {
-                u64::try_from(operand) == Ok(value)
+                let Ok(value) = i64::try_from(value) else { return false }; value == operand
             }
             (JsonNumber::Float(value), ArrayNumber::Integer(operand)) => {
                 #[allow(clippy::cast_precision_loss)]
