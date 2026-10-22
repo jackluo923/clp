@@ -101,5 +101,6 @@ logging
 design-kv-ir-streams/index
 design-metadata-db
 design-parsing-wildcard-queries
+design-clpp-wildcard-search-implementation
 design-clpp-wildcard-search
 :::
