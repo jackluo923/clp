@@ -2665,3 +2665,33 @@ fn compact_columns_reject_null_arguments() {
             ptr::null_mut(), &raw mut text, &raw mut text_len, &raw mut rows, ptr::null_mut()));
     }
 }
+
+#[test]
+fn wildcard_projection_preserves_full_search_semantics() {
+    // Empty objects, explicit nulls, empty/nested arrays, and mixed schemas must
+    // keep the full search engine's semantics; `*` is not replaced with true.
+    let source = concat!(
+        "{}\n", "{\"obj\":{}}\n", "{\"a\":null}\n", "{\"a\":[]}\n",
+        "{\"a\":[{},null]}\n", "{\"a\":[{\"x\":1},{\"nested\":{\"x\":2}}]}\n",
+        "{\"n\":1,\"text\":\"alpha\"}\n", "{\"n\":2,\"text\":\"beta 12\"}\n",
+        "{\"n\":3,\"a\":[{\"x\":3}]}\n"
+    );
+    for structured in [false, true] {
+        let path = std::env::temp_dir().join(format!("clp-wildcard-{structured}-{}.clps", std::process::id()));
+        std::fs::write(&path, adaptive_archive(source.as_bytes(), structured)).unwrap();
+        for query in ["*", "NOT *", "* AND n >= 2", "* OR n:1", "NOT (* AND n:1)",
+            "*:alpha", "a.*:*", "a.x:*", "NOT a.x:*", "* AND a.x:3",
+            "* AND $_filename:*", "* AND $_filename:missing", "*:(*)"] {
+            let mut expected = CallbackState::default();
+            let (status, count, error) = search(&open_archive(&path), &compile_query(query, 0), &mut expected);
+            assert_eq!(CLP_S_STATUS_OK, status, "{query}: {error}");
+            for fields in [&[][..], &["n", "text"][..]] {
+                let rows = projected_rows(&path, query, fields, false);
+                let columns = projected_rows(&path, query, fields, true);
+                assert_eq!(count as usize, rows.len(), "{structured}: {query}");
+                assert_eq!(rows, columns, "{structured}: {query}");
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+}

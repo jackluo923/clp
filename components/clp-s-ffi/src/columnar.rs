@@ -30,6 +30,7 @@ use clp_s::archive::append_parsed_logtype_template;
 use clp_s::search::ArchiveSearchOptions;
 use clp_s::search::DictionaryMatches;
 use clp_s::search::ColumnNamespace;
+use clp_s::search::{ComparisonOperator, Literal};
 use clp_s::search::ExpressionKind;
 use clp_s::search::FieldForm;
 use clp_s::search::ParsedQuery;
@@ -483,13 +484,26 @@ fn dictionaries_read_by(tree: &SchemaTree, nodes: &[u32], shaped: &[u32]) -> Dic
 /// Every schema node the query's filter reads, sorted: each node a predicate compares, and the
 /// log-order column when a range-index selector places rows by walking it.
 ///
-/// `None` means the set cannot be pinned down (a wildcard, an unfamiliar namespace or expression
-/// kind), so the scan must load every column and every dictionary.
+/// Bare default `*` existence needs only schema metadata. Other wildcard paths,
+/// unfamiliar namespaces and expression kinds remain conservative: `None` loads
+/// every column and dictionary.
 fn filter_nodes(parsed: &ParsedQuery, tree: &SchemaTree) -> Option<Vec<u32>> {
     let mut nodes: Vec<u32> = Vec::new();
     let mut needs_log_order = false;
     for node in parsed.nodes() {
         let path = match node.kind() {
+            ExpressionKind::Predicate(predicate)
+                if predicate.path().is_default_wildcard()
+                    && predicate.operator() == ComparisonOperator::Equal
+                    && matches!(predicate.value(), Literal::String(value)
+                        if value.wildcard_pattern() == "*") =>
+            {
+                // Bare `*` is existence, not a value search. The semantic evaluator
+                // checks schema nodes and terminal array presence without reading
+                // values. Keep that evaluator (including NOT/empty-schema behavior),
+                // but do not load payload columns or dictionaries for this leaf.
+                continue;
+            }
             ExpressionKind::Predicate(predicate) => predicate.path(),
             ExpressionKind::List(list) => list.path(),
             ExpressionKind::Not { .. } | ExpressionKind::Boolean { .. } => continue,
@@ -1389,5 +1403,41 @@ mod tests {
             split_descriptor("\\u002"),
             "an incomplete code is the letter it starts with"
         );
+    }
+}
+
+#[cfg(test)]
+mod wildcard_projection_tests {
+    use super::*;
+    use std::io::Cursor;
+    use clp_s::archive::SingleFileArchiveReader;
+    use clp_s::search::{parse_kql, KqlLimits};
+
+    #[test]
+    fn existence_loads_only_projected_columns_and_no_dictionaries() {
+        let mut writer = clp_s::writer::OpenArchive::new(Cursor::new(Vec::new()),
+            clp_s::writer::WriterOptions::default().with_separate_columns_min_size(1)
+                .with_adaptive_numeric_columns(true));
+        let source = b"{\"n\":1,\"text\":\"hello 12 world\",\"tag\":\"alpha\"}\n{\"n\":2,\"text\":\"hello 34 world\",\"tag\":\"beta\"}\n";
+        let mut parser = clp_s::ingest::ParseManyReader::new(&source[..], Default::default());
+        parser.read_to_end(&mut clp_s::ingest::JsonArchiveSink::new(&mut writer, Default::default())).unwrap();
+        let bytes = writer.finish().unwrap().into_inner().into_inner();
+        for fields in [vec!["n".to_owned()], Vec::new()] {
+            let reader = SingleFileArchiveReader::open(Cursor::new(bytes.clone())).unwrap();
+            let parsed = parse_kql("*", KqlLimits::default()).unwrap();
+            let mut scan = ProjectedScanner::open(Box::new(reader), parsed, &Default::default(), &fields).unwrap();
+            assert_eq!(Some(vec![]), scan.filter_nodes);
+            assert!(scan.catalog.variable_dictionary().is_empty());
+            assert!(scan.catalog.log_type_dictionary().is_empty());
+            assert!(scan.catalog.array_dictionary().is_empty());
+            let (_, _, rows) = scan.next_columns().unwrap().unwrap();
+            assert_eq!(2, rows);
+            let layout = scan.stream.as_ref().unwrap().column_layout().unwrap();
+            assert_eq!(fields.len(), layout.iter().filter(|slot| slot.loaded).count());
+            assert_eq!(fields.len() * rows * 8, scan.stream.as_ref().unwrap().len());
+            // Value-search wildcards still require their payloads.
+            let parsed = parse_kql("*:alpha", KqlLimits::default()).unwrap();
+            assert!(filter_nodes(&parsed, scan.catalog.schema_tree()).is_none());
+        }
     }
 }
