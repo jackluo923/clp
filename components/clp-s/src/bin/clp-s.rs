@@ -199,7 +199,8 @@ struct CompressArgs {
     /// output that the C++ reference reads.
     #[arg(long, default_value_t = false)]
     no_adaptive_numeric_columns: bool,
-    /// Omit optional count/sum/min/max numeric summaries from new archives.
+    /// Omit the optional numeric summaries (count/sum/min/max) and timestamp chunk index from new
+    /// archives.
     #[arg(long, default_value_t = false)]
     no_numeric_summaries: bool,
     /// Store string and CLP-string columns plainly rather than adaptively (adaptive is the default

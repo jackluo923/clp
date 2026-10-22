@@ -323,7 +323,8 @@ impl EncodedDirectoryArchive {
         let mut metadata =
             zstd::stream::decode_all(compressed_metadata).map_err(WriterError::Io)?;
         let packet_count = metadata.first_mut().ok_or(WriterError::SizeOverflow)?;
-        debug_assert_eq!(3, *packet_count);
+        // Info, file info and timestamp dictionary, then any optional summaries.
+        debug_assert!(*packet_count >= 3);
         *packet_count = packet_count
             .checked_add(1)
             .ok_or(WriterError::SizeOverflow)?;

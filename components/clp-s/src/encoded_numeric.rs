@@ -212,6 +212,32 @@ impl<'a> NumericColumn<'a> {
     }
     /// Conservative signed bounds, only when the representable offset range
     /// cannot wrap across i64::MAX. A slice can safely use its parent's bounds.
+    /// An upper bound on the values as unsigned integers, read from the compact layout without
+    /// materializing rows: exact for plain, constant and frame-of-reference columns, and the
+    /// largest stored value for dictionaries and runs. `None` for an empty column, or when a
+    /// frame-of-reference offset would wrap past `u64::MAX`.
+    pub(crate) fn max_u64(self) -> Option<u64> {
+        if self.len == 0 {
+            return None;
+        }
+        match self.encoding {
+            None => self.bytes.as_chunks::<8>().0.iter().map(|bytes| u64::from_le_bytes(*bytes)).max(),
+            Some(NumericEncoding::Constant) => u64_at(self.bytes, 0).ok(),
+            Some(NumericEncoding::FrameOfReference) => {
+                let base = u64_at(self.bytes, 0).ok()?;
+                let largest = Self::codes(&self.bytes[9..], self.bytes[8], self.offset, self.len).max()?;
+                base.checked_add(largest)
+            }
+            Some(NumericEncoding::Dictionary) => {
+                let (_, values, _, _) = dictionary(self.bytes).ok()?;
+                values.as_chunks::<8>().0.iter().map(|bytes| u64::from_le_bytes(*bytes)).max()
+            }
+            Some(NumericEncoding::RunEnds) => (0..u32_at(self.bytes, 0).ok()? as usize)
+                .map(|run| self.run_value(run))
+                .max(),
+        }
+    }
+
     pub(crate) fn integer_bounds(self) -> Option<(i64, i64)> {
         if self.len == 0 || self.encoding != Some(NumericEncoding::FrameOfReference) {
             return None;

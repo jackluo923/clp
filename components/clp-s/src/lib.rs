@@ -68,3 +68,4 @@ pub use record::RecordWriter;
 
 /// Compression-time numeric aggregate metadata.
 pub mod numeric_summary;
+pub mod timestamp_chunks;

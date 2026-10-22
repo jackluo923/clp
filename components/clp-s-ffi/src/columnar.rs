@@ -1176,9 +1176,12 @@ impl ProjectedScanner {
             let Some(schema) = self.catalog.schema_map().get(table.schema_id()) else {
                 return Ok(true);
             };
+            // A table whose timestamp chunks all lie outside the query's window is never read.
+            let rows = usize::try_from(table.message_count()).unwrap_or(usize::MAX);
             if compiled.may_match_schema(schema).map_err(|source| {
                 ScanError::Archive(format!("failed to compile query: {source}"))
-            })? {
+            })? && compiled.table_row_span(table.schema_id(), rows) != clp_s::timestamp_chunks::RowSpan::Empty
+            {
                 return Ok(true);
             }
         }

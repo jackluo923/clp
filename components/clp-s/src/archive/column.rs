@@ -1511,10 +1511,7 @@ fn dictionary_id_column<'table, 'archive>(
     };
     // IDs are dense from zero, so an in-range upper bound proves every reference exists.
     let proven = ids.data.encoded_values_all(valid).unwrap_or(false)
-        || (!validate_float
-            && ids.data.integer_bounds().is_some_and(|(low, high)| {
-                low >= 0 && u64::try_from(high).is_ok_and(|high| high < dictionary.len() as u64)
-            }));
+        || (!validate_float && ids.data.max_u64().is_some_and(|max| max < dictionary.len() as u64));
     if proven {
         return Ok(DictionaryIdColumn { ids, dictionary });
     }

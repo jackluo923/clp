@@ -650,7 +650,11 @@ fn scan_streams<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
         let tables = stream_tables(table_metadata.schema_tables(), stream_id);
         let mut any_may_match = false;
         for table in tables {
-            if schema_may_match(catalog, compiled, table.schema_id())? {
+            // A table whose timestamp chunks all lie outside the query's window is never read.
+            let rows = usize::try_from(table.message_count()).unwrap_or(usize::MAX);
+            if schema_may_match(catalog, compiled, table.schema_id())?
+                && compiled.table_row_span(table.schema_id(), rows) != crate::timestamp_chunks::RowSpan::Empty
+            {
                 any_may_match = true;
                 break;
             }

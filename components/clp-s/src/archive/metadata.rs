@@ -230,11 +230,16 @@ pub struct ArchiveMetadata {
     range_index: Option<RangeIndex>,
     unknown_packet_count: u8,
     numeric_summaries: Option<Vec<u8>>,
+    timestamp_chunks: Option<Vec<u8>>,
 }
 
 impl ArchiveMetadata {
     /// Optional numeric summary payload; interpreted by aggregate readers only.
     pub fn numeric_summaries(&self) -> Option<&[u8]> { self.numeric_summaries.as_deref() }
+
+    /// Optional timestamp chunk index payload; see [`crate::timestamp_chunks`].
+    #[must_use]
+    pub fn timestamp_chunks(&self) -> Option<&[u8]> { self.timestamp_chunks.as_deref() }
 
     /// Returns the validated section directory.
     #[must_use]
@@ -340,6 +345,7 @@ fn decode_packets<R: Read>(
     let mut timestamp_dictionary = None;
     let mut range_index = None;
     let mut numeric_summaries = None;
+    let mut timestamp_chunks = None;
     let mut unknown_packet_count = 0_u8;
 
     for packet_index in 0..packet_count {
@@ -401,6 +407,10 @@ fn decode_packets<R: Read>(
                 reject_duplicate(numeric_summaries.is_some(), packet_type)?;
                 numeric_summaries = Some(read_payload(reader, packet_size)?);
             }
+            crate::timestamp_chunks::PACKET_TYPE => {
+                reject_duplicate(timestamp_chunks.is_some(), packet_type)?;
+                timestamp_chunks = Some(read_payload(reader, packet_size)?);
+            }
             _ => {
                 skip_payload(reader, packet_size)?;
                 unknown_packet_count = unknown_packet_count
@@ -428,6 +438,7 @@ fn decode_packets<R: Read>(
         range_index,
         unknown_packet_count,
         numeric_summaries,
+        timestamp_chunks,
     })
 }
 

@@ -1865,3 +1865,97 @@ fn timestamp_key_windows_outside_the_archive_range_skip_it_unread() {
     assert_eq!((3, 1), search("NOT ts < 1700000000000000000"));
     assert_eq!((0, 1), search("NOT ts >= 1700000000000000000"));
 }
+
+#[test]
+fn timestamp_chunks_skip_rows_and_tables_outside_the_window_without_changing_results() {
+    // 200,000 rows in chunks of 65,536: rows below 131,072 (chunks 0 and 1) are early, the rest
+    // (chunks 2 and 3) a million seconds later, so a window in the gap meets the archive's range
+    // but no chunk.
+    let directory = TestDirectory::new("timestamp-chunks");
+    let input = directory.path().join("input.jsonl");
+    let early = 1_783_328_900_000_i64;
+    let late = early + 1_000_000_000;
+    let mut text = String::new();
+    for row in 0..200_000_i64 {
+        let ts = if row < 131_072 { early + row } else { late + row };
+        text.push_str(&format!("{{\"ts\":{ts},\"v\":{}}}\n", row % 7));
+    }
+    fs::write(&input, text).expect("write input");
+    let compress = |name: &str, env: &[(&str, &str)], extra: &[&str]| {
+        let archives = directory.path().join(name);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_clp-s"));
+        command.args(["c", "--single-file-archive", "--disable-log-order", "--timestamp-key", "ts"]);
+        command.args(extra).arg(&archives).arg(&input);
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let output = command.output().expect("run clp-s");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        fs::read_dir(&archives).expect("list").next().expect("one archive").expect("entry").path()
+    };
+    let indexed = compress("indexed", &[], &[]);
+    let plain = compress("plain", &[("CLP_DISABLE_TIMESTAMP_CHUNKS", "1")], &[]);
+    let no_summaries = compress("no-summaries", &[], &["--no-numeric-summaries"]);
+
+    let open = |archive: &Path| {
+        let mut reader = clp_s::archive::SingleFileArchiveReader::open(fs::File::open(archive).expect("open"))
+            .expect("read archive");
+        let catalog = reader.read_catalog(clp_s::archive::ArchiveCatalogLimits::default()).expect("catalog");
+        (reader, catalog)
+    };
+    let (_, catalog) = open(&indexed);
+    let chunks = clp_s::timestamp_chunks::TimestampChunks::decode(
+        catalog.metadata().timestamp_chunks().expect("indexed archive has chunks"),
+    )
+    .expect("decode chunks");
+    assert_eq!(1, chunks.columns.len());
+    assert_eq!(4, chunks.columns[0].bounds.len());
+    assert!(open(&plain).1.metadata().timestamp_chunks().is_none());
+    assert!(open(&no_summaries).1.metadata().timestamp_chunks().is_none());
+
+    let ns = |ms: i64| ms * 1_000_000;
+    let table = &catalog.table_metadata().schema_tables()[0];
+    let rows = usize::try_from(table.message_count()).expect("rows");
+    let span = |kql: &str| {
+        let query = clp_s::search::parse_kql(kql, clp_s::search::KqlLimits::default()).expect("parse");
+        let compiled = query
+            .compile_for_archive(&catalog, clp_s::search::SearchOptions::default())
+            .expect("compile");
+        compiled.table_row_span(table.schema_id(), rows)
+    };
+    use clp_s::timestamp_chunks::RowSpan;
+    assert_eq!(RowSpan::Rows(131_072, 196_608), span(&format!("ts: {}", ns(late + 140_000))));
+    assert_eq!(RowSpan::Rows(0, 131_072), span(&format!("ts >= {} AND ts <= {}", ns(early + 65_000), ns(early + 66_000))));
+    assert_eq!(RowSpan::Empty, span(&format!("ts > {} AND ts < {}", ns(early + 200_000), ns(late))));
+    assert_eq!(RowSpan::All, span(&format!("ts > {} OR v: 3", ns(late))));
+    assert_eq!(RowSpan::All, span(&format!("NOT ts > {}", ns(late))));
+
+    let search = |archive: &Path, kql: &str| {
+        let query = clp_s::search::parse_kql(kql, clp_s::search::KqlLimits::default()).expect("parse");
+        let (mut reader, _) = open(archive);
+        let mut sink = CountingSink::default();
+        let stats = clp_s::search::search_archive(
+            &mut reader,
+            &query,
+            &mut sink,
+            &clp_s::search::ArchiveSearchOptions::default(),
+        )
+        .expect("search");
+        (sink.rows, stats.streams_scanned())
+    };
+    let queries = [
+        format!("ts: {}", ns(late + 140_000)),
+        format!("ts >= {} AND ts <= {}", ns(early + 65_000), ns(early + 66_000)),
+        format!("ts >= {} AND v: 3", ns(late + 199_000)),
+        format!("ts > {} AND ts < {}", ns(early + 200_000), ns(late)),
+        format!("ts > {} OR v: 3", ns(late + 150_000)),
+        format!("NOT ts > {}", ns(early + 100)),
+        format!("ts >= {} AND NOT v: 3", ns(late + 131_072)),
+    ];
+    for kql in &queries {
+        assert_eq!(search(&plain, kql).0, search(&indexed, kql).0, "{kql}");
+    }
+    // The gap window meets the archive's range, so only the chunks prove it empty, unread.
+    assert_eq!((0, 0), search(&indexed, &queries[3]));
+    assert_eq!(0, search(&plain, &queries[3]).0);
+}

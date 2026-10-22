@@ -1171,7 +1171,13 @@ fn encode_records(
         // Validation hook: emit legacy archives for same-build fallback comparisons.
         let disabled = std::env::var("CLP_DISABLE_NUMERIC_SUMMARIES").is_ok_and(|v| !v.is_empty() && v != "0");
         let summaries = if disabled || !options.numeric_summaries { None } else { Some(records.numeric_summaries()?) };
-        let mut encoded = EncodedEmptyArchive::from_sections_with_summaries(options, sections, &timestamp_dictionary, summaries.as_deref())?;
+        // Validation hook, as above: emit archives without the timestamp chunk index.
+        let chunks_disabled = std::env::var("CLP_DISABLE_TIMESTAMP_CHUNKS").is_ok_and(|v| !v.is_empty() && v != "0");
+        // Like the numeric summaries, the chunk index is optional Rust metadata; disabling those
+        // (for byte parity with the C++ writer) omits it too.
+        let chunks = if chunks_disabled || !options.numeric_summaries { None } else { records.timestamp_chunks()? };
+        let mut encoded = EncodedEmptyArchive::from_sections_with_summaries(options, sections, &timestamp_dictionary,
+            summaries.as_deref(), chunks.as_deref())?;
         if mixed {
             encoded.header = ArchiveHeader::new_with_version(crate::archive::ArchiveVersion::MIXED_INTEGERS,
                 options.uncompressed_size, encoded.archive_size, u32::try_from(encoded.metadata.len()).map_err(|_| WriterError::SizeOverflow)?);
@@ -1227,7 +1233,7 @@ impl EncodedEmptyArchive {
         sections: [Vec<u8>; SFA_SECTION_NAMES.len()],
         timestamp_dictionary: &[u8],
     ) -> Result<Self, WriterError> {
-        Self::from_sections_with_summaries(options, sections, timestamp_dictionary, None)
+        Self::from_sections_with_summaries(options, sections, timestamp_dictionary, None, None)
     }
 
     fn from_sections_with_summaries(
@@ -1235,12 +1241,17 @@ impl EncodedEmptyArchive {
         sections: [Vec<u8>; SFA_SECTION_NAMES.len()],
         timestamp_dictionary: &[u8],
         summaries: Option<&[u8]>,
+        timestamp_chunks: Option<&[u8]>,
     ) -> Result<Self, WriterError> {
         let offsets = section_offsets(&sections)?;
         let mut metadata_payload = encode_metadata_payload(offsets, timestamp_dictionary)?;
         if let Some(summaries) = summaries {
             metadata_payload[0] += 1;
             append_packet(&mut metadata_payload, crate::numeric_summary::PACKET_TYPE, summaries)?;
+        }
+        if let Some(chunks) = timestamp_chunks {
+            metadata_payload[0] += 1;
+            append_packet(&mut metadata_payload, crate::timestamp_chunks::PACKET_TYPE, chunks)?;
         }
         check_limit(
             WriterResource::DecompressedMetadata,

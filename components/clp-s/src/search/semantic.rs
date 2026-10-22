@@ -619,6 +619,10 @@ pub struct CompiledQuery<'query, 'archive> {
     lists: Vec<CompiledList>,
     authoritative_timestamp_range: Option<CompiledAuthoritativeTimestampRange>,
     archive_may_match: bool,
+    /// Inclusive epoch-nanosecond windows every match must satisfy, one per timestamp column.
+    timestamp_windows: Vec<(u32, i64, i64)>,
+    /// The archive's timestamp chunk index, decoded only when a window can use it.
+    timestamp_chunks: Option<crate::timestamp_chunks::TimestampChunks>,
 }
 
 impl ParsedQuery {
@@ -685,9 +689,102 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
             lists: builder.lists,
             authoritative_timestamp_range,
             archive_may_match: true,
+            timestamp_windows: Vec::new(),
+            timestamp_chunks: None,
         };
         compiled.archive_may_match = compiled.compute_archive_may_match();
+        compiled.timestamp_windows = compiled.compute_timestamp_windows();
+        if !compiled.timestamp_windows.is_empty() {
+            compiled.timestamp_chunks = catalog
+                .metadata()
+                .timestamp_chunks()
+                .and_then(|bytes| crate::timestamp_chunks::TimestampChunks::decode(bytes).ok());
+        }
         Ok(compiled)
+    }
+
+    /// The window each timestamp column must lie in for a row to match.
+    ///
+    /// Only the root's top-level conjunction is read, as for the range-index selector: a
+    /// comparison there constrains every match, while one under `OR` or `NOT` does not. A
+    /// comparison on a timestamp column compares its epoch nanoseconds with the operand, so the
+    /// windows are in nanoseconds.
+    fn compute_timestamp_windows(&self) -> Vec<(u32, i64, i64)> {
+        let tree = self.catalog.schema_tree();
+        let mut windows: Vec<(u32, i64, i64)> = Vec::new();
+        let mut pending = vec![self.query.root()];
+        while let Some(node) = pending.pop() {
+            match self.nodes.get(node.index()).copied() {
+                Some(CompiledNode::Boolean { operator: BooleanOperator::And, left, right }) => {
+                    pending.push(left);
+                    pending.push(right);
+                }
+                Some(CompiledNode::Predicate(index)) => {
+                    let Some(compiled) = self.predicates.get(index) else { continue };
+                    let ResolvedPath::Schema(schema) = &compiled.resolved else { continue };
+                    let Ok(predicate) = self.predicate_ref(compiled) else { continue };
+                    if compiled.negated
+                        || schema.nodes.is_empty()
+                        || is_exists(predicate)
+                        || predicate.path().components().iter().any(PathComponent::is_wildcard)
+                        || !schema.nodes.iter().all(|id| {
+                            tree.get(*id as usize).is_some_and(|node| node.node_type() == NodeType::Timestamp)
+                        })
+                    {
+                        continue;
+                    }
+                    let Some(operand) = compiled.value.timestamp_nanoseconds.or_else(|| {
+                        match numeric_literal(predicate.value()) {
+                            Some(NumericLiteral::Integer(value)) => Some(value),
+                            _ => None,
+                        }
+                    }) else {
+                        continue;
+                    };
+                    // An empty window is written low > high.
+                    let (low, high) = match predicate.operator() {
+                        ComparisonOperator::Equal => (operand, operand),
+                        ComparisonOperator::Less => operand.checked_sub(1).map_or((1, 0), |high| (i64::MIN, high)),
+                        ComparisonOperator::LessOrEqual => (i64::MIN, operand),
+                        ComparisonOperator::Greater => operand.checked_add(1).map_or((1, 0), |low| (low, i64::MAX)),
+                        ComparisonOperator::GreaterOrEqual => (operand, i64::MAX),
+                    };
+                    for &column in &schema.nodes {
+                        match windows.iter_mut().find(|(node, _, _)| *node == column) {
+                            Some(window) => {
+                                window.1 = window.1.max(low);
+                                window.2 = window.2.min(high);
+                            }
+                            None => windows.push((column, low, high)),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        windows
+    }
+
+    /// The rows of a table that can match, from the archive's timestamp chunk index.
+    ///
+    /// [`RowSpan::All`](crate::timestamp_chunks::RowSpan::All) when the query sets no time window
+    /// or the archive has no index for the table; [`RowSpan::Empty`](crate::timestamp_chunks::RowSpan::Empty)
+    /// lets a reader skip the table without decoding it.
+    #[must_use]
+    pub fn table_row_span(&self, schema_id: i32, rows: usize) -> crate::timestamp_chunks::RowSpan {
+        use crate::timestamp_chunks::RowSpan;
+        let Some(chunks) = &self.timestamp_chunks else {
+            return RowSpan::All;
+        };
+        let Some(schema) = self.catalog.schema_map().get(schema_id) else {
+            return RowSpan::All;
+        };
+        self.timestamp_windows
+            .iter()
+            .filter(|(node, _, _)| schema_contains_node(schema, *node))
+            .fold(RowSpan::All, |span, &(node, low, high)| {
+                span.intersect(chunks.row_span(schema_id, node, rows, low, high))
+            })
     }
 
     /// Matches one lazily decoded schema table in physical row order.
@@ -792,7 +889,14 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
     ) -> Result<MatchBitmap, SearchError> {
         self.validate_table(decoded)?;
         let table_index = TableIndex::new(decoded, self.catalog, self.options.limits())?;
-        Evaluator::new(self, decoded, table_index).evaluate()
+        let mut evaluator = Evaluator::new(self, decoded, table_index);
+        let rows = decoded.table().message_count();
+        evaluator.chunk_span = match self.table_row_span(decoded.schema().id(), rows) {
+            crate::timestamp_chunks::RowSpan::All => None,
+            crate::timestamp_chunks::RowSpan::Empty => Some((0, 0)),
+            crate::timestamp_chunks::RowSpan::Rows(start, end) => Some((start, end)),
+        };
+        evaluator.evaluate()
     }
 
     /// Returns the semantic options captured at compilation.
@@ -2975,6 +3079,10 @@ struct Evaluator<'compiled, 'query, 'archive, 'table> {
     /// Per-row failures outside the run are no longer raised, since those rows are never read.
     /// Schema-level refusals still are: every leaf is still evaluated, over an empty row range.
     row_span: Option<(usize, usize)>,
+    /// Rows the query's time window can reach, from the timestamp chunk index. Every other row is
+    /// a non-match: column scans skip them, and the final bitmap is cleared outside this span,
+    /// which also keeps a `NOT` from turning an unread row into a match.
+    chunk_span: Option<(usize, usize)>,
 }
 
 impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive, 'table> {
@@ -2993,6 +3101,7 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
             array_scratch: ArrayScratch::default(),
             range_work: Vec::new(),
             row_span: None,
+            chunk_span: None,
         }
     }
 
@@ -3023,6 +3132,15 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
             // and still report what they refuse to evaluate.
             self.row_span = Some(true_span(&bitmap).unwrap_or((0, 0)));
             self.states[node_index] = Some(bitmap);
+        }
+        if let Some((start, end)) = self.chunk_span {
+            self.row_span = Some(match self.row_span {
+                Some((a, b)) => {
+                    let start = start.max(a);
+                    (start, end.min(b).max(start))
+                }
+                None => (start, end),
+            });
         }
         for (index, node) in self.compiled.nodes.iter().copied().enumerate() {
             if self.states[index].is_some() {
@@ -3071,6 +3189,11 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
                 combine(&mut bitmap, &timestamp_bitmap, BooleanOperator::And);
                 self.release_bitmap(timestamp_bitmap.len());
             }
+        }
+        if let Some((start, end)) = self.chunk_span {
+            let rows = bitmap.len();
+            bitmap[..start.min(rows)].fill(Tri::False as u8);
+            bitmap[end.min(rows)..].fill(Tri::False as u8);
         }
         let match_count = normalize_matches(&mut bitmap);
         Ok(MatchBitmap {

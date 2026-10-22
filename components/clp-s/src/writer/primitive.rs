@@ -1048,6 +1048,36 @@ impl PrimitiveArchive {
         Ok(fields)
     }
 
+    /// The timestamp chunk index of every table's timestamp columns, or `None` when no table has
+    /// one. See [`crate::timestamp_chunks`].
+    pub(super) fn timestamp_chunks(&self) -> Result<Option<Vec<u8>>, WriterError> {
+        use crate::timestamp_chunks::{CHUNK_ROWS, ChunkColumn, TimestampChunks};
+        let mut columns = Vec::new();
+        for table in &self.tables.tables {
+            for column in &table.columns {
+                let TableColumnData::Timestamp { deltas, .. } = &column.data else {
+                    continue;
+                };
+                let epochs = deltas.chunks_exact(8).scan(0_i64, |epoch, delta| {
+                    *epoch = epoch.wrapping_add(i64::from_le_bytes(delta.try_into().unwrap()));
+                    Some(*epoch)
+                });
+                columns.push(ChunkColumn {
+                    schema: table.schema_id,
+                    node: column.node_id,
+                    bounds: TimestampChunks::bounds(epochs, CHUNK_ROWS),
+                });
+            }
+        }
+        if columns.is_empty() {
+            return Ok(None);
+        }
+        TimestampChunks { version: 1, chunk_rows: CHUNK_ROWS, columns }
+            .encode()
+            .map(Some)
+            .map_err(|source| WriterError::Io(std::io::Error::other(source)))
+    }
+
     pub(super) fn numeric_summaries(&self) -> Result<Vec<u8>, WriterError> {
         use crate::numeric_summary::{ColumnSummary, NumericSummaries};
         let mut columns = Vec::new();
