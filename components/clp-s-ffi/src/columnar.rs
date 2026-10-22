@@ -197,6 +197,8 @@ fn user_root(tree: &SchemaTree) -> Option<usize> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchiveFieldType {
     pub path: Vec<u8>,
+    /// The schema-tree node the path addresses.
+    pub node_id: usize,
     pub node_type: NodeType,
 }
 
@@ -238,6 +240,7 @@ pub fn archive_field_types(tree: &SchemaTree) -> Vec<ArchiveFieldType> {
         }
         types.push(ArchiveFieldType {
             path,
+            node_id,
             node_type: node.node_type(),
         });
     }

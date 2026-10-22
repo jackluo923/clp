@@ -2362,7 +2362,8 @@ pub unsafe extern "C" fn clp_s_v2_archive_field_types(
                 .map_err(|source| {
                     ApiError::Archive(format!("failed to read archive catalog: {source}"))
                 })?;
-            let fields = columnar::archive_field_types(catalog.schema_tree());
+            let mut fields = columnar::archive_field_types(catalog.schema_tree());
+            narrow_signed_mixed_integers(&catalog, &mut fields);
             let entries = fields
                 .iter()
                 .map(|field| ClpSV2ArchiveFieldType {
@@ -2383,6 +2384,51 @@ pub unsafe extern "C" fn clp_s_v2_archive_field_types(
             out_list.write(Box::into_raw(handle));
             Ok(())
         })
+    }
+}
+
+/// Reports a mixed-integer column as a signed integer when the archive's numeric summaries prove
+/// it holds no value above `i64::MAX`.
+///
+/// The writer stores integer columns in a layout that can hold unsigned 64-bit values whether or
+/// not any does, so its node type alone says "signed or unsigned" for every integer column, and a
+/// reader then has to treat each as possibly unsigned. The summaries count every value per
+/// schema table; a column is narrowed only when every table holding it has a summary and none
+/// recorded an unsigned-range value. Archives without summaries are left unchanged.
+fn narrow_signed_mixed_integers(catalog: &clp_s::archive::ArchiveCatalog, fields: &mut [columnar::ArchiveFieldType]) {
+    use clp_s::archive::{NodeType, SchemaEntry};
+    let Some(summaries) = catalog
+        .metadata()
+        .numeric_summaries()
+        .and_then(|bytes| clp_s::numeric_summary::NumericSummaries::decode(bytes).ok())
+    else {
+        return;
+    };
+    let tree = catalog.schema_tree();
+    // Per mixed-integer node: whether every table holding it has a summary with no unsigned value.
+    let mut signed = vec![None::<bool>; tree.len()];
+    for table in catalog.table_metadata().schema_tables() {
+        let Some(schema) = catalog.schema_map().get(table.schema_id()) else { continue };
+        for entry in schema.entries() {
+            let SchemaEntry::Node(node) = *entry else { continue };
+            let node = node as usize;
+            if tree.get(node).map(|n| n.node_type()) != Some(NodeType::MixedInteger) {
+                continue;
+            }
+            let summary = summaries
+                .columns
+                .iter()
+                .find(|column| column.schema == table.schema_id() && column.node as usize == node);
+            let proven = summary.is_some_and(|column| column.unsigned.count == 0);
+            signed[node] = Some(signed[node].unwrap_or(true) && proven);
+        }
+    }
+    for field in fields.iter_mut() {
+        if field.node_type == NodeType::MixedInteger && field.node_id < signed.len()
+            && signed[field.node_id] == Some(true)
+        {
+            field.node_type = NodeType::Integer;
+        }
     }
 }
 
