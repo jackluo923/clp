@@ -1349,6 +1349,16 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
             if is_exists(predicate) {
                 return is_search_value_node(node.node_type());
             }
+            if node.node_type() == NodeType::ClpString {
+                let dictionary = self.catalog.log_type_dictionary().for_field(node_id);
+                let anchored = variable_pattern(predicate).or_else(|| clp_pattern(predicate))
+                    .and_then(|pattern| super::clp_pattern::ClpPattern::new(
+                        pattern, self.options.ignore_case(), 0,
+                    ));
+                if anchored.is_some_and(|plan| !plan.dictionary_may_match(dictionary)) {
+                    return false;
+                }
+            }
             node_may_match_without_table(node.node_type(), predicate, &compiled.value)
         })
     }
@@ -3266,7 +3276,7 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
                 .table()
                 .column(column_index)
                 .ok_or(SearchError::SizeOverflow)?;
-            self.scan_column(filter, column.data(), bitmap)?;
+            self.scan_column(filter, node_id, column.data(), bitmap)?;
         }
         // Mixed/type-restricted columns resolve eligibility per row. Leave their
         // ineligible rows Unknown so NOT/!= cannot turn them into matches.
@@ -3277,6 +3287,7 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
     fn scan_column(
         &mut self,
         filter: EvaluationFilter<'_, '_>,
+        node_id: u32,
         column: ColumnData<'table, 'archive>,
         bitmap: &mut [u8],
     ) -> Result<(), SearchError> {
@@ -3284,7 +3295,7 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
             && let Some(signed) = mixed.signed_column()
             && !matches!(filter.predicate.value(), Literal::Unsigned { .. }) {
             // Preserve existing encoded scans when no large UInt64 is present.
-            self.scan_column(filter, ColumnData::Integer(signed), bitmap)?;
+            self.scan_column(filter, node_id, ColumnData::Integer(signed), bitmap)?;
             for value in bitmap {
                 if *value == Tri::Unknown as u8 { *value = Tri::False as u8; }
             }
@@ -3366,7 +3377,7 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
                 filter.value.variable_ids.or_matches(bitmap, column.ids().iter().skip(skip));
             }
             ColumnData::ClpString(column) => {
-                self.scan_clp(filter.expression, filter.predicate, column, skip, bitmap)?;
+                self.scan_clp(filter.expression, filter.predicate, node_id, column, skip, bitmap)?;
             }
             ColumnData::UnstructuredArray(_) => return Err(SearchError::SizeOverflow),
             ColumnData::DeprecatedDateString(_) => {
@@ -3394,12 +3405,22 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
         &mut self,
         expression: NodeId,
         predicate: PredicateRef<'_>,
+        node_id: u32,
         column: crate::archive::ClpStringColumn<'table, 'archive>,
         row_offset: usize,
         bitmap: &mut [u8],
     ) -> Result<(), SearchError> {
+        let dictionary = self.compiled.catalog.log_type_dictionary().for_field(node_id);
+        let mut anchored = variable_pattern(predicate).or_else(|| clp_pattern(predicate))
+            .and_then(|pattern| super::clp_pattern::ClpPattern::new(
+                pattern, self.compiled.options.ignore_case(), dictionary.len(),
+            ));
         for (offset, destination) in bitmap.iter_mut().enumerate() {
             let row = row_offset + offset;
+            if let Some(matched) = anchored.as_mut().and_then(|plan| plan.matches(column, row, dictionary)) {
+                if matched { *destination = Tri::True as u8; }
+                continue;
+            }
             let record = column.record(row).ok_or(SearchError::SizeOverflow)?;
             self.clp_scratch.clear();
             append_clp_message_bounded(
@@ -5136,6 +5157,9 @@ mod tests {
                     PackedStreamLimits::default(),
                 )
                 .expect("read semantic stream");
+            let stream = catalog.materialize_adaptive_numerics(
+                stream_id as u64, stream, ColumnLimits::default(),
+            ).expect("prepare semantic columns");
             let tables = catalog
                 .schema_tables(
                     u64::try_from(stream_id).expect("stream ID fits u64"),
@@ -5427,6 +5451,96 @@ mod tests {
                     .expect("match C++ null transform"),
                 "{query}"
             );
+        }
+    }
+
+    #[test]
+    fn anchored_clp_predicates_match_reconstructed_messages() {
+        let messages: &[&str] = &[
+            "prefix -9223372036854775808 suffix\n", "prefix 9223372036854775807 suffix\n",
+            "prefix 0 suffix\n", "prefix 12.340 suffix\n", "prefix -0.00 suffix\n",
+            "prefix 2ms suffix\n", "prefix 1ms suffix\n", "prefix literal*? suffix\n",
+            "prefix \\slash É😀 suffix\n", "other 2ms suffix\n",
+            "sendHeartbeat took 2ms\n", "sendHeartbeat took 1ms\n", "UPPER 2ms suffix\n",
+            "prefix 12 took 2ms suffix\n", "prefix 34 took 1ms suffix\n",
+        ];
+        let mut archive = OpenArchive::new(Cursor::new(Vec::new()), WriterOptions::default());
+        for (id, message) in messages.iter().enumerate() {
+            archive.append_record(RecordRef::new(&[
+                FieldRef::new(b"id", ValueRef::I64(id as i64)),
+                FieldRef::new(b"msg", ValueRef::String(message.as_bytes())),
+            ])).unwrap();
+        }
+        let bytes = archive.finish().unwrap().into_inner().into_inner();
+        let mut reader = SingleFileArchiveReader::open(Cursor::new(&bytes)).unwrap();
+        let catalog = reader.read_catalog(ArchiveCatalogLimits::default()).unwrap();
+        assert!(catalog.log_type_dictionary().entries().any(|e| e.placeholder_counts().encoded_variables() > 0));
+        let patterns = ["prefix*", "prefix -*", "prefix -9223372036854775808*",
+            "*suffix\n", "*2ms suffix\n", "*1ms\n", "*sendHeartbeat took 2ms\n",
+            "*9223372036854775807 suffix\n", "*0 suffix\n", "prefix 12.3*",
+            "*12.340 suffix\n", "*-0.00 suffix\n", "prefix 2ms suffix\n",
+            r"prefix literal\*\?*", "*É😀 suffix\n", r"prefix \\slash*",
+            "upper*", "*UPPER 2ms suffix\n", "missing*", "*missing",
+            "prefix*ms*", "prefix ?ms suffix\n", "prefix 12 took 2ms suffix\n",
+            "prefix 12 took 2*", "*34 took 1ms suffix\n"];
+        for pattern in patterns {
+            for ignore_case in [false, true] {
+                let expected: Vec<i64> = messages.iter().enumerate().filter_map(|(i, message)|
+                    wildcard_match(message.as_bytes(), pattern, ignore_case).then_some(i as i64)).collect();
+                let query = format!("msg:\"{pattern}\"");
+                assert_eq!(matched_ids(&bytes, &query, ignore_case), expected, "{query}");
+                let inverse: Vec<i64> = (0..messages.len() as i64).filter(|id| !expected.contains(id)).collect();
+                assert_eq!(matched_ids(&bytes, &format!("NOT {query}"), ignore_case), inverse, "NOT {query}");
+            }
+        }
+    }
+
+    #[test]
+    fn anchored_search_uses_the_columns_own_dictionary_without_reconstruction() {
+        for per_field in [false, true] {
+            let options = WriterOptions::default().with_adaptive_numeric_columns(true)
+                .with_adaptive_string_columns(true).with_field_logtype_dictionaries(per_field);
+            let mut archive = OpenArchive::new(Cursor::new(Vec::new()), options);
+            for id in 0..12 {
+                let message = format!("sendHeartbeat took {id}ms\n");
+                let other = format!("other event {id}\n");
+                archive.append_record(RecordRef::new(&[
+                    FieldRef::new(b"id", ValueRef::I64(id)),
+                    FieldRef::new(b"msg", ValueRef::String(message.as_bytes())),
+                    FieldRef::new(b"other", ValueRef::String(other.as_bytes())),
+                ])).unwrap();
+            }
+            let bytes = archive.finish().unwrap().into_inner().into_inner();
+            let mut reader = SingleFileArchiveReader::open(Cursor::new(&bytes)).unwrap();
+            let catalog = reader.read_catalog(ArchiveCatalogLimits::default()).unwrap();
+            for (query, possible) in [
+                ("msg:\"never matches*\"", false),
+                ("NOT msg:\"never matches*\"", true),
+                ("msg:\"never matches*\" AND other:\"other*\"", false),
+                ("msg:\"never matches*\" OR other:\"other*\"", true),
+            ] {
+                let parsed = parse_kql(query, KqlLimits::default()).unwrap();
+                let compiled = parsed.compile_for_archive(&catalog, SearchOptions::default()).unwrap();
+                assert_eq!(compiled.may_match_archive(), possible, "{query}");
+            }
+            if per_field {
+                let parsed = parse_kql("other:\"sendHeartbeat*\"", KqlLimits::default()).unwrap();
+                assert!(!parsed.compile_for_archive(&catalog, SearchOptions::default()).unwrap().may_match_archive());
+            }
+            // A zero reconstruction allowance proves these answers use template/variable
+            // comparisons. The same tests cover global and independent per-field IDs.
+            let limits = SearchLimits::default().with_value_limits(0, 1_048_576);
+            let options = SearchOptions::new(false, limits);
+            for (query, expected) in [
+                ("msg:\"*took 2ms\n\"", vec![2]),
+                ("msg:\"sendHeartbeat took 2*\"", vec![2]),
+                ("other:\"other event 2\n\"", vec![2]),
+                ("msg:\"never matches*\"", vec![]),
+                ("msg:\"*took 2ms\n\" OR other:\"other event 3*\"", vec![2, 3]),
+            ] {
+                assert_eq!(matched_integer_field(&bytes, query, b"id", options).unwrap(), expected,
+                           "per_field={per_field}, {query}");
+            }
         }
     }
 

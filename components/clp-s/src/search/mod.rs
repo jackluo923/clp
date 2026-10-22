@@ -9,6 +9,7 @@ mod aggregation;
 mod archive;
 mod array;
 mod ast;
+mod clp_pattern;
 mod jsonl;
 mod kv_ir;
 mod lexer;

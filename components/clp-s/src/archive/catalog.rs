@@ -441,9 +441,8 @@ impl ArchiveCatalog {
                 size = output.len() - start;
                 changed = true;
             } else if strings && node_type == Some(NodeType::ClpString) && !stored.is_empty() {
-                let raw = decode_adaptive_clp_string(stored, message_count, limits).map_err(decode_err)?;
-                output.extend_from_slice(&raw);
-                size = raw.len();
+                decode_adaptive_clp_string(stored, message_count, limits, &mut output).map_err(decode_err)?;
+                size = output.len() - start;
                 changed = true;
             } else if node_type == Some(NodeType::Float) && !stored.is_empty() {
                 crate::adaptive_float::decode_to_le(stored, message_count, &mut output).map_err(decode_err)?;
@@ -744,7 +743,8 @@ fn decode_adaptive_clp_string(
     stored: &[u8],
     rows: usize,
     limits: ColumnLimits,
-) -> Result<Vec<u8>, crate::adaptive_int::AdaptiveDecodeError> {
+    output: &mut Vec<u8>,
+) -> Result<(), crate::adaptive_int::AdaptiveDecodeError> {
     use crate::adaptive_int::AdaptiveDecodeError;
     let read_u64 = |bytes: &[u8], at: usize| -> Result<u64, AdaptiveDecodeError> {
         bytes
@@ -767,24 +767,16 @@ fn decode_adaptive_clp_string(
     }
     let count = usize::try_from(count).map_err(|_| AdaptiveDecodeError::Malformed)?;
     let variables = &stored[descriptors_end + 8..];
-    let descriptors = crate::adaptive_int::decode(descriptors, rows)?;
-    let variables = if 0 == count {
-        if !variables.is_empty() {
-            return Err(AdaptiveDecodeError::Malformed);
-        }
-        Vec::new()
+    // Decode directly into the final stream buffer instead of retaining expanded descriptor
+    // and variable vectors plus a second full-size byte buffer before copying it yet again.
+    crate::adaptive_int::decode_to_le(descriptors, rows, output)?;
+    output.extend_from_slice(&(count as u64).to_le_bytes());
+    if count == 0 {
+        if !variables.is_empty() { return Err(AdaptiveDecodeError::Malformed); }
     } else {
-        crate::adaptive_int::decode(variables, count)?
-    };
-    let mut raw = Vec::with_capacity((descriptors.len() + 1 + variables.len()) * 8);
-    for value in &descriptors {
-        raw.extend_from_slice(&value.to_le_bytes());
+        crate::adaptive_int::decode_to_le(variables, count, output)?;
     }
-    raw.extend_from_slice(&(count as u64).to_le_bytes());
-    for value in &variables {
-        raw.extend_from_slice(&value.to_le_bytes());
-    }
-    Ok(raw)
+    Ok(())
 }
 
 /// Layout-independent inputs needed to assemble an [`ArchiveCatalog`].
