@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -229,6 +230,36 @@ auto invert(ColumnScan::Bitmap& bitmap) -> void {
 }
 
 template <typename T>
+auto encoded_values(BaseColumnReader* reader) -> NumericColumnView const* {
+    if constexpr (std::is_same_v<T, int64_t>) {
+        if (reader->get_type() == NodeType::Integer) {
+            return static_cast<Int64ColumnReader*>(reader)->encoded_values();
+        }
+    } else if constexpr (std::is_same_v<T, double>) {
+        if (reader->get_type() == NodeType::Float) {
+            return static_cast<FloatColumnReader*>(reader)->encoded_values();
+        }
+    }
+    return nullptr;
+}
+
+/** Proves all/none for a monotone comparison or an equality operand outside the FOR range. */
+auto compare_bounds(FilterOperation operation, int64_t low, int64_t high, int64_t operand)
+        -> std::optional<bool> {
+    if (is_equality_operation(operation)) {
+        if (low == high) {
+            return compare(operation, low, operand);
+        }
+        if (operand < low || operand > high) {
+            return operation == FilterOperation::NEQ;
+        }
+        return std::nullopt;
+    }
+    auto const first{compare(operation, low, operand)};
+    return first == compare(operation, high, operand) ? std::optional{first} : std::nullopt;
+}
+
+template <typename T>
 [[nodiscard]] auto build_basic_filter(
         uint64_t num_messages,
         ColumnScan::BasicReaderMap const& reader_map,
@@ -242,6 +273,30 @@ template <typename T>
         return bitmap;
     }
     for (auto* reader : readers->second) {
+        if constexpr (sizeof(T) == sizeof(uint64_t)) {
+            if (auto const* encoded{encoded_values<T>(reader)}; encoded != nullptr) {
+                if constexpr (std::is_same_v<T, int64_t>) {
+                    if (auto const bounds{encoded->integer_bounds()}) {
+                        if (auto const match{compare_bounds(
+                                    operation,
+                                    bounds->first,
+                                    bounds->second,
+                                    operand
+                            )})
+                        {
+                            if (*match) {
+                                std::ranges::fill(bitmap, 1);
+                            }
+                            continue;
+                        }
+                    }
+                }
+                encoded->or_matches(bitmap, [&](uint64_t bits) {
+                    return compare(operation, std::bit_cast<T>(bits), operand);
+                });
+                continue;
+            }
+        }
         for (uint64_t message_index{0}; message_index < num_messages; ++message_index) {
             auto const value = std::get<T>(reader->extract_value(message_index));
             bitmap[message_index] |= compare(operation, value, operand) ? 1 : 0;
@@ -323,20 +378,29 @@ template <typename T>
     NumericPatternMatcher const matcher{std::move(pattern)};
     constexpr size_t cNumericConversionBufferSize{64};
     std::array<char, cNumericConversionBufferSize> buf{};
+    auto matches = [&](T value) {
+        auto const result = [&]() -> auto {
+            if constexpr (std::is_floating_point_v<T>) {
+                return fmt::format_to_n(buf.begin(), buf.size(), FMT_COMPILE("{:.17g}"), value);
+            }
+            return fmt::format_to_n(buf.begin(), buf.size(), FMT_COMPILE("{}"), value);
+        }();
+        if (result.size > buf.size()) {
+            return false;
+        }
+        bool const matched{matcher.matches(std::string_view{buf.data(), result.size})};
+        return (FilterOperation::EQ == operation) == matched;
+    };
     for (auto* reader : readers->second) {
+        if (auto const* encoded{encoded_values<T>(reader)}; encoded != nullptr) {
+            encoded->or_matches(bitmap, [&](uint64_t bits) {
+                return matches(std::bit_cast<T>(bits));
+            });
+            continue;
+        }
         for (uint64_t message_index{0}; message_index < num_messages; ++message_index) {
             auto const value = std::get<T>(reader->extract_value(message_index));
-            auto const result = [&]() -> auto {
-                if constexpr (std::is_floating_point_v<T>) {
-                    return fmt::format_to_n(buf.begin(), buf.size(), FMT_COMPILE("{:.17g}"), value);
-                }
-                return fmt::format_to_n(buf.begin(), buf.size(), FMT_COMPILE("{}"), value);
-            }();
-            if (result.size > buf.size()) {
-                continue;
-            }
-            bool const matched{matcher.matches(std::string_view{buf.data(), result.size})};
-            bitmap[message_index] |= ((FilterOperation::EQ == operation) == matched) ? 1 : 0;
+            bitmap[message_index] |= matches(value) ? 1 : 0;
         }
     }
     return bitmap;

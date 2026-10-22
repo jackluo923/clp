@@ -1,5 +1,6 @@
 #include "ColumnReader.hpp"
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -22,12 +23,14 @@
 
 namespace clp_s {
 auto Int64ColumnReader::load(BufferViewReader& reader, uint64_t num_messages) -> void {
+    m_encoded.reset();
     m_values = reader.read_unaligned_span_u64<int64_t>(num_messages);
 }
 
 auto Int64ColumnReader::extract_value(uint64_t cur_message)
         -> std::variant<int64_t, double, std::string, uint8_t> {
-    return m_values[cur_message];
+    return m_encoded ? std::bit_cast<int64_t>(m_encoded->bits_at(cur_message))
+                     : m_values[cur_message];
 }
 
 auto DeltaEncodedInt64ColumnReader::load(BufferViewReader& reader, uint64_t num_messages) -> void {
@@ -60,6 +63,7 @@ auto DeltaEncodedInt64ColumnReader::extract_value(uint64_t cur_message)
 }
 
 auto FloatColumnReader::load(BufferViewReader& reader, uint64_t num_messages) -> void {
+    m_encoded.reset();
     m_values = reader.read_unaligned_span_u64<double>(num_messages);
 }
 
@@ -70,7 +74,12 @@ auto FormattedFloatColumnReader::load(BufferViewReader& reader, uint64_t num_mes
 
 auto Int64ColumnReader::extract_string_value_into_buffer(uint64_t cur_message, std::string& buffer)
         -> void {
-    buffer.append(std::to_string(m_values[cur_message]));
+    buffer.append(
+            std::to_string(
+                    m_encoded ? std::bit_cast<int64_t>(m_encoded->bits_at(cur_message))
+                              : m_values[cur_message]
+            )
+    );
 }
 
 auto DeltaEncodedInt64ColumnReader::extract_string_value_into_buffer(
@@ -82,7 +91,8 @@ auto DeltaEncodedInt64ColumnReader::extract_string_value_into_buffer(
 
 auto FloatColumnReader::extract_value(uint64_t cur_message)
         -> std::variant<int64_t, double, std::string, uint8_t> {
-    return m_values[cur_message];
+    return m_encoded ? std::bit_cast<double>(m_encoded->bits_at(cur_message))
+                     : m_values[cur_message];
 }
 
 auto FormattedFloatColumnReader::extract_value(uint64_t cur_message)
@@ -96,7 +106,12 @@ auto BooleanColumnReader::load(BufferViewReader& reader, uint64_t num_messages) 
 
 auto FloatColumnReader::extract_string_value_into_buffer(uint64_t cur_message, std::string& buffer)
         -> void {
-    buffer.append(std::to_string(m_values[cur_message]));
+    buffer.append(
+            std::to_string(
+                    m_encoded ? std::bit_cast<double>(m_encoded->bits_at(cur_message))
+                              : m_values[cur_message]
+            )
+    );
 }
 
 auto FormattedFloatColumnReader::extract_string_value_into_buffer(

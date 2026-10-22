@@ -205,12 +205,30 @@ void SchemaReader::load(
         }
         auto const type{reader->get_type()};
         if (adaptive && (type == NodeType::Integer || type == NodeType::Float) && size != 0) {
-            m_decoded_columns[i] = adaptive_column::decode(
-                    {data, size},
+            if (data[0] == 0) {
+                // The tagged plain codec already contains ordinary values; borrow them directly.
+                BufferViewReader plain{data + 1, size - 1};
+                reader->load(plain, m_num_messages);
+                if (plain.get_remaining_size() != 0) {
+                    throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);
+                }
+                continue;
+            }
+            auto const numeric_type{
                     type == NodeType::Integer ? adaptive_column::Type::Integer
-                                              : adaptive_column::Type::Float,
-                    m_num_messages
-            );
+                                              : adaptive_column::Type::Float
+            };
+            if (auto view{NumericColumnView::try_load({data, size}, numeric_type, m_num_messages)})
+            {
+                if (type == NodeType::Integer) {
+                    static_cast<Int64ColumnReader*>(reader)->load_encoded(std::move(*view));
+                } else {
+                    static_cast<FloatColumnReader*>(reader)->load_encoded(std::move(*view));
+                }
+                continue;
+            }
+            m_decoded_columns[i]
+                    = adaptive_column::decode({data, size}, numeric_type, m_num_messages);
             BufferViewReader decoded{m_decoded_columns[i].data(), m_decoded_columns[i].size()};
             reader->load(decoded, m_num_messages);
         } else {

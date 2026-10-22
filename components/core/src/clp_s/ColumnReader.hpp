@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
@@ -13,6 +14,7 @@
 #include <clp_s/DictionaryReader.hpp>
 #include <clp_s/ErrorCode.hpp>
 #include <clp_s/FloatFormatEncoding.hpp>
+#include <clp_s/NumericColumnView.hpp>
 #include <clp_s/SchemaTree.hpp>
 #include <clp_s/TimestampDictionaryReader.hpp>
 #include <clp_s/TraceableException.hpp>
@@ -104,6 +106,12 @@ public:
     // Constructor
     explicit Int64ColumnReader(int32_t id) : BaseColumnReader(id) {}
 
+    auto load_encoded(NumericColumnView view) -> void { m_encoded = std::move(view); }
+
+    [[nodiscard]] auto encoded_values() const -> NumericColumnView const* {
+        return m_encoded ? &*m_encoded : nullptr;
+    }
+
     // Methods inherited from BaseColumnReader
     auto load(BufferViewReader& reader, uint64_t num_messages) -> void override;
 
@@ -117,6 +125,7 @@ public:
 
 private:
     UnalignedMemSpan<int64_t> m_values;
+    std::optional<NumericColumnView> m_encoded;
 };
 
 class DeltaEncodedInt64ColumnReader : public BaseColumnReader {
@@ -154,6 +163,12 @@ public:
     // Constructor
     explicit FloatColumnReader(int32_t id) : BaseColumnReader(id) {}
 
+    auto load_encoded(NumericColumnView view) -> void { m_encoded = std::move(view); }
+
+    [[nodiscard]] auto encoded_values() const -> NumericColumnView const* {
+        return m_encoded ? &*m_encoded : nullptr;
+    }
+
     // Methods inherited from BaseColumnReader
     auto load(BufferViewReader& reader, uint64_t num_messages) -> void override;
 
@@ -167,6 +182,7 @@ public:
 
 private:
     UnalignedMemSpan<double> m_values;
+    std::optional<NumericColumnView> m_encoded;
 };
 
 class FormattedFloatColumnReader : public BaseColumnReader {

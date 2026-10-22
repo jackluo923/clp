@@ -255,6 +255,8 @@ set(
         Utils.hpp
         AdaptiveColumn.cpp
         AdaptiveColumn.hpp
+        NumericColumnView.cpp
+        NumericColumnView.hpp
         ZstdCompressor.cpp
         ZstdCompressor.hpp
         ZstdDecompressor.cpp

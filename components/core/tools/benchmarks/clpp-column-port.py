@@ -54,6 +54,11 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", required=True, type=Path)
     parser.add_argument("--candidate", required=True, type=Path)
+    parser.add_argument(
+        "--baseline-adaptive",
+        action="store_true",
+        help="Use adaptive storage for the baseline too when comparing subsequent reader changes.",
+    )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--rows", type=int, default=100000)
     parser.add_argument("--repeats", type=int, default=3)
@@ -129,10 +134,21 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 ],
             )
         )
-    results = {"rows": args.rows, "repeats": args.repeats, "workloads": {}}
+    results = {
+        "rows": args.rows,
+        "repeats": args.repeats,
+        "baseline_adaptive": args.baseline_adaptive,
+        "workloads": {},
+    }
     for name, input_file, prefix, compress_options, queries in workloads:
         configurations = [
-            ("baseline", args.baseline, []),
+            (
+                "baseline",
+                args.baseline,
+                ["--adaptive-numeric-columns", "--separate-columns-min-size", "1048576"]
+                if args.baseline_adaptive
+                else [],
+            ),
             ("legacy", args.candidate, []),
             ("separate", args.candidate, ["--separate-columns-min-size", "1"]),
             (
@@ -196,20 +212,31 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                     "count": counts[label],
                     "seconds": statistics.median(durations),
                 }
-            old_count, _ = count(args.candidate, prefix, archives["baseline"], query)
-            assert old_count == counts["baseline"], (name, query, "legacy read differs")
-        # The old reader must reject adaptive layout instead of treating encoded bytes as records.
-        rejected = subprocess.run(
-            [str(args.baseline), *prefix, "s", str(archives["adaptive"]), queries[0], "--count"],
-            capture_output=True,
-            check=False,
-        )
-        if name == "numeric" and args.rows >= 100000:
+            baseline_count, _ = count(args.candidate, prefix, archives["baseline"], query)
+            assert baseline_count == counts["baseline"], (
+                name,
+                query,
+                "baseline archive read differs",
+            )
+        if not args.baseline_adaptive and name == "numeric" and args.rows >= 100000:
+            # Readers predating the port must reject the new layout, not misinterpret its bytes.
+            rejected = subprocess.run(
+                [
+                    str(args.baseline),
+                    *prefix,
+                    "s",
+                    str(archives["adaptive"]),
+                    queries[0],
+                    "--count",
+                ],
+                capture_output=True,
+                check=False,
+            )
             assert rejected.returncode != 0, "baseline unexpectedly accepted adaptive archive"
         results["workloads"][name] = measurements
         (args.output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
         print(json.dumps({"workload": name, "results": measurements}), flush=True)
-    print("Search counts, ordered extraction, and legacy reads agree.", flush=True)
+    print("Search counts, ordered extraction, and baseline archive reads agree.", flush=True)
 
 
 if __name__ == "__main__":
