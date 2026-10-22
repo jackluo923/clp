@@ -371,6 +371,98 @@ fn schema_may_match(
     truths(root, nodes, &eligible) & 1 != 0
 }
 
+/// Whether node `index` is NULL whenever every field it reads is absent.
+///
+/// Field reads, casts, arithmetic and comparisons propagate NULL. Constants, `IS [NOT] NULL` and
+/// Boolean connectives can yield a value with no input, and a conditional is NULL-propagating only
+/// when both its operands are; all of those are treated as yielding a value.
+fn null_without_fields(index: usize, nodes: &[Node]) -> bool {
+    let Some(node) = nodes.get(index) else { return false };
+    let left = node.left as usize;
+    let right = node.right as usize;
+    match node.op {
+        0 => true,
+        2 => left < index && null_without_fields(left, nodes),
+        3..=12 => {
+            (left < index && null_without_fields(left, nodes))
+                || (right < index && null_without_fields(right, nodes))
+        }
+        17 => {
+            left < index && right < index
+                && null_without_fields(left, nodes) && null_without_fields(right, nodes)
+        }
+        _ => false,
+    }
+}
+
+/// Whether the predicate rooted at `index` can only be true on a row holding a field it reads.
+fn untrue_without_fields(index: usize, nodes: &[Node]) -> bool {
+    if null_without_fields(index, nodes) {
+        return true;
+    }
+    let Some(node) = nodes.get(index) else { return false };
+    let (left, right) = (node.left as usize, node.right as usize);
+    match node.op {
+        // AND is untrue if either side is; OR only if both are. IS NOT NULL of nothing is false.
+        13 => (left < index && untrue_without_fields(left, nodes)) || (right < index && untrue_without_fields(right, nodes)),
+        14 => left < index && right < index && untrue_without_fields(left, nodes) && untrue_without_fields(right, nodes),
+        16 => true,
+        _ => false,
+    }
+}
+
+/// The fields node `index` reads.
+fn fields_of(index: usize, nodes: &[Node], fields: &mut Vec<usize>) {
+    let Some(node) = nodes.get(index) else { return };
+    let (left, right) = (node.left as usize, node.right as usize);
+    match node.op {
+        0 => fields.push(left),
+        1 => {}
+        2 | 15 | 16 => {
+            if left < index { fields_of(left, nodes, fields) }
+        }
+        _ => {
+            if left < index { fields_of(left, nodes, fields) }
+            if right < index { fields_of(right, nodes, fields) }
+        }
+    }
+}
+
+/// A KQL query for the rows that can contribute, or `None` when every row can.
+///
+/// A row contributes only if it holds a field some aggregate reads, when every aggregate is NULL
+/// without its fields, and only if it holds a field the predicate reads, when the predicate cannot
+/// be true without one. The engine skips, unread, every table holding no such field.
+fn field_existence_kql(paths: &[String], nodes: &[Node], outputs: &[u32], predicate: i32) -> Option<String> {
+    let any_of = |roots: &[usize]| {
+        let mut fields = Vec::new();
+        for root in roots {
+            fields_of(*root, nodes, &mut fields);
+        }
+        let mut names: Vec<&String> = fields.iter().filter_map(|field| paths.get(*field)).collect();
+        names.sort();
+        names.dedup();
+        (!names.is_empty()).then(|| {
+            names
+                .iter()
+                .map(|path| format!("\"{}\": *", path.replace('\\', "\\\\").replace('"', "\\\"")))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        })
+    };
+    let mut conjuncts = Vec::new();
+    let roots: Vec<usize> = outputs.iter().map(|root| *root as usize).collect();
+    if roots.iter().all(|root| null_without_fields(*root, nodes)) {
+        conjuncts.extend(any_of(&roots));
+    }
+    if predicate >= 0 && untrue_without_fields(predicate as usize, nodes) {
+        conjuncts.extend(any_of(&[predicate as usize]));
+    }
+    (!conjuncts.is_empty()).then(|| {
+        conjuncts.iter().map(|kql| format!("({kql})")).collect::<Vec<_>>().join(" AND ")
+    })
+}
+
 /// All pointer ranges must be valid for this synchronous call. Output has output_len entries.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clp_s_v6_numeric_aggregate(
@@ -518,7 +610,14 @@ pub unsafe extern "C" fn clp_s_v6_numeric_aggregate(
                     max_decompressed
                 },
             ));
-            let parsed = parse_kql("*", KqlLimits::default()).map_err(failure)?;
+            // Rows that hold none of the fields an aggregate or the predicate needs cannot
+            // contribute, so the scan matches only rows that can; see field_existence_kql.
+            let parsed = match field_existence_kql(&paths, nodes, outputs, predicate) {
+                Some(kql) => parse_kql(&kql, KqlLimits::default())
+                    .or_else(|_| parse_kql("*", KqlLimits::default())),
+                None => parse_kql("*", KqlLimits::default()),
+            }
+            .map_err(failure)?;
             let mut scanner =
                 columnar::ProjectedScanner::open(archive.open_reader()?, parsed, &options, &paths)
                     .map_err(failure)?;
@@ -588,6 +687,32 @@ pub unsafe extern "C" fn clp_s_v6_numeric_aggregate(
 
 #[cfg(test)]
 mod tests {
+
+    fn node(op: u32, left: u32, right: u32) -> Node {
+        Node { op, typ: 0, left, right, bits: [0, 0] }
+    }
+
+    #[test]
+    fn aggregate_scans_read_only_rows_that_can_contribute() {
+        let paths = vec!["A".to_owned(), "B".to_owned(), "ts".to_owned()];
+        // 0: A, 1: B, 2: A*B, 3: constant, 4: ts, 5: ts >= c, 6: A IS NULL, 7: A >= c
+        let nodes = vec![
+            node(0, 0, 0), node(0, 1, 0), node(5, 0, 1), node(1, 0, 0),
+            node(0, 2, 0), node(12, 4, 3), node(15, 0, 0), node(12, 0, 3),
+        ];
+        // sum(A*B): rows holding A or B.
+        assert_eq!(Some(r#"("A": * OR "B": *)"#.to_owned()), field_existence_kql(&paths, &nodes, &[2], -1));
+        // sum(A*B) WHERE ts >= c: also rows holding ts.
+        assert_eq!(Some(r#"("A": * OR "B": *) AND ("ts": *)"#.to_owned()), field_existence_kql(&paths, &nodes, &[2], 5));
+        // count(*) WHERE A >= c: only the predicate restricts.
+        assert_eq!(Some(r#"("A": *)"#.to_owned()), field_existence_kql(&paths, &nodes, &[3], 7));
+        // count(*) alone, or a predicate true without its field (A IS NULL): every row counts.
+        assert_eq!(None, field_existence_kql(&paths, &nodes, &[3], -1));
+        assert_eq!(None, field_existence_kql(&paths, &nodes, &[3], 6));
+        // One aggregate over a constant keeps every row for the aggregates.
+        assert_eq!(None, field_existence_kql(&paths, &nodes, &[2, 3], -1));
+    }
+
     use super::*;
     #[test]
     fn abi_layout_and_integer_overflow() {
