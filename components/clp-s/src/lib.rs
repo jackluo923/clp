@@ -7,6 +7,7 @@
 
 mod adaptive_float;
 mod adaptive_int;
+mod encoded_numeric;
 pub mod archive;
 mod byte_scan;
 mod extract;

@@ -3189,12 +3189,15 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
         };
         match column {
             ColumnData::Integer(column) => {
-                or_i64_matches(
-                    bitmap,
-                    column.iter().skip(skip),
-                    filter.predicate,
-                    filter.value.timestamp_nanoseconds,
-                );
+                if !column.or_encoded_matches(skip, bitmap, Tri::True as u8, |value| {
+                    scalar_i64_matches(value, filter.predicate, filter.value.timestamp_nanoseconds)
+                }) {
+                    // Keep the canonical loop monomorphic so LLVM can vectorize it.
+                    let bytes = column.canonical_bytes().expect("canonical fallback");
+                    or_i64_matches(bitmap, bytes.as_chunks::<8>().0.iter().copied()
+                        .map(i64::from_le_bytes).skip(skip), filter.predicate,
+                        filter.value.timestamp_nanoseconds);
+                }
             }
             ColumnData::DeltaInteger(column) => {
                 or_i64_matches(
@@ -3205,9 +3208,15 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
                 );
             }
             ColumnData::Float(column) => {
-                or_matches(bitmap, column.iter().skip(skip), |value| {
+                if !column.or_encoded_matches(skip, bitmap, Tri::True as u8, |value| {
                     scalar_f64_matches(value, filter.predicate, filter.value.timestamp_nanoseconds)
-                });
+                }) {
+                    let bytes = column.canonical_bytes().expect("canonical fallback");
+                    or_matches(bitmap, bytes.as_chunks::<8>().0.iter().copied()
+                        .map(f64::from_le_bytes).skip(skip), |value| {
+                            scalar_f64_matches(value, filter.predicate, filter.value.timestamp_nanoseconds)
+                        });
+                }
             }
             ColumnData::FormattedFloat(column) => {
                 or_matches(bitmap, column.values().iter().skip(skip), |value| {

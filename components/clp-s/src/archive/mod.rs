@@ -143,3 +143,5 @@ pub use timestamp_dictionary::TimestampDictionaryLimits;
 pub use timestamp_dictionary::TimestampDictionaryResource;
 pub use timestamp_dictionary::TimestampPatternEntry;
 pub use timestamp_dictionary::TimestampRangeEntry;
+
+pub use crate::encoded_numeric::NumericEncoding;

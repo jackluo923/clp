@@ -2554,6 +2554,10 @@ const fn hex_nibble(value: u8) -> u8 {
 // with the compact ABI across stream/table boundaries and sparse selections.
 type OwnedProjectedCell = (u32, i64, u64, Vec<u8>);
 fn projected_rows(path: &Path, query: &str, names: &[&str], columns: bool) -> Vec<Vec<OwnedProjectedCell>> {
+    projected_rows_version(path, query, names, if columns { 3 } else { 2 })
+}
+
+fn projected_rows_version(path: &Path, query: &str, names: &[&str], version: u32) -> Vec<Vec<OwnedProjectedCell>> {
     let query = compile_query(query, 0);
     let path = path.to_str().unwrap().as_bytes();
     let fields: Vec<_> = names.iter().map(|name| ClpSV2ProjectedField {
@@ -2563,13 +2567,14 @@ fn projected_rows(path: &Path, query: &str, names: &[&str], columns: bool) -> Ve
     let mut message = [0u8; 512];
     let mut error = error_buffer(&mut message);
     let mut result = Vec::new();
+    let next_columns = if version == 4 { clp_s_v4_scanner_next_columns } else { clp_s_v3_scanner_next_columns };
     // SAFETY: All inputs and output storage live through each call; returned views are
     // copied before the next call, and the scanner is freed exactly once.
     unsafe {
         assert_eq!(CLP_S_STATUS_OK, clp_s_v2_scanner_open(path.as_ptr(), path.len(), query.0,
             fields.as_ptr(), fields.len(), &raw mut scanner, &raw mut error), "{}", error_text(&message));
         loop {
-            if !columns {
+            if version == 2 {
                 let mut values: Vec<ClpSV2Value> = (0..names.len()).map(|_| std::mem::zeroed()).collect();
                 let mut has_row = 0;
                 assert_eq!(CLP_S_STATUS_OK, clp_s_v2_scanner_next_row(scanner, values.as_mut_ptr(),
@@ -2582,14 +2587,14 @@ fn projected_rows(path: &Path, query: &str, names: &[&str], columns: bool) -> Ve
                 let mut text = ptr::null();
                 let mut text_len = 0;
                 let mut rows = 0;
-                assert_eq!(CLP_S_STATUS_OK, clp_s_v3_scanner_next_columns(scanner, &raw mut views,
+                assert_eq!(CLP_S_STATUS_OK, next_columns(scanner, &raw mut views,
                     &raw mut text, &raw mut text_len, &raw mut rows, &raw mut error), "{}", error_text(&message));
                 if rows == 0 {
                     assert!(views.is_null());
                     assert!(text.is_null());
                     assert_eq!(0, text_len);
                     // EOF is stable and clears all outputs.
-                    assert_eq!(CLP_S_STATUS_OK, clp_s_v3_scanner_next_columns(scanner, &raw mut views,
+                    assert_eq!(CLP_S_STATUS_OK, next_columns(scanner, &raw mut views,
                         &raw mut text, &raw mut text_len, &raw mut rows, &raw mut error));
                     assert_eq!(0, rows);
                     break;
@@ -2602,6 +2607,10 @@ fn projected_rows(path: &Path, query: &str, names: &[&str], columns: bool) -> Ve
                             CLP_S_V2_VALUE_ABSENT => (v.kind, 0, 0, Vec::new()),
                             CLP_S_V2_VALUE_INTEGER => (v.kind, v.data.add(row * 8).cast::<i64>().read_unaligned(), 0, Vec::new()),
                             CLP_S_V2_VALUE_FLOAT => (v.kind, 0, v.data.add(row * 8).cast::<u64>().read_unaligned(), Vec::new()),
+                            CLP_S_V4_COLUMN_CONSTANT_INTEGER if version == 4 =>
+                                (CLP_S_V2_VALUE_INTEGER, v.data.cast::<i64>().read_unaligned(), 0, Vec::new()),
+                            CLP_S_V4_COLUMN_CONSTANT_FLOAT if version == 4 =>
+                                (CLP_S_V2_VALUE_FLOAT, 0, v.data.cast::<u64>().read_unaligned(), Vec::new()),
                             CLP_S_V2_VALUE_UNSUPPORTED => {
                                 let c = v.data.cast::<ClpSV2Cell>().add(row).read_unaligned();
                                 assert!(c.text_offset + c.text_length <= text_len);
@@ -2636,6 +2645,7 @@ fn compact_columns_match_row_abi() {
             let old = projected_rows(&path, query, fields, false);
             let new = projected_rows(&path, query, fields, true);
             assert_eq!(old, new, "query {query}, fields {fields:?}");
+            assert_eq!(old, projected_rows_version(&path, query, fields, 4));
             if query == "*" { assert_eq!(5003, new.len()); }
         }
     }
@@ -2690,6 +2700,7 @@ fn wildcard_projection_preserves_full_search_semantics() {
                 let columns = projected_rows(&path, query, fields, true);
                 assert_eq!(count as usize, rows.len(), "{structured}: {query}");
                 assert_eq!(rows, columns, "{structured}: {query}");
+                assert_eq!(rows, projected_rows_version(&path, query, fields, 4));
             }
         }
         std::fs::remove_file(path).unwrap();

@@ -63,6 +63,9 @@ pub mod kind {
     pub const STRING: u32 = 4;
     pub const TIMESTAMP: u32 = 5;
     pub const UNSUPPORTED: u32 = 6;
+    // v4 column layouts only, never v2 cell kinds or v3 dense columns.
+    pub const CONSTANT_INTEGER: u32 = 7;
+    pub const CONSTANT_FLOAT: u32 = 8;
 }
 
 /// One projected value, with text held as a span into the batch's arena.
@@ -691,6 +694,10 @@ impl ProjectedScanner {
     /// matches. Other types keep the v2 projection semantics. Must not be mixed
     /// with `next_row` or `next_batch` on the same scanner.
     pub fn next_columns(&mut self) -> Result<Option<(&[ColumnView], &[u8], usize)>, ScanError> {
+        self.next_columns_with_constants(false)
+    }
+
+    pub fn next_columns_with_constants(&mut self, constants: bool) -> Result<Option<(&[ColumnView], &[u8], usize)>, ScanError> {
         self.column_views.clear();
         self.text.clear();
         loop {
@@ -702,7 +709,7 @@ impl ProjectedScanner {
                     continue;
                 }
             }
-            if let Some(rows) = self.project_next_table_columns()? {
+            if let Some(rows) = self.project_next_table_columns(constants)? {
                 return Ok(Some((&self.column_views, &self.text, rows)));
             }
             self.stream = None;
@@ -710,7 +717,7 @@ impl ProjectedScanner {
         }
     }
 
-    fn project_next_table_columns(&mut self) -> Result<Option<usize>, ScanError> {
+    fn project_next_table_columns(&mut self, constants: bool) -> Result<Option<usize>, ScanError> {
         let stream = self.stream.as_ref().expect("stream is loaded");
         let compiled = self.parsed.compile_for_archive_reusing(
             &self.catalog, self.options.search(), &mut self.dictionary_matches,
@@ -744,12 +751,18 @@ impl ProjectedScanner {
                 buffer.numeric.clear();
                 buffer.cells.clear();
                 let data = slot.and_then(|i| decoded.table().column(i)).map(|c| c.data());
-                let (kind, bytes) = match data {
-                    Some(ColumnData::Integer(values)) => (kind::INTEGER, Some(values.encoded_bytes())),
-                    Some(ColumnData::Float(values)) => (kind::FLOAT, Some(values.encoded_bytes())),
-                    _ => (kind::UNSUPPORTED, None),
+                let (kind, bytes, constant) = match data {
+                    Some(ColumnData::Integer(values)) => (kind::INTEGER, values.canonical_bytes(), values.constant_value().map(|v| v as u64)),
+                    Some(ColumnData::Float(values)) => (kind::FLOAT, values.canonical_bytes(), values.constant_value().map(f64::to_bits)),
+                    _ => (kind::UNSUPPORTED, None, None),
                 };
-                let view = if let Some(bytes) = bytes {
+                let view = if constants && let Some(value) = constant {
+                    buffer.numeric.push(value);
+                    ColumnView {
+                        kind: if kind == kind::INTEGER { kind::CONSTANT_INTEGER } else { kind::CONSTANT_FLOAT },
+                        reserved: 0, data: buffer.numeric.as_ptr().cast(),
+                    }
+                } else if let Some(bytes) = bytes {
                     // A projected member may have a truncated column. Only
                     // borrow when it covers the complete physical row domain.
                     if cfg!(target_endian = "little")
@@ -763,6 +776,26 @@ impl ProjectedScanner {
                         }
                         ColumnView { kind, reserved: 0, data: buffer.numeric.as_ptr().cast() }
                     }
+                } else if matches!(kind, kind::INTEGER | kind::FLOAT) {
+                    // Compact dictionaries/runs expand only the selected output. A v3 caller
+                    // also gets dense constants, preserving that API's original contract.
+                    if rows == bitmap.len() {
+                        match data {
+                            Some(ColumnData::Integer(values)) => values.append_bits(&mut buffer.numeric),
+                            Some(ColumnData::Float(values)) => values.append_bits(&mut buffer.numeric),
+                            _ => unreachable!(),
+                        }
+                    } else {
+                        for row in bitmap.matching_rows() {
+                            let bits = match data {
+                                Some(ColumnData::Integer(values)) => values.get(row).map(|v| v as u64),
+                                Some(ColumnData::Float(values)) => values.get(row).map(f64::to_bits),
+                                _ => unreachable!(),
+                            }.ok_or_else(|| ScanError::Projection("selected row outside compact column".into()))?;
+                            buffer.numeric.push(bits);
+                        }
+                    }
+                    ColumnView { kind, reserved: 0, data: buffer.numeric.as_ptr().cast() }
                 } else if data.is_none() {
                     ColumnView { kind: kind::ABSENT, reserved: 0, data: std::ptr::null() }
                 } else {
@@ -1438,6 +1471,50 @@ mod wildcard_projection_tests {
             // Value-search wildcards still require their payloads.
             let parsed = parse_kql("*:alpha", KqlLimits::default()).unwrap();
             assert!(filter_nodes(&parsed, scan.catalog.schema_tree()).is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod encoded_numeric_tests {
+    use super::*;
+    use std::io::Cursor;
+    use clp_s::archive::{NumericEncoding, SingleFileArchiveReader};
+    use clp_s::search::{parse_kql, KqlLimits};
+
+    #[test]
+    fn constants_stay_compact_and_v3_remains_dense() {
+        let mut writer = clp_s::writer::OpenArchive::new(Cursor::new(Vec::new()),
+            clp_s::writer::WriterOptions::default().with_separate_columns_min_size(1)
+                .with_adaptive_numeric_columns(true));
+        let source = "{\"i\":-42,\"f\":2.5}\n".repeat(10000);
+        let mut parser = clp_s::ingest::ParseManyReader::new(source.as_bytes(), Default::default());
+        parser.read_to_end(&mut clp_s::ingest::JsonArchiveSink::new(&mut writer,
+            clp_s::ingest::JsonArchiveOptions::default().with_retain_float_format(false))).unwrap();
+        let bytes = writer.finish().unwrap().into_inner().into_inner();
+        for constants in [false, true] {
+            for query in ["*", "i:-42 AND f >= 2.5", "NOT i:1 OR f < 0", "i:1 OR f >= 2.5"] {
+                let reader = SingleFileArchiveReader::open(Cursor::new(bytes.clone())).unwrap();
+                let parsed = parse_kql(query, KqlLimits::default()).unwrap();
+                let mut scan = ProjectedScanner::open(Box::new(reader), parsed, &Default::default(),
+                    &["i".to_owned(), "f".to_owned()]).unwrap();
+                let (columns, _, rows) = scan.next_columns_with_constants(constants).unwrap().unwrap();
+                assert_eq!(10000, rows);
+                assert_eq!(columns[0].kind, if constants { kind::CONSTANT_INTEGER } else { kind::INTEGER });
+                assert_eq!(columns[1].kind, if constants { kind::CONSTANT_FLOAT } else { kind::FLOAT });
+                // SAFETY: The borrowed views remain live until the next scanner call.
+                unsafe {
+                    for row in 0..if constants { 1 } else { rows } {
+                        assert_eq!(-42, columns[0].data.cast::<i64>().add(row).read_unaligned());
+                        assert_eq!(2.5f64.to_bits(), columns[1].data.cast::<u64>().add(row).read_unaligned());
+                    }
+                }
+                let stream = scan.stream.as_ref().unwrap();
+                assert_eq!(16, stream.len());
+                assert!(stream.column_layout().unwrap().iter().filter(|slot| slot.loaded)
+                    .all(|slot| slot.numeric_encoding == Some(NumericEncoding::Constant)));
+                for buffer in &scan.column_buffers { assert_eq!(if constants { 1 } else { rows }, buffer.numeric.len()); }
+            }
         }
     }
 }

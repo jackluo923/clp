@@ -6,6 +6,7 @@ use std::iter::FusedIterator;
 
 use super::dictionary::ArrayDictionary;
 use super::packed_stream::ColumnSlot;
+use crate::encoded_numeric::NumericColumn;
 use super::dictionary::LogTypeDictionary;
 use super::dictionary::LogTypeDictionaryEntry;
 use super::dictionary::LogTypeVariableKind;
@@ -266,56 +267,34 @@ impl ColumnData<'_, '_> {
     }
 }
 
-/// A zero-copy little-endian signed 64-bit column.
+/// A borrowed signed 64-bit column, either canonical or compact numeric data.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct I64Column<'a> {
-    bytes: &'a [u8],
-}
-
+pub struct I64Column<'a> { data: NumericColumn<'a> }
 impl<'a> I64Column<'a> {
-    /// Returns the number of values.
     #[must_use]
-    pub const fn len(self) -> usize {
-        self.bytes.len() / U64_SIZE
-    }
-
-    /// Returns whether the column contains no values.
+    pub const fn len(self) -> usize { self.data.len() }
     #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.bytes.is_empty()
-    }
-
-    /// Returns one decoded little-endian value.
+    pub const fn is_empty(self) -> bool { self.len() == 0 }
     #[must_use]
-    pub fn get(self, index: usize) -> Option<i64> {
-        read_i64_at(self.bytes, index)
+    pub fn get(self, index: usize) -> Option<i64> { self.data.get(index).map(|v| v as i64) }
+    pub fn iter(self) -> impl ExactSizeIterator<Item=i64> + DoubleEndedIterator + FusedIterator + 'a {
+        self.data.iter().map(|v| v as i64)
     }
-
-    /// Iterates decoded values without materializing an aligned copy.
-    pub fn iter(
-        self,
-    ) -> impl ExactSizeIterator<Item = i64> + DoubleEndedIterator + FusedIterator + 'a {
-        self.bytes
-            .as_chunks::<U64_SIZE>()
-            .0
-            .iter()
-            .copied()
-            .map(i64::from_le_bytes)
-    }
-
-    /// Returns the exact little-endian bytes backing this view.
+    /// Underlying bytes, possibly compact; use canonical_bytes for fixed-stride access.
     #[must_use]
-    pub const fn encoded_bytes(self) -> &'a [u8] {
-        self.bytes
+    pub const fn encoded_bytes(self) -> &'a [u8] { self.data.bytes }
+    #[must_use]
+    pub const fn canonical_bytes(self) -> Option<&'a [u8]> { self.data.canonical_bytes() }
+    /// Appends native-endian value bits in a sequential pass for numeric FFI output.
+    pub fn append_bits(self, output: &mut Vec<u64>) { self.data.append_bits(output); }
+    #[must_use]
+    pub fn constant_value(self) -> Option<i64> { self.data.constant().map(|v| v as i64) }
+    pub(crate) fn or_encoded_matches(self, skip: usize, bitmap: &mut [u8], truth: u8,
+        mut matches: impl FnMut(i64) -> bool) -> bool {
+        self.data.or_matches(skip, bitmap, truth, |v| matches(v as i64))
     }
-
     fn slice(self, start: usize, count: usize) -> Option<Self> {
-        let byte_start = start.checked_mul(U64_SIZE)?;
-        let byte_len = count.checked_mul(U64_SIZE)?;
-        let byte_end = byte_start.checked_add(byte_len)?;
-        Some(Self {
-            bytes: self.bytes.get(byte_start..byte_end)?,
-        })
+        self.data.slice(start, count).map(|data| Self { data })
     }
 }
 
@@ -365,47 +344,29 @@ impl<'a> U64Column<'a> {
 
 /// A zero-copy little-endian finite binary64 column.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct F64Column<'a> {
-    bytes: &'a [u8],
-}
-
+pub struct F64Column<'a> { data: NumericColumn<'a> }
 impl<'a> F64Column<'a> {
-    /// Returns the number of values.
     #[must_use]
-    pub const fn len(self) -> usize {
-        self.bytes.len() / U64_SIZE
-    }
-
-    /// Returns whether the column contains no values.
+    pub const fn len(self) -> usize { self.data.len() }
     #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.bytes.is_empty()
-    }
-
-    /// Returns one decoded finite binary64 value.
+    pub const fn is_empty(self) -> bool { self.len() == 0 }
     #[must_use]
-    pub fn get(self, index: usize) -> Option<f64> {
-        self.bytes
-            .get(index.checked_mul(U64_SIZE)?..index.checked_add(1)?.checked_mul(U64_SIZE)?)
-            .map(decode_f64_chunk)
+    pub fn get(self, index: usize) -> Option<f64> { self.data.get(index).map(f64::from_bits) }
+    pub fn iter(self) -> impl ExactSizeIterator<Item=f64> + DoubleEndedIterator + FusedIterator + 'a {
+        self.data.iter().map(f64::from_bits)
     }
-
-    /// Iterates decoded values without materializing an aligned copy.
-    pub fn iter(
-        self,
-    ) -> impl ExactSizeIterator<Item = f64> + DoubleEndedIterator + FusedIterator + 'a {
-        self.bytes
-            .as_chunks::<U64_SIZE>()
-            .0
-            .iter()
-            .copied()
-            .map(f64::from_le_bytes)
-    }
-
-    /// Returns the exact little-endian bytes backing this view.
+    /// Underlying bytes, possibly compact; use canonical_bytes for fixed-stride access.
     #[must_use]
-    pub const fn encoded_bytes(self) -> &'a [u8] {
-        self.bytes
+    pub const fn encoded_bytes(self) -> &'a [u8] { self.data.bytes }
+    #[must_use]
+    pub const fn canonical_bytes(self) -> Option<&'a [u8]> { self.data.canonical_bytes() }
+    /// Appends native-endian value bits in a sequential pass for numeric FFI output.
+    pub fn append_bits(self, output: &mut Vec<u64>) { self.data.append_bits(output); }
+    #[must_use]
+    pub fn constant_value(self) -> Option<f64> { self.data.constant().map(f64::from_bits) }
+    pub(crate) fn or_encoded_matches(self, skip: usize, bitmap: &mut [u8], truth: u8,
+        mut matches: impl FnMut(f64) -> bool) -> bool {
+        self.data.or_matches(skip, bitmap, truth, |v| matches(f64::from_bits(v)))
     }
 }
 
@@ -464,7 +425,7 @@ impl<'a> DeltaI64Column<'a> {
     #[must_use]
     pub fn values(self) -> DeltaI64Values<'a> {
         DeltaI64Values {
-            deltas: self.deltas.bytes.as_chunks::<U64_SIZE>().0.iter(),
+            deltas: self.deltas.data.bytes.as_chunks::<U64_SIZE>().0.iter(),
             current: 0,
         }
     }
@@ -1091,7 +1052,14 @@ pub fn decode_schema_table<'table, 'archive>(
     timestamp_dictionary: &'archive TimestampDictionary,
     limits: ColumnLimits,
 ) -> Result<SchemaTable<'table, 'archive>, ColumnError> {
-    let table_size = u64::try_from(table_bytes.len()).map_err(|_| ColumnError::SizeOverflow)?;
+    let logical_bytes = match column_layout {
+        Some(layout) => layout.iter().try_fold(0usize, |sum, slot| {
+            let size = if slot.loaded && slot.numeric_encoding.is_some() { slot.size } else { slot.stored };
+            sum.checked_add(size).ok_or(ColumnError::SizeOverflow)
+        })?,
+        None => table_bytes.len(),
+    };
+    let table_size = u64::try_from(logical_bytes.max(table_bytes.len())).map_err(|_| ColumnError::SizeOverflow)?;
     if table_size > limits.table_bytes {
         return Err(ColumnError::TableTooLarge {
             actual: table_size,
@@ -1150,6 +1118,22 @@ pub fn decode_schema_table<'table, 'archive>(
         if let Some(slot) = column_layout.and_then(|layout| layout.get(column_index)) {
             if !slot.loaded {
                 projected = true;
+                continue;
+            }
+            if let Some(encoding) = slot.numeric_encoding {
+                let bytes = cursor.take(context, slot.stored)?;
+                let data = NumericColumn::encoded(bytes, message_count, encoding)
+                    .map_err(|_| corrupt(context, None, ColumnCorruption::InvalidAdaptiveNumeric))?;
+                let data = match node_type {
+                    NodeType::Integer => ColumnData::Integer(I64Column { data }),
+                    NodeType::Float => {
+                        let values = F64Column { data };
+                        validate_finite_floats(values, context)?;
+                        ColumnData::Float(values)
+                    }
+                    _ => return Err(corrupt(context, None, ColumnCorruption::InvalidAdaptiveNumeric)),
+                };
+                columns.push(Column { schema_entry_index, node_id, data });
                 continue;
             }
             column_rows = slot.stored_rows(message_count);
@@ -1323,7 +1307,7 @@ fn take_i64_column<'a>(
     count: usize,
 ) -> Result<I64Column<'a>, ColumnError> {
     Ok(I64Column {
-        bytes: cursor.take_fixed(context, count, U64_SIZE)?,
+        data: NumericColumn::plain(cursor.take_fixed(context, count, U64_SIZE)?),
     })
 }
 
@@ -1353,7 +1337,7 @@ fn take_float_column<'a>(
     count: usize,
 ) -> Result<F64Column<'a>, ColumnError> {
     let values = F64Column {
-        bytes: cursor.take_fixed(context, count, U64_SIZE)?,
+        data: NumericColumn::plain(cursor.take_fixed(context, count, U64_SIZE)?),
     };
     validate_finite_floats(values, context)?;
     Ok(values)
@@ -1569,6 +1553,17 @@ fn validate_finite_floats(
     column: F64Column<'_>,
     context: ColumnContext,
 ) -> Result<(), ColumnError> {
+    if let Some(bytes) = column.canonical_bytes() {
+        // Preserve the original fixed-stride loop for ordinary columns.
+        if let Some(message_index) = bytes.as_chunks::<8>().0.iter()
+            .position(|value| !f64::from_le_bytes(*value).is_finite()) {
+            return Err(corrupt(context, Some(message_index), ColumnCorruption::NonFiniteFloat));
+        }
+        return Ok(());
+    }
+    if column.data.encoded_values_all(|bits| f64::from_bits(bits).is_finite()) == Some(true) {
+        return Ok(());
+    }
     for (message_index, value) in column.iter().enumerate() {
         if !value.is_finite() {
             return Err(corrupt(
@@ -1831,6 +1826,8 @@ impl Error for EncodedFloatErrorReason {}
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum ColumnCorruption {
+    /// A compact numeric layout or its values are invalid.
+    InvalidAdaptiveNumeric,
     /// A raw or formatted binary64 value is NaN or infinite.
     NonFiniteFloat,
     /// A Boolean byte is not canonical `0` or `1`.
@@ -1928,6 +1925,7 @@ pub enum ColumnCorruption {
 impl Display for ColumnCorruption {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidAdaptiveNumeric => formatter.write_str("invalid compact numeric column"),
             Self::NonFiniteFloat => formatter.write_str("binary64 value is not finite"),
             Self::InvalidBoolean { actual } => write!(formatter, "Boolean byte is {actual}"),
             Self::InvalidFloatFormat { raw, reason } => {
@@ -2199,11 +2197,6 @@ impl<'a> TableCursor<'a> {
         Ok(decode_u64_chunk(self.take(context, U64_SIZE)?))
     }
 
-    /// Steps over `size` bytes without decoding them.
-    fn skip(&mut self, context: ColumnContext, size: usize) -> Result<(), ColumnError> {
-        self.take(context, size).map(|_| ())
-    }
-
     fn take(&mut self, context: ColumnContext, size: usize) -> Result<&'a [u8], ColumnError> {
         let remaining = self.remaining();
         if size > remaining {
@@ -2224,12 +2217,6 @@ impl<'a> TableCursor<'a> {
     }
 }
 
-fn read_i64_at(bytes: &[u8], index: usize) -> Option<i64> {
-    let start = index.checked_mul(U64_SIZE)?;
-    let end = start.checked_add(U64_SIZE)?;
-    Some(decode_i64_chunk(bytes.get(start..end)?))
-}
-
 fn read_u64_at(bytes: &[u8], index: usize) -> Option<u64> {
     let start = index.checked_mul(U64_SIZE)?;
     let end = start.checked_add(U64_SIZE)?;
@@ -2242,16 +2229,8 @@ fn read_u16_at(bytes: &[u8], index: usize) -> Option<u16> {
     Some(decode_u16_chunk(bytes.get(start..end)?))
 }
 
-fn decode_i64_chunk(bytes: &[u8]) -> i64 {
-    i64::from_le_bytes(copy_array(bytes))
-}
-
 fn decode_u64_chunk(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(copy_array(bytes))
-}
-
-fn decode_f64_chunk(bytes: &[u8]) -> f64 {
-    f64::from_bits(decode_u64_chunk(bytes))
 }
 
 fn decode_u16_chunk(bytes: &[u8]) -> u16 {
@@ -2648,6 +2627,34 @@ mod tests {
         assert_eq!(2, table.len());
         assert_eq!(1, table.columns()[0].schema_entry_index());
         assert_eq!(2, table.columns()[1].schema_entry_index());
+    }
+
+    #[test]
+    fn compact_columns_preserve_limits_and_float_validation() {
+        use crate::encoded_numeric::NumericEncoding;
+        let resources = resources(&[], &[], &[], &[]);
+        let tree = flat_tree(&[NodeType::Float]);
+        let schema = schema(&tree, &[0]);
+        let slot = ColumnSlot { numeric_encoding: Some(NumericEncoding::Constant),
+            size: 8000, stored: 8, loaded: true };
+        let decode = |bytes: &[u8], slot: ColumnSlot, limits| decode_schema_table(bytes,
+            Some(&[slot]), &schema, &tree, 1000, &resources.variable, &resources.logtype,
+            &resources.array, &resources.timestamp, limits).map(|_| ());
+        assert!(matches!(decode(&42f64.to_le_bytes(), slot,
+            ColumnLimits::new(7999, u64::MAX, 1, u64::MAX, u64::MAX)),
+            Err(ColumnError::TableTooLarge { actual: 8000, limit: 7999 })));
+        assert!(decode(&42f64.to_le_bytes(), slot, ColumnLimits::default()).is_ok());
+        assert!(matches!(decode(&f64::NAN.to_le_bytes(), slot, ColumnLimits::default()),
+            Err(ColumnError::Corrupt { reason: ColumnCorruption::NonFiniteFloat, .. })));
+        // Unused dictionary entries retain the canonical decoder's semantics.
+        let mut bytes = 2u32.to_le_bytes().to_vec();
+        bytes.extend(42f64.to_le_bytes()); bytes.extend(f64::NAN.to_le_bytes()); bytes.push(0);
+        let slot = ColumnSlot { numeric_encoding: Some(NumericEncoding::Dictionary),
+            stored: bytes.len(), ..slot };
+        assert!(decode(&bytes, slot, ColumnLimits::default()).is_ok());
+        bytes[4..12].copy_from_slice(&f64::NAN.to_le_bytes());
+        assert!(matches!(decode(&bytes, slot, ColumnLimits::default()),
+            Err(ColumnError::Corrupt { reason: ColumnCorruption::NonFiniteFloat, .. })));
     }
 
     #[test]

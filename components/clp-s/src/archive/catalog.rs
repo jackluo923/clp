@@ -317,9 +317,9 @@ impl ArchiveCatalog {
         )
     }
 
-    /// Rewrites the adaptive per-column integer streams of a decoded separate-column stream back to
-    /// the canonical raw 8-byte little-endian layout, so [`Self::schema_tables`] and its
-    /// fixed-stride column readers decode them unchanged.
+    /// Prepares adaptive numeric columns for [`Self::schema_tables`]. Constants, dictionaries,
+    /// and runs retain compact reader-only layouts; other codecs decode to canonical 8-byte
+    /// little-endian values. Archive bytes and writer encodings are unchanged.
     ///
     /// Call this after [`SingleFileArchiveReader::read_packed_stream`] only for archives whose
     /// version [`supports_adaptive_numeric`](super::ArchiveVersion::supports_adaptive_numeric); a
@@ -389,15 +389,22 @@ impl ArchiveCatalog {
             .filter(|node_type| is_value_bearing(*node_type))
             .collect();
 
-        // Walk the concatenated per-column bytes, decoding each loaded numeric (integer or float)
-        // column back to raw 8-byte values and copying every other column verbatim.
+        // Preserve compact numeric encodings where supported, decode other numeric codecs,
+        // and copy nonnumeric columns verbatim.
         let bytes = stream.as_bytes();
         let numeric_size = message_count.checked_mul(8).ok_or(TableStreamError::SizeOverflow)?;
-        // Reserve canonical space once. CLP strings can vary in size and grow this buffer.
+        // Reserve the retained representation once. CLP strings can grow this buffer.
+        let mut capacity_offset = 0usize;
         let capacity = layout.iter().enumerate().try_fold(0usize, |sum, (index, slot)| {
             let numeric = matches!(node_types.get(index), Some(NodeType::Integer | NodeType::Float))
                 || strings && matches!(node_types.get(index), Some(NodeType::VarString | NodeType::DictionaryFloat));
-            let size = if !slot.loaded { 0 } else if numeric && slot.stored != 0 { numeric_size } else { slot.stored };
+            let node_type = node_types.get(index).copied();
+            // Compact representations retain their encoded size, not rows * 8 capacity.
+            let compact = matches!(node_type, Some(NodeType::Integer | NodeType::Float))
+                && bytes.get(capacity_offset)
+                    .is_some_and(|tag| crate::encoded_numeric::encoding(&[*tag], node_type == Some(NodeType::Float)).is_some());
+            let size = if !slot.loaded { 0 } else if numeric && !compact && slot.stored != 0 { numeric_size } else { slot.stored };
+            capacity_offset += slot.stored;
             sum.checked_add(size).ok_or(TableStreamError::SizeOverflow)
         })?;
         let mut output = Vec::with_capacity(capacity);
@@ -411,8 +418,17 @@ impl ArchiveCatalog {
             let decode_err = |source| TableStreamError::AdaptiveNumeric { schema_id, column_index, source };
             let start = output.len();
             let mut size = slot.size;
+            let mut numeric_encoding = None;
             if !slot.loaded {
                 // A projected-out column occupies no bytes.
+            } else if matches!(node_type, Some(NodeType::Integer | NodeType::Float))
+                && !stored.is_empty()
+                && crate::encoded_numeric::encoding(stored, node_type == Some(NodeType::Float)).is_some()
+            {
+                numeric_encoding = crate::encoded_numeric::prepare(stored, message_count,
+                    node_type == Some(NodeType::Float), &mut output).map_err(decode_err)?;
+                size = numeric_size;
+                changed = true;
             } else if (node_type == Some(NodeType::Integer)
                 || strings && matches!(node_type, Some(NodeType::VarString | NodeType::DictionaryFloat)))
                 && !stored.is_empty()
@@ -432,7 +448,7 @@ impl ArchiveCatalog {
             } else {
                 output.extend_from_slice(stored);
             }
-            output_layout.push(ColumnSlot { size, stored: output.len() - start, loaded: slot.loaded });
+            output_layout.push(ColumnSlot { size, stored: output.len() - start, loaded: slot.loaded, numeric_encoding });
         }
         if !changed { return Ok(stream); }
         Ok(DecodedPackedStream::from_column_buffer(output, output_layout))

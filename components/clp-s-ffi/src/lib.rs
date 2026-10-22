@@ -190,6 +190,11 @@ pub const CLP_S_V2_VALUE_STRING: u32 = columnar::kind::STRING;
 pub const CLP_S_V2_VALUE_TIMESTAMP: u32 = columnar::kind::TIMESTAMP;
 /// A present value kind that this ABI cannot represent directly.
 pub const CLP_S_V2_VALUE_UNSUPPORTED: u32 = columnar::kind::UNSUPPORTED;
+/// v4 column layout: one repeated native-endian signed 64-bit integer.
+pub const CLP_S_V4_COLUMN_CONSTANT_INTEGER: u32 = columnar::kind::CONSTANT_INTEGER;
+/// v4 column layout: one repeated native-endian binary64 value.
+pub const CLP_S_V4_COLUMN_CONSTANT_FLOAT: u32 = columnar::kind::CONSTANT_FLOAT;
+
 
 /// Use the ABI's default KV-IR encoding (four-byte in ABI v1).
 pub const CLP_S_KV_IR_ENCODING_DEFAULT: u32 = 0;
@@ -2450,6 +2455,38 @@ pub unsafe extern "C" fn clp_s_v3_scanner_next_columns(
     out_row_count: *mut usize,
     error: *mut ClpSErrorBuffer,
 ) -> ClpSStatus {
+    // SAFETY: Forwarded unchanged from the caller's contract.
+    unsafe { scanner_next_columns(scanner, out_columns, out_text, out_text_length, out_row_count, false, error) }
+}
+
+/// v4 adds constant INTEGER/FLOAT columns (kinds 7/8), each holding one native-endian
+/// 8-byte value repeated for the entire batch. Other layouts and lifetimes match v3.
+/// v2/v3 callers continue receiving their original dense layouts.
+///
+/// # Safety
+/// As for clp_s_v3_scanner_next_columns. Do not mix scanner consumption APIs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clp_s_v4_scanner_next_columns(
+    scanner: *mut ClpSV2Scanner,
+    out_columns: *mut *const ClpSV3Column,
+    out_text: *mut *const u8,
+    out_text_length: *mut usize,
+    out_row_count: *mut usize,
+    error: *mut ClpSErrorBuffer,
+) -> ClpSStatus {
+    // SAFETY: Forwarded unchanged from the caller's contract.
+    unsafe { scanner_next_columns(scanner, out_columns, out_text, out_text_length, out_row_count, true, error) }
+}
+
+unsafe fn scanner_next_columns(
+    scanner: *mut ClpSV2Scanner,
+    out_columns: *mut *const ClpSV3Column,
+    out_text: *mut *const u8,
+    out_text_length: *mut usize,
+    out_row_count: *mut usize,
+    constants: bool,
+    error: *mut ClpSErrorBuffer,
+) -> ClpSStatus {
     // SAFETY: The caller provides live storage under this function's contract.
     unsafe {
         ffi_entry(error, || {
@@ -2464,7 +2501,7 @@ pub unsafe extern "C" fn clp_s_v3_scanner_next_columns(
             let scanner = scanner.as_mut().ok_or_else(|| {
                 ApiError::InvalidArgument("scanner handle must not be null".into())
             })?;
-            if let Some((columns, arena, rows)) = scanner.inner.next_columns()
+            if let Some((columns, arena, rows)) = (if constants { scanner.inner.next_columns_with_constants(true) } else { scanner.inner.next_columns() })
                 .map_err(|e| ApiError::Archive(e.to_string()))? {
                 out_columns.write(columns.as_ptr());
                 out_text.write(arena.as_ptr());

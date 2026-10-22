@@ -65,10 +65,13 @@ pub struct DecodedPackedStream {
 /// `size` is the column's length in a whole table; `stored` is how much of it the stream actually
 /// holds, which is all of it, none of it for a column the projection skipped, or a leading part
 /// for a column read only as far as the rows a query can match. The buffer holds exactly the
-/// stored bytes of each column in order, so a column that was skipped or cut short occupies
-/// nothing, and the table decoder reads each column for the rows its stored bytes cover.
+/// stored bytes of each column in order. A skipped column occupies nothing. A compact numeric
+/// slot stores its encoded payload for all rows while `size` remains the logical rows * 8 size;
+/// `numeric_encoding` tells the table decoder how to interpret those bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ColumnSlot {
+    /// Reader-only compact numeric representation; absent on raw frame reads.
+    pub numeric_encoding: Option<crate::encoded_numeric::NumericEncoding>,
     pub size: usize,
     pub stored: usize,
     pub loaded: bool,
@@ -78,7 +81,7 @@ impl ColumnSlot {
     /// Returns how many of `rows` this column holds, given a whole column covers all of them.
     #[must_use]
     pub const fn stored_rows(&self, rows: usize) -> usize {
-        if self.stored >= self.size {
+        if self.numeric_encoding.is_some() || self.stored >= self.size {
             return rows;
         }
         if 0 == self.size || 0 == rows {
@@ -480,6 +483,7 @@ pub(super) fn decode_column_frames(
             .checked_add(stored)
             .ok_or(PackedStreamError::SizeOverflow)?;
         layout.push(ColumnSlot {
+            numeric_encoding: None,
             size,
             stored,
             loaded,
@@ -624,6 +628,7 @@ impl DecodedPackedStream {
                     let stored = data.len().min(size);
                     bytes.extend_from_slice(&data[..stored]);
                     layout.push(ColumnSlot {
+            numeric_encoding: None,
                         size,
                         stored,
                         loaded: true,
@@ -631,6 +636,7 @@ impl DecodedPackedStream {
                 }
                 None => {
                     layout.push(ColumnSlot {
+            numeric_encoding: None,
                         size,
                         stored: 0,
                         loaded: false,

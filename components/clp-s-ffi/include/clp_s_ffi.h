@@ -565,6 +565,21 @@ clp_s_status clp_s_v3_scanner_next_columns(
         clp_s_error_buffer *error
 );
 
+/** v4 adds constant numeric columns. data contains ONE native-endian 8-byte
+ * value repeated out_row_count times. The v3 function still emits dense values.
+ * All other layouts, lifetime and exclusive-consumption rules are the same. */
+#define CLP_S_V4_COLUMN_CONSTANT_INTEGER 7
+#define CLP_S_V4_COLUMN_CONSTANT_FLOAT 8
+clp_s_status clp_s_v4_scanner_next_columns(
+        clp_s_v2_scanner *scanner,
+        const clp_s_v3_column **out_columns,
+        const uint8_t **out_text,
+        size_t *out_text_length,
+        size_t *out_row_count,
+        clp_s_error_buffer *error
+);
+
+
 /**
  * Opens a projected scan over the first stream in a local zstd-framed KV-IR file. `query` and every
  * field descriptor are borrowed only for this call. `fields` may be NULL only when `field_count`
