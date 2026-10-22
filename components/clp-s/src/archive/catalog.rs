@@ -333,7 +333,7 @@ impl ArchiveCatalog {
     pub fn materialize_adaptive_numerics(
         &self,
         stream_id: u64,
-        stream: DecodedPackedStream,
+        mut stream: DecodedPackedStream,
         limits: ColumnLimits,
     ) -> Result<DecodedPackedStream, TableStreamError> {
         if let Some(grouped) = self.table_metadata.grouped_stream_for(stream_id) {
@@ -388,6 +388,31 @@ impl ArchiveCatalog {
             })
             .filter(|node_type| is_value_bearing(*node_type))
             .collect();
+
+        // Message-only scans can retain the original decompressed frames. In particular,
+        // plain variable payloads are borrowed rather than copied into a second huge buffer.
+        if strings && layout.iter().enumerate().all(|(i, slot)|
+            !slot.loaded || node_types.get(i) == Some(&NodeType::ClpString)) {
+            let mut offset = 0usize;
+            let mut prepared = Vec::with_capacity(layout.len());
+            for (column_index, slot) in layout.iter().enumerate() {
+                let end = offset.checked_add(slot.stored).ok_or(TableStreamError::SizeOverflow)?;
+                let stored = stream.as_bytes().get(offset..end).ok_or(TableStreamError::SizeOverflow)?;
+                offset = end;
+                let view = if slot.loaded {
+                    Some(super::ClpColumnLayout::prepare(stored, message_count, limits)
+                        .map_err(|source| TableStreamError::AdaptiveNumeric { schema_id, column_index, source })?)
+                } else { None };
+                prepared.push(view);
+            }
+            for (slot, view) in stream.column_layout_mut().unwrap().iter_mut().zip(prepared) {
+                if let Some(view) = view {
+                    slot.size = view.logical_size(message_count).map_err(|_| TableStreamError::SizeOverflow)?;
+                    slot.clp_layout = Some(std::sync::Arc::new(view));
+                }
+            }
+            return Ok(stream);
+        }
 
         // Preserve compact numeric encodings where supported, decode other numeric codecs,
         // and copy nonnumeric columns verbatim.
@@ -451,7 +476,7 @@ impl ArchiveCatalog {
             } else {
                 output.extend_from_slice(stored);
             }
-            output_layout.push(ColumnSlot { size, stored: output.len() - start, loaded: slot.loaded, numeric_encoding });
+            output_layout.push(ColumnSlot { clp_layout: None, size, stored: output.len() - start, loaded: slot.loaded, numeric_encoding });
         }
         if !changed { return Ok(stream); }
         Ok(DecodedPackedStream::from_column_buffer(output, output_layout))

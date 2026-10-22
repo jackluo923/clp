@@ -2,6 +2,7 @@
 
 mod catalog;
 mod column;
+mod compact_clp;
 mod dictionary;
 mod directory;
 mod encoded_variable;
@@ -27,6 +28,7 @@ pub use column::ClpDescriptor;
 pub use column::ClpStringColumn;
 pub use column::ClpStringRecord;
 pub use column::Column;
+pub use compact_clp::ClpColumnLayout;
 pub use column::ColumnCorruption;
 pub use column::ColumnData;
 pub use column::ColumnError;

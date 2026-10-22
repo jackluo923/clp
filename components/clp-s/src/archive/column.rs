@@ -809,7 +809,7 @@ impl<'table, 'archive> ClpStringRecord<'table, 'archive> {
 /// A zero-copy CLP string or unstructured-array column.
 #[derive(Clone, Copy, Debug)]
 pub struct ClpStringColumn<'table, 'archive> {
-    descriptors: U64Column<'table>,
+    descriptors: NumericColumn<'table>,
     encoded_variables: I64Column<'table>,
     variable_dictionary: &'archive VariableDictionary,
     logtype_dictionary: LogTypeDictionaryRef<'archive>,
@@ -825,7 +825,7 @@ impl<'table, 'archive> ClpStringColumn<'table, 'archive> {
     /// Returns whether the column contains no records.
     #[must_use]
     pub const fn is_empty(self) -> bool {
-        self.descriptors.is_empty()
+        self.descriptors.len() == 0
     }
 
     /// Returns one decoded descriptor.
@@ -1046,7 +1046,7 @@ impl<'table, 'archive> TimestampColumn<'table, 'archive> {
 #[allow(clippy::too_many_arguments)]
 pub fn decode_schema_table<'table, 'archive>(
     table_bytes: &'table [u8],
-    column_layout: Option<&[ColumnSlot]>,
+    column_layout: Option<&'table [ColumnSlot]>,
     schema: &SchemaDefinition,
     schema_tree: &SchemaTree,
     message_count: u64,
@@ -1058,7 +1058,7 @@ pub fn decode_schema_table<'table, 'archive>(
 ) -> Result<SchemaTable<'table, 'archive>, ColumnError> {
     let logical_bytes = match column_layout {
         Some(layout) => layout.iter().try_fold(0usize, |sum, slot| {
-            let size = if slot.loaded && slot.numeric_encoding.is_some() { slot.size } else { slot.stored };
+            let size = if slot.loaded && (slot.numeric_encoding.is_some() || slot.clp_layout.is_some()) { slot.size } else { slot.stored };
             sum.checked_add(size).ok_or(ColumnError::SizeOverflow)
         })?,
         None => table_bytes.len(),
@@ -1122,6 +1122,24 @@ pub fn decode_schema_table<'table, 'archive>(
         if let Some(slot) = column_layout.and_then(|layout| layout.get(column_index)) {
             if !slot.loaded {
                 projected = true;
+                continue;
+            }
+            if let Some(view) = slot.clp_layout.as_ref() {
+                if node_type != NodeType::ClpString {
+                    return Err(corrupt(context, None, ColumnCorruption::InvalidAdaptiveNumeric));
+                }
+                let stored = cursor.take(context, slot.stored)?;
+                let (descriptors, variables) = view.views(stored, message_count)
+                    .map_err(|_| corrupt(context, None, ColumnCorruption::InvalidAdaptiveNumeric))?;
+                check_encoded_variable_count(view.variable_count as u64, context, limits, &mut total_encoded_variables)?;
+                let encoded_variables = I64Column { data: variables };
+                let logtypes = LogTypeDictionaryRef::Log(logtype_dictionary.for_field(node_id));
+                if limits.validate_dictionary_references {
+                    validate_clp_descriptors(descriptors, encoded_variables, context, variable_dictionary, logtypes)?;
+                }
+                columns.push(Column { schema_entry_index, node_id, data: ColumnData::ClpString(ClpStringColumn {
+                    descriptors, encoded_variables, variable_dictionary, logtype_dictionary: logtypes,
+                }) });
                 continue;
             }
             if node_type == NodeType::MixedInteger {
@@ -1451,8 +1469,37 @@ fn take_clp_string_column<'table, 'archive>(
     limits: ColumnLimits,
     total_encoded_variables: &mut u64,
 ) -> Result<ClpStringColumn<'table, 'archive>, ColumnError> {
-    let descriptors = take_u64_column(cursor, context, message_count)?;
+    let descriptors = NumericColumn::plain(cursor.take_fixed(context, message_count, U64_SIZE)?);
     let encoded_variable_count = cursor.take_u64(context)?;
+    check_encoded_variable_count(encoded_variable_count, context, limits, total_encoded_variables)?;
+    let encoded_variable_count =
+        usize::try_from(encoded_variable_count).map_err(|_| ColumnError::SizeOverflow)?;
+    let encoded_variables = take_i64_column(cursor, context, encoded_variable_count)?;
+    if !limits.validate_dictionary_references {
+        return Ok(ClpStringColumn {
+            descriptors,
+            encoded_variables,
+            variable_dictionary,
+            logtype_dictionary,
+        });
+    }
+    validate_clp_descriptors(
+        descriptors,
+        encoded_variables,
+        context,
+        variable_dictionary,
+        logtype_dictionary,
+    )?;
+    Ok(ClpStringColumn {
+        descriptors,
+        encoded_variables,
+        variable_dictionary,
+        logtype_dictionary,
+    })
+}
+
+fn check_encoded_variable_count(encoded_variable_count: u64, context: ColumnContext,
+    limits: ColumnLimits, total_encoded_variables: &mut u64) -> Result<(), ColumnError> {
     if encoded_variable_count > limits.encoded_variables_per_column {
         return Err(ColumnError::EncodedVariableCountTooLarge {
             column_index: context.column_index,
@@ -1479,30 +1526,7 @@ fn take_clp_string_column<'table, 'archive>(
             limit: limits.total_encoded_variables,
         });
     }
-    let encoded_variable_count =
-        usize::try_from(encoded_variable_count).map_err(|_| ColumnError::SizeOverflow)?;
-    let encoded_variables = take_i64_column(cursor, context, encoded_variable_count)?;
-    if !limits.validate_dictionary_references {
-        return Ok(ClpStringColumn {
-            descriptors,
-            encoded_variables,
-            variable_dictionary,
-            logtype_dictionary,
-        });
-    }
-    validate_clp_descriptors(
-        descriptors,
-        encoded_variables,
-        context,
-        variable_dictionary,
-        logtype_dictionary,
-    )?;
-    Ok(ClpStringColumn {
-        descriptors,
-        encoded_variables,
-        variable_dictionary,
-        logtype_dictionary,
-    })
+    Ok(())
 }
 
 fn take_deprecated_date_string_column<'table, 'archive>(
@@ -1600,7 +1624,7 @@ fn validate_finite_floats(
 }
 
 fn validate_clp_descriptors(
-    descriptors: U64Column<'_>,
+    descriptors: NumericColumn<'_>,
     encoded_variables: I64Column<'_>,
     context: ColumnContext,
     variable_dictionary: &VariableDictionary,
@@ -2658,25 +2682,25 @@ mod tests {
         let resources = resources(&[], &[], &[], &[]);
         let tree = flat_tree(&[NodeType::Float]);
         let schema = schema(&tree, &[0]);
-        let slot = ColumnSlot { numeric_encoding: Some(NumericEncoding::Constant),
+        let slot = ColumnSlot { clp_layout: None, numeric_encoding: Some(NumericEncoding::Constant),
             size: 8000, stored: 8, loaded: true };
         let decode = |bytes: &[u8], slot: ColumnSlot, limits| decode_schema_table(bytes,
             Some(&[slot]), &schema, &tree, 1000, &resources.variable, &resources.logtype,
             &resources.array, &resources.timestamp, limits).map(|_| ());
-        assert!(matches!(decode(&42f64.to_le_bytes(), slot,
+        assert!(matches!(decode(&42f64.to_le_bytes(), slot.clone(),
             ColumnLimits::new(7999, u64::MAX, 1, u64::MAX, u64::MAX)),
             Err(ColumnError::TableTooLarge { actual: 8000, limit: 7999 })));
-        assert!(decode(&42f64.to_le_bytes(), slot, ColumnLimits::default()).is_ok());
-        assert!(matches!(decode(&f64::NAN.to_le_bytes(), slot, ColumnLimits::default()),
+        assert!(decode(&42f64.to_le_bytes(), slot.clone(), ColumnLimits::default()).is_ok());
+        assert!(matches!(decode(&f64::NAN.to_le_bytes(), slot.clone(), ColumnLimits::default()),
             Err(ColumnError::Corrupt { reason: ColumnCorruption::NonFiniteFloat, .. })));
         // Unused dictionary entries retain the canonical decoder's semantics.
         let mut bytes = 2u32.to_le_bytes().to_vec();
         bytes.extend(42f64.to_le_bytes()); bytes.extend(f64::NAN.to_le_bytes()); bytes.push(0);
-        let slot = ColumnSlot { numeric_encoding: Some(NumericEncoding::Dictionary),
+        let slot = ColumnSlot { clp_layout: None, numeric_encoding: Some(NumericEncoding::Dictionary),
             stored: bytes.len(), ..slot };
-        assert!(decode(&bytes, slot, ColumnLimits::default()).is_ok());
+        assert!(decode(&bytes, slot.clone(), ColumnLimits::default()).is_ok());
         bytes[4..12].copy_from_slice(&f64::NAN.to_le_bytes());
-        assert!(matches!(decode(&bytes, slot, ColumnLimits::default()),
+        assert!(matches!(decode(&bytes, slot.clone(), ColumnLimits::default()),
             Err(ColumnError::Corrupt { reason: ColumnCorruption::NonFiniteFloat, .. })));
     }
 

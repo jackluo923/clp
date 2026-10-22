@@ -68,8 +68,10 @@ pub struct DecodedPackedStream {
 /// stored bytes of each column in order. A skipped column occupies nothing. A compact numeric
 /// slot stores its encoded payload for all rows while `size` remains the logical rows * 8 size;
 /// `numeric_encoding` tells the table decoder how to interpret those bytes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColumnSlot {
+    /// Reader-only adaptive CLP view; absent on raw frame reads.
+    pub clp_layout: Option<std::sync::Arc<super::ClpColumnLayout>>,
     /// Reader-only compact numeric representation; absent on raw frame reads.
     pub numeric_encoding: Option<crate::encoded_numeric::NumericEncoding>,
     pub size: usize,
@@ -81,7 +83,7 @@ impl ColumnSlot {
     /// Returns how many of `rows` this column holds, given a whole column covers all of them.
     #[must_use]
     pub const fn stored_rows(&self, rows: usize) -> usize {
-        if self.numeric_encoding.is_some() || self.stored >= self.size {
+        if self.clp_layout.is_some() || self.numeric_encoding.is_some() || self.stored >= self.size {
             return rows;
         }
         if 0 == self.size || 0 == rows {
@@ -483,7 +485,7 @@ pub(super) fn decode_column_frames(
             .checked_add(stored)
             .ok_or(PackedStreamError::SizeOverflow)?;
         layout.push(ColumnSlot {
-            numeric_encoding: None,
+            clp_layout: None, numeric_encoding: None,
             size,
             stored,
             loaded,
@@ -493,11 +495,9 @@ pub(super) fn decode_column_frames(
     bytes
         .try_reserve_exact(total)
         .map_err(|_| PackedStreamError::AllocationFailed { requested: total })?;
-    bytes.resize(total, 0);
 
     let mut context = zstd::zstd_safe::DCtx::create();
     let mut compressed = Vec::new();
-    let mut output_start = 0_usize;
     let mut index = 0;
     while index < sizes.len() {
         if !loaded[index] {
@@ -517,15 +517,9 @@ pub(super) fn decode_column_frames(
                 .zip(usize::try_from(stop - run_start).ok())
                 .and_then(|(start, stop)| compressed.get(start..stop))
                 .ok_or(PackedStreamError::SizeOverflow)?;
-            let output_end = output_start + sizes[frame];
             decode_frame_into(
-                &mut context,
-                input,
-                &mut bytes[output_start..output_end],
-                limits,
-                raw_frames,
+                &mut context, input, &mut bytes, sizes[frame], limits, raw_frames,
             )?;
-            output_start = output_end;
         }
         index = end;
     }
@@ -561,21 +555,24 @@ pub(super) fn grouped_frame_ranges(
     Ok((offsets, sizes))
 }
 
-/// Decompresses one whole zstd frame into `output`, which must come out exactly full.
+/// Appends a whole frame into reserved capacity. Zstd's safe Cursor<Vec> WriteBuf
+/// initializes and exposes only the bytes actually written, avoiding a zero-fill pass.
+/// The allocation bounds the entire selected stream; each frame's result must match its size.
 fn decode_frame_into(
     context: &mut zstd::zstd_safe::DCtx<'_>,
     compressed: &[u8],
-    output: &mut [u8],
+    output: &mut Vec<u8>,
+    expected_size: usize,
     limits: PackedStreamLimits,
     raw_frames: bool,
 ) -> Result<(), PackedStreamError> {
     let compressed_size = usize_to_u64(compressed.len())?;
-    let advertised = usize_to_u64(output.len())?;
+    let advertised = usize_to_u64(expected_size)?;
     if validate_frame_sizes(compressed_size, compressed_size, advertised, limits)? {
         return Ok(());
     }
-    if raw_frames && compressed.len() == output.len() {
-        output.copy_from_slice(compressed);
+    if raw_frames && compressed.len() == expected_size {
+        output.extend_from_slice(compressed);
         return Ok(());
     }
     let zstd_error = |code| {
@@ -599,10 +596,13 @@ fn decode_frame_into(
             remaining: usize_to_u64(compressed.len() - frame_size)?,
         });
     }
+    let start = output.len();
+    let mut cursor = io::Cursor::new(output);
+    cursor.set_position(usize_to_u64(start)?);
     let written = context
-        .decompress(output, compressed)
+        .decompress(&mut cursor, compressed)
         .map_err(|code| PackedStreamError::Io(zstd_error(code)))?;
-    if written != output.len() {
+    if written != expected_size {
         return Err(PackedStreamError::DecompressedSizeMismatch {
             advertised,
             actual: usize_to_u64(written)?,
@@ -628,7 +628,7 @@ impl DecodedPackedStream {
                     let stored = data.len().min(size);
                     bytes.extend_from_slice(&data[..stored]);
                     layout.push(ColumnSlot {
-            numeric_encoding: None,
+            clp_layout: None, numeric_encoding: None,
                         size,
                         stored,
                         loaded: true,
@@ -636,7 +636,7 @@ impl DecodedPackedStream {
                 }
                 None => {
                     layout.push(ColumnSlot {
-            numeric_encoding: None,
+            clp_layout: None, numeric_encoding: None,
                         size,
                         stored: 0,
                         loaded: false,
@@ -673,7 +673,7 @@ impl DecodedPackedStream {
             let right_end = right_offset.checked_add(b.stored)?;
             let left_bytes = self.bytes.get(left_offset..left_end)?;
             let right_bytes = other.bytes.get(right_offset..right_end)?;
-            let (slot, data) = if a.loaded { (*a, left_bytes) } else { (*b, right_bytes) };
+            let (slot, data) = if a.loaded { (a.clone(), left_bytes) } else { (b.clone(), right_bytes) };
             bytes.extend_from_slice(data);
             layout.push(slot);
             left_offset = left_end;
@@ -696,6 +696,10 @@ impl DecodedPackedStream {
             bytes,
             column_layout: None,
         }
+    }
+
+    pub(crate) fn column_layout_mut(&mut self) -> Option<&mut [ColumnSlot]> {
+        self.column_layout.as_deref_mut()
     }
 
     /// The per-column layout of a projected stream, or `None` for a whole stream.
@@ -1084,6 +1088,22 @@ mod tests {
     }
 
     #[test]
+    fn column_frames_append_into_spare_capacity_and_reject_wrong_sizes() {
+        let a = compress(b"first column");
+        let b = compress(b"second column");
+        let mut context = zstd::zstd_safe::DCtx::create();
+        let mut output = Vec::with_capacity(100);
+        decode_frame_into(&mut context, &a, &mut output, 12, TEST_LIMITS, false).unwrap();
+        decode_frame_into(&mut context, &b, &mut output, 13, TEST_LIMITS, false).unwrap();
+        decode_frame_into(&mut context, b"raw", &mut output, 3, TEST_LIMITS, true).unwrap();
+        assert_eq!(output, b"first columnsecond columnraw");
+        // Even spare capacity beyond this frame cannot hide an advertised-size mismatch.
+        assert!(decode_frame_into(&mut context, &a, &mut output, 11, TEST_LIMITS, false).is_err());
+        let mut truncated = Vec::with_capacity(100);
+        assert!(decode_frame_into(&mut context, &a[..a.len()-1], &mut truncated, 12, TEST_LIMITS, false).is_err());
+    }
+
+    #[test]
     fn decodes_one_exact_bounded_frame() {
         let expected = b"one packed stream split across decoder reads";
         let compressed = compress(expected);
@@ -1297,11 +1317,11 @@ mod projected_merge_tests {
 
     #[test]
     fn merge_keeps_compact_layouts_and_interleaved_columns() {
-        let compact = ColumnSlot { size: 800, stored: 8, loaded: true,
+        let compact = ColumnSlot { clp_layout: None, size: 800, stored: 8, loaded: true,
             numeric_encoding: Some(NumericEncoding::Constant) };
-        let skipped = ColumnSlot { size: 9, stored: 0, loaded: false, numeric_encoding: None };
+        let skipped = ColumnSlot { clp_layout: None, size: 9, stored: 0, loaded: false, numeric_encoding: None };
         let left = DecodedPackedStream::from_column_buffer(42i64.to_le_bytes().to_vec(),
-            vec![compact, skipped, skipped]);
+            vec![compact.clone(), skipped.clone(), skipped]);
         let right = DecodedPackedStream::from_columns(vec![None, Some(vec![1, 2, 3]), None], &[9, 3, 9]);
         let merged = left.merge_disjoint_columns(right).unwrap();
         assert_eq!(&merged.as_bytes()[..8], &42i64.to_le_bytes());
