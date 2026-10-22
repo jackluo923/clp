@@ -3275,16 +3275,14 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
                     scalar_f64_matches(value, filter.predicate, filter.value.timestamp_nanoseconds)
                 }) {
                     let bytes = column.canonical_bytes().expect("canonical fallback");
-                    or_matches(bitmap, bytes.as_chunks::<8>().0.iter().copied()
-                        .map(f64::from_le_bytes).skip(skip), |value| {
-                            scalar_f64_matches(value, filter.predicate, filter.value.timestamp_nanoseconds)
-                        });
+                    or_f64_matches(bitmap, bytes.as_chunks::<8>().0.iter().copied()
+                        .map(f64::from_le_bytes).skip(skip), filter.predicate,
+                        filter.value.timestamp_nanoseconds);
                 }
             }
             ColumnData::FormattedFloat(column) => {
-                or_matches(bitmap, column.values().iter().skip(skip), |value| {
-                    scalar_f64_matches(value, filter.predicate, filter.value.timestamp_nanoseconds)
-                });
+                or_f64_matches(bitmap, column.values().iter().skip(skip), filter.predicate,
+                    filter.value.timestamp_nanoseconds);
             }
             ColumnData::DictionaryFloat(column) => {
                 filter.value.dictionary_float_ids.or_matches(bitmap, column.ids().iter().skip(skip));
@@ -3701,22 +3699,98 @@ fn or_matches<T>(
     }
 }
 
+/// Select the comparison once so each row loop has a fixed operation and type.
+fn or_comparison_matches<T: Copy + PartialOrd>(
+    bitmap: &mut [u8], values: impl Iterator<Item = T>, operand: T,
+    operator: ComparisonOperator,
+) {
+    match operator {
+        ComparisonOperator::Equal => or_matches(bitmap, values, |v| v == operand),
+        ComparisonOperator::Less => or_matches(bitmap, values, |v| v < operand),
+        ComparisonOperator::LessOrEqual => or_matches(bitmap, values, |v| v <= operand),
+        ComparisonOperator::Greater => or_matches(bitmap, values, |v| v > operand),
+        ComparisonOperator::GreaterOrEqual => or_matches(bitmap, values, |v| v >= operand),
+    }
+}
+
 fn or_i64_matches(
     bitmap: &mut [u8],
     values: impl Iterator<Item = i64>,
     predicate: PredicateRef<'_>,
     timestamp_nanoseconds: Option<i64>,
 ) {
-    if timestamp_nanoseconds.is_none()
-        && ComparisonOperator::Equal == predicate.operator()
-        && let Literal::Integer { value: operand, .. } = predicate.value()
-    {
-        or_matches(bitmap, values, |value| value == *operand);
+    if let Some(operand) = timestamp_nanoseconds {
+        or_comparison_matches(bitmap, values, operand, predicate.operator());
     } else {
-        or_matches(bitmap, values, |value| {
-            scalar_i64_matches(value, predicate, timestamp_nanoseconds)
-        });
+        match numeric_literal(predicate.value()) {
+            Some(NumericLiteral::Integer(operand)) =>
+                or_comparison_matches(bitmap, values, operand, predicate.operator()),
+            Some(NumericLiteral::Float(operand)) =>
+                or_i64_float_matches(bitmap, values, operand, predicate.operator()),
+            None => {},
+        }
     }
+}
+
+/// Resolve the scalar mixed-type rules once. Never round row integers to f64:
+/// that loses distinctions above 2^53. NaN matches nothing for every operator.
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::float_cmp)]
+fn or_i64_float_matches(
+    bitmap: &mut [u8], values: impl Iterator<Item = i64>, operand: f64,
+    operator: ComparisonOperator,
+) {
+    const LOWER: f64 = -9_223_372_036_854_775_808.0;
+    const UPPER: f64 = 9_223_372_036_854_775_808.0;
+    // None means no match; Some(None) means every supplied value matches.
+    let bound = match operator {
+        ComparisonOperator::Equal => {
+            if (LOWER..UPPER).contains(&operand) && operand.fract() == 0.0
+                && operand == (operand as i64) as f64
+            { Some(Some(operand as i64)) } else { None }
+        },
+        ComparisonOperator::Less => {
+            if operand > LOWER {
+                Some((operand < UPPER).then(|| operand.ceil() as i64))
+            } else { None }
+        },
+        ComparisonOperator::LessOrEqual => {
+            if operand >= LOWER {
+                Some((operand < UPPER).then(|| operand.floor() as i64))
+            } else { None }
+        },
+        ComparisonOperator::Greater => {
+            if operand < UPPER {
+                Some((operand >= LOWER).then(|| operand.floor() as i64))
+            } else { None }
+        },
+        ComparisonOperator::GreaterOrEqual => {
+            if operand < UPPER {
+                Some((operand > LOWER).then(|| operand.ceil() as i64))
+            } else { None }
+        },
+    };
+    match bound {
+        None => {},
+        Some(None) => or_matches(bitmap, values, |_| true),
+        Some(Some(operand)) => or_comparison_matches(bitmap, values, operand, operator),
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn or_f64_matches(
+    bitmap: &mut [u8], values: impl Iterator<Item = f64>, predicate: PredicateRef<'_>,
+    timestamp_nanoseconds: Option<i64>,
+) {
+    let operand = if let Some(timestamp) = timestamp_nanoseconds {
+        timestamp_seconds(timestamp)
+    } else {
+        match numeric_literal(predicate.value()) {
+            Some(NumericLiteral::Integer(value)) => value as f64,
+            Some(NumericLiteral::Float(value)) => value,
+            None => return,
+        }
+    };
+    or_comparison_matches(bitmap, values, operand, predicate.operator());
 }
 
 fn make_array_predicate<'query>(
@@ -4433,6 +4507,63 @@ mod tests {
                 }
                 times.remove(0); times.sort_unstable();
                 println!("MEMBERSHIP {name} {method} median_ns={}", (times[4] + times[5]) / 2);
+            }
+        }
+    }
+
+    #[test]
+    fn specialized_numeric_loops_match_scalar_at_precision_boundaries() {
+        let parsed = parse_kql("x:0", KqlLimits::default()).unwrap();
+        let ExpressionKind::Predicate(base) = parsed.node(parsed.root()).unwrap().kind() else { panic!("predicate") };
+        let mut integers = vec![i64::MIN, i64::MIN + 1, i64::MIN + 1024,
+            -(1_i64 << 53) - 1, -(1_i64 << 53), -2, -1, 0, 1, 2,
+            (1_i64 << 53) - 1, 1_i64 << 53, (1_i64 << 53) + 1,
+            i64::MAX - 1024, i64::MAX - 1, i64::MAX];
+        let mut floats: Vec<f64> = integers.iter().map(|v| *v as f64).collect();
+        floats.extend([f64::NAN, f64::NEG_INFINITY, f64::INFINITY, -0.0, 0.0,
+            -1.5, 1.5, -f64::MIN_POSITIVE, f64::MIN_POSITIVE, f64::from_bits(1)]);
+        let mut bits = 42_u64;
+        for _ in 0..256 {
+            bits = bits.wrapping_mul(6364136223846793005).wrapping_add(1);
+            integers.push(bits as i64);
+            floats.push(f64::from_bits(bits));
+        }
+        let mut literals: Vec<Literal> = integers.iter().map(|value| Literal::Integer {
+            value: *value, source: value.to_string(),
+        }).collect();
+        literals.extend(floats.iter().map(|value| Literal::Float { value: *value, source: value.to_string() }));
+        for literal in &literals {
+            for operator in [ComparisonOperator::Equal, ComparisonOperator::Less,
+                ComparisonOperator::LessOrEqual, ComparisonOperator::Greater, ComparisonOperator::GreaterOrEqual] {
+                let predicate = PredicateRef { path: base.path(), operator, value: literal };
+                for skip in [0, 1, 7] {
+                    let mut actual: Vec<u8> = (0..integers.len() + 3).map(|i| (i % 3) as u8).collect();
+                    let mut expected = actual.clone();
+                    or_matches(&mut expected, integers.iter().copied().skip(skip), |v| scalar_i64_matches(v, predicate, None));
+                    or_i64_matches(&mut actual, integers.iter().copied().skip(skip), predicate, None);
+                    assert_eq!(actual, expected, "integer {literal:?} {operator:?} skip={skip}");
+                    let mut actual: Vec<u8> = (0..floats.len() + 3).map(|i| (i % 3) as u8).collect();
+                    let mut expected = actual.clone();
+                    or_matches(&mut expected, floats.iter().copied().skip(skip), |v| scalar_f64_matches(v, predicate, None));
+                    or_f64_matches(&mut actual, floats.iter().copied().skip(skip), predicate, None);
+                    assert_eq!(actual, expected, "float {literal:?} {operator:?} skip={skip}");
+                }
+            }
+        }
+        for timestamp in [i64::MIN, -1, 0, 1, 1_000_000_001, i64::MAX] {
+            for operator in [ComparisonOperator::Equal, ComparisonOperator::Less,
+                ComparisonOperator::LessOrEqual, ComparisonOperator::Greater, ComparisonOperator::GreaterOrEqual] {
+                let predicate = PredicateRef { path: base.path(), operator, value: base.value() };
+                let mut actual = vec![Tri::Unknown as u8; integers.len()];
+                let mut expected = actual.clone();
+                or_matches(&mut expected, integers.iter().copied(), |v| scalar_i64_matches(v, predicate, Some(timestamp)));
+                or_i64_matches(&mut actual, integers.iter().copied(), predicate, Some(timestamp));
+                assert_eq!(actual, expected);
+                let mut actual = vec![Tri::Unknown as u8; floats.len()];
+                let mut expected = actual.clone();
+                or_matches(&mut expected, floats.iter().copied(), |v| scalar_f64_matches(v, predicate, Some(timestamp)));
+                or_f64_matches(&mut actual, floats.iter().copied(), predicate, Some(timestamp));
+                assert_eq!(actual, expected);
             }
         }
     }
