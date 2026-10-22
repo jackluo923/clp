@@ -188,9 +188,10 @@ struct CompressArgs {
     #[arg(long, default_value_t = 512_u64 * 1024 * 1024)]
     max_document_size: u64,
     /// Store each schema table of at least this many uncompressed bytes as one zstd frame per
-    /// column, so a reader can inflate only the columns a query needs. Zero keeps the shared
-    /// per-stream frame. Archives written with this set need a reader that supports it.
-    #[arg(long, default_value_t = 0)]
+    /// column, so a reader can inflate only the columns a query needs. Defaults to 1 MiB so small
+    /// tables can share compression frames. Zero disables this size-based split; adaptive numeric
+    /// tables still use per-column frames. Archives written with this set need a supporting reader.
+    #[arg(long, default_value_t = 1024_u64 * 1024)]
     separate_columns_min_size: u64,
     /// Disable adaptive per-column numeric encoding (enabled by default). Adaptive encoding stores
     /// each integer or float column with the smallest of a set of lightweight codecs chosen by
