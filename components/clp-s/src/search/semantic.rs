@@ -1041,15 +1041,13 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
             return Tri::Unknown;
         };
         // Timestamp columns compare their decoded epoch nanoseconds, whereas the
-        // archive bounds may be milliseconds or floating-point seconds. Those
-        // bounds also lose sub-unit precision. Until their scale and rounding are
-        // translated conservatively, they cannot prove a timestamp predicate
-        // true or false (including under NOT). Let the column evaluator decide.
+        // archive bounds are milliseconds (or floating-point seconds from older
+        // producers) that lose sub-unit precision. See `timestamp_column_leaf`.
         if schema.nodes.iter().any(|id| {
             self.catalog.schema_tree().get(*id as usize)
                 .is_some_and(|node| node.node_type() == NodeType::Timestamp)
         }) {
-            return Tri::Unknown;
+            return self.timestamp_column_leaf(schema, compiled, predicate);
         }
         if predicate
             .path()
@@ -1075,6 +1073,72 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
             return Tri::Unknown;
         };
         timestamp_bounds_filter(range.bounds(), compiled, predicate)
+    }
+
+    /// Whether the archive's recorded range proves a predicate on a timestamp column false.
+    ///
+    /// The column compares decoded epoch nanoseconds with the operand: the nanoseconds of a
+    /// timestamp literal, or an integer literal taken as nanoseconds. The archive's bounds are
+    /// whole milliseconds that the writer rounds outward (floor for the start, ceiling for the
+    /// end), so scaled to nanoseconds they still contain every value. A further millisecond of
+    /// slack on each side covers producers that round differently. Bounds in floating-point
+    /// seconds are not translated.
+    ///
+    /// Only `False` is returned, never `True`: an archive can hold rows without the field,
+    /// which a negated predicate would match, so the bounds may skip an archive but must not
+    /// claim that every row matches.
+    fn timestamp_column_leaf(
+        &self,
+        schema: &ResolvedSchemaPath,
+        compiled: &CompiledValue,
+        predicate: PredicateRef<'_>,
+    ) -> Tri {
+        const NANOSECONDS_PER_MILLISECOND: i64 = 1_000_000;
+        const SLACK_NANOSECONDS: i64 = NANOSECONDS_PER_MILLISECOND - 1;
+        if is_exists(predicate)
+            || predicate.path().components().iter().any(PathComponent::is_wildcard)
+        {
+            return Tri::Unknown;
+        }
+        let tree = self.catalog.schema_tree();
+        let all_timestamps = schema.nodes.iter().all(|id| {
+            tree.get(*id as usize).is_some_and(|node| node.node_type() == NodeType::Timestamp)
+        });
+        // Every resolved column must be covered by the one range consulted.
+        let Some(range) = self
+            .catalog
+            .metadata()
+            .timestamp_dictionary()
+            .ranges()
+            .iter()
+            .find(|range| {
+                schema.nodes.iter().all(|node| {
+                    range.column_ids().iter().any(|column| u32::try_from(*column) == Ok(*node))
+                })
+            })
+        else {
+            return Tri::Unknown;
+        };
+        let TimestampBounds::Epoch { start, end } = range.bounds() else {
+            return Tri::Unknown;
+        };
+        let operand = compiled.timestamp_nanoseconds.or_else(|| match numeric_literal(predicate.value()) {
+            Some(NumericLiteral::Integer(value)) => Some(value),
+            _ => None,
+        });
+        let (Some(operand), true) = (operand, all_timestamps) else {
+            return Tri::Unknown;
+        };
+        let start = start
+            .saturating_mul(NANOSECONDS_PER_MILLISECOND)
+            .saturating_sub(SLACK_NANOSECONDS);
+        let end = end
+            .saturating_mul(NANOSECONDS_PER_MILLISECOND)
+            .saturating_add(SLACK_NANOSECONDS);
+        match evaluate_timestamp_bounds(start, end, operand, predicate.operator()) {
+            Tri::False => Tri::False,
+            Tri::True | Tri::Unknown => Tri::Unknown,
+        }
     }
 
     fn evaluate_schema_preflight(&self) -> Result<bool, SearchError> {

@@ -1786,3 +1786,82 @@ fn results_cache_connection_setup_is_lazy_and_never_writes_stdout() {
     assert_eq!(b"", matching.stdout.as_slice());
     assert_ne!(b"", matching.stderr.as_slice());
 }
+
+/// Counts matching rows without writing them anywhere.
+#[derive(Default)]
+struct CountingSink {
+    rows: usize,
+}
+
+impl clp_s::search::ArchiveMatchSink for CountingSink {
+    fn write_matches(&mut self, matches: clp_s::search::ArchiveTableMatches<'_, '_, '_>) -> io::Result<()> {
+        self.rows += matches.matching_rows().count();
+        Ok(())
+    }
+}
+
+#[test]
+fn timestamp_key_windows_outside_the_archive_range_skip_it_unread() {
+    // Epoch milliseconds under --timestamp-key are stored as nanoseconds, which is what
+    // a predicate on the column compares against.
+    let directory = TestDirectory::new("timestamp-window");
+    let input = directory.path().join("input.jsonl");
+    fs::write(
+        &input,
+        "{\"ts\":1783328900001,\"v\":1}\n{\"ts\":1783328900500,\"v\":2}\n{\"ts\":1783328901000,\"v\":3}\n",
+    )
+    .expect("write input");
+    let archives = directory.path().join("archives");
+    let output = clp_s(&[
+        "c".as_ref(),
+        "--single-file-archive".as_ref(),
+        "--disable-log-order".as_ref(),
+        "--timestamp-key".as_ref(),
+        "ts".as_ref(),
+        archives.as_os_str(),
+        input.as_os_str(),
+    ]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let archive = fs::read_dir(&archives)
+        .expect("list archives")
+        .next()
+        .expect("one archive")
+        .expect("archive entry")
+        .path();
+
+    let search = |kql: &str| {
+        let query = clp_s::search::parse_kql(kql, clp_s::search::KqlLimits::default())
+            .expect("parse query");
+        let mut reader = clp_s::archive::SingleFileArchiveReader::open(
+            fs::File::open(&archive).expect("open archive"),
+        )
+        .expect("read archive");
+        let mut sink = CountingSink::default();
+        let stats = clp_s::search::search_archive(
+            &mut reader,
+            &query,
+            &mut sink,
+            &clp_s::search::ArchiveSearchOptions::default(),
+        )
+        .expect("search");
+        (sink.rows, stats.streams_scanned())
+    };
+
+    // Disjoint windows prove the archive empty from its recorded range alone.
+    for kql in [
+        "ts >= 1700000000000000000 AND ts <= 1700000000980000000",
+        "ts > 1783328901000999999",
+        "ts < 1783328900000000000",
+        "ts: 1783328899999000000",
+    ] {
+        assert_eq!((0, 0), search(kql), "{kql}");
+    }
+    // Overlapping windows, including those touching only the first or last record,
+    // are left to the column evaluator.
+    assert_eq!((1, 1), search("ts >= 1783328900400000000 AND ts <= 1783328900600000000"));
+    assert_eq!((1, 1), search("ts <= 1783328900001000000"));
+    assert_eq!((1, 1), search("ts >= 1783328901000000000"));
+    // A negated predicate is never pruned from the bounds.
+    assert_eq!((3, 1), search("NOT ts < 1700000000000000000"));
+    assert_eq!((0, 1), search("NOT ts >= 1700000000000000000"));
+}
