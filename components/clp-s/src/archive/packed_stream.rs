@@ -132,26 +132,73 @@ impl Drop for DecodedPackedStream {
     }
 }
 
-/// Decompression buffers kept per thread between packed streams.
+/// Empty decompression allocations shared between scan workers.
 ///
-/// A packed stream is usually tens to hundreds of megabytes, which the allocator maps fresh for
-/// each stream and unmaps when it is dropped. Every page of a fresh mapping is then faulted in and
-/// zero-filled as zstd writes it, and every unmap stalls the faults of the process's other
-/// threads. A scan worker reads many streams in turn, so keeping its last buffers avoids both.
+/// Reusing initialized pages avoids the page faults of fresh large mappings. DuckDB can
+/// schedule the next archive task on a different thread, so returned buffers are available
+/// process-wide rather than stranded on their releasing thread.
 ///
-/// At most [`MAX_RETAINED_BUFFERS`] buffers are kept per thread, the largest first, together no
-/// more than the retention limit: 256 MiB unless `CLP_S_STREAM_BUFFER_RETAIN_BYTES` sets another
-/// number of bytes (0 disables reuse). Threads in a long-lived pool keep their buffers between
-/// queries, so the limit bounds that idle memory.
+/// At most 32 buffers and 1 GiB are retained across queries. The environment variable
+/// `CLP_S_STREAM_BUFFER_RETAIN_BYTES` overrides this process-wide byte limit (0 disables
+/// retention). Active scans exclusively own their checked-out buffers; this is an idle-memory
+/// limit, not a bound on all in-flight scan memory. The pool never holds decoded row contents
+/// as a logical value: returned buffers have length zero and decoders initialize their output.
 pub(crate) mod stream_buffers {
-    use std::cell::RefCell;
-    use std::sync::OnceLock;
+    use std::sync::{Mutex, OnceLock};
 
-    const DEFAULT_RETAINED_BYTES: usize = 256 << 20;
-    const MAX_RETAINED_BUFFERS: usize = 4;
+    // One process-wide budget: DuckDB tasks can resume on a different worker.
+    const DEFAULT_RETAINED_BYTES: usize = 1024 << 20;
+    const MAX_RETAINED_BUFFERS: usize = 32;
 
-    thread_local! {
-        static POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    #[derive(Default)]
+    struct BufferPool {
+        buffers: Vec<Vec<u8>>,
+    }
+
+    impl BufferPool {
+        fn take(&mut self, capacity: usize) -> Vec<u8> {
+            let fitting = self
+                .buffers
+                .iter()
+                .enumerate()
+                .filter(|(_, buffer)| buffer.capacity() >= capacity)
+                .min_by_key(|(_, buffer)| buffer.capacity())
+                .map(|(index, _)| index);
+            fitting.map_or_else(Vec::new, |index| self.buffers.swap_remove(index))
+        }
+
+        /// Returns evicted allocations so their destruction happens after unlocking.
+        fn put(&mut self, mut buffer: Vec<u8>, limit: usize) -> Vec<Vec<u8>> {
+            if buffer.capacity() == 0 || buffer.capacity() > limit {
+                return vec![buffer];
+            }
+            buffer.clear();
+            self.buffers.push(buffer);
+            self.buffers
+                .sort_unstable_by_key(|buffer| std::cmp::Reverse(buffer.capacity()));
+            let mut total = 0usize;
+            let keep = self
+                .buffers
+                .iter()
+                .take(MAX_RETAINED_BUFFERS)
+                .take_while(|buffer| {
+                    let Some(next) = total.checked_add(buffer.capacity()) else {
+                        return false;
+                    };
+                    if next > limit {
+                        return false;
+                    }
+                    total = next;
+                    true
+                })
+                .count();
+            self.buffers.split_off(keep)
+        }
+    }
+
+    fn pool() -> &'static Mutex<BufferPool> {
+        static POOL: OnceLock<Mutex<BufferPool>> = OnceLock::new();
+        POOL.get_or_init(|| Mutex::new(BufferPool::default()))
     }
 
     fn retained_limit() -> usize {
@@ -164,56 +211,117 @@ pub(crate) mod stream_buffers {
         })
     }
 
-    /// An empty buffer with room for at least `capacity` bytes when this thread kept one that
-    /// large, taking the smallest that fits; otherwise a new empty buffer for the caller to size.
-    pub(crate) fn take(capacity: usize) -> Vec<u8> {
-        POOL.try_with(|pool| {
-            let Ok(mut pool) = pool.try_borrow_mut() else {
-                return Vec::new();
-            };
-            let fitting = pool
-                .iter()
-                .enumerate()
-                .filter(|(_, buffer)| buffer.capacity() >= capacity)
-                .min_by_key(|(_, buffer)| buffer.capacity())
-                .map(|(index, _)| index);
-            fitting.map_or_else(Vec::new, |index| pool.swap_remove(index))
-        })
-        .unwrap_or_default()
+    /// Round large retained outputs to reusable size classes. Neighboring archives often
+    /// differ by only a few bytes; exact capacities otherwise require fresh page faults.
+    /// Small outputs and outputs outside the retention budget keep their exact size.
+    pub(crate) fn allocation_capacity(required: usize) -> usize {
+        rounded_capacity(required, retained_limit())
     }
 
-    /// Keeps `buffer` for this thread's next stream if the retention limits allow.
-    pub(crate) fn give_back(mut buffer: Vec<u8>) {
+    fn rounded_capacity(required: usize, limit: usize) -> usize {
+        const MIN_ROUNDED: usize = 32 << 20;
+        const GRANULARITY: usize = 8 << 20;
+        if required < MIN_ROUNDED || required > limit {
+            return required;
+        }
+        required
+            .checked_add(GRANULARITY - 1)
+            .map(|n| n / GRANULARITY * GRANULARITY)
+            .filter(|&n| n <= limit)
+            .unwrap_or(required)
+    }
+
+    /// Takes the smallest fitting empty allocation, regardless of its releasing thread.
+    pub(crate) fn take(capacity: usize) -> Vec<u8> {
+        pool()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take(capacity)
+    }
+
+    /// Retains empty capacity under a process-wide byte/count cap. Active readers own
+    /// their allocations exclusively, and no lock is held during I/O or decompression.
+    pub(crate) fn give_back(buffer: Vec<u8>) {
         let limit = retained_limit();
-        if 0 == buffer.capacity() || buffer.capacity() > limit {
+        if buffer.capacity() == 0 || buffer.capacity() > limit {
             return;
         }
-        buffer.clear();
-        // During thread teardown the pool may already be gone; the buffer is then just freed.
-        let _ = POOL.try_with(|pool| {
-            let Ok(mut pool) = pool.try_borrow_mut() else {
-                return;
-            };
-            pool.push(buffer);
-            pool.sort_unstable_by_key(|buffer| std::cmp::Reverse(buffer.capacity()));
-            let mut total = 0usize;
-            let mut kept = 0usize;
-            pool.retain(|buffer| {
-                total = total.saturating_add(buffer.capacity());
-                kept += 1;
-                kept <= MAX_RETAINED_BUFFERS && total <= limit
-            });
-        });
+        let evicted = {
+            let mut pool = pool().lock().unwrap_or_else(|error| error.into_inner());
+            pool.put(buffer, limit)
+        };
+        drop(evicted);
     }
 
     #[cfg(test)]
-    pub(crate) fn retained() -> Vec<usize> {
-        POOL.with_borrow(|pool| pool.iter().map(Vec::capacity).collect())
-    }
+    mod tests {
+        use super::*;
+        use std::sync::Arc;
 
-    #[cfg(test)]
-    pub(crate) fn clear() {
-        POOL.with_borrow_mut(Vec::clear);
+        #[test]
+        fn a_buffer_can_move_between_worker_threads_without_copying() {
+            let pool = Arc::new(Mutex::new(BufferPool::default()));
+            let buffer = vec![0xaa; 4096];
+            let pointer = buffer.as_ptr() as usize;
+            pool.lock().unwrap().put(buffer, 8192);
+            let other = Arc::clone(&pool);
+            std::thread::spawn(move || {
+                let mut buffer = other.lock().unwrap().take(4000);
+                assert_eq!(buffer.as_ptr() as usize, pointer);
+                assert!(buffer.is_empty());
+                buffer.extend_from_slice(b"new contents");
+                other.lock().unwrap().put(buffer, 8192);
+            })
+            .join()
+            .unwrap();
+            let buffer = pool.lock().unwrap().take(4096);
+            assert_eq!(buffer.as_ptr() as usize, pointer);
+            assert!(buffer.is_empty());
+        }
+
+        #[test]
+        fn the_smallest_fit_is_taken_and_inflight_buffers_are_not_shared() {
+            let mut pool = BufferPool::default();
+            for n in [10, 50, 20, 40, 30] {
+                pool.put(Vec::with_capacity(n), 1000);
+            }
+            let first = pool.take(25);
+            let second = pool.take(25);
+            assert_eq!((first.capacity(), second.capacity()), (30, 40));
+            assert_ne!(first.as_ptr(), second.as_ptr());
+            assert_eq!(pool.take(100).capacity(), 0);
+            assert_eq!(pool.buffers.len(), 3);
+        }
+
+        #[test]
+        fn retention_obeys_both_byte_and_count_limits_and_can_be_disabled() {
+            let mut pool = BufferPool::default();
+            for n in 1..=40 {
+                pool.put(Vec::with_capacity(n), usize::MAX);
+            }
+            assert_eq!(pool.buffers.len(), MAX_RETAINED_BUFFERS);
+            assert_eq!(pool.buffers.last().unwrap().capacity(), 9);
+            let evicted = pool.put(Vec::with_capacity(50), 100);
+            assert_eq!(pool.buffers.iter().map(Vec::capacity).sum::<usize>(), 90);
+            assert!(!evicted.is_empty());
+            assert_eq!(pool.put(Vec::with_capacity(101), 100).len(), 1);
+            assert_eq!(pool.buffers.len(), 2);
+            let mut disabled = BufferPool::default();
+            assert_eq!(disabled.put(Vec::with_capacity(10), 0).len(), 1);
+            assert!(disabled.buffers.is_empty());
+        }
+
+        #[test]
+        fn size_classes_respect_limits_and_integer_overflow() {
+            let mib = 1 << 20;
+            assert_eq!(rounded_capacity(1000, 1024 * mib), 1000);
+            assert_eq!(rounded_capacity(32 * mib, 1024 * mib), 32 * mib);
+            assert_eq!(rounded_capacity(52 * mib + 1, 1024 * mib), 56 * mib);
+            assert_eq!(rounded_capacity(52 * mib + 1, 53 * mib), 52 * mib + 1);
+            assert_eq!(rounded_capacity(52 * mib + 1, 0), 52 * mib + 1);
+            assert_eq!(rounded_capacity(1024 * mib + 1, 1024 * mib), 1024 * mib + 1);
+            assert_eq!(rounded_capacity(usize::MAX, usize::MAX), usize::MAX);
+        }
     }
 }
 
@@ -584,10 +692,11 @@ pub(super) fn decode_column_frames(
             loaded,
         });
     }
-    let mut bytes = stream_buffers::take(total);
+    let capacity = stream_buffers::allocation_capacity(total);
+    let mut bytes = stream_buffers::take(capacity);
     bytes
-        .try_reserve_exact(total)
-        .map_err(|_| PackedStreamError::AllocationFailed { requested: total })?;
+        .try_reserve_exact(capacity)
+        .map_err(|_| PackedStreamError::AllocationFailed { requested: capacity })?;
 
     let mut context = zstd::zstd_safe::DCtx::create();
     let compressed_total = offsets
@@ -1533,45 +1642,7 @@ mod stream_buffer_tests {
     use super::*;
 
     #[test]
-    fn a_dropped_stream_leaves_its_buffer_for_the_next_one_on_the_thread() {
-        stream_buffers::clear();
-        let mut bytes = Vec::with_capacity(4096);
-        bytes.extend_from_slice(&[7; 100]);
-        let pointer = bytes.as_ptr();
-        drop(DecodedPackedStream::from_tables(bytes));
-        assert_eq!(stream_buffers::retained(), [4096]);
-        let reused = stream_buffers::take(1000);
-        assert_eq!((reused.as_ptr(), reused.len(), reused.capacity()), (pointer, 0, 4096));
-        assert!(stream_buffers::retained().is_empty());
-        // A request larger than anything kept gets a new buffer and leaves the pool alone.
-        stream_buffers::give_back(reused);
-        assert_eq!(stream_buffers::take(8192).capacity(), 0);
-        assert_eq!(stream_buffers::retained(), [4096]);
-        stream_buffers::clear();
-    }
-
-    #[test]
-    fn the_pool_takes_the_smallest_fit_and_keeps_only_the_largest_few() {
-        stream_buffers::clear();
-        for capacity in [10, 50, 20, 40, 30] {
-            stream_buffers::give_back(Vec::with_capacity(capacity));
-        }
-        assert_eq!(stream_buffers::retained(), [50, 40, 30, 20]);
-        assert_eq!(stream_buffers::take(25).capacity(), 30);
-        assert_eq!(stream_buffers::retained(), [50, 40, 20]);
-        stream_buffers::clear();
-    }
-
-    #[test]
-    fn buffers_beyond_the_retention_limit_are_freed() {
-        stream_buffers::clear();
-        stream_buffers::give_back(Vec::with_capacity((256 << 20) + 1));
-        assert!(stream_buffers::retained().is_empty());
-    }
-
-    #[test]
     fn decoded_columns_are_unchanged_when_their_buffer_is_reused() {
-        stream_buffers::clear();
         let frames: Vec<Vec<u8>> = vec![vec![1; 64], vec![2; 32]];
         let compressed: Vec<Vec<u8>> =
             frames.iter().map(|frame| zstd::encode_all(frame.as_slice(), 3).unwrap()).collect();
@@ -1598,6 +1669,5 @@ mod stream_buffer_tests {
         stream_buffers::give_back(dirty);
         let second = decode();
         assert_eq!(second.as_bytes(), first.as_slice());
-        stream_buffers::clear();
     }
 }
