@@ -606,8 +606,7 @@ impl WriterOptions {
                     | AdaptiveColumns::GROUPED_TABLES
                     | AdaptiveColumns::VERBATIM_TEXT
                     | AdaptiveColumns::DICTIONARY_LONG_DISTANCE_MATCHING
-                    | AdaptiveColumns::FIELD_DICTIONARIES
-                    | AdaptiveColumns::DECIMAL_FLOATS,
+                    | AdaptiveColumns::FIELD_DICTIONARIES,
             ),
         }
     }
@@ -656,11 +655,13 @@ impl WriterOptions {
     /// Enables or disables storing float columns as decimals, which takes effect only with adaptive
     /// numeric columns.
     ///
-    /// When enabled (the default), a float column whose every value is `m / 10^k` for integers `m`
-    /// and one scale `k` of at most 15, rounded to a double, or to a float when every value is a
-    /// widened float, may be stored as its scale and its mantissas in an integer scheme, if that
-    /// is smallest. Values are reproduced bit for bit. An archive with such a column is stamped
-    /// version 0.11.0, which earlier readers refuse.
+    /// When enabled (off by default), a float column whose every value is `m / 10^k` for integers
+    /// `m` and one scale `k` of at most 15, rounded to a double, or to a float when every value is
+    /// a widened float, may be stored as its scale and its mantissas in an integer scheme, if that
+    /// is smallest. Values are reproduced bit for bit. Archives shrink, but filters on such a
+    /// column decode every row, where a dictionary-encoded float column tests each distinct value
+    /// once. An archive with such a column is stamped version 0.11.0, which earlier readers
+    /// refuse.
     #[must_use]
     pub const fn with_decimal_float_columns(mut self, enabled: bool) -> Self {
         self.adaptive = self.adaptive.with(AdaptiveColumns::DECIMAL_FLOATS, enabled);
@@ -2301,12 +2302,10 @@ mod tests {
         for values in cases {
             let expected: Vec<u64> = values.iter().map(|v| v.to_bits()).collect();
             let (version, bits) = adaptive_float_column_bits(adaptive_float_archive(&values));
-            // An adaptive archive, with per-field log-type dictionaries, adaptive string columns
-            // and text stored whole by default, is stamped 0.9.0, or 0.11.0 with decimal floats.
-            assert!(
-                [crate::archive::ArchiveVersion::VERBATIM_TEXT, crate::archive::ArchiveVersion::DECIMAL_FLOATS]
-                    .contains(&version),
-                "{version:?}"
+            assert_eq!(
+                version,
+                crate::archive::ArchiveVersion::VERBATIM_TEXT,
+                "an adaptive archive, with per-field log-type dictionaries, adaptive string columns and text stored whole by default, is stamped 0.9.0"
             );
             assert_eq!(bits, expected, "float column round-trips bit-exact");
         }
@@ -2320,11 +2319,11 @@ mod tests {
         let widened: Vec<f64> = doubles.iter().map(|&v| f64::from(v as f32)).collect();
         for values in [&doubles, &widened] {
             let expected: Vec<u64> = values.iter().map(|v| v.to_bits()).collect();
-            let decimal = adaptive_float_archive(values);
+            let decimal = adaptive_float_archive_with(values, WriterOptions::default().with_decimal_float_columns(true));
             let (version, bits) = adaptive_float_column_bits(decimal.clone());
             assert_eq!(crate::archive::ArchiveVersion::DECIMAL_FLOATS, version);
             assert_eq!(expected, bits);
-            let plain = adaptive_float_archive_with(values, WriterOptions::default().with_decimal_float_columns(false));
+            let plain = adaptive_float_archive(values);
             assert!(decimal.len() < plain.len(), "{} >= {}", decimal.len(), plain.len());
             let (version, bits) = adaptive_float_column_bits(plain);
             assert_eq!(crate::archive::ArchiveVersion::VERBATIM_TEXT, version);
