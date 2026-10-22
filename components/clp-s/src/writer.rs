@@ -658,10 +658,12 @@ impl WriterOptions {
     /// When enabled (off by default), a float column whose every value is `m / 10^k` for integers
     /// `m` and one scale `k` of at most 15, rounded to a double, or to a float when every value is
     /// a widened float, may be stored as its scale and its mantissas in an integer scheme, if that
-    /// is smallest. Values are reproduced bit for bit. Archives shrink, but filters on such a
-    /// column decode every row, where a dictionary-encoded float column tests each distinct value
-    /// once. An archive with such a column is stamped version 0.11.0, which earlier readers
-    /// refuse.
+    /// is smallest. Values are reproduced bit for bit. Archives shrink, but reading such a column
+    /// decompresses its mantissas into, and decodes them out of, buffers of 8 bytes per row, where
+    /// a dictionary-encoded float column is a fraction of that and filters test each distinct
+    /// value once. Faulting in those buffers dominates: about 14 ms per million rows in a fresh
+    /// process, and almost nothing once a long-running reader's stream buffer pool retains them.
+    /// An archive with such a column is stamped version 0.11.0, which earlier readers refuse.
     #[must_use]
     pub const fn with_decimal_float_columns(mut self, enabled: bool) -> Self {
         self.adaptive = self.adaptive.with(AdaptiveColumns::DECIMAL_FLOATS, enabled);

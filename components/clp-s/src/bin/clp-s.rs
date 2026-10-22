@@ -201,8 +201,11 @@ struct CompressArgs {
     no_adaptive_numeric_columns: bool,
     /// Allow float columns to be stored as decimal mantissas and a scale when that reproduces
     /// every value and is smallest (off by default; needs adaptive numeric columns). Float32
-    /// signals and few-digit readings shrink by a third or more, but filters on such a column
-    /// decode every row. Such a column stamps archive version 0.11.0, which earlier readers refuse.
+    /// signals and few-digit readings shrink about 18% beyond the default, but reading such a
+    /// column fills two buffers of 8 bytes per row, which a fresh process must fault in: each
+    /// search adds about 14 ms per million rows, and a long-running reader such as DuckDB pays it
+    /// on its first query only. Such a column stamps archive version 0.11.0, which earlier readers
+    /// refuse.
     #[arg(long, default_value_t = false)]
     decimal_float_columns: bool,
     /// Omit the optional numeric summaries (count/sum/min/max) and timestamp chunk index from new
