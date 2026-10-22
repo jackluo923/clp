@@ -72,6 +72,12 @@ fn validate_dictionary_codes(codes: &[u8], width: u8, rows: usize, entries: usiz
             let code = (usize::from(codes[full_bytes]) >> (lane * usize::from(width))) & mask;
             if code >= entries { return Err(Error::Truncated); }
         }
+    } else if width == 16 {
+        // Whole little-endian u16 codes; `unpack_bits_iter` has checked the span.
+        let codes = &codes[..rows * 2];
+        if codes.chunks_exact(2).fold(0, |max, c| max.max(u16::from_le_bytes([c[0], c[1]]))) as usize >= entries {
+            return Err(Error::Truncated);
+        }
     } else {
         for code in decoded {
             if code >= entries as u64 { return Err(Error::Truncated); }
@@ -421,6 +427,10 @@ impl<'a> NumericColumn<'a> {
                         (2, true) => or_dictionary_bytes::<4>(codes, start, bitmap, truth, &accepted),
                         (4, true) => or_dictionary_bytes::<2>(codes, start, bitmap, truth, &accepted),
                         (8, true) => or_dictionary_bytes::<1>(codes, start, bitmap, truth, &accepted),
+                        (16, _) => for (dest, code) in bitmap.iter_mut()
+                            .zip(codes[start * 2..(start + count) * 2].chunks_exact(2)) {
+                            if accepted[usize::from(u16::from_le_bytes([code[0], code[1]]))] { *dest = truth; }
+                        },
                         _ => for (dest, code) in bitmap.iter_mut().zip(Self::codes(codes, width, start, count)) {
                             if accepted[code as usize] { *dest = truth; }
                         },
@@ -540,8 +550,8 @@ mod tests {
                 check(&wire, &[], float);
             }
             let values = [0u64, u64::MAX, i64::MIN as u64, 42, 0x7ff8000000001234];
-            for width in [3, 7, 8, 9, 31, 63, 64] {
-                let indices: Vec<_> = (0..39).map(|i| (i % values.len()) as u64).collect();
+            for (width, rows) in [3, 7, 8, 9, 16, 31, 63, 64].map(|w| (w, 39)).into_iter().chain([(16, 300)]) {
+                let indices: Vec<_> = (0..rows).map(|i| (i * 7 % values.len()) as u64).collect();
                 let mut wire = vec![if float { 2 } else { 3 }];
                 wire.extend((values.len() as u32).to_le_bytes());
                 for value in values { wire.extend(value.to_le_bytes()); }
@@ -556,6 +566,22 @@ mod tests {
             let mut expected = Vec::new();
             for (v, count) in runs { wire.extend(v.to_le_bytes()); wire.extend(count.to_le_bytes()); expected.extend(std::iter::repeat_n(v, count as usize)); }
             check(&wire, &expected, float);
+        }
+    }
+
+    #[test]
+    fn sixteen_bit_dictionary_codes_beyond_the_table_are_rejected() {
+        for rows in [3, 300] {
+            let mut wire = vec![2];
+            wire.extend(2u32.to_le_bytes());
+            for value in [5u64, 6] { wire.extend(value.to_le_bytes()); }
+            wire.push(16);
+            let mut indices = vec![1u64; rows];
+            indices[rows - 1] = 2;
+            adaptive_int::pack_bits(&indices, 16, &mut wire);
+            let mut bytes = Vec::new();
+            let kind = prepare(&wire, rows, true, &mut bytes).unwrap().unwrap();
+            assert!(NumericColumn::encoded(&bytes, rows, kind).is_err(), "rows={rows}");
         }
     }
 

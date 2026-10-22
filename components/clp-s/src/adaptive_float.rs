@@ -17,6 +17,10 @@
 //!   like-significance bytes (which are highly repetitive across nearby values) sit together and
 //!   zstd can compress them; the mechanism Parquet uses for floating point.
 //! - `DICT` — a table of the distinct bit patterns plus bit-packed indices (low-cardinality floats).
+//!   Offered twice: with the table in first-appearance order and the narrowest indices, and with
+//!   the table sorted by value and indices one or two whole bytes wide. Sorted, a slowly varying
+//!   signal has slowly varying indices, and whole bytes keep them aligned, which zstd exploits as
+//!   it does integers; filters still test each distinct value once.
 //! - `RLE` — `(value, run-length)` pairs (long constant runs).
 //! - `CONSTANT` — a single value (the whole column is one number).
 //! - `DECIMAL` — the integers `m` and one scale `k` such that every value is `m / 10^k`, rounded
@@ -136,6 +140,33 @@ fn encode_dict(bits: &[u64], cardinality: usize) -> Vec<u8> {
     out
 }
 
+/// A `DICT` stream whose table is sorted by value and whose indices are 8 or 16 bits wide. Only
+/// for a column of at most 65,536 distinct values.
+fn encode_sorted_dict(bits: &[u64], cardinality: usize) -> Vec<u8> {
+    let mut table: Vec<u64> = Vec::with_capacity(cardinality);
+    let mut seen: HashMap<u64, ()> = HashMap::with_capacity(cardinality);
+    for &v in bits {
+        if seen.insert(v, ()).is_none() {
+            table.push(v);
+        }
+    }
+    // Total order on the values; bit patterns are distinct, so ties cannot occur.
+    table.sort_unstable_by(|a, b| f64::from_bits(*a).total_cmp(&f64::from_bits(*b)));
+    let index_of: HashMap<u64, u64> = table.iter().enumerate().map(|(i, &v)| (v, i as u64)).collect();
+    let indices: Vec<u64> = bits.iter().map(|v| index_of[v]).collect();
+    let idx_width = if table.len() <= 1 << 8 { 8 } else { 16 };
+    let mut out =
+        Vec::with_capacity(1 + 4 + table.len() * 8 + 1 + packed_len(bits.len(), idx_width));
+    out.push(DICT);
+    out.extend_from_slice(&(table.len() as u32).to_le_bytes());
+    for &v in &table {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.push(idx_width);
+    pack_bits(&indices, idx_width, &mut out);
+    out
+}
+
 fn encode_rle(bits: &[u64], runs: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 4 + runs * 12);
     out.push(RLE);
@@ -217,7 +248,7 @@ pub fn candidates(bits: &[u64], decimal: bool) -> impl Iterator<Item = Vec<u8>> 
     let decimal = decimal
         && stats.is_some_and(|(cardinality, _)| cardinality != Some(1))
         && bits.len() >= 2;
-    let fixed = (0..4).filter_map(move |scheme| {
+    let fixed = (0..5).filter_map(move |scheme| {
         let Some((cardinality, runs)) = stats else {
             return (scheme == 0).then(|| vec![PLAIN]);
         };
@@ -231,6 +262,9 @@ pub fn candidates(bits: &[u64], decimal: bool) -> impl Iterator<Item = Vec<u8>> 
                 .filter(|&n| n < bits.len())
                 .map(|n| encode_dict(bits, n)),
             3 if runs * 2 < bits.len() => Some(encode_rle(bits, runs)),
+            4 => cardinality
+                .filter(|&n| n < bits.len() && n <= 1 << 16)
+                .map(|n| encode_sorted_dict(bits, n)),
             _ => None,
         }
     });
@@ -403,6 +437,7 @@ mod tests {
             super::BYTE_STREAM_SPLIT,
             super::DICT,
             super::RLE,
+            super::DICT,
         ] {
             let candidate = candidates.next().expect("candidate in historical order");
             assert_eq!(scheme, candidate[0]);
@@ -490,6 +525,30 @@ mod tests {
     }
 
     #[test]
+    fn sorted_dictionaries_order_values_and_align_indices() {
+        let values = [2.5_f64, -1.0, 7.25, -1.0, 2.5, 100.0, -0.0, 0.0];
+        let bits: Vec<u64> = values.iter().map(|v| v.to_bits()).collect();
+        let stream = encode_sorted_dict(&bits, 6);
+        assert_eq!(bits, decode(&stream, bits.len()).unwrap());
+        let table: Vec<f64> = stream[5..5 + 6 * 8]
+            .chunks_exact(8)
+            .map(|c| f64::from_bits(u64::from_le_bytes(c.try_into().unwrap())))
+            .collect();
+        assert_eq!(vec![-1.0, -0.0, 0.0, 2.5, 7.25, 100.0], table);
+        assert!(table[1].is_sign_negative());
+        assert_eq!(8, stream[5 + 6 * 8]);
+        assert_eq!(&[3, 0, 4, 0, 3, 5, 1, 2], &stream[5 + 6 * 8 + 1..]);
+        // More than 256 distinct values take 16-bit indices.
+        let many: Vec<u64> = (0..1000).map(|i| f64::from(999 - i % 300).to_bits()).collect();
+        let stream = encode_sorted_dict(&many, 300);
+        assert_eq!(16, stream[5 + 300 * 8]);
+        assert_eq!(many, decode(&stream, many.len()).unwrap());
+        let mut le = Vec::new();
+        decode_to_le(&stream, many.len(), &mut le).unwrap();
+        assert_eq!(many.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(), le);
+    }
+
+    #[test]
     fn decimal_columns_use_the_smallest_exact_scale() {
         let parsed = |texts: &[&str]| -> Vec<u64> { texts.iter().map(|t| t.parse::<f64>().unwrap().to_bits()).collect() };
         // Doubles parsed from decimal text: the scale is the most fractional digits.
@@ -516,8 +575,8 @@ mod tests {
         for bits in [&parsed, &widened] {
             round_trip(bits);
             let schemes: Vec<u8> = candidates(bits, true).map(|c| c[0]).collect();
-            assert_eq!(&[PLAIN, BYTE_STREAM_SPLIT, DICT], &schemes[..3]);
-            assert!(schemes.len() > 3 && schemes[3..].iter().all(|&s| s == DECIMAL), "{schemes:?}");
+            assert_eq!(&[PLAIN, BYTE_STREAM_SPLIT, DICT, DICT], &schemes[..4]);
+            assert!(schemes.len() > 4 && schemes[4..].iter().all(|&s| s == DECIMAL), "{schemes:?}");
             assert!(candidates(bits, false).all(|c| c[0] != DECIMAL));
         }
         // A column of one value stays constant.
