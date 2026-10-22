@@ -735,26 +735,13 @@ pub unsafe extern "C" fn clp_s_v6_numeric_aggregate(
                     check()?;
                     return Ok(());
                 }
-                if predicate == -1 && force_scan == 0 {
-                    for (i, root) in outputs.iter().enumerate() {
-                        if let Some(f) = summary_field(*root as usize, nodes) {
-                            if let Some(summary) = metadata.field(&paths[f], fields[f].typ)? {
-                                out[i] = summary;
-                            }
-                        }
-                    }
-                    if out.iter().all(|s| s.supported != 0) {
-                        check()?;
-                        return Ok(());
-                    }
-                }
-                if predicate >= 0 && force_scan == 0 {
+                if force_scan == 0 {
                     window_partials = window::partials(metadata, &paths, fields, nodes, outputs, sum_required, predicate)?;
                     if let Some(partials) = &window_partials {
                         let scan_tables = partials.scan_tables.iter().filter(|scan| **scan).count();
                         if std::env::var_os("CLP_SCAN_PROFILE").is_some() {
-                            eprintln!("[clp aggregate] window_summary_tables={} window_rejected_tables={} window_scan_tables={scan_tables}",
-                                partials.covered_tables, partials.rejected_tables);
+                            eprintln!("[clp aggregate] window_summary_tables={} window_rejected_tables={} window_scan_tables={scan_tables} predicate_covered_tables={} summary_partials={}",
+                                partials.covered_tables, partials.rejected_tables, partials.predicate_covered_tables, partials.summary_partials);
                         }
                         if scan_tables == 0 {
                             for (i, root) in outputs.iter().enumerate() {
@@ -781,12 +768,40 @@ pub unsafe extern "C" fn clp_s_v6_numeric_aggregate(
                     max_decompressed
                 },
             ));
-            // Rows that hold none of the fields an aggregate or the predicate needs cannot
-            // contribute, so the scan matches only rows that can; see field_existence_kql.
-            let mut prefilters: Vec<_> = field_existence_kql(&paths, nodes, outputs, predicate)
-                .into_iter()
-                .collect();
-            let time_filters = timestamp_prefilters(&catalog, &paths, fields, nodes, predicate);
+            let table_count = catalog.table_metadata().schema_tables().len();
+            let (scan_tables, scan_outputs, all_rows, metadata_outputs, mut ints, mut floats) = match window_partials {
+                Some(p) => (p.scan_tables, p.scan_outputs, p.all_rows, p.metadata_outputs, p.ints, p.floats),
+                None => (vec![true; table_count], vec![vec![true; output_len]; table_count],
+                    vec![false; table_count], vec![false; output_len],
+                    vec![IntegerSummary::default(); output_len], vec![FloatSummary::default(); output_len]),
+            };
+            let dependencies: Vec<Vec<usize>> = outputs.iter().map(|root| {
+                let mut fields = Vec::new(); fields_of(*root as usize, nodes, &mut fields); fields
+            }).collect();
+            let mut predicate_fields = Vec::new();
+            if predicate >= 0 { fields_of(predicate as usize, nodes, &mut predicate_fields); }
+            let table_fields: Vec<Vec<bool>> = (0..table_count).map(|table| {
+                let mut needed = vec![force_scan != 0; field_len];
+                if scan_tables[table] {
+                    for (i, deps) in dependencies.iter().enumerate() {
+                        if scan_outputs[table][i] { for &field in deps { needed[field] = true; } }
+                    }
+                    if !all_rows[table] { for &field in &predicate_fields { needed[field] = true; } }
+                } else { needed.fill(false); }
+                needed
+            }).collect();
+            let active: Vec<_> = (0..field_len).filter(|field| table_fields.iter().any(|needed| needed[*field])).collect();
+            let scan_paths: Vec<_> = active.iter().map(|&field| paths[field].clone()).collect();
+            let plans = table_fields.iter().enumerate().map(|(table, needed)| columnar::NumericColumnPlan {
+                fields: active.iter().map(|&field| needed[field]).collect(), all_rows: all_rows[table],
+            }).collect();
+            let residual = if scan_tables.iter().enumerate().any(|(i, scan)| *scan && !all_rows[i]) { predicate } else { -1 };
+            let scan_roots: Vec<_> = outputs.iter().enumerate().filter_map(|(i, root)|
+                scan_outputs.iter().any(|scan| scan[i]).then_some(*root)).collect();
+            // Necessary conditions apply only to unresolved tables. Covered tables
+            // bypass this query altogether and retain their exact SQL coverage proof.
+            let mut prefilters: Vec<_> = field_existence_kql(&paths, nodes, &scan_roots, residual).into_iter().collect();
+            let time_filters = timestamp_prefilters(&catalog, &paths, fields, nodes, residual);
             let time_filter_count = time_filters.len();
             prefilters.extend(time_filters);
             let kql = if prefilters.is_empty() {
@@ -803,31 +818,32 @@ pub unsafe extern "C" fn clp_s_v6_numeric_aggregate(
                 }
                 Err(_) => parse_kql("*", KqlLimits::default()).map_err(failure)?,
             };
-            let mut scanner =
-                columnar::ProjectedScanner::open_with_catalog(reader, catalog, parsed, &options, &paths)
-                    .map_err(failure)?;
-            let (mut ints, mut floats) = match window_partials {
-                Some(partials) => {
-                    scanner.restrict_tables(&partials.scan_tables).map_err(failure)?;
-                    (partials.ints, partials.floats)
-                }
-                None => (vec![IntegerSummary::default(); output_len], vec![FloatSummary::default(); output_len]),
-            };
+            let mut scanner = columnar::ProjectedScanner::open_with_catalog(reader, catalog, parsed, &options, &scan_paths)
+                .map_err(failure)?;
+            scanner.set_numeric_plans(plans).map_err(failure)?;
+            scanner.restrict_tables(&scan_tables).map_err(failure)?;
             let mut values = vec![None; field_len];
             let mut cache = vec![None; node_len];
             let window_scan = if force_scan == 0 {
                 window::ScanProgram::new(nodes, fields, outputs, predicate)
             } else { None };
+            let covered_scan = if force_scan == 0 { window::ScanProgram::new(nodes, fields, outputs, -1) } else { None };
+            let mut projected = vec![columnar::ColumnView { kind: columnar::kind::ABSENT, reserved: 0, data: std::ptr::null() }; field_len];
             let profile = std::env::var_os("CLP_SCAN_PROFILE").is_some();
             let mut evaluated_rows = 0u64;
-            while let Some((columns, text, rows)) =
-                scanner.next_columns_with_constants(true).map_err(failure)?
-            {
+            let mut predicate_rows = 0u64;
+            if profile { eprintln!("[clp aggregate] projected_fields={} input_fields={field_len}", active.len()); }
+            while let Some((table, columns, text, rows)) = scanner.next_numeric_columns().map_err(failure)? {
+                for (&field, column) in active.iter().zip(columns) { projected[field] = *column; }
+                let columns = &projected;
+                let table_predicate = if all_rows[table] { -1 } else { predicate };
+                let table_window_scan = if all_rows[table] { &covered_scan } else { &window_scan };
                 if profile {
                     evaluated_rows = evaluated_rows.saturating_add(rows as u64);
+                    if table_predicate >= 0 { predicate_rows = predicate_rows.saturating_add(rows as u64); }
                 }
-                if let Some(window_scan) = &window_scan {
-                    window_scan.consume(&columns, text, rows, fields, sum_required,
+                if let Some(window_scan) = table_window_scan {
+                    window_scan.consume(columns, text, rows, fields, sum_required, &scan_outputs[table],
                         &mut ints, &mut floats, &check)?;
                     continue;
                 }
@@ -835,22 +851,20 @@ pub unsafe extern "C" fn clp_s_v6_numeric_aggregate(
                     if row % 8192 == 0 {
                         check()?;
                     }
-                    for (i, column) in columns.iter().enumerate() {
-                        values[i] = value(column, row, text, fields[i].typ)?;
+                    for &i in &active {
+                        values[i] = value(&columns[i], row, text, fields[i].typ)?;
                     }
                     cache.fill(None);
-                    if predicate >= 0
+                    if table_predicate >= 0
                         && !matches!(
-                            evaluate(predicate as usize, nodes, &values, &mut cache)?,
+                            evaluate(table_predicate as usize, nodes, &values, &mut cache)?,
                             Some(Scalar::Bool(true))
                         )
                     {
                         continue;
                     }
                     for (i, root) in outputs.iter().enumerate() {
-                        if out[i].supported != 0 {
-                            continue;
-                        }
+                        if !scan_outputs[table][i] { continue; }
                         match evaluate(*root as usize, nodes, &values, &mut cache)? {
                             Some(Scalar::Int(v)) => {
                                 if sum_required[i] == 0 {
@@ -873,7 +887,7 @@ pub unsafe extern "C" fn clp_s_v6_numeric_aggregate(
                 }
             }
             if profile {
-                eprintln!("[clp aggregate] evaluated_rows={evaluated_rows}");
+                eprintln!("[clp aggregate] evaluated_rows={evaluated_rows} predicate_rows={predicate_rows}");
             }
             for (i, root) in outputs.iter().enumerate() {
                 if out[i].supported == 0 {
@@ -881,7 +895,7 @@ pub unsafe extern "C" fn clp_s_v6_numeric_aggregate(
                         ints[i].clone(),
                         floats[i].clone(),
                         nodes[*root as usize].typ,
-                        false,
+                        metadata_outputs[i],
                     );
                 }
             }

@@ -209,7 +209,11 @@ impl ScanProgram {
         outputs: &[u32],
         predicate: i32,
     ) -> Option<Self> {
-        let conditions = conditions(nodes, fields, predicate)?;
+        let conditions = if predicate < 0 {
+            Vec::new()
+        } else {
+            conditions(nodes, fields, predicate)?
+        };
         let inputs = inputs(nodes, fields, outputs)?;
         let mut ranges: Vec<(usize, i128, i128)> = Vec::new();
         let mut empty = false;
@@ -261,6 +265,7 @@ impl ScanProgram {
         rows: usize,
         fields: &[Field],
         sum_required: &[u8],
+        scan_outputs: &[bool],
         ints: &mut [IntegerSummary],
         floats: &mut [FloatSummary],
         check: &impl Fn() -> Result<(), ApiError>,
@@ -289,6 +294,9 @@ impl ScanProgram {
                 }
             }
             for (i, input) in self.inputs.iter().enumerate() {
+                if !scan_outputs[i] {
+                    continue;
+                }
                 check()?;
                 for &row in &selected {
                     let v = match input {
@@ -326,10 +334,15 @@ impl ScanProgram {
 
 pub(super) struct Partials {
     pub scan_tables: Vec<bool>,
+    pub scan_outputs: Vec<Vec<bool>>,
+    pub all_rows: Vec<bool>,
+    pub metadata_outputs: Vec<bool>,
     pub ints: Vec<IntegerSummary>,
     pub floats: Vec<FloatSummary>,
     pub covered_tables: usize,
     pub rejected_tables: usize,
+    pub predicate_covered_tables: usize,
+    pub summary_partials: usize,
 }
 
 pub(super) fn partials(
@@ -341,13 +354,20 @@ pub(super) fn partials(
     sum_required: &[u8],
     predicate: i32,
 ) -> Result<Option<Partials>, ApiError> {
-    let Some(conditions) = conditions(nodes, fields, predicate) else {
-        return Ok(None);
+    let conditions = if predicate < 0 {
+        Vec::new()
+    } else {
+        let Some(conditions) = conditions(nodes, fields, predicate) else {
+            return Ok(None);
+        };
+        conditions
     };
-    let Some(inputs) = inputs(nodes, fields, outputs) else {
-        // Cross-column expressions and per-aggregate FILTERs still scan.
-        return Ok(None);
-    };
+    // Coverage is independent of aggregate arguments. Arithmetic/FILTER outputs
+    // still evaluate normally; independently eligible outputs can use summaries.
+    let inputs: Vec<_> = outputs
+        .iter()
+        .map(|&root| inputs(nodes, fields, &[root]).and_then(|mut values| values.pop()))
+        .collect();
     let field_nodes: Vec<_> = paths
         .iter()
         .map(|p| columnar::resolve_descriptor_path(ctx.catalog.schema_tree(), p))
@@ -355,28 +375,35 @@ pub(super) fn partials(
     let tables = ctx.catalog.table_metadata().schema_tables();
     let mut result = Partials {
         scan_tables: vec![true; tables.len()],
+        scan_outputs: vec![vec![true; outputs.len()]; tables.len()],
+        all_rows: vec![false; tables.len()],
+        metadata_outputs: vec![true; outputs.len()],
         ints: vec![IntegerSummary::default(); outputs.len()],
         floats: vec![FloatSummary::default(); outputs.len()],
         covered_tables: 0,
         rejected_tables: 0,
+        predicate_covered_tables: 0,
+        summary_partials: 0,
     };
     for (index, table) in tables.iter().enumerate() {
         match coverage(ctx, table, &field_nodes, fields, &conditions)? {
             Coverage::None => {
                 result.scan_tables[index] = false;
+                result.scan_outputs[index].fill(false);
                 result.rejected_tables += 1;
                 continue;
             }
             Coverage::Unknown => continue,
             Coverage::All => (),
         }
-        let mut summaries = Vec::with_capacity(inputs.len());
+        result.all_rows[index] = true;
+        result.predicate_covered_tables += 1;
         for (i, input) in inputs.iter().enumerate() {
             let summary = match input {
-                Input::Field(field) => {
+                Some(Input::Field(field)) => {
                     ctx.field_tables(&field_nodes[*field], fields[*field].typ, [table])?
                 }
-                Input::Constant(value) => {
+                Some(Input::Constant(value)) => {
                     let mut summary = ClpNumericSummary {
                         supported: 1,
                         from_metadata: 1,
@@ -395,25 +422,17 @@ pub(super) fn partials(
                                 );
                             }
                         }
-                        // Constant floating SUM changes rounding relative to repeated addition;
-                        // leave it on the established evaluator.
-                        Some(_) => break,
+                        // Preserve repeated addition for a floating constant.
+                        Some(_) => continue,
                         None => (),
                     }
                     Some(summary)
                 }
+                None => continue,
             };
             let Some(summary) = summary.filter(|s| s.supported != 0) else {
-                break;
+                continue;
             };
-            summaries.push(summary);
-        }
-        // Use a table's summaries only if every output can be answered. Otherwise
-        // one shared scan computes all outputs, with no skipped expression errors.
-        if summaries.len() != inputs.len() {
-            continue;
-        }
-        for (i, summary) in summaries.iter().enumerate() {
             if nodes[outputs[i] as usize].typ == 3 {
                 result.floats[i]
                     .merge(&FloatSummary {
@@ -437,9 +456,18 @@ pub(super) fn partials(
                     })
                     .ok_or_else(|| failure("integer aggregate overflow"))?;
             }
+            result.scan_outputs[index][i] = false;
+            result.summary_partials += 1;
         }
-        result.scan_tables[index] = false;
-        result.covered_tables += 1;
+        if result.scan_outputs[index].iter().all(|scan| !scan) {
+            result.scan_tables[index] = false;
+            result.covered_tables += 1;
+        }
+    }
+    for scan in &result.scan_outputs {
+        for (i, scan) in scan.iter().enumerate() {
+            result.metadata_outputs[i] &= !scan;
+        }
     }
     Ok(Some(result))
 }

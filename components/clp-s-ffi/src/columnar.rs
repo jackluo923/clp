@@ -288,6 +288,13 @@ pub(crate) fn resolve_descriptor_path(tree: &SchemaTree, descriptor: &str) -> Ve
     resolve_path(tree, &parts.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
+/// Numeric aggregation's per-table projection and proof that every row qualifies.
+/// Only installed by the numeric planner, before consuming compact columns.
+pub(crate) struct NumericColumnPlan {
+    pub fields: Vec<bool>,
+    pub all_rows: bool,
+}
+
 /// A pull-based projected scan over one archive.
 pub struct ProjectedScanner {
     reader: Box<dyn ArchiveReader>,
@@ -302,6 +309,8 @@ pub struct ProjectedScanner {
     filter_nodes: Option<Vec<u32>>,
     /// Sorted schema nodes the scan reads, or `None` to read every column.
     wanted_nodes: Option<Vec<u32>>,
+    numeric_plans: Option<Vec<NumericColumnPlan>>,
+    numeric_all_rows: Option<ParsedQuery>,
     /// Dictionary matches this query has already resolved against this archive.
     ///
     /// The query is compiled once per packed stream and once per buffer refill, and resolving a
@@ -577,6 +586,27 @@ fn filter_nodes(parsed: &ParsedQuery, tree: &SchemaTree) -> Option<Vec<u32>> {
 }
 
 impl ProjectedScanner {
+    pub(crate) fn set_numeric_plans(&mut self, plans: Vec<NumericColumnPlan>) -> Result<(), ScanError> {
+        if plans.len() != self.matchable_tables.len() || plans.iter().any(|p| p.fields.len() != self.field_count)
+            || self.stream_index != 0 || self.stream.is_some() || self.table_cursor != 0 {
+            return Err(ScanError::Projection("invalid initial numeric column plans".into()));
+        }
+        self.numeric_all_rows = Some(clp_s::search::parse_kql("*", Default::default())
+            .map_err(|e| ScanError::Projection(e.to_string()))?);
+        for (i, plan) in plans.iter().enumerate() {
+            if plan.all_rows {
+                self.matchable_tables[i] = true;
+            }
+        }
+        self.numeric_plans = Some(plans);
+        Ok(())
+    }
+
+    pub(crate) fn next_numeric_columns(&mut self) -> Result<Option<(usize, &[ColumnView], &[u8], usize)>, ScanError> {
+        let Some((_, _, rows)) = self.next_columns_with_constants(true)? else { return Ok(None); };
+        Ok(Some((self.table_cursor - 1, &self.column_views, &self.text, rows)))
+    }
+
     /// Restrict a newly opened scanner to physical tables not already answered by summaries.
     /// Call before consuming any rows; false entries are skipped by every scan surface.
     pub(crate) fn restrict_tables(&mut self, allowed: &[bool]) -> Result<(), ScanError> {
@@ -758,6 +788,8 @@ impl ProjectedScanner {
             field_shapes,
             filter_nodes,
             wanted_nodes,
+            numeric_plans: None,
+            numeric_all_rows: None,
             dictionary_matches,
             matchable_tables,
             all_match_tables,
@@ -797,7 +829,7 @@ impl ProjectedScanner {
                 }
                 // An empty projection needs only the match cardinality. Skip data
                 // streams only when every table is rejected or proven all-match.
-                if self.field_count == 0 {
+                if self.field_count == 0 && self.numeric_plans.is_none() {
                     let (first, end) = self.stream_table_range(self.stream_index as u64);
                     if (first..end).all(|i| !self.matchable_tables[i] || self.all_match_tables[i]) {
                         let mut rows = 0usize;
@@ -829,9 +861,6 @@ impl ProjectedScanner {
 
     fn project_next_table_columns(&mut self, constants: bool) -> Result<Option<usize>, ScanError> {
         let stream = self.stream.as_ref().expect("stream is loaded");
-        let compiled = self.parsed.compile_for_archive_reusing(
-            &self.catalog, self.options.search(), &mut self.dictionary_matches,
-        ).map_err(|e| ScanError::Archive(e.to_string()))?;
         let mut tables = self.catalog.schema_tables(
             self.stream_index as u64, stream, self.options.columns(),
         ).map_err(|e| ScanError::Archive(e.to_string()))?;
@@ -842,6 +871,13 @@ impl ProjectedScanner {
             let decoded = decoded.map_err(|e| ScanError::Archive(e.to_string()))?;
             self.table_cursor = decoded.table_index() + 1;
             if !self.matchable_tables[decoded.table_index()] { continue; }
+            let plan = self.numeric_plans.as_ref().map(|plans| &plans[decoded.table_index()]);
+            let parsed = if plan.is_some_and(|p| p.all_rows) {
+                self.numeric_all_rows.as_ref().expect("numeric all-row query")
+            } else { &self.parsed };
+            let compiled = parsed.compile_for_archive_reusing(
+                &self.catalog, self.options.search(), &mut self.dictionary_matches,
+            ).map_err(|e| ScanError::Archive(e.to_string()))?;
             if !compiled.may_match_schema(decoded.schema())
                 .map_err(|e| ScanError::Archive(e.to_string()))? {
                 continue;
@@ -857,7 +893,8 @@ impl ProjectedScanner {
             }
             // Resolve fields without borrowing all of self: compiled borrows
             // the reusable dictionary matches for this table.
-            let columns: Vec<Option<usize>> = self.field_nodes.iter().map(|nodes| {
+            let columns: Vec<Option<usize>> = self.field_nodes.iter().enumerate().map(|(field, nodes)| {
+                if plan.is_some_and(|p| !p.fields[field]) { return None; }
                 decoded.table().columns().iter().position(|c| nodes.contains(&c.node_id()))
             }).collect();
             for (field, slot) in columns.iter().enumerate() {
@@ -1228,6 +1265,9 @@ impl ProjectedScanner {
     /// Which columns of a separate-column stream the filter reads, in column order, or `None`
     /// when its columns are unknown or the stream shares one frame across its tables.
     fn filter_mask(&self, stream_id: u64) -> Option<Vec<bool>> {
+        if self.numeric_plans.as_ref().is_some_and(|plans| plans[self.stream_table_range(stream_id).0].all_rows) {
+            return None;
+        }
         let filter = self.filter_nodes.as_deref()?;
         self.column_nodes(stream_id).map(|nodes| {
             nodes
@@ -1296,6 +1336,16 @@ impl ProjectedScanner {
     }
 
     fn projection_mask(&self, stream_id: u64) -> Option<Vec<bool>> {
+        if let Some(plans) = &self.numeric_plans {
+            let plan = &plans[self.stream_table_range(stream_id).0];
+            let mut wanted: Vec<_> = self.field_nodes.iter().zip(&plan.fields)
+                .filter(|(_, needed)| **needed).flat_map(|(nodes, _)| nodes.iter().copied()).collect();
+            if !plan.all_rows { wanted.extend_from_slice(self.filter_nodes.as_deref()?); }
+            wanted.sort_unstable();
+            wanted.dedup();
+            return self.column_nodes(stream_id)
+                .map(|nodes| nodes.iter().map(|id| wanted.binary_search(id).is_ok()).collect());
+        }
         let wanted = self.wanted_nodes.as_deref()?;
         self.column_nodes(stream_id)
             .map(|nodes| nodes.iter().map(|id| wanted.binary_search(id).is_ok()).collect())
@@ -1823,6 +1873,68 @@ mod prefilter_reuse_tests {
             self.reads.borrow_mut().push((id, wanted.to_vec()));
             if self.whole_projection { self.inner.read_packed_stream(m, t, id, l) }
             else { self.inner.read_packed_stream_projected(m, t, id, wanted, truncate, l) }
+        }
+    }
+
+    #[test]
+    fn numeric_table_plans_skip_summary_and_covered_timestamp_columns() {
+        use clp_s::writer::{FieldRef, OpenArchive, RecordRef, TimestampRef, ValueRef, WriterOptions};
+        for (separate, whole_projection) in [(true, false), (true, true), (false, false)] {
+            let mut writer = OpenArchive::new(Cursor::new(Vec::new()), WriterOptions::default()
+                .with_separate_columns_min_size(if separate { 1 } else { u64::MAX }));
+            for (group, timestamps) in [(b"covered".as_slice(), [1000, 1100]), (b"boundary", [1200, 1400])] {
+                for ts in timestamps {
+                    let raw = ts.to_string();
+                    writer.append_record(RecordRef::new(&[
+                        FieldRef::new(b"ts", ValueRef::Timestamp(TimestampRef::new(ts * 1_000_000, &raw, r"\L", "ts"))),
+                        FieldRef::new(b"a", ValueRef::I64(ts)), FieldRef::new(b"b", ValueRef::I64(2)),
+                        FieldRef::new(b"c", ValueRef::I64(3)), FieldRef::new(group, ValueRef::I64(1)),
+                    ])).unwrap();
+                }
+            }
+            let bytes = writer.finish().unwrap().into_inner().into_inner();
+            let reads = Reads::default();
+            let reader = RecordingReader { inner: SingleFileArchiveReader::open(Cursor::new(bytes)).unwrap(),
+                reads: reads.clone(), whole_projection };
+            let fields: Vec<_> = ["ts", "a", "b", "c"].iter().map(|s| s.to_string()).collect();
+            let mut scan = ProjectedScanner::open(Box::new(reader),
+                parse_kql("ts >= 1000000000 AND ts < 1300000000", KqlLimits::default()).unwrap(),
+                &Default::default(), &fields).unwrap();
+            let covered = resolve_descriptor_path(scan.catalog.schema_tree(), "covered");
+            let covered: Vec<_> = scan.catalog.table_metadata().schema_tables().iter().map(|table|
+                scan.catalog.schema_map().get(table.schema_id()).unwrap().entries().iter()
+                    .any(|e| matches!(e, SchemaEntry::Node(id) if covered.contains(id)))).collect();
+            scan.set_numeric_plans(covered.iter().map(|all| NumericColumnPlan {
+                all_rows: *all, fields: vec![!*all, true, true, !*all],
+            }).collect()).unwrap();
+            let mut counts = [0, 0];
+            while let Some((table, columns, text, rows)) = scan.next_numeric_columns().unwrap() {
+                if covered[table] {
+                    counts[0] += rows;
+                    assert!(text.is_empty(), "covered timestamps must not be reconstructed");
+                    assert_eq!(columns[0].kind, kind::ABSENT);
+                    assert_eq!(columns[3].kind, kind::ABSENT);
+                } else {
+                    counts[1] += rows;
+                    assert_ne!(columns[0].kind, kind::ABSENT);
+                    assert_ne!(columns[3].kind, kind::ABSENT);
+                }
+            }
+            assert_eq!(counts, [2, 1]);
+            if separate {
+                let ts = resolve_descriptor_path(scan.catalog.schema_tree(), "ts");
+                let c = resolve_descriptor_path(scan.catalog.schema_tree(), "c");
+                let reads = reads.borrow();
+                assert!(!reads.is_empty());
+                for (stream, wanted) in reads.iter() {
+                    if covered[scan.stream_table_range(*stream as u64).0] {
+                        let columns = scan.column_nodes(*stream as u64).unwrap();
+                        for (node, wanted) in columns.iter().zip(wanted) {
+                            if ts.contains(node) || c.contains(node) { assert!(!wanted, "summary/time column requested"); }
+                        }
+                    }
+                }
+            }
         }
     }
 

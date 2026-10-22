@@ -277,26 +277,18 @@ fn uncertain_summaries_and_extra_conditions_never_certify_coverage() {
             .unwrap()
             .is_none()
     );
-    extra = nodes.clone();
-    extra.push(node(5, 2, 1, 1));
-    assert!(
-        partials(&ctx, &paths, &fields, &extra, &[7], &[1], 6)
+    for expression in [node(5, 2, 1, 1), node(17, 2, 1, 4), node(2, 4, 1, 0)] {
+        extra = nodes.clone();
+        extra.push(expression);
+        let plan = partials(&ctx, &paths, &fields, &extra, &[7], &[1], 6)
             .unwrap()
-            .is_none()
-    );
-    extra[7] = node(17, 2, 1, 4);
-    assert!(
-        partials(&ctx, &paths, &fields, &extra, &[7], &[1], 6)
-            .unwrap()
-            .is_none()
-    );
-    extra = nodes.clone();
-    extra.push(node(2, 4, 1, 0));
-    assert!(
-        partials(&ctx, &paths, &fields, &extra, &[7], &[1], 6)
-            .unwrap()
-            .is_none()
-    );
+            .unwrap();
+        // Timestamp coverage is valid independently of the output. These
+        // expressions still scan, preserving argument/filter/cast errors.
+        assert_eq!(plan.predicate_covered_tables, 3);
+        assert_eq!(plan.covered_tables, 0);
+        assert_eq!(plan.scan_tables.iter().filter(|scan| **scan).count(), 3);
+    }
 }
 
 #[test]
@@ -331,5 +323,64 @@ fn mixed_integer_units_use_source_extrema_and_string_patterns_require_scanning()
             assert_eq!((actual.count, actual.sum), (forced.count, forced.sum));
             assert_eq!(actual.from_metadata != 0, all);
         }
+    }
+}
+
+#[test]
+fn arithmetic_and_summary_outputs_share_coverage_without_double_counting() {
+    for separate in [false, true] {
+        let bytes = tables(separate);
+        for (lo, hi, predicate, count, squares, sum) in [
+            (0, 2000, 6, 6, 9100, 210),
+            (1000, 1300, 6, 3, 1400, 60),
+            (0, 2000, -1, 8, 59100, 510),
+        ] {
+            let mut nodes = program(lo, hi, 0);
+            nodes.push(node(5, 2, 1, 1));
+            for outputs in [vec![7, 1], vec![7, 1, 0]] {
+                let actual = run(&bytes, &fields(0), &nodes, &outputs, predicate, 0);
+                let forced = run(&bytes, &fields(0), &nodes, &outputs, predicate, 1);
+                for (a, b) in actual.iter().zip(&forced) {
+                    assert_eq!(
+                        (a.count, a.sum, a.min, a.max),
+                        (b.count, b.sum, b.min, b.max)
+                    );
+                }
+                assert_eq!((actual[0].count, integer(actual[0].sum)), (count, squares));
+                assert_eq!(integer(actual[1].sum), sum);
+                assert_eq!(actual[0].from_metadata, 0);
+                assert_eq!(actual[1].from_metadata != 0, lo == 0);
+            }
+            // Timestamp access inside an aggregate FILTER must survive global
+            // window elimination, even when SUM(a) independently uses summaries.
+            nodes.push(node(17, 2, 7, 4));
+            let actual = run(&bytes, &fields(0), &nodes, &[8, 1], predicate, 0);
+            let forced = run(&bytes, &fields(0), &nodes, &[8, 1], predicate, 1);
+            for (a, b) in actual.iter().zip(&forced) {
+                assert_eq!(
+                    (a.count, a.sum, a.min, a.max),
+                    (b.count, b.sum, b.min, b.max)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn covered_constant_float_scans_keep_table_identity_with_zero_projected_fields() {
+    for separate in [false, true] {
+        let bytes = tables(separate);
+        let mut nodes = program(0, 2000, 0);
+        nodes.push(Node {
+            bits: [1.25f64.to_bits(), 0],
+            ..node(1, 3, 0, 0)
+        });
+        let actual = run(&bytes, &fields(0), &nodes, &[7], 6, 0)[0];
+        let forced = run(&bytes, &fields(0), &nodes, &[7], 6, 1)[0];
+        assert_eq!((actual.count, actual.float_sum), (6, 7.5));
+        assert_eq!(
+            (actual.count, actual.float_sum),
+            (forced.count, forced.float_sum)
+        );
     }
 }
