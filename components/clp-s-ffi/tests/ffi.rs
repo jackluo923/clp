@@ -2738,3 +2738,40 @@ fn timestamp_source_scalars_and_search_surfaces_agree() {
         }
     }
 }
+
+#[test]
+fn timestamp_integer_unit_metadata_is_conservative() {
+    use clp_s::writer::{FieldRef, OpenArchive, RecordRef, TimestampRef, ValueRef, WriterOptions};
+    for (patterns, expected) in [
+        (vec![r"\E"], 1_000_000_000), (vec![r"\L"], 1_000_000),
+        (vec![r"\C"], 1_000), (vec![r"\N"], 1),
+        (vec![r"\L", r"\N"], 0), (vec![r#""\L""#], 0),
+        (vec![r#""\Y-\m-\dT\H:\M:\S""#], 0), (vec![], 0),
+    ] {
+        let mut writer = OpenArchive::new(std::io::Cursor::new(Vec::new()), WriterOptions::default());
+        for pattern in patterns {
+            let raw = clp_s::timestamp::TimestampPattern::compile(pattern, Default::default())
+                .unwrap().format_epoch_nanoseconds(1_000_000_000).unwrap();
+            writer.append_record(RecordRef::new(&[FieldRef::new(b"ts",
+                ValueRef::Timestamp(TimestampRef::new(1_000_000_000, &raw, pattern, "ts")))]))
+                .unwrap();
+        }
+        let path = std::env::temp_dir().join(format!("clp-timestamp-unit-{}.clps", std::process::id()));
+        std::fs::write(&path, writer.finish().unwrap().into_inner().into_inner()).unwrap();
+        let archive = open_archive(&path);
+        let mut list = ptr::null_mut();
+        let mut entries = ptr::null();
+        let mut count = 0;
+        let mut message = [0; 512];
+        let mut error = error_buffer(&mut message);
+        // SAFETY: The archive and outputs remain live; free the returned owner once.
+        unsafe {
+            assert_eq!(CLP_S_STATUS_OK, clp_s_v2_archive_field_types(archive.0,
+                &raw mut list, &raw mut entries, &raw mut count, &raw mut error));
+            assert_eq!(expected, clp_s_v3_archive_timestamp_integer_scale(list));
+            assert_eq!(0, clp_s_v3_archive_timestamp_integer_scale(ptr::null()));
+            clp_s_v2_archive_field_type_list_free(list);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+}

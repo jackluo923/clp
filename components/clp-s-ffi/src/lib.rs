@@ -2275,6 +2275,42 @@ pub struct ClpSV2ArchiveFieldTypeList {
     /// Owns the paths `entries` point into; a path's bytes do not move when the handle does.
     _fields: Vec<columnar::ArchiveFieldType>,
     entries: Vec<ClpSV2ArchiveFieldType>,
+    timestamp_integer_scale: i64,
+}
+
+// An archive-wide proof is deliberately conservative: no table decoding is
+// needed, but every pattern must describe the same unquoted integer epoch.
+fn timestamp_integer_scale(patterns: &[clp_s::archive::TimestampPatternEntry]) -> i64 {
+    let mut scale = 0;
+    for pattern in patterns {
+        let current = match pattern.raw() {
+            r"\E" => 1_000_000_000,
+            r"\L" => 1_000_000,
+            r"\C" => 1_000,
+            r"\N" => 1,
+            _ => return 0,
+        };
+        if scale != 0 && scale != current {
+            return 0;
+        }
+        scale = current;
+    }
+    scale
+}
+
+/// Returns nanoseconds per original integer timestamp unit, or zero if unknown.
+/// Strings, floats, mixed units and empty pattern catalogs are not certified.
+/// The caller must separately prove the field holds only timestamp nodes.
+///
+/// # Safety
+/// A non-null `list` must be a live handle returned by
+/// [`clp_s_v2_archive_field_types`]. A null handle returns zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clp_s_v3_archive_timestamp_integer_scale(
+    list: *const ClpSV2ArchiveFieldTypeList,
+) -> i64 {
+    // SAFETY: The caller guarantees a live handle when non-null.
+    unsafe { list.as_ref() }.map_or(0, |list| list.timestamp_integer_scale)
 }
 
 /// Lists the user-namespace schema nodes of an archive, with escaped dot paths and types.
@@ -2338,6 +2374,9 @@ pub unsafe extern "C" fn clp_s_v2_archive_field_types(
             let handle = Box::new(ClpSV2ArchiveFieldTypeList {
                 _fields: fields,
                 entries,
+                timestamp_integer_scale: timestamp_integer_scale(
+                    catalog.metadata().timestamp_dictionary().patterns(),
+                ),
             });
             out_entries.write(handle.entries.as_ptr());
             out_count.write(handle.entries.len());

@@ -697,6 +697,11 @@ clp_s_status clp_s_v2_archive_field_types(
 /** Frees a field-type listing. A null handle is a no-op. */
 void clp_s_v2_archive_field_type_list_free(clp_s_v2_archive_field_type_list *list);
 
+/** Nanoseconds per unquoted integer timestamp unit; zero if not uniform/known.
+ * The caller must also certify that the field has only timestamp nodes.
+ * A null list returns zero; a non-null list must be live. */
+int64_t clp_s_v3_archive_timestamp_integer_scale(const clp_s_v2_archive_field_type_list *list);
+
 #if defined(__cplusplus)
 #define CLP_S_ABI_STATIC_ASSERT(condition, message) static_assert((condition), message)
 #elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
