@@ -1722,7 +1722,7 @@ mod tests {
             MemorySink::default(),
             StatsCollector::default(),
             ArchiveSetOptions::new(
-                WriterOptions::default()
+                WriterOptions::default().with_numeric_summaries(false)
                     .with_log_order(true)
                     .with_dictionary_compression_level(3)
                     .with_dictionary_long_distance_matching(false),

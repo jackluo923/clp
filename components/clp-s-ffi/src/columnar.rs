@@ -145,7 +145,7 @@ impl std::fmt::Display for ScanError {
 /// single node: the same field can be an integer in one schema and a string in another. Object and
 /// structured-array nodes are structural and carry no value, so they are skipped, which mirrors
 /// how the core projection resolves the same descriptors.
-fn resolve_path(tree: &SchemaTree, components: &[&str]) -> Vec<u32> {
+pub(crate) fn resolve_path(tree: &SchemaTree, components: &[&str]) -> Vec<u32> {
     let mut resolved = Vec::new();
     let nodes = tree.nodes();
     let Some(mut current) = user_root(tree) else {

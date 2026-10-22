@@ -1015,6 +1015,24 @@ CLP_S_ABI_STATIC_ASSERT(sizeof(clp_s_kv_ir_event_view) == 120, "event-view ABI v
 #undef CLP_S_ABI_STATIC_ASSERT
 #endif
 
+/* Unfiltered numeric partials. Integer words are signed 128-bit, low word first.
+ * type: 0 BIGINT, 1 UBIGINT, 2 HUGEINT, 3 DOUBLE, 4 TINYINT, 5 SMALLINT, 6 INTEGER.
+ * supported=0 requests the caller's normal typed scan (e.g. timestamp scalar casts).
+ * Optional compression summaries are used when eligible; otherwise scan in Rust.
+ * cancel/context must remain valid for the synchronous call; zero limits use defaults.
+ */
+typedef struct clp_s_v5_numeric_summary_result {
+    uint64_t count;
+    uint64_t sum[2], min[2], max[2];
+    double float_sum, float_min, float_max;
+    uint64_t from_metadata, supported;
+} clp_s_v5_numeric_summary_result;
+clp_s_status clp_s_v5_numeric_summary(
+    uint8_t const *path, size_t path_length, uint8_t const *field, size_t field_length,
+    uint32_t type, uint64_t max_compressed, uint64_t max_decompressed, uint32_t force_scan,
+    uint32_t (*cancel)(void *), void *context, clp_s_v5_numeric_summary_result *out,
+    clp_s_error_buffer *error);
+
 #ifdef __cplusplus
 }
 #endif

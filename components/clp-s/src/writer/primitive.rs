@@ -1048,6 +1048,45 @@ impl PrimitiveArchive {
         Ok(fields)
     }
 
+    pub(super) fn numeric_summaries(&self) -> Result<Vec<u8>, WriterError> {
+        use crate::numeric_summary::{ColumnSummary, NumericSummaries};
+        let mut columns = Vec::new();
+        for table in &self.tables.tables {
+            for column in &table.columns {
+                let mut summary = ColumnSummary { schema: table.schema_id, node: column.node_id, ..Default::default() };
+                match &column.data {
+                    TableColumnData::MixedInteger(buffer) => {
+                        for (row, bytes) in buffer.bits.chunks_exact(8).enumerate() {
+                            let bits = u64::from_le_bytes(bytes.try_into().unwrap());
+                            let unsigned = !buffer.bitmap.is_empty() && buffer.bitmap[row / 8] & (1 << (row % 8)) != 0;
+                            let v = if unsigned { i128::from(bits) } else { i128::from(bits as i64) };
+                            summary.add_integer(v).ok_or(WriterError::SizeOverflow)?;
+                        }
+                    }
+                    TableColumnData::Fixed(bytes) if column.node_type == NodeType::Integer => {
+                        for bytes in bytes.chunks_exact(8) {
+                            summary.add_integer(i128::from(i64::from_le_bytes(bytes.try_into().unwrap()))).ok_or(WriterError::SizeOverflow)?;
+                        }
+                    }
+                    TableColumnData::Fixed(bytes) if column.node_type == NodeType::Float => {
+                        for bytes in bytes.chunks_exact(8) {
+                            summary.float.add(f64::from_le_bytes(bytes.try_into().unwrap())).ok_or(WriterError::SizeOverflow)?;
+                        }
+                    }
+                    TableColumnData::FormattedFloat { values, .. } => {
+                        for bytes in values.chunks_exact(8) {
+                            summary.float.add(f64::from_le_bytes(bytes.try_into().unwrap())).ok_or(WriterError::SizeOverflow)?;
+                        }
+                    }
+                    _ => continue,
+                }
+                columns.push(summary);
+            }
+        }
+        rmp_serde::to_vec(&NumericSummaries { version: 1, columns })
+            .map_err(|source| WriterError::Io(std::io::Error::other(source)))
+    }
+
     pub(super) fn encode_sections(
         &self,
         options: WriterOptions,

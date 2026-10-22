@@ -477,6 +477,7 @@ pub struct WriterOptions {
     emit_log_order_column: bool,
     separate_columns_min_size: u64,
     adaptive: AdaptiveColumns,
+    numeric_summaries: bool,
 }
 
 /// When the strings of a CLP-string field are stored whole; see
@@ -563,6 +564,13 @@ impl AdaptiveColumns {
 }
 
 impl WriterOptions {
+    /// Store versioned numeric summaries in archive metadata (enabled by default).
+    #[must_use]
+    pub const fn with_numeric_summaries(mut self, enabled: bool) -> Self {
+        self.numeric_summaries = enabled;
+        self
+    }
+
     const DEFAULT_MINIMUM_PACKED_STREAM_SIZE: u64 = 1024 * 1024;
     const DEFAULT_DICTIONARY_COMPRESSION_LEVEL: i32 = 9;
 
@@ -586,8 +594,9 @@ impl WriterOptions {
             record_log_order: true,
             emit_log_order_column: true,
             separate_columns_min_size: 0,
-            // Library default stays conservative (0.5.0, C++-reference-compatible). The `clp-s`
-            // compression CLI turns this on by default; embedders opt in via the builder.
+            numeric_summaries: true,
+            // Adaptive column encodings are disabled in the library default. The
+            // compression CLI enables them; numeric summaries are enabled in both.
             adaptive: AdaptiveColumns(
                 AdaptiveColumns::STRINGS
                     | AdaptiveColumns::BINARY_UUIDS
@@ -1159,7 +1168,10 @@ fn encode_records(
         let mixed = records.has_mixed_integers();
         let options = if mixed { options.with_adaptive_numeric_columns(true).with_adaptive_string_columns(true) } else { options };
         let (sections, timestamp_dictionary) = records.encode_sections(options)?;
-        let mut encoded = EncodedEmptyArchive::from_sections_with_timestamp(options, sections, &timestamp_dictionary)?;
+        // Validation hook: emit legacy archives for same-build fallback comparisons.
+        let disabled = std::env::var("CLP_DISABLE_NUMERIC_SUMMARIES").is_ok_and(|v| !v.is_empty() && v != "0");
+        let summaries = if disabled || !options.numeric_summaries { None } else { Some(records.numeric_summaries()?) };
+        let mut encoded = EncodedEmptyArchive::from_sections_with_summaries(options, sections, &timestamp_dictionary, summaries.as_deref())?;
         if mixed {
             encoded.header = ArchiveHeader::new_with_version(crate::archive::ArchiveVersion::MIXED_INTEGERS,
                 options.uncompressed_size, encoded.archive_size, u32::try_from(encoded.metadata.len()).map_err(|_| WriterError::SizeOverflow)?);
@@ -1215,8 +1227,21 @@ impl EncodedEmptyArchive {
         sections: [Vec<u8>; SFA_SECTION_NAMES.len()],
         timestamp_dictionary: &[u8],
     ) -> Result<Self, WriterError> {
+        Self::from_sections_with_summaries(options, sections, timestamp_dictionary, None)
+    }
+
+    fn from_sections_with_summaries(
+        options: WriterOptions,
+        sections: [Vec<u8>; SFA_SECTION_NAMES.len()],
+        timestamp_dictionary: &[u8],
+        summaries: Option<&[u8]>,
+    ) -> Result<Self, WriterError> {
         let offsets = section_offsets(&sections)?;
-        let metadata_payload = encode_metadata_payload(offsets, timestamp_dictionary)?;
+        let mut metadata_payload = encode_metadata_payload(offsets, timestamp_dictionary)?;
+        if let Some(summaries) = summaries {
+            metadata_payload[0] += 1;
+            append_packet(&mut metadata_payload, crate::numeric_summary::PACKET_TYPE, summaries)?;
+        }
         check_limit(
             WriterResource::DecompressedMetadata,
             len_u64(&metadata_payload)?,
@@ -1243,8 +1268,8 @@ impl EncodedEmptyArchive {
             options.limits.archive,
         )?;
 
-        // Stamp the adaptive-integer format version only when the opt-in flag is set, so default
-        // writes remain byte-identical 0.5.0 archives that 0.5.x readers still accept.
+        // The archive version describes column encodings. Numeric summaries live
+        // in their own versioned metadata packet.
         let version = if options.verbatim_text().is_some() {
             crate::archive::ArchiveVersion::VERBATIM_TEXT
         } else if options.adaptive_string_columns() {
@@ -2385,7 +2410,7 @@ mod tests {
         const CPP_ORACLE: &[u8] = include_bytes!("../tests/fixtures/sfa-v0.5.0-strings-cpp.bin");
         // C++ compresses dictionaries at the archive's level, without long-distance matching.
         let rust = string_archive(
-            WriterOptions::default()
+            WriterOptions::default().with_numeric_summaries(false)
                 .with_uncompressed_size(205)
                 .with_dictionary_compression_level(3)
                 .with_dictionary_long_distance_matching(false),
@@ -2397,7 +2422,7 @@ mod tests {
     fn timestamp_writer_is_byte_identical_to_the_pinned_cpp_oracle() {
         const CPP_ORACLE: &[u8] = include_bytes!("../tests/fixtures/sfa-v0.5.0-timestamps-cpp.bin");
         let source_size = u64::try_from(TIMESTAMP_SOURCE.len()).expect("source size fits u64");
-        let rust = timestamp_archive(WriterOptions::default().with_uncompressed_size(source_size));
+        let rust = timestamp_archive(WriterOptions::default().with_numeric_summaries(false).with_uncompressed_size(source_size));
         assert_eq!(CPP_ORACLE, rust);
     }
 
@@ -2409,7 +2434,7 @@ mod tests {
             u64::try_from(UNSTRUCTURED_ARRAY_SOURCE.len()).expect("source size fits u64");
         // C++ compresses dictionaries at the archive's level, without long-distance matching.
         let rust = unstructured_array_archive(
-            WriterOptions::default()
+            WriterOptions::default().with_numeric_summaries(false)
                 .with_uncompressed_size(source_size)
                 .with_dictionary_compression_level(3)
                 .with_dictionary_long_distance_matching(false),
@@ -3125,7 +3150,7 @@ mod tests {
         let source_size = u64::try_from(RETAINED_FLOAT_SOURCE.len()).expect("source size fits u64");
         // C++ compresses dictionaries at the archive's level, without long-distance matching.
         let rust = retained_float_archive(
-            WriterOptions::default()
+            WriterOptions::default().with_numeric_summaries(false)
                 .with_uncompressed_size(source_size)
                 .with_dictionary_compression_level(3)
                 .with_dictionary_long_distance_matching(false),

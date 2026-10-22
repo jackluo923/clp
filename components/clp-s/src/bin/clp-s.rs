@@ -199,6 +199,9 @@ struct CompressArgs {
     /// output that the C++ reference reads.
     #[arg(long, default_value_t = false)]
     no_adaptive_numeric_columns: bool,
+    /// Omit optional count/sum/min/max numeric summaries from new archives.
+    #[arg(long, default_value_t = false)]
+    no_numeric_summaries: bool,
     /// Store string and CLP-string columns plainly rather than adaptively (adaptive is the default
     /// with adaptive numeric columns). Adaptive encoding gives each string column, a run of
     /// dictionary IDs, the smallest of the integer schemes, and stamps archive version 0.8.0,
@@ -686,6 +689,7 @@ fn run_compress(arguments: &CompressArgs) -> CliResult<()> {
     );
     let stats = CompressionArchiveStats::new(arguments.output.print_archive_stats, published_ids);
     let writer_options = WriterOptions::new(arguments.compression_level)
+        .with_numeric_summaries(!arguments.no_numeric_summaries)
         .with_dictionary_compression_level(arguments.dictionary_compression_level)
         .with_dictionary_long_distance_matching(!arguments.no_dictionary_long_distance_matching)
         .with_field_logtype_dictionaries(!arguments.no_field_logtype_dictionaries)

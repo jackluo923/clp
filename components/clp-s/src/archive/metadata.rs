@@ -229,9 +229,13 @@ pub struct ArchiveMetadata {
     timestamp_dictionary: TimestampDictionary,
     range_index: Option<RangeIndex>,
     unknown_packet_count: u8,
+    numeric_summaries: Option<Vec<u8>>,
 }
 
 impl ArchiveMetadata {
+    /// Optional numeric summary payload; interpreted by aggregate readers only.
+    pub fn numeric_summaries(&self) -> Option<&[u8]> { self.numeric_summaries.as_deref() }
+
     /// Returns the validated section directory.
     #[must_use]
     pub const fn directory(&self) -> &SectionDirectory {
@@ -335,6 +339,7 @@ fn decode_packets<R: Read>(
     let mut file_info = None;
     let mut timestamp_dictionary = None;
     let mut range_index = None;
+    let mut numeric_summaries = None;
     let mut unknown_packet_count = 0_u8;
 
     for packet_index in 0..packet_count {
@@ -392,6 +397,10 @@ fn decode_packets<R: Read>(
                         .map_err(|source| MetadataError::InvalidRangeIndex { source })?,
                 );
             }
+            crate::numeric_summary::PACKET_TYPE => {
+                reject_duplicate(numeric_summaries.is_some(), packet_type)?;
+                numeric_summaries = Some(read_payload(reader, packet_size)?);
+            }
             _ => {
                 skip_payload(reader, packet_size)?;
                 unknown_packet_count = unknown_packet_count
@@ -418,6 +427,7 @@ fn decode_packets<R: Read>(
         timestamp_dictionary,
         range_index,
         unknown_packet_count,
+        numeric_summaries,
     })
 }
 

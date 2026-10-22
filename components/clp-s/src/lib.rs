@@ -65,3 +65,6 @@ pub use record::RecordProgram;
 pub use record::RecordResource;
 pub use record::RecordScratch;
 pub use record::RecordWriter;
+
+/// Compression-time numeric aggregate metadata.
+pub mod numeric_summary;

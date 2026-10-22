@@ -3573,3 +3573,5 @@ mod tests {
         assert_eq!(bytes, []);
     }
 }
+
+mod numeric_aggregate;

@@ -576,6 +576,7 @@ mod tests {
     /// archive's level without long-distance matching.
     fn options() -> WriterOptions {
         WriterOptions::default()
+            .with_numeric_summaries(false)
             .with_log_order(false)
             .with_uncompressed_size(u64::try_from(SOURCE.len()).expect("source size fits u64"))
             .with_dictionary_compression_level(3)
