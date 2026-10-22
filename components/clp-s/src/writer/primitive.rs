@@ -4972,7 +4972,7 @@ fn table_has_numeric_column(table: &TableBuilder) -> bool {
 /// smallest compressed frame to `out`, returning the chosen encoding's uncompressed (pre-zstd)
 /// byte length. Ties keep the earliest candidate, which is plain.
 fn write_best_candidate(
-    candidates: Vec<Vec<u8>>,
+    candidates: impl IntoIterator<Item = Vec<u8>>,
     compressor: &mut zstd::bulk::Compressor<'_>,
     raw_frames: bool,
     out: &mut Vec<u8>,
@@ -4980,14 +4980,21 @@ fn write_best_candidate(
     let mut best: Option<Vec<u8>> = None;
     let mut best_uncompressed = 0_usize;
     for candidate in candidates {
-        let frame = column_frame(candidate.as_slice(), compressor, raw_frames)?;
+        let uncompressed = candidate.len();
+        let compressed = compressor.compress(&candidate).map_err(WriterError::Io)?;
+        // We already own this candidate: a raw winner can be moved instead of copied.
+        let frame = if raw_frames && compressed.len() >= uncompressed {
+            candidate
+        } else {
+            compressed
+        };
         let better = match &best {
             None => true,
             Some(current) => frame.len() < current.len(),
         };
         if better {
             best = Some(frame);
-            best_uncompressed = candidate.len();
+            best_uncompressed = uncompressed;
         }
     }
     let frame = best.expect("candidates is never empty");
@@ -5020,6 +5027,15 @@ fn encode_plain_column(
     raw_frames: bool,
     out: &mut Vec<u8>,
 ) -> Result<u64, WriterError> {
+    // Fixed columns are already in wire order; a logtype remap cannot affect them.
+    if let TableColumnData::Fixed(bytes) | TableColumnData::DeltaI64 { deltas: bytes, .. } =
+        &column.data
+    {
+        if !bytes.is_empty() {
+            out.extend_from_slice(&column_frame(bytes, compressor, raw_frames)?);
+        }
+        return usize_u64(bytes.len());
+    }
     let length = column.encoded_len();
     if 0 != length {
         let mut raw = Vec::new();
@@ -5061,7 +5077,7 @@ fn encode_adaptive_integer_column(
 /// The candidate whose zstd frame is smallest, as raw (pre-zstd) bytes. Ties keep the earliest,
 /// which is plain.
 fn best_candidate(
-    candidates: Vec<Vec<u8>>,
+    candidates: impl IntoIterator<Item = Vec<u8>>,
     compressor: &mut zstd::bulk::Compressor<'_>,
 ) -> Result<Vec<u8>, WriterError> {
     let mut best: Option<(usize, Vec<u8>)> = None;
@@ -5229,9 +5245,11 @@ fn encode_grouped_tables(
                 best_candidate(adaptive_int::candidates(&values(&plain)), compressor)?,
             ),
             NodeType::Float => {
-                let bits: Vec<u64> = values(&plain)
+                let bits: Vec<u64> = plain
+                    .as_chunks::<8>()
+                    .0
                     .iter()
-                    .map(|value| value.cast_unsigned())
+                    .map(|chunk| u64::from_le_bytes(*chunk))
                     .collect();
                 (
                     GroupedFrameEncoding::Float,

@@ -135,28 +135,29 @@ fn encode_rle(bits: &[u64], runs: usize) -> Vec<u8> {
     out
 }
 
-/// Encoded candidate buffers worth zstd-measuring for this float column, each a full scheme byte +
+/// Lazily encoded candidates worth zstd-measuring for this float column, each a full scheme byte +
 /// payload. `bits` are the raw `f64::to_bits` patterns. The caller compresses each and keeps the
 /// smallest.
 #[must_use]
-pub fn candidates(bits: &[u64]) -> Vec<Vec<u8>> {
-    if bits.is_empty() {
-        return vec![vec![PLAIN]];
-    }
-    let (small_cardinality, runs) = scan(bits);
-    if small_cardinality == Some(1) {
-        return vec![encode_constant(bits[0])];
-    }
-    let mut out = vec![encode_plain(bits), encode_byte_stream_split(bits)];
-    if let Some(cardinality) = small_cardinality {
-        if cardinality < bits.len() {
-            out.push(encode_dict(bits, cardinality));
+pub fn candidates(bits: &[u64]) -> impl Iterator<Item = Vec<u8>> + '_ {
+    let stats = (!bits.is_empty()).then(|| scan(bits));
+    (0..4).filter_map(move |scheme| {
+        let Some((cardinality, runs)) = stats else {
+            return (scheme == 0).then(|| vec![PLAIN]);
+        };
+        if cardinality == Some(1) {
+            return (scheme == 0).then(|| encode_constant(bits[0]));
         }
-    }
-    if runs * 2 < bits.len() {
-        out.push(encode_rle(bits, runs));
-    }
-    out
+        match scheme {
+            0 => Some(encode_plain(bits)),
+            1 => Some(encode_byte_stream_split(bits)),
+            2 => cardinality
+                .filter(|&n| n < bits.len())
+                .map(|n| encode_dict(bits, n)),
+            3 if runs * 2 < bits.len() => Some(encode_rle(bits, runs)),
+            _ => None,
+        }
+    })
 }
 
 /// Decodes a column stream produced by any of the [`candidates`] schemes into `row_count` raw
@@ -254,7 +255,12 @@ pub(crate) fn decode_to_le(
         BYTE_STREAM_SPLIT => {
             if rest.len() < size { return Err(AdaptiveDecodeError::Truncated); }
             let start = out.len();
-            out.resize(start.checked_add(size).ok_or(AdaptiveDecodeError::Malformed)?, 0);
+            out.resize(
+                start
+                    .checked_add(size)
+                    .ok_or(AdaptiveDecodeError::Malformed)?,
+                0,
+            );
             for plane in 0..8 {
                 for row in 0..row_count {
                     out[start + row * 8 + plane] = rest[plane * row_count + row];
@@ -275,6 +281,26 @@ pub(crate) fn decode_to_le(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lazy_candidates_keep_wire_order() {
+        let values: Vec<_> = [1, 3, 2]
+            .into_iter()
+            .flat_map(|value| [value; 16])
+            .collect();
+        let mut candidates = super::candidates(&values);
+        for scheme in [
+            super::PLAIN,
+            super::BYTE_STREAM_SPLIT,
+            super::DICT,
+            super::RLE,
+        ] {
+            let candidate = candidates.next().expect("candidate in historical order");
+            assert_eq!(scheme, candidate[0]);
+            assert_eq!(values, super::decode(&candidate, values.len()).unwrap());
+        }
+        assert_eq!(None, candidates.next());
+        assert_eq!(None, candidates.next());
+    }
     use super::*;
 
     fn round_trip(bits: &[u64]) {
@@ -328,7 +354,7 @@ mod tests {
     #[test]
     fn constant_column_picks_constant() {
         let bits = vec![2.5_f64.to_bits(); 1000];
-        let cands = candidates(&bits);
+        let cands: Vec<_> = candidates(&bits).collect();
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0][0], CONSTANT);
         round_trip(&bits);

@@ -70,13 +70,17 @@ pub(crate) fn bit_width_for(max: u64) -> u8 {
 
 /// LSB-first bit-packing of `values`, each occupying `width` bits, appended to `out`.
 pub(crate) fn pack_bits(values: &[u64], width: u8, out: &mut Vec<u8>) {
+    pack_bits_iter(values.iter().copied(), width, out);
+}
+
+fn pack_bits_iter(values: impl IntoIterator<Item = u64>, width: u8, out: &mut Vec<u8>) {
     if width == 0 {
         return;
     }
     let w = u32::from(width);
     let mut acc: u128 = 0;
     let mut nbits: u32 = 0;
-    for &v in values {
+    for v in values {
         let v = if width < 64 {
             v & ((1u64 << width) - 1)
         } else {
@@ -101,7 +105,11 @@ pub(crate) fn packed_len(count: usize, width: u8) -> usize {
 }
 
 /// Inverse of [`pack_bits`]: unpack `count` values of `width` bits from the front of `bytes`.
-pub(crate) fn unpack_bits(bytes: &[u8], width: u8, count: usize) -> Result<Vec<u64>, AdaptiveDecodeError> {
+pub(crate) fn unpack_bits(
+    bytes: &[u8],
+    width: u8,
+    count: usize,
+) -> Result<Vec<u64>, AdaptiveDecodeError> {
     Ok(unpack_bits_iter(bytes, width, count)?.collect())
 }
 
@@ -234,11 +242,8 @@ fn encode_for(values: &[i64], min: i64, span: u64) -> Vec<u8> {
     out.push(FOR);
     out.extend_from_slice(&min.to_le_bytes());
     out.push(width);
-    let offsets: Vec<u64> = values
-        .iter()
-        .map(|&v| (v as u64).wrapping_sub(min as u64))
-        .collect();
-    pack_bits(&offsets, width, &mut out);
+    let offsets = values.iter().map(|&v| (v as u64).wrapping_sub(min as u64));
+    pack_bits_iter(offsets, width, &mut out);
     out
 }
 
@@ -250,14 +255,11 @@ fn encode_delta(values: &[i64], min_delta: i64, max_delta: i64) -> Option<Vec<u8
     out.extend_from_slice(&values[0].to_le_bytes());
     out.extend_from_slice(&min_delta.to_le_bytes());
     out.push(width);
-    let offsets: Vec<u64> = values
-        .windows(2)
-        .map(|w| {
-            let delta = w[1] - w[0];
-            (delta as u64).wrapping_sub(min_delta as u64)
-        })
-        .collect();
-    pack_bits(&offsets, width, &mut out);
+    let offsets = values.windows(2).map(|w| {
+        let delta = w[1] - w[0];
+        (delta as u64).wrapping_sub(min_delta as u64)
+    });
+    pack_bits_iter(offsets, width, &mut out);
     Some(out)
 }
 
@@ -302,39 +304,35 @@ fn encode_rle(values: &[i64], runs: usize) -> Vec<u8> {
     out
 }
 
-/// Encoded candidate buffers (each a full scheme byte + payload) worth zstd-measuring for this
+/// Lazily encoded candidates (each a full scheme byte + payload) worth zstd-measuring for this
 /// column. The caller compresses each and keeps the smallest. `PLAIN` is always present as a floor,
 /// except for a constant column, where `CONSTANT` alone is unbeatable.
 #[must_use]
-pub fn candidates(values: &[i64]) -> Vec<Vec<u8>> {
-    if values.is_empty() {
-        return vec![vec![PLAIN]];
-    }
-    let stats = scan(values);
-    if stats.small_cardinality == Some(1) {
-        return vec![encode_constant(values[0])];
-    }
-
-    let mut out = vec![encode_plain(values)];
-    if let Some(span) = span(stats.min, stats.max) {
-        out.push(encode_for(values, stats.min, span));
-    }
-    if let Some((min_delta, max_delta)) = stats.delta_range {
-        if let Some(delta) = encode_delta(values, min_delta, max_delta) {
-            out.push(delta);
+pub fn candidates(values: &[i64]) -> impl Iterator<Item = Vec<u8>> + '_ {
+    let stats = (!values.is_empty()).then(|| scan(values));
+    // Keep the historical candidate and tie-break order, but construct only the candidate
+    // being measured. Losing buffers are released before the next encoding is generated.
+    (0..5).filter_map(move |scheme| {
+        let Some(stats) = &stats else {
+            return (scheme == 0).then(|| vec![PLAIN]);
+        };
+        if stats.small_cardinality == Some(1) {
+            return (scheme == 0).then(|| encode_constant(values[0]));
         }
-    }
-    if let Some(cardinality) = stats.small_cardinality {
-        // Only worth it when the dictionary is meaningfully smaller than storing the values.
-        if cardinality < values.len() {
-            out.push(encode_dict(values, cardinality));
+        match scheme {
+            0 => Some(encode_plain(values)),
+            1 => span(stats.min, stats.max).map(|span| encode_for(values, stats.min, span)),
+            2 => stats
+                .delta_range
+                .and_then(|(min, max)| encode_delta(values, min, max)),
+            3 => stats
+                .small_cardinality
+                .filter(|&n| n < values.len())
+                .map(|n| encode_dict(values, n)),
+            4 if stats.runs * 2 < values.len() => Some(encode_rle(values, stats.runs)),
+            _ => None,
         }
-    }
-    // Worth trying only when runs actually compress the column.
-    if stats.runs * 2 < values.len() {
-        out.push(encode_rle(values, stats.runs));
-    }
-    out
+    })
 }
 
 /// Decodes a column stream produced by any of the [`candidates`] schemes back into `row_count`
@@ -513,6 +511,27 @@ pub(crate) fn decode_runs_to_le(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lazy_candidates_keep_wire_order() {
+        let values: Vec<_> = [1, 3, 2]
+            .into_iter()
+            .flat_map(|value| [value; 16])
+            .collect();
+        let mut candidates = super::candidates(&values);
+        for scheme in [
+            super::PLAIN,
+            super::FOR,
+            super::DELTA,
+            super::DICT,
+            super::RLE,
+        ] {
+            let candidate = candidates.next().expect("candidate in historical order");
+            assert_eq!(scheme, candidate[0]);
+            assert_eq!(values, super::decode(&candidate, values.len()).unwrap());
+        }
+        assert_eq!(None, candidates.next());
+        assert_eq!(None, candidates.next());
+    }
     use super::*;
 
     fn round_trip(values: &[i64]) {
@@ -549,7 +568,7 @@ mod tests {
     #[test]
     fn constant_column_picks_constant() {
         let values = vec![7i64; 1000];
-        let cands = candidates(&values);
+        let cands: Vec<_> = candidates(&values).collect();
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0][0], CONSTANT);
         round_trip(&values);
