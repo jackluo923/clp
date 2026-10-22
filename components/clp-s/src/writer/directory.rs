@@ -76,9 +76,14 @@ pub struct OpenDirectoryArchive {
 impl OpenDirectoryArchive {
     /// Creates an empty directory archive without touching external state.
     pub fn new(options: WriterOptions) -> Self {
+        Self::new_with_template_keys(options, super::TemplateKeys::default())
+    }
+
+    /// Creates an archive with runtime template-partitioning hints.
+    pub fn new_with_template_keys(options: WriterOptions, keys: super::TemplateKeys) -> Self {
         Self {
             options,
-            records: PrimitiveArchive::with_verbatim_text(options.verbatim_text()),
+            records: PrimitiveArchive::with_verbatim_text(options.verbatim_text(), keys),
         }
     }
 

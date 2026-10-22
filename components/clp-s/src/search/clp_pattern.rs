@@ -176,6 +176,11 @@ impl ClpPattern {
             })
     }
 
+    /// False proves this escaped template cannot satisfy the anchored pattern, for any variables.
+    pub(super) fn template_may_match(&self, template: &[u8]) -> bool {
+        !matches!(compile_template(template, &self.literal, self.anchor, self.ignore_case), Some(Template::Constant(false)))
+    }
+
     /// None means the original evaluator must decide (unsupported variable representation).
     pub(super) fn matches(
         &mut self,

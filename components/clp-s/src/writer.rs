@@ -19,6 +19,8 @@ mod filesystem;
 mod primitive;
 mod retained_float;
 mod timestamp;
+mod template_keys;
+pub use template_keys::TemplateKeys;
 
 use std::error::Error;
 use std::fmt::Display;
@@ -983,10 +985,15 @@ pub struct OpenArchive<W> {
 impl<W> OpenArchive<W> {
     /// Creates an empty open archive without touching `output`.
     pub fn new(output: W, options: WriterOptions) -> Self {
+        Self::new_with_template_keys(output, options, TemplateKeys::default())
+    }
+
+    /// Creates an archive with runtime template-partitioning hints.
+    pub fn new_with_template_keys(output: W, options: WriterOptions, keys: TemplateKeys) -> Self {
         Self {
             output,
             options,
-            records: PrimitiveArchive::with_verbatim_text(options.verbatim_text()),
+            records: PrimitiveArchive::with_verbatim_text(options.verbatim_text(), keys),
         }
     }
 
@@ -1177,7 +1184,7 @@ fn encode_records(
         // (for byte parity with the C++ writer) omits it too.
         let chunks = if chunks_disabled || !options.numeric_summaries { None } else { records.timestamp_chunks()? };
         let mut encoded = EncodedEmptyArchive::from_sections_with_summaries(options, sections, &timestamp_dictionary,
-            summaries.as_deref(), chunks.as_deref())?;
+            summaries.as_deref(), chunks.as_deref(), records.template_index()?.as_deref())?;
         if mixed {
             encoded.header = ArchiveHeader::new_with_version(crate::archive::ArchiveVersion::MIXED_INTEGERS,
                 options.uncompressed_size, encoded.archive_size, u32::try_from(encoded.metadata.len()).map_err(|_| WriterError::SizeOverflow)?);
@@ -1233,7 +1240,7 @@ impl EncodedEmptyArchive {
         sections: [Vec<u8>; SFA_SECTION_NAMES.len()],
         timestamp_dictionary: &[u8],
     ) -> Result<Self, WriterError> {
-        Self::from_sections_with_summaries(options, sections, timestamp_dictionary, None, None)
+        Self::from_sections_with_summaries(options, sections, timestamp_dictionary, None, None, None)
     }
 
     fn from_sections_with_summaries(
@@ -1242,6 +1249,7 @@ impl EncodedEmptyArchive {
         timestamp_dictionary: &[u8],
         summaries: Option<&[u8]>,
         timestamp_chunks: Option<&[u8]>,
+        template_index: Option<&[u8]>,
     ) -> Result<Self, WriterError> {
         let offsets = section_offsets(&sections)?;
         let mut metadata_payload = encode_metadata_payload(offsets, timestamp_dictionary)?;
@@ -1252,6 +1260,10 @@ impl EncodedEmptyArchive {
         if let Some(chunks) = timestamp_chunks {
             metadata_payload[0] += 1;
             append_packet(&mut metadata_payload, crate::timestamp_chunks::PACKET_TYPE, chunks)?;
+        }
+        if let Some(index) = template_index {
+            metadata_payload[0] += 1;
+            append_packet(&mut metadata_payload, crate::template_index::PACKET_TYPE, index)?;
         }
         check_limit(
             WriterResource::DecompressedMetadata,

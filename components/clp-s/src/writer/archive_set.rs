@@ -560,6 +560,7 @@ pub struct ArchiveSetWriter<S, C> {
     sink: S,
     stats_callback: C,
     options: ArchiveSetOptions,
+    template_keys: super::TemplateKeys,
     state: ArchiveSetState,
     next_archive_index: u64,
     closed_ranges: Vec<ArchiveSetRange>,
@@ -569,12 +570,18 @@ pub struct ArchiveSetWriter<S, C> {
 impl<S: FinalizedArchiveSink, C: ArchiveSetStatsCallback> ArchiveSetWriter<S, C> {
     /// Creates a session without invoking either callback.
     pub fn new(sink: S, stats_callback: C, options: ArchiveSetOptions) -> Self {
+        Self::new_with_template_keys(sink, stats_callback, options, super::TemplateKeys::default())
+    }
+
+    /// Creates a session whose template hints persist across archive rotation.
+    pub fn new_with_template_keys(sink: S, stats_callback: C, options: ArchiveSetOptions, template_keys: super::TemplateKeys) -> Self {
         let writer = options.writer.with_uncompressed_size(0);
         Self {
             sink,
             stats_callback,
             options,
-            state: ArchiveSetState::Open(Box::new(OpenDirectoryArchive::new(writer))),
+            state: ArchiveSetState::Open(Box::new(OpenDirectoryArchive::new_with_template_keys(writer, template_keys.clone()))),
+            template_keys,
             next_archive_index: 0,
             closed_ranges: Vec::new(),
             active_source: None,
@@ -1146,8 +1153,9 @@ impl<S: FinalizedArchiveSink, C: ArchiveSetStatsCallback> ArchiveSetWriter<S, C>
                         // so the member's per-table span baselines reset to empty.
                         source.table_row_starts = Vec::new();
                     }
-                    ArchiveSetState::Open(Box::new(OpenDirectoryArchive::new(
+                    ArchiveSetState::Open(Box::new(OpenDirectoryArchive::new_with_template_keys(
                         self.options.writer.with_uncompressed_size(0),
+                        self.template_keys.clone(),
                     )))
                 }
                 FollowingState::Finished => ArchiveSetState::Finished,
@@ -2039,6 +2047,25 @@ mod tests {
             )
             .expect("extract one rotated row");
             assert_eq!(format!("{{\"n\":{index}}}\n").as_bytes(), output);
+        }
+    }
+
+    #[test]
+    fn template_hints_survive_archive_rotation() {
+        let mut writer = ArchiveSetWriter::new_with_template_keys(
+            MemorySink::default(), StatsCollector::default(), options(1, true),
+            crate::writer::TemplateKeys::parse_csv("body").unwrap());
+        for body in ["alpha value 1", "beta value 2", "alpha value 3"] {
+            writer.append_record(RecordRef::new(&[
+                FieldRef::new(b"body", ValueRef::String(body.as_bytes()))
+            ])).unwrap();
+        }
+        let (sink, _) = writer.finish().unwrap().into_parts();
+        assert!(sink.archives.len() >= 3);
+        for published in &sink.archives[..3] {
+            let mut reader = SingleFileArchiveReader::open(Cursor::new(&published.sfa)).unwrap();
+            let catalog = reader.read_catalog(ArchiveCatalogLimits::default()).unwrap();
+            assert_eq!(catalog.metadata().template_index().unwrap().columns.len(), 1);
         }
     }
 

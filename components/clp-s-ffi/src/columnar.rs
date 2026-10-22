@@ -299,6 +299,8 @@ pub struct ProjectedScanner {
     /// string predicate reads every dictionary entry, so without this a string-filtered scan pays
     /// for the whole dictionary a dozen times over.
     dictionary_matches: DictionaryMatches,
+    /// Metadata-only table decisions made once per archive, before stream I/O.
+    matchable_tables: Vec<bool>,
     /// Log-event ranges the query's range-index selector accepts, when one governs every match.
     ///
     /// A row outside them cannot match, and rows are written in log order, so a column needs
@@ -427,13 +429,15 @@ fn load_dictionaries(
 fn nodes_of_matchable_tables(
     catalog: &ArchiveCatalog,
     compiled: &clp_s::search::CompiledQuery<'_, '_>,
-) -> Result<Vec<bool>, ScanError> {
+) -> Result<(Vec<bool>, Vec<bool>), ScanError> {
     let mut held = vec![false; catalog.schema_tree().len()];
-    for table in catalog.table_metadata().schema_tables() {
+    let mut matchable = vec![false; catalog.table_metadata().schema_tables().len()];
+    for (index, table) in catalog.table_metadata().schema_tables().iter().enumerate() {
         // A schema the map lacks is left to the table decoder to report; until then, any column
         // may be written.
         let Some(schema) = catalog.schema_map().get(table.schema_id()) else {
             held.fill(true);
+            matchable.fill(true);
             break;
         };
         if !compiled
@@ -442,6 +446,11 @@ fn nodes_of_matchable_tables(
         {
             continue;
         }
+        let rows = usize::try_from(table.message_count()).unwrap_or(usize::MAX);
+        if compiled.table_row_span(table.schema_id(), rows) == clp_s::timestamp_chunks::RowSpan::Empty {
+            continue;
+        }
+        matchable[index] = true;
         for entry in schema.entries() {
             if let SchemaEntry::Node(node) = *entry
                 && let Some(slot) = held.get_mut(node as usize)
@@ -450,7 +459,7 @@ fn nodes_of_matchable_tables(
             }
         }
     }
-    Ok(held)
+    Ok((held, matchable))
 }
 
 /// The dictionaries the columns behind `nodes` are read through. A string is a variable ID, a CLP
@@ -617,9 +626,10 @@ impl ProjectedScanner {
         )?;
         // Compiling here answers which source files the selector accepts once, rather than once
         // per stream, and the answer outlives the compiled query it came from.
-        let (accepted_ranges, held) = {
+        let mut dictionary_matches = DictionaryMatches::new();
+        let (accepted_ranges, (held, matchable_tables)) = {
             let compiled = parsed
-                .compile_for_archive(&catalog, options.search())
+                .compile_for_archive_reusing(&catalog, options.search(), &mut dictionary_matches)
                 .map_err(|source| {
                     ScanError::Archive(format!("failed to compile query: {source}"))
                 })?;
@@ -676,7 +686,8 @@ impl ProjectedScanner {
             field_shapes,
             filter_nodes,
             wanted_nodes,
-            dictionary_matches: DictionaryMatches::new(),
+            dictionary_matches,
+            matchable_tables,
             accepted_ranges,
             stream_index: 0,
             stream_count,
@@ -1181,32 +1192,9 @@ impl ProjectedScanner {
         (first, end)
     }
 
-    /// Whether the query could match a row of any table in `tables`, judged from schemas alone.
-    fn any_schema_may_match(&mut self, tables: std::ops::Range<usize>) -> Result<bool, ScanError> {
-        let compiled = self
-            .parsed
-            .compile_for_archive_reusing(
-                &self.catalog,
-                self.options.search(),
-                &mut self.dictionary_matches,
-            )
-            .map_err(|source| ScanError::Archive(format!("failed to compile query: {source}")))?;
-        let metadata = self.catalog.table_metadata().schema_tables();
-        for table in &metadata[tables] {
-            // A schema the map lacks is left to the table decoder to report.
-            let Some(schema) = self.catalog.schema_map().get(table.schema_id()) else {
-                return Ok(true);
-            };
-            // A table whose timestamp chunks all lie outside the query's window is never read.
-            let rows = usize::try_from(table.message_count()).unwrap_or(usize::MAX);
-            if compiled.may_match_schema(schema).map_err(|source| {
-                ScanError::Archive(format!("failed to compile query: {source}"))
-            })? && compiled.table_row_span(table.schema_id(), rows) != clp_s::timestamp_chunks::RowSpan::Empty
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+    /// Reuse archive-open metadata decisions instead of recompiling for every skipped stream.
+    fn any_schema_may_match(&self, tables: std::ops::Range<usize>) -> Result<bool, ScanError> {
+        Ok(self.matchable_tables.get(tables).is_none_or(|tables| tables.iter().any(|value| *value)))
     }
 
     fn stream_table(&self, stream_id: u64) -> Option<&SchemaTableMetadata> {

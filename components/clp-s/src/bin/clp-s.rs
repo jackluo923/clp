@@ -218,6 +218,12 @@ struct CompressArgs {
     /// string columns).
     #[arg(long, default_value_t = false)]
     no_grouped_array_tables: bool,
+    /// Comma-separated string-field paths whose CLP templates partition physical tables.
+    /// Uses the same dotted/escaped path syntax as --timestamp-key; for example message,event.body.
+    /// With multiple fields, their template combination is the partition key. No fields are selected
+    /// by default. Missing, non-CLP, and verbatim values keep ordinary storage behavior.
+    #[arg(long, value_name = "CSV")]
+    template_keys: Option<String>,
     /// Keep extracting variables from every CLP string, instead of storing text that is not a log
     /// message whole (storing it whole is the default with adaptive string columns).
     #[arg(long, default_value_t = false)]
@@ -674,6 +680,8 @@ fn run(cli: Cli) -> CliResult<()> {
 fn run_compress(arguments: &CompressArgs) -> CliResult<()> {
     let timestamp_resolvers =
         CompressionTimestampResolvers::parse(arguments.timestamp_key.as_deref())?;
+    let template_keys = arguments.template_keys.as_deref()
+        .map(clp_s::writer::TemplateKeys::parse_csv).transpose()?.unwrap_or_default();
     let archive_creator_id = Uuid::new_v4().to_string();
     let inputs = prepare_compression_inputs(arguments, &archive_creator_id)?;
     create_output_directory(&arguments.archives_dir)?;
@@ -707,10 +715,11 @@ fn run_compress(arguments: &CompressArgs) -> CliResult<()> {
         .with_verbatim_text_min_strings(arguments.verbatim_text_min_strings)
         .with_log_order(!arguments.representation.disable_log_order)
         .with_log_order_column(!arguments.representation.no_log_order_column);
-    let mut archive_set = ArchiveSetWriter::new(
+    let mut archive_set = ArchiveSetWriter::new_with_template_keys(
         publisher,
         stats,
         ArchiveSetOptions::new(writer_options, arguments.target_encoded_size),
+        template_keys,
     );
     let parse_limits = ParseManyLimits::new(
         arguments.max_document_size,

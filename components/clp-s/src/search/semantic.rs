@@ -1372,6 +1372,14 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
                 .get(node_id as usize)
                 .is_some_and(|node| {
                     let node_type = node.node_type();
+                    if !negated && node_type == NodeType::ClpString {
+                        if let Some(template) = self.catalog.metadata().template_index()
+                            .and_then(|index| index.template(schema.id(), node_id)) {
+                            let plan = variable_pattern(predicate).or_else(|| clp_pattern(predicate))
+                                .and_then(|pattern| super::clp_pattern::ClpPattern::new(pattern, self.options.ignore_case(), 0));
+                            if plan.is_some_and(|plan| !plan.template_may_match(template)) { return false; }
+                        }
+                    }
                     if is_exists(predicate) || negated && matches!(predicate.value(), Literal::Null)
                     {
                         is_search_value_node(node_type)

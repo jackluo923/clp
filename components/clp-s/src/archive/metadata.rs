@@ -231,9 +231,13 @@ pub struct ArchiveMetadata {
     unknown_packet_count: u8,
     numeric_summaries: Option<Vec<u8>>,
     timestamp_chunks: Option<Vec<u8>>,
+    template_index: Option<crate::template_index::TemplateIndex>,
 }
 
 impl ArchiveMetadata {
+    /// Per-table hinted-field templates, if this archive includes a valid index.
+    pub fn template_index(&self) -> Option<&crate::template_index::TemplateIndex> { self.template_index.as_ref() }
+
     /// Optional numeric summary payload; interpreted by aggregate readers only.
     pub fn numeric_summaries(&self) -> Option<&[u8]> { self.numeric_summaries.as_deref() }
 
@@ -346,6 +350,8 @@ fn decode_packets<R: Read>(
     let mut range_index = None;
     let mut numeric_summaries = None;
     let mut timestamp_chunks = None;
+    let mut template_index = None;
+    let mut template_index_seen = false;
     let mut unknown_packet_count = 0_u8;
 
     for packet_index in 0..packet_count {
@@ -407,6 +413,11 @@ fn decode_packets<R: Read>(
                 reject_duplicate(numeric_summaries.is_some(), packet_type)?;
                 numeric_summaries = Some(read_payload(reader, packet_size)?);
             }
+            crate::template_index::PACKET_TYPE => {
+                reject_duplicate(template_index_seen, packet_type)?;
+                template_index_seen = true;
+                template_index = crate::template_index::TemplateIndex::decode(&read_payload(reader, packet_size)?);
+            }
             crate::timestamp_chunks::PACKET_TYPE => {
                 reject_duplicate(timestamp_chunks.is_some(), packet_type)?;
                 timestamp_chunks = Some(read_payload(reader, packet_size)?);
@@ -439,6 +450,7 @@ fn decode_packets<R: Read>(
         unknown_packet_count,
         numeric_summaries,
         timestamp_chunks,
+        template_index,
     })
 }
 
