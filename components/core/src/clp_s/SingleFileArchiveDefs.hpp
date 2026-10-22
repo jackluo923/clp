@@ -49,6 +49,9 @@ constexpr uint32_t cArchiveVersion{
         make_archive_version(cArchiveMajorVersion, cArchiveMinorVersion, cArchivePatchVersion)
 };
 
+// 0.6 matches the Rust separate-column numeric scheme headers. Packed tables retain 0.5 bytes.
+constexpr uint32_t cAdaptiveNumericVersion{make_archive_version(0, 6, 0)};
+
 // Format version markers for backwards compatibility.
 constexpr uint32_t cDeprecatedDateStringFormatVersionMarker{make_archive_version(0, 5, 0)};
 

@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "AdaptiveColumn.hpp"
 #include "ColumnValueFilter.hpp"
 
 namespace clp_s {
@@ -40,6 +41,61 @@ void SchemaWriter::store(ZstdCompressor& compressor) {
     for (auto& writer : m_columns) {
         writer->store(compressor);
     }
+}
+
+auto SchemaWriter::has_numeric_columns(SchemaTree const& tree) const -> bool {
+    return std::ranges::any_of(m_column_node_ids, [&](auto id) {
+        auto const type{tree.get_node(id).get_type()};
+        return type == NodeType::Integer || type == NodeType::Float;
+    });
+}
+
+auto SchemaWriter::store_separate(
+        FileWriter& file,
+        ZSTD_CCtx& context,
+        int level,
+        SchemaTree const& tree,
+        bool adaptive
+) -> std::vector<ColumnFrame> {
+    std::vector<ColumnFrame> frames;
+    std::vector<char> raw;
+    std::vector<char> compressed;
+    for (size_t i{0}; i < m_columns.size(); ++i) {
+        raw.clear();
+        m_columns[i]->store(raw);
+        auto const type{tree.get_node(m_column_node_ids[i]).get_type()};
+        if (raw.empty()) {
+            frames.push_back({0, 0});
+            continue;
+        }
+        if (adaptive && (type == NodeType::Integer || type == NodeType::Float)) {
+            auto frame{adaptive_column::encode(
+                    raw,
+                    type == NodeType::Integer ? adaptive_column::Type::Integer
+                                              : adaptive_column::Type::Float,
+                    context,
+                    level
+            )};
+            file.write(frame.compressed.data(), frame.compressed.size());
+            frames.push_back({frame.uncompressed_size, frame.compressed.size()});
+        } else {
+            compressed.resize(ZSTD_compressBound(raw.size()));
+            auto const size{ZSTD_compressCCtx(
+                    &context,
+                    compressed.data(),
+                    compressed.size(),
+                    raw.data(),
+                    raw.size(),
+                    level
+            )};
+            if (ZSTD_isError(size)) {
+                throw std::runtime_error{ZSTD_getErrorName(size)};
+            }
+            file.write(compressed.data(), size);
+            frames.push_back({raw.size(), size});
+        }
+    }
+    return frames;
 }
 
 auto SchemaWriter::build_value_filters() const

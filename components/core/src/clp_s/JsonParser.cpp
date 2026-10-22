@@ -270,6 +270,8 @@ JsonParser::JsonParser(JsonParserOption const& option)
     m_archive_options.print_archive_stats = option.print_archive_stats;
     m_archive_options.single_file_archive = option.single_file_archive;
     m_archive_options.min_table_size = option.min_table_size;
+    m_archive_options.separate_columns_min_size = option.separate_columns_min_size;
+    m_archive_options.adaptive_numeric_columns = option.adaptive_numeric_columns;
     m_archive_options.id = m_generator();
     m_archive_options.authoritative_timestamp = m_timestamp_column;
     m_archive_options.authoritative_timestamp_namespace = m_timestamp_namespace;
@@ -1610,8 +1612,8 @@ auto JsonParser::parse_str_field(
                     node_id = float_node_id.value();
                     if (false == m_retain_float_format) {
                         // The value is stored as a bare double, so the text it is searched and
-                        // printed as may differ from the lexeme; the rule's values cannot be bounded
-                        // by the lexemes alone.
+                        // printed as may differ from the lexeme; the rule's values cannot be
+                        // bounded by the lexemes alone.
                         YSTDLIB_ERROR_HANDLING_TRYV(
                                 m_archive_writer->mark_rule_unbounded(qualified_name)
                         );

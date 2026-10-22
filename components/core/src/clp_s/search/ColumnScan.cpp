@@ -26,6 +26,7 @@
 #include "ast/FilterOperation.hpp"
 #include "ast/Literal.hpp"
 #include "ast/OrExpr.hpp"
+#include "DictionaryIdSet.hpp"
 
 using clp_s::search::ast::AndExpr;
 using clp_s::search::ast::FilterExpr;
@@ -160,7 +161,7 @@ clp_string_matches(ClpStringColumnReader* reader, clp::Query const& query, uint6
         ColumnScan::VarStringReaderMap const& reader_map,
         int32_t column_id,
         FilterOperation operation,
-        std::unordered_set<int64_t> const& matching_vars
+        DictionaryIdSet const& matching_vars
 ) -> ColumnScan::Bitmap;
 
 /**
@@ -409,7 +410,7 @@ clp_string_matches(ClpStringColumnReader* reader, clp::Query const& query, uint6
         ColumnScan::VarStringReaderMap const& reader_map,
         int32_t column_id,
         FilterOperation operation,
-        std::unordered_set<int64_t> const& matching_vars
+        DictionaryIdSet const& matching_vars
 ) -> ColumnScan::Bitmap {
     ColumnScan::Bitmap bitmap(num_messages, 0);
     auto const readers = reader_map.find(column_id);

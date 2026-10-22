@@ -5,7 +5,6 @@
 #include <memory>
 #include <optional>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include <clp/Query.hpp>
@@ -13,6 +12,7 @@
 #include <clp_s/SchemaReader.hpp>
 #include <clp_s/search/ast/Expression.hpp>
 #include <clp_s/search/ast/FilterExpr.hpp>
+#include <clp_s/search/DictionaryIdSet.hpp>
 
 namespace clp_s::search {
 class ColumnScan : public FilterClass {
@@ -24,7 +24,7 @@ public:
             = std::unordered_map<int32_t, std::vector<VariableStringColumnReader*>>;
     using TimestampReaderMap = std::unordered_map<int32_t, TimestampColumnReader*>;
     using ClpQueryMap = std::unordered_map<ast::Expression*, clp::Query*>;
-    using VarMatchMap = std::unordered_map<ast::Expression*, std::unordered_set<int64_t>*>;
+    using VarMatchMap = std::unordered_map<ast::Expression*, DictionaryIdSet const*>;
 
     /**
      * Attempts to build a column scan for the given expression over the given ERT.

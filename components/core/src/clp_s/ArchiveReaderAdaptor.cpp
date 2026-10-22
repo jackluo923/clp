@@ -222,6 +222,11 @@ ErrorCode ArchiveReaderAdaptor::try_read_header(clp::ReaderInterface& reader) {
         return ErrorCodeMetadataCorrupted;
     }
 
+    auto const [major, minor, patch]{decompose_archive_version(m_archive_header.version)};
+    if (major != 0 || minor > 6) {
+        return ErrorCodeUnsupported;
+    }
+
     switch (static_cast<ArchiveCompressionType>(m_archive_header.compression_type)) {
         case ArchiveCompressionType::Zstd:
             break;

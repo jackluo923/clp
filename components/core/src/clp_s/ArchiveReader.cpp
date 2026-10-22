@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string_view>
 #include <system_error>
 #include <unordered_map>
@@ -160,18 +161,7 @@ auto ArchiveReader::read_metadata() -> ystdlib::error_handling::Result<void> {
 
     YSTDLIB_ERROR_HANDLING_TRYV(m_stream_reader.read_metadata(m_table_metadata_decompressor));
 
-    uint64_t num_separate_column_schemas{0};
-    if (auto const error{
-                m_table_metadata_decompressor.try_read_numeric_value(num_separate_column_schemas)
-        };
-        ErrorCodeSuccess != error)
-    {
-        throw OperationFailed(error, __FILENAME__, __LINE__);
-    }
-
-    if (0 != num_separate_column_schemas) {
-        throw OperationFailed(ErrorCodeUnsupported, __FILENAME__, __LINE__);
-    }
+    m_stream_reader.read_separate_metadata(m_table_metadata_decompressor);
 
     uint64_t num_schemas{0};
     if (auto const error{m_table_metadata_decompressor.try_read_numeric_value(num_schemas)};
@@ -214,6 +204,19 @@ auto ArchiveReader::read_metadata() -> ystdlib::error_handling::Result<void> {
             - prev_metadata.stream_offset()
     );
     m_id_to_schema_metadata[prev_schema_id] = prev_metadata;
+    std::set<size_t> separate_seen;
+    for (auto const& [id, metadata] : m_id_to_schema_metadata) {
+        if (m_stream_reader.is_separate(metadata.stream_id())
+            && (metadata.stream_offset() != 0 || !separate_seen.insert(metadata.stream_id()).second
+                || metadata.uncompressed_size()
+                           != m_stream_reader.get_uncompressed_stream_size(metadata.stream_id())))
+        {
+            throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);
+        }
+    }
+    if (separate_seen.size() != m_stream_reader.get_num_separate_streams()) {
+        throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);
+    }
     m_table_metadata_decompressor.close();
 
     m_archive_reader_adaptor->checkin_reader_for_section(constants::cArchiveTableMetadataFile);
@@ -403,7 +406,8 @@ void ArchiveReader::open_packed_streams() {
 SchemaReader& ArchiveReader::read_schema_table(
         int32_t schema_id,
         bool should_extract_timestamp,
-        bool should_marshal_records
+        bool should_marshal_records,
+        std::optional<std::unordered_set<int32_t>> const& required_columns
 ) {
     if (m_id_to_schema_metadata.count(schema_id) == 0) {
         throw OperationFailed(ErrorCodeFileNotFound, __FILENAME__, __LINE__);
@@ -417,11 +421,18 @@ SchemaReader& ArchiveReader::read_schema_table(
     );
 
     auto const& schema_metadata = m_id_to_schema_metadata[schema_id];
-    auto stream_buffer = read_stream(schema_metadata.stream_id(), true);
+    std::vector<uint8_t> selection;
+    if (required_columns && m_stream_reader.is_separate(schema_metadata.stream_id())) {
+        selection = m_schema_reader.select_columns(*required_columns);
+    }
+    auto stream_buffer = read_stream(schema_metadata.stream_id(), true, selection);
     m_schema_reader.load(
             stream_buffer,
             schema_metadata.stream_offset(),
-            schema_metadata.uncompressed_size()
+            schema_metadata.uncompressed_size(),
+            m_stream_reader.get_column_sizes(schema_metadata.stream_id()),
+            m_archive_reader_adaptor->get_header().version >= cAdaptiveNumericVersion,
+            selection
     );
     return m_schema_reader;
 }
@@ -437,7 +448,9 @@ std::vector<std::shared_ptr<SchemaReader>> ArchiveReader::read_all_tables() {
         schema_reader->load(
                 stream_buffer,
                 schema_metadata.stream_offset(),
-                schema_metadata.uncompressed_size()
+                schema_metadata.uncompressed_size(),
+                m_stream_reader.get_column_sizes(schema_metadata.stream_id()),
+                m_archive_reader_adaptor->get_header().version >= cAdaptiveNumericVersion
         );
         readers.push_back(std::move(schema_reader));
     }
@@ -709,13 +722,18 @@ void ArchiveReader::close() {
     m_id_to_schema_metadata.clear();
     m_schema_ids.clear();
     m_cur_stream_id = 0;
+    m_cur_stream_complete = false;
     m_stream_buffer.reset();
     m_stream_buffer_size = 0ULL;
     m_log_event_idx_column_id = -1;
 }
 
-std::shared_ptr<char[]> ArchiveReader::read_stream(size_t stream_id, bool reuse_buffer) {
-    if (nullptr != m_stream_buffer && m_cur_stream_id == stream_id) {
+std::shared_ptr<char[]> ArchiveReader::read_stream(
+        size_t stream_id,
+        bool reuse_buffer,
+        std::span<uint8_t const> selection
+) {
+    if (nullptr != m_stream_buffer && m_cur_stream_id == stream_id && m_cur_stream_complete) {
         return m_stream_buffer;
     }
 
@@ -724,8 +742,11 @@ std::shared_ptr<char[]> ArchiveReader::read_stream(size_t stream_id, bool reuse_
         m_stream_buffer_size = 0;
     }
 
-    m_stream_reader.read_stream(stream_id, m_stream_buffer, m_stream_buffer_size);
+    m_stream_reader.read_stream(stream_id, m_stream_buffer, m_stream_buffer_size, selection);
     m_cur_stream_id = stream_id;
+    m_cur_stream_complete = selection.empty() || std::ranges::all_of(selection, [](auto value) {
+                                return value != 0;
+                            });
     return m_stream_buffer;
 }
 
@@ -828,9 +849,7 @@ auto ArchiveReader::read_column_value_filters()
     }
 
     decompressor.close();
-    m_archive_reader_adaptor->checkin_reader_for_section(
-            constants::cArchiveColumnValueFiltersFile
-    );
+    m_archive_reader_adaptor->checkin_reader_for_section(constants::cArchiveColumnValueFiltersFile);
     return filters;
 }
 }  // namespace clp_s

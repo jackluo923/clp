@@ -94,6 +94,8 @@ public:
      * @param schema_id
      */
     auto schema_init(int32_t schema_id) -> EvaluatedValue;
+    /** Required physical nodes after schema resolution; nullopt preserves the general read path. */
+    auto get_required_columns() const -> std::optional<std::unordered_set<int32_t>>;
 
     /**
      * Selects a filtering implementation, and prepares a filter on a given ERT.
@@ -146,6 +148,8 @@ private:
 
     std::map<std::string, std::optional<clp::Query>> m_string_query_map;
     std::map<std::string, std::unordered_set<int64_t>> m_string_var_match_map;
+    // Matching sets are immutable after global_init; share each prepared lookup across ERTs.
+    std::unordered_map<std::unordered_set<int64_t> const*, DictionaryIdSet> m_dictionary_id_sets;
     std::unordered_map<ast::Expression*, clp::Query*> m_expr_clp_query;
     std::unordered_map<ast::Expression*, std::unordered_set<int64_t>*> m_expr_var_match_map;
     std::unordered_map<int32_t, std::vector<ClpStringColumnReader*>> m_clp_string_readers;

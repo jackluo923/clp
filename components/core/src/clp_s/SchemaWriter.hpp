@@ -10,6 +10,7 @@
 #include "ColumnWriter.hpp"
 #include "FileWriter.hpp"
 #include "ParsedMessage.hpp"
+#include "SchemaTree.hpp"
 #include "ZstdCompressor.hpp"
 
 namespace clp_s {
@@ -47,6 +48,20 @@ public:
      * @param compressor
      */
     void store(ZstdCompressor& compressor);
+
+    struct ColumnFrame {
+        uint64_t uncompressed_size;
+        uint64_t compressed_size;
+    };
+
+    auto store_separate(
+            FileWriter& file,
+            ZSTD_CCtx& context,
+            int level,
+            SchemaTree const& tree,
+            bool adaptive
+    ) -> std::vector<ColumnFrame>;
+    auto has_numeric_columns(SchemaTree const& tree) const -> bool;
 
     /**
      * Builds a value filter per schema tree node for every column type that supports one. A node

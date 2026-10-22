@@ -102,6 +102,10 @@ public:
 
     int get_compression_level() const { return m_compression_level; }
 
+    auto get_separate_columns_min_size() const -> size_t { return m_separate_columns_min_size; }
+
+    auto get_adaptive_numeric_columns() const -> bool { return m_adaptive_numeric_columns; }
+
     size_t get_target_encoded_size() const { return m_target_encoded_size; }
 
     size_t get_max_document_size() const { return m_max_document_size; }
@@ -261,6 +265,8 @@ private:
     std::string m_output_dir;
     std::string m_timestamp_key;
     int m_compression_level{3};
+    size_t m_separate_columns_min_size{};
+    bool m_adaptive_numeric_columns{false};
     size_t m_target_encoded_size{8ULL * 1024 * 1024 * 1024};  // 8 GiB
     bool m_print_archive_stats{false};
     size_t m_max_document_size{512ULL * 1024 * 1024};  // 512 MiB

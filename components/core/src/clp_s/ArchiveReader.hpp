@@ -120,13 +120,21 @@ public:
      * @param schema_id
      * @param should_extract_timestamp
      * @param should_marshal_records
+     * @param required_columns Field IDs needed by the query, or nullopt to load all columns.
+     * Only separate-column ERTs support a selection.
      * @return the schema reader
      */
     SchemaReader& read_schema_table(
             int32_t schema_id,
             bool should_extract_timestamp,
-            bool should_marshal_records
+            bool should_marshal_records,
+            std::optional<std::unordered_set<int32_t>> const& required_columns = std::nullopt
     );
+
+    /** Whether this ERT supports reading individual columns after metadata has been loaded. */
+    [[nodiscard]] auto has_separate_columns(int32_t schema_id) const -> bool {
+        return m_stream_reader.is_separate(m_id_to_schema_metadata.at(schema_id).stream_id());
+    }
 
     /**
      * Loads all of the tables in the archive and returns SchemaReaders for them.
@@ -346,7 +354,8 @@ private:
      * data returned previous calls to read_stream
      * @return a buffer containing the decompressed stream identified by stream_id
      */
-    std::shared_ptr<char[]> read_stream(size_t stream_id, bool reuse_buffer);
+    std::shared_ptr<char[]>
+    read_stream(size_t stream_id, bool reuse_buffer, std::span<uint8_t const> selection = {});
 
     /**
      * Reads the log type metadata from the archive.
@@ -402,6 +411,7 @@ private:
     std::shared_ptr<char[]> m_stream_buffer{};
     size_t m_stream_buffer_size{0ULL};
     size_t m_cur_stream_id{0ULL};
+    bool m_cur_stream_complete{false};
     int32_t m_log_event_idx_column_id{-1};
 
     std::optional<Clpp> m_clpp;

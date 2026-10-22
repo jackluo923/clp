@@ -253,6 +253,8 @@ set(
         TraceableException.hpp
         Utils.cpp
         Utils.hpp
+        AdaptiveColumn.cpp
+        AdaptiveColumn.hpp
         ZstdCompressor.cpp
         ZstdCompressor.hpp
         ZstdDecompressor.cpp

@@ -41,6 +41,8 @@ struct ArchiveWriterOption {
     int compression_level;
     bool print_archive_stats;
     bool single_file_archive;
+    size_t separate_columns_min_size{};
+    bool adaptive_numeric_columns{false};
     size_t min_table_size;
     std::vector<std::string> authoritative_timestamp;
     std::string authoritative_timestamp_namespace;
@@ -456,6 +458,8 @@ private:
     bool m_print_archive_stats{};
     bool m_single_file_archive{};
     size_t m_min_table_size{};
+    size_t m_separate_columns_min_size{};
+    bool m_adaptive_numeric_columns{false};
 
     std::vector<std::string> m_authoritative_timestamp;
     std::string m_authoritative_timestamp_namespace;

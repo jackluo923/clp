@@ -12,6 +12,7 @@ set(
         ClppMatcher.hpp
         ClppShapeDecomposer.hpp
         ClppShapeQueryMatcher.hpp
+        DictionaryIdSet.hpp
         EvaluateRangeIndexFilters.cpp
         EvaluateRangeIndexFilters.hpp
         EvaluateTimestampIndex.cpp

@@ -4,6 +4,7 @@
 #include <vector>
 
 #include <spdlog/spdlog.h>
+#include <utils/profiling/ScopedProfiler.hpp>
 
 #include "../../clp/type_utils.hpp"
 #include "../SchemaTree.hpp"
@@ -16,8 +17,6 @@
 #include "ast/Literal.hpp"
 #include "ast/OrExpr.hpp"
 #include "EvaluateTimestampIndex.hpp"
-
-#include <utils/profiling/ScopedProfiler.hpp>
 
 using clp_s::search::ast::AndExpr;
 using clp_s::search::ast::ColumnDescriptor;
@@ -110,7 +109,11 @@ bool Output::filter() {
             return m_archive_reader->read_schema_table(
                     schema_id,
                     m_output_handler->should_output_metadata(),
-                    m_should_marshal_records
+                    m_should_marshal_records,
+                    !m_should_marshal_records && !m_output_handler->should_output_metadata()
+                                    && m_archive_reader->has_separate_columns(schema_id)
+                            ? m_query_runner.get_required_columns()
+                            : std::nullopt
             );
         }();
         auto& filter = m_query_runner.prepare_filter(reader);

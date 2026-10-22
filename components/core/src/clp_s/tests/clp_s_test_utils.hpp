@@ -30,7 +30,9 @@
         bool retain_float_format,
         bool single_file_archive,
         bool structurize_arrays,
-        std::optional<std::filesystem::path> parsing_spec_path = std::nullopt
+        std::optional<std::filesystem::path> parsing_spec_path = std::nullopt,
+        bool adaptive_numeric_columns = false,
+        size_t separate_columns_min_size = 0
 ) -> std::vector<clp_s::ArchiveStats>;
 
 [[nodiscard]] auto get_heuristic_parsing_spec_path() -> std::filesystem::path;

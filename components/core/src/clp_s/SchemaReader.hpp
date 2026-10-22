@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -231,8 +232,28 @@ public:
      * @param stream_buffer
      * @param offset
      * @param uncompressed_size
+     * @param column_sizes Per-column encoded sizes, or empty for a packed ERT.
+     * @param adaptive Whether separate numeric columns carry adaptive codec headers.
+     * @param selection One flag per physical column, or empty to load all columns. Omitted
+     * columns must not be accessed until loaded by another call.
      */
-    void load(std::shared_ptr<char[]> stream_buffer, size_t offset, size_t uncompressed_size);
+    void load(
+            std::shared_ptr<char[]> stream_buffer,
+            size_t offset,
+            size_t uncompressed_size,
+            std::span<size_t const> column_sizes = {},
+            bool adaptive = false,
+            std::span<uint8_t const> selection = {}
+    );
+
+    /** Selects every physical occurrence of the requested field IDs. */
+    auto select_columns(std::unordered_set<int32_t> const& ids) const -> std::vector<uint8_t> {
+        std::vector<uint8_t> selection;
+        for (auto* column : m_columns) {
+            selection.push_back(ids.contains(column->get_id()));
+        }
+        return selection;
+    }
 
     /**
      * @return the number of messages in the schema
@@ -640,6 +661,7 @@ private:
     std::vector<BaseColumnReader*> m_columns;
     std::vector<BaseColumnReader*> m_reordered_columns;
     std::shared_ptr<char[]> m_stream_buffer;
+    std::vector<std::vector<char>> m_decoded_columns;
 
     BaseColumnReader* m_timestamp_column;
     std::function<epochtime_t()> m_get_timestamp;

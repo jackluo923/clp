@@ -40,6 +40,8 @@ void ArchiveWriter::open(ArchiveWriterOption const& option) {
     m_print_archive_stats = option.print_archive_stats;
     m_single_file_archive = option.single_file_archive;
     m_min_table_size = option.min_table_size;
+    m_separate_columns_min_size = option.separate_columns_min_size;
+    m_adaptive_numeric_columns = option.adaptive_numeric_columns;
     m_archives_dir = option.archives_dir;
     m_authoritative_timestamp = option.authoritative_timestamp;
     m_authoritative_timestamp_namespace = option.authoritative_timestamp_namespace;
@@ -317,7 +319,7 @@ void ArchiveWriter::write_archive_files(
 
 void ArchiveWriter::write_archive_header(FileWriter& archive_writer, size_t metadata_section_size) {
     ArchiveHeader header{
-            cArchiveVersion,
+            m_adaptive_numeric_columns ? cAdaptiveNumericVersion : cArchiveVersion,
             m_uncompressed_size,
             m_compressed_size,
             static_cast<uint32_t>(metadata_section_size),
@@ -407,10 +409,7 @@ void ArchiveWriter::initialize_schema_writer(SchemaWriter* writer, Schema const&
                 );
                 break;
             case NodeType::VarString:
-                writer->append_column(
-                        id,
-                        std::make_unique<VariableStringColumnWriter>(m_var_dict)
-                );
+                writer->append_column(id, std::make_unique<VariableStringColumnWriter>(m_var_dict));
                 break;
             case NodeType::Boolean:
                 writer->append_column(id, std::make_unique<BooleanColumnWriter>());
@@ -468,9 +467,14 @@ std::pair<size_t, size_t> ArchiveWriter::store_tables() {
      *   - For each stream:
      *     - Offset into the file: <64-bit integer>
      *     - Uncompressed size: <64-bit integer>
-     *   - Number of separate column schemas: <64-bit integer>
-     *     It is always 0 in the current implementation.
-     *   - Undefined section for separate column schemas, reserved for future support.
+     *   - Number of streams with separate column frames: <64-bit integer>
+     *   - For each separate stream, in ascending stream ID order:
+     *     - Stream ID: <64-bit integer>
+     *     - Number of physical columns: <64-bit integer>
+     *     - For each column: uncompressed size and compressed size, both <64-bit integer>
+     *     - Empty columns have both sizes set to zero and no frame bytes.
+     *   - Separate streams contain one ERT at offset zero. For adaptive numeric columns,
+     *     uncompressed sizes describe the encoded payload before Zstd, including its scheme tag.
      *
      * Section 2: Schema Tables Metadata
      * - Contains metadata about schema tables associated with each compression stream.
@@ -502,32 +506,69 @@ std::pair<size_t, size_t> ArchiveWriter::store_tables() {
     };
     std::sort(schemas.begin(), schemas.end(), comp);
 
+    std::vector<std::pair<uint64_t, std::vector<SchemaWriter::ColumnFrame>>> separate;
+    std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)> context{ZSTD_createCCtx(), ZSTD_freeCCtx};
+    if (!context) {
+        throw std::bad_alloc{};
+    }
     uint64_t current_stream_offset{0};
-    uint64_t current_stream_id{0};
     uint64_t current_table_file_offset{0};
-    m_tables_compressor.open(m_tables_file_writer, m_compression_level);
+    bool packed_open{false};
+    auto finish_packed = [&]() {
+        if (!packed_open) {
+            return;
+        }
+        m_tables_compressor.close();
+        stream_metadata.emplace_back(current_table_file_offset, current_stream_offset);
+        packed_open = false;
+        current_stream_offset = 0;
+    };
     for (auto it : schemas) {
-        it->second->store(m_tables_compressor);
-        schema_metadata.emplace_back(
-                current_stream_id,
-                current_stream_offset,
-                it->first,
-                it->second->get_num_messages()
-        );
-        current_stream_offset += it->second->get_total_uncompressed_size();
-
-        if (current_stream_offset > m_min_table_size || schemas.size() == schema_metadata.size()) {
-            stream_metadata.emplace_back(current_table_file_offset, current_stream_offset);
-            m_tables_compressor.close();
-            current_stream_offset = 0;
-            ++current_stream_id;
-            current_table_file_offset = m_tables_file_writer.get_pos();
-
-            if (schemas.size() != schema_metadata.size()) {
+        auto& table{*it->second};
+        bool const separate_columns{
+                (m_separate_columns_min_size != 0
+                 && table.get_total_uncompressed_size() >= m_separate_columns_min_size)
+                || (m_adaptive_numeric_columns && m_separate_columns_min_size == 0
+                    && table.has_numeric_columns(m_schema_tree))
+        };
+        if (separate_columns) {
+            finish_packed();
+            auto const offset{m_tables_file_writer.get_pos()};
+            auto frames{table.store_separate(
+                    m_tables_file_writer,
+                    *context,
+                    m_compression_level,
+                    m_schema_tree,
+                    m_adaptive_numeric_columns
+            )};
+            uint64_t size{};
+            for (auto const& frame : frames) {
+                size += frame.uncompressed_size;
+            }
+            auto const id{stream_metadata.size()};
+            separate.emplace_back(id, std::move(frames));
+            schema_metadata.emplace_back(id, 0, it->first, table.get_num_messages());
+            stream_metadata.emplace_back(offset, size);
+        } else {
+            if (!packed_open) {
+                current_table_file_offset = m_tables_file_writer.get_pos();
                 m_tables_compressor.open(m_tables_file_writer, m_compression_level);
+                packed_open = true;
+            }
+            table.store(m_tables_compressor);
+            schema_metadata.emplace_back(
+                    stream_metadata.size(),
+                    current_stream_offset,
+                    it->first,
+                    table.get_num_messages()
+            );
+            current_stream_offset += table.get_total_uncompressed_size();
+            if (current_stream_offset > m_min_table_size) {
+                finish_packed();
             }
         }
     }
+    finish_packed();
 
     m_table_metadata_compressor.write_numeric_value(static_cast<uint64_t>(stream_metadata.size()));
     for (auto& stream : stream_metadata) {
@@ -535,10 +576,15 @@ std::pair<size_t, size_t> ArchiveWriter::store_tables() {
         m_table_metadata_compressor.write_numeric_value(stream.uncompressed_size);
     }
 
-    // The current implementation doesn't store large tables as separate columns, so this is always
-    // zero.
-    uint64_t const num_separate_column_schemas{0};
-    m_table_metadata_compressor.write_numeric_value(num_separate_column_schemas);
+    m_table_metadata_compressor.write_numeric_value(static_cast<uint64_t>(separate.size()));
+    for (auto const& [id, frames] : separate) {
+        m_table_metadata_compressor.write_numeric_value(id);
+        m_table_metadata_compressor.write_numeric_value(static_cast<uint64_t>(frames.size()));
+        for (auto const& frame : frames) {
+            m_table_metadata_compressor.write_numeric_value(frame.uncompressed_size);
+            m_table_metadata_compressor.write_numeric_value(frame.compressed_size);
+        }
+    }
 
     m_table_metadata_compressor.write_numeric_value(static_cast<uint64_t>(schema_metadata.size()));
     for (auto& schema : schema_metadata) {

@@ -110,10 +110,9 @@ auto evaluate_numeric_wildcard_filter(
  * @return false if the column definitely holds no integer matching `pattern`, true if it may (or
  * `pattern` is not of the supported form).
  */
-[[nodiscard]] auto integer_prefix_pattern_may_match(
-        std::string_view pattern,
-        ColumnValueFilter const& value_filter
-) -> bool {
+[[nodiscard]] auto
+integer_prefix_pattern_may_match(std::string_view pattern, ColumnValueFilter const& value_filter)
+        -> bool {
     if (pattern.size() < 2 || '*' != pattern.back()) {
         return true;
     }
@@ -145,6 +144,7 @@ auto evaluate_numeric_wildcard_filter(
 }  // namespace
 
 void QueryRunner::global_init() {
+    m_dictionary_id_sets.clear();
     populate_internal_columns();
     populate_string_queries(m_expr);
 }
@@ -165,6 +165,37 @@ auto QueryRunner::schema_init(int32_t schema_id) -> EvaluatedValue {
 
     add_wildcard_columns_to_searched_columns();
     return m_expression_value;
+}
+
+auto QueryRunner::get_required_columns() const -> std::optional<std::unordered_set<int32_t>> {
+    if (!m_wildcard_columns.empty()) {
+        return std::nullopt;
+    }
+    std::unordered_set<int32_t> columns;
+    if (m_expression_value != EvaluatedValue::Unknown) {
+        return columns;
+    }
+    std::vector<ast::Expression*> pending{m_expr.get()};
+    while (!pending.empty()) {
+        auto* expr{pending.back()};
+        pending.pop_back();
+        if (auto* filter{dynamic_cast<ast::FilterExpr*>(expr)}; filter != nullptr) {
+            auto const id{filter->get_column()->get_column_id()};
+            if (id < 0) {
+                return std::nullopt;
+            }
+            columns.insert(id);
+        } else {
+            for (auto it{expr->op_begin()}; it != expr->op_end(); ++it) {
+                auto* child{dynamic_cast<ast::Expression*>(it->get())};
+                if (child == nullptr) {
+                    return std::nullopt;
+                }
+                pending.push_back(child);
+            }
+        }
+    }
+    return columns;
 }
 
 void QueryRunner::clear_readers() {
@@ -225,6 +256,13 @@ auto QueryRunner::prepare_filter(SchemaReader& reader) -> FilterClass& {
 
     reader.initialize_filter(*this);
 
+    ColumnScan::VarMatchMap compiled_matches;
+    for (auto const& [expr, ids] : m_expr_var_match_map) {
+        if (ids != nullptr) {
+            auto const [it, inserted]{m_dictionary_id_sets.try_emplace(ids, *ids)};
+            compiled_matches.emplace(expr, &it->second);
+        }
+    }
     auto column_scan = ColumnScan::try_create(
             m_expr,
             m_basic_readers,
@@ -233,7 +271,7 @@ auto QueryRunner::prepare_filter(SchemaReader& reader) -> FilterClass& {
             m_timestamp_readers,
             m_deprecated_datestring_reader,
             m_expr_clp_query,
-            m_expr_var_match_map,
+            compiled_matches,
             reader.get_num_messages()
     );
     if (column_scan.has_value()) {

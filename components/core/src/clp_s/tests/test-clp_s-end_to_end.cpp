@@ -6,6 +6,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -438,4 +439,56 @@ TEST_CASE("clp-s-compress-extract-timestamps", "[clp-s][end-to-end]") {
             get_test_input_local_path(cTestEndToEndTimestampInputFile),
             extracted_json_path
     );
+}
+
+TEST_CASE("clp-s-separate-column-roundtrip", "[clp-s][SeparateColumns]") {
+    auto const single_file_archive = GENERATE(false, true);
+    auto const adaptive = GENERATE(false, true);
+    auto const arrays = GENERATE(false, true);
+    TestOutputCleaner const cleanup{
+            {std::string{cTestEndToEndArchiveDirectory},
+             std::string{cTestEndToEndOutputDirectory},
+             std::string{cTestEndToEndOutputSortedJson}}
+    };
+    std::ignore = compress_archive(
+            get_test_input_local_path(cTestEndToEndInputFile),
+            std::string{cTestEndToEndArchiveDirectory},
+            std::nullopt,
+            false,
+            single_file_archive,
+            arrays,
+            std::nullopt,
+            adaptive,
+            1
+    );
+    compare(extract(false));
+    for (auto const& entry : std::filesystem::directory_iterator(cTestEndToEndArchiveDirectory)) {
+        clp_s::ArchiveReader archive;
+        archive.open(
+                clp_s::Path{
+                        .source = clp_s::InputSource::Filesystem,
+                        .path = entry.path().string()
+                },
+                clp_s::ArchiveReader::Options{}
+        );
+        archive.read_dictionaries_and_metadata();
+        archive.open_packed_streams();
+        for (auto const id : archive.get_schema_ids()) {
+            REQUIRE(archive.has_separate_columns(id));
+            auto const rows{
+                    archive.read_schema_table(id, false, false, std::unordered_set<int32_t>{})
+                            .get_num_messages()
+            };
+            // A cached partial read must not expose omitted bytes to a subsequent full read.
+            auto& reader{archive.read_schema_table(id, false, true)};
+            std::string record;
+            uint64_t count{};
+            while (reader.get_next_message(record)) {
+                REQUIRE_FALSE(record.empty());
+                ++count;
+            }
+            REQUIRE(count == rows);
+        }
+        archive.close();
+    }
 }

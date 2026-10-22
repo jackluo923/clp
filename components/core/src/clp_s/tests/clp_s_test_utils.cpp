@@ -20,7 +20,9 @@ auto compress_archive(
         bool retain_float_format,
         bool single_file_archive,
         bool structurize_arrays,
-        std::optional<std::filesystem::path> parsing_spec_path
+        std::optional<std::filesystem::path> parsing_spec_path,
+        bool adaptive_numeric_columns,
+        size_t separate_columns_min_size
 ) -> std::vector<clp_s::ArchiveStats> {
     constexpr auto cDefaultTargetEncodedSize{8ULL * 1024 * 1024 * 1024};  // 8 GiB
     constexpr auto cDefaultMaxDocumentSize{512ULL * 1024 * 1024};  // 512 MiB
@@ -41,6 +43,8 @@ auto compress_archive(
     parser_option.max_document_size = cDefaultMaxDocumentSize;
     parser_option.min_table_size = cDefaultMinTableSize;
     parser_option.compression_level = cDefaultCompressionLevel;
+    parser_option.adaptive_numeric_columns = adaptive_numeric_columns;
+    parser_option.separate_columns_min_size = separate_columns_min_size;
     parser_option.print_archive_stats = cDefaultPrintArchiveStats;
     parser_option.retain_float_format = retain_float_format;
     parser_option.structurize_arrays = structurize_arrays;

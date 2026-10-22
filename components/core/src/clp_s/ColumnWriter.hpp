@@ -15,6 +15,34 @@
 #include <clp_s/ZstdCompressor.hpp>
 
 namespace clp_s {
+/** Routes the existing column serialization to a packed stream or an uncompressed frame buffer. */
+class ColumnWriterSink {
+public:
+    ColumnWriterSink(ZstdCompressor& compressor) : m_compressor{&compressor} {}
+
+    ColumnWriterSink(std::vector<char>& buffer) : m_buffer{&buffer} {}
+
+    auto write(char const* data, size_t size) -> void {
+        if (size == 0) {
+            return;
+        }
+        if (m_buffer != nullptr) {
+            m_buffer->insert(m_buffer->end(), data, data + size);
+        } else {
+            m_compressor->write(data, size);
+        }
+    }
+
+    template <typename T>
+    auto write_numeric_value(T value) -> void {
+        write(reinterpret_cast<char const*>(&value), sizeof(value));
+    }
+
+private:
+    ZstdCompressor* m_compressor{};
+    std::vector<char>* m_buffer{};
+};
+
 class BaseColumnWriter {
 public:
     // Constructors
@@ -39,10 +67,10 @@ public:
     virtual auto add_value(ParsedMessage::variable_t& value) -> size_t = 0;
 
     /**
-     * Stores the column to a compressed file.
+     * Serializes the column into a packed stream or a frame buffer.
      * @param compressor
      */
-    virtual auto store(ZstdCompressor& compressor) -> void = 0;
+    virtual auto store(ColumnWriterSink compressor) -> void = 0;
 
     /**
      * Returns the total size of the header data that will be written to the compressor. This header
@@ -69,7 +97,7 @@ public:
     // Methods implementing BaseColumnWriter
     auto add_value(ParsedMessage::variable_t& value) -> size_t override;
 
-    auto store(ZstdCompressor& compressor) -> void override;
+    auto store(ColumnWriterSink compressor) -> void override;
 
     [[nodiscard]] auto append_value_filter_keys(std::vector<int64_t>& keys) const -> bool override;
 
@@ -83,7 +111,7 @@ public:
     // Methods implementing BaseColumnWriter
     auto add_value(ParsedMessage::variable_t& value) -> size_t override;
 
-    auto store(ZstdCompressor& compressor) -> void override;
+    auto store(ColumnWriterSink compressor) -> void override;
 
     // Methods
     [[nodiscard]] auto add_value(int64_t value) -> size_t;
@@ -99,7 +127,7 @@ public:
     // Methods implementing BaseColumnWriter
     auto add_value(ParsedMessage::variable_t& value) -> size_t override;
 
-    auto store(ZstdCompressor& compressor) -> void override;
+    auto store(ColumnWriterSink compressor) -> void override;
 
 private:
     // Data members
@@ -111,7 +139,7 @@ public:
     // Methods implementing BaseColumnWriter
     auto add_value(ParsedMessage::variable_t& value) -> size_t override;
 
-    auto store(ZstdCompressor& compressor) -> void override;
+    auto store(ColumnWriterSink compressor) -> void override;
 
 private:
     // Data members
@@ -128,7 +156,7 @@ public:
     // Methods implementing BaseColumnWriter
     auto add_value(ParsedMessage::variable_t& value) -> size_t override;
 
-    auto store(ZstdCompressor& compressor) -> void override;
+    auto store(ColumnWriterSink compressor) -> void override;
 
 private:
     // Data members
@@ -141,7 +169,7 @@ public:
     // Methods implementing BaseColumnWriter
     auto add_value(ParsedMessage::variable_t& value) -> size_t override;
 
-    auto store(ZstdCompressor& compressor) -> void override;
+    auto store(ColumnWriterSink compressor) -> void override;
 
 private:
     // Data members
@@ -164,7 +192,7 @@ public:
     // Methods implementing BaseColumnWriter
     auto add_value(ParsedMessage::variable_t& value) -> size_t override;
 
-    auto store(ZstdCompressor& compressor) -> void override;
+    auto store(ColumnWriterSink compressor) -> void override;
 
     // Methods
     [[nodiscard]] auto get_total_header_size() const -> size_t override { return sizeof(size_t); }
@@ -221,7 +249,7 @@ public:
     // Methods implementing BaseColumnWriter
     auto add_value(ParsedMessage::variable_t& value) -> size_t override;
 
-    auto store(ZstdCompressor& compressor) -> void override;
+    auto store(ColumnWriterSink compressor) -> void override;
 
     [[nodiscard]] auto append_value_filter_keys(std::vector<int64_t>& keys) const -> bool override;
 
@@ -236,7 +264,7 @@ public:
     // Methods implementing BaseColumnWriter
     auto add_value(ParsedMessage::variable_t& value) -> size_t override;
 
-    auto store(ZstdCompressor& compressor) -> void override;
+    auto store(ColumnWriterSink compressor) -> void override;
 
 private:
     // Data members

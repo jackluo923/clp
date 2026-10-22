@@ -370,6 +370,14 @@ CommandLineArguments::parse_arguments(int argc, char const** argv) {
                         default_value(m_compression_level),
                     "1 (fast/low compression) to 19 (slow/high compression)."
             )(
+                    "separate-columns-min-size",
+                    po::value<size_t>(&m_separate_columns_min_size)->default_value(0),
+                    "Minimum ERT size (B) for separate column frames; 0 uses the numeric option's policy."
+            )(
+                    "adaptive-numeric-columns",
+                    po::bool_switch(&m_adaptive_numeric_columns),
+                    "Choose lossless numeric encodings (archive 0.6); with a zero size threshold, separate every ERT containing numeric columns."
+            )(
                     "target-encoded-size",
                     po::value<size_t>(&m_target_encoded_size)->value_name("TARGET_ENCODED_SIZE")->
                         default_value(m_target_encoded_size),

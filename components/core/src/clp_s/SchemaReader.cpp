@@ -29,6 +29,8 @@
 #include <clpp/ErrorCode.hpp>
 #include <clpp/TextShape.hpp>
 
+#include "AdaptiveColumn.hpp"
+
 namespace clp_s {
 namespace {
 /**
@@ -163,12 +165,61 @@ int64_t SchemaReader::get_next_log_event_idx() const {
     return 0;
 }
 
-void
-SchemaReader::load(std::shared_ptr<char[]> stream_buffer, size_t offset, size_t uncompressed_size) {
+void SchemaReader::load(
+        std::shared_ptr<char[]> stream_buffer,
+        size_t offset,
+        size_t uncompressed_size,
+        std::span<size_t const> column_sizes,
+        bool adaptive,
+        std::span<uint8_t const> selection
+) {
     m_stream_buffer = stream_buffer;
     BufferViewReader buffer_reader{m_stream_buffer.get() + offset, uncompressed_size};
-    for (auto& reader : m_columns) {
-        reader->load(buffer_reader, m_num_messages);
+    if (!selection.empty() && selection.size() != m_columns.size()) {
+        throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);
+    }
+    m_decoded_columns.clear();
+    if (!column_sizes.empty()) {
+        if (column_sizes.size() != m_columns.size()) {
+            throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);
+        }
+        m_decoded_columns.resize(m_columns.size());
+    }
+    for (size_t i{0}; i < m_columns.size(); ++i) {
+        auto* reader{m_columns[i]};
+        if (column_sizes.empty()) {
+            reader->load(buffer_reader, m_num_messages);
+            continue;
+        }
+        auto const size{column_sizes[i]};
+        if (size > buffer_reader.get_remaining_size()) {
+            throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);
+        }
+        auto* data{
+                m_stream_buffer.get() + offset + uncompressed_size
+                - buffer_reader.get_remaining_size()
+        };
+        std::ignore = buffer_reader.read_unaligned_span<char>(size);
+        if (!selection.empty() && !selection[i]) {
+            continue;
+        }
+        auto const type{reader->get_type()};
+        if (adaptive && (type == NodeType::Integer || type == NodeType::Float) && size != 0) {
+            m_decoded_columns[i] = adaptive_column::decode(
+                    {data, size},
+                    type == NodeType::Integer ? adaptive_column::Type::Integer
+                                              : adaptive_column::Type::Float,
+                    m_num_messages
+            );
+            BufferViewReader decoded{m_decoded_columns[i].data(), m_decoded_columns[i].size()};
+            reader->load(decoded, m_num_messages);
+        } else {
+            BufferViewReader column{data, size};
+            reader->load(column, m_num_messages);
+            if (column.get_remaining_size() != 0) {
+                throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);
+            }
+        }
     }
     if (buffer_reader.get_remaining_size() > 0) {
         throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);

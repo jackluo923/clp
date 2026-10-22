@@ -2,7 +2,9 @@
 #define CLP_S_PACKEDSTREAMREADER_HPP
 
 #include <cstddef>
+#include <map>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -48,6 +50,18 @@ public:
     [[nodiscard]] auto read_metadata(ZstdDecompressor& decompressor)
             -> ystdlib::error_handling::Result<void>;
 
+    /** Reads and validates per-column frame extents immediately after stream metadata. */
+    auto read_separate_metadata(ZstdDecompressor& decompressor) -> void;
+
+    auto get_column_sizes(size_t stream_id) const -> std::span<size_t const> {
+        auto const it{m_column_sizes.find(stream_id)};
+        return it == m_column_sizes.end() ? std::span<size_t const>{} : it->second;
+    }
+
+    auto get_num_separate_streams() const -> size_t { return m_column_sizes.size(); }
+
+    auto is_separate(size_t stream_id) const -> bool { return m_column_sizes.contains(stream_id); }
+
     /**
      * Opens a file reader for the tables section. Must be invoked before reading packed streams.
      * @param adaptor a reader adaptor for the archive
@@ -60,10 +74,10 @@ public:
     void close();
 
     /**
-     * Decompresses a stream with a given stream_id and returns it. This function must be called
-     * strictly in ascending stream_id order. If this function is called twice for the same stream
-     * or if a stream with lower id is requested after a stream with higher id then an error is
-     * thrown.
+     * Decompresses a stream with a given stream_id and returns it. Streams must be requested in
+     * ascending order. A separate-column stream may be read again at the same ID to load columns
+     * omitted by an earlier selection. Packed streams cannot be read twice, and moving to an
+     * earlier stream is rejected.
      *
      * Note: the buffer and buffer size are returned by reference. This is to support the use case
      * where the caller wants to re-use the same buffer for multiple streams to avoid allocations
@@ -76,8 +90,15 @@ public:
      * if it is too small to contain the requested stream.
      * @param buf_size the size of the underlying buffer owned by buf -- passed and updated by
      * reference
+     * @param selection One flag per physical column, or empty to read all columns. Applies only
+     * to separate streams; skipped buffer regions remain uninitialized.
      */
-    void read_stream(size_t stream_id, std::shared_ptr<char[]>& buf, size_t& buf_size);
+    void read_stream(
+            size_t stream_id,
+            std::shared_ptr<char[]>& buf,
+            size_t& buf_size,
+            std::span<uint8_t const> selection = {}
+    );
 
     [[nodiscard]] size_t get_uncompressed_stream_size(size_t stream_id) const {
         return m_stream_metadata.at(stream_id).uncompressed_size;
@@ -92,6 +113,8 @@ private:
     };
 
     std::vector<PackedStreamMetadata> m_stream_metadata;
+    std::map<size_t, std::vector<size_t>> m_column_sizes;
+    std::map<size_t, std::vector<size_t>> m_column_compressed_sizes;
     std::shared_ptr<ArchiveReaderAdaptor> m_adaptor;
     std::unique_ptr<clp::ReaderInterface> m_packed_stream_reader;
     ZstdDecompressor m_packed_stream_decompressor;
