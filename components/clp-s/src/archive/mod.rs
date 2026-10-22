@@ -3,6 +3,7 @@
 mod catalog;
 mod column;
 mod compact_clp;
+mod clp_descriptors;
 mod dictionary;
 mod directory;
 mod encoded_variable;

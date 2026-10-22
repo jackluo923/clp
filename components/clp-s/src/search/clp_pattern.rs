@@ -180,10 +180,11 @@ impl ClpPattern {
     pub(super) fn matches(
         &mut self,
         column: ClpStringColumn<'_, '_>,
-        row: usize,
+        descriptor: crate::archive::ClpDescriptor,
+        next_descriptor: Option<crate::archive::ClpDescriptor>,
         dictionary: &LogTypeDictionary,
     ) -> Option<bool> {
-        let id = column.descriptor(row)?.logtype_id() as usize;
+        let id = descriptor.logtype_id() as usize;
         let slot = self.templates.get_mut(id)?;
         if slot.is_none() {
             *slot = Some(compile_template(
@@ -202,16 +203,21 @@ impl ClpPattern {
             );
         }
         if let Some(plan) = &self.dictionary_plans[id] {
-            let offset = usize::try_from(column.descriptor(row)?.encoded_variable_offset()).ok()?;
-            let value = column
-                .encoded_variables()
-                .get(offset.checked_add(plan.index)?)?;
+            let offset = usize::try_from(descriptor.encoded_variable_offset()).ok()?;
+            let end = next_descriptor
+                .map(|d| d.encoded_variable_offset() as usize)
+                .unwrap_or(column.encoded_variables().len());
+            let at = offset.checked_add(plan.index)?;
+            if at >= end {
+                return None;
+            }
+            let value = column.encoded_variables().get(at)?;
             return plan.contains(value as u64);
         }
         match slot.as_ref()? {
             Template::Constant(value) => Some(*value),
             Template::Check { parts, consumed } => {
-                let record = column.record(row)?;
+                let record = column.record_from_descriptors(descriptor, next_descriptor)?;
                 let variables = record.encoded_variables();
                 let mut consumed = *consumed;
                 let mut integer = itoa::Buffer::new();

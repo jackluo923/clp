@@ -6,6 +6,10 @@ use std::ops::Range;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Storage {
+    Delta {
+        range: Range<usize>,
+        checkpoints: std::sync::OnceLock<Vec<u64>>,
+    },
     Borrowed {
         range: Range<usize>,
         encoding: Option<NumericEncoding>,
@@ -17,6 +21,36 @@ enum Storage {
 }
 
 impl Storage {
+    fn prepare_descriptors(stored: &[u8], range: Range<usize>, rows: usize) -> Result<Self, Error> {
+        if rows > 0 && stored.get(range.start) == Some(&2) {
+            let range = range.start + 1..range.end;
+            let checkpoints = std::sync::OnceLock::new();
+            super::clp_descriptors::Descriptors::delta(
+                stored.get(range.clone()).ok_or(Error::Truncated)?,
+                rows,
+                &checkpoints,
+            )?;
+            return Ok(Self::Delta { range, checkpoints });
+        }
+        Self::prepare(stored, range, rows)
+    }
+    fn descriptors<'a>(
+        &'a self,
+        stored: &'a [u8],
+        rows: usize,
+    ) -> Result<super::clp_descriptors::Descriptors<'a>, Error> {
+        match self {
+            Self::Delta { range, checkpoints } => super::clp_descriptors::Descriptors::delta(
+                stored.get(range.clone()).ok_or(Error::Truncated)?,
+                rows,
+                checkpoints,
+            ),
+            _ => self
+                .view(stored, rows)
+                .map(super::clp_descriptors::Descriptors::Numeric),
+        }
+    }
+
     fn prepare(stored: &[u8], range: Range<usize>, rows: usize) -> Result<Self, Error> {
         let bytes = stored.get(range.clone()).ok_or(Error::Truncated)?;
         if rows == 0 && bytes.is_empty() {
@@ -57,6 +91,7 @@ impl Storage {
 
     fn view<'a>(&'a self, stored: &'a [u8], rows: usize) -> Result<NumericColumn<'a>, Error> {
         let (bytes, encoding) = match self {
+            Self::Delta { .. } => return Err(Error::Malformed),
             Self::Borrowed { range, encoding } => (
                 stored.get(range.clone()).ok_or(Error::Truncated)?,
                 *encoding,
@@ -105,7 +140,7 @@ impl ClpColumnLayout {
             return Err(Error::Malformed);
         }
         Ok(Self {
-            descriptors: Storage::prepare(stored, 8..end, rows)?,
+            descriptors: Storage::prepare_descriptors(stored, 8..end, rows)?,
             variables: Storage::prepare(stored, start..stored.len(), count)?,
             variable_count: count,
         })
@@ -122,9 +157,9 @@ impl ClpColumnLayout {
         &'a self,
         stored: &'a [u8],
         rows: usize,
-    ) -> Result<(NumericColumn<'a>, NumericColumn<'a>), Error> {
+    ) -> Result<(super::clp_descriptors::Descriptors<'a>, NumericColumn<'a>), Error> {
         Ok((
-            self.descriptors.view(stored, rows)?,
+            self.descriptors.descriptors(stored, rows)?,
             self.variables.view(stored, self.variable_count)?,
         ))
     }

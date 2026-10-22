@@ -810,6 +810,19 @@ impl ProjectedScanner {
                     ColumnView { kind, reserved: 0, data: buffer.numeric.as_ptr().cast() }
                 } else if data.is_none() {
                     ColumnView { kind: kind::ABSENT, reserved: 0, data: std::ptr::null() }
+                } else if let Some(ColumnData::ClpString(values)) = data
+                    && self.field_shapes[field] == FieldForm::Value {
+                    let mut cursor = values.cursor();
+                    for row in bitmap.matching_rows() {
+                        let record = cursor.record(row).ok_or_else(|| ScanError::Projection("invalid CLP descriptor".into()))?;
+                        let start = self.text.len();
+                        append_clp_message_bounded(record.logtype(), values.variable_dictionary(),
+                            &record.encoded_variables(), &mut self.text, CLP_SCRATCH_LIMIT)
+                            .map_err(|e| ScanError::Projection(e.to_string()))?;
+                        buffer.cells.push(Cell { kind: kind::STRING, integer: 0, real: 0.0,
+                            text_offset: start, text_length: self.text.len() - start });
+                    }
+                    ColumnView { kind: kind::UNSUPPORTED, reserved: 0, data: buffer.cells.as_ptr().cast() }
                 } else if let Some(ColumnData::VarString(values) | ColumnData::DictionaryFloat(values)) = data {
                     // Matching rows ascend, so a cursor reads run-encoded IDs without searching.
                     let mut values = values.cursor();

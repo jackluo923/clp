@@ -3626,13 +3626,16 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
             .and_then(|pattern| super::clp_pattern::ClpPattern::new(
                 pattern, self.compiled.options.ignore_case(), dictionary.len(),
             ));
+        let mut descriptors = column.descriptors().skip(row_offset).peekable();
         for (offset, destination) in bitmap.iter_mut().enumerate() {
+            let descriptor = descriptors.next().ok_or(SearchError::SizeOverflow)?;
+            let next_descriptor = descriptors.peek().copied();
             let row = row_offset + offset;
-            if let Some(matched) = anchored.as_mut().and_then(|plan| plan.matches(column, row, dictionary)) {
+            if let Some(matched) = anchored.as_mut().and_then(|plan| plan.matches(column, descriptor, next_descriptor, dictionary)) {
                 if matched { *destination = Tri::True as u8; }
                 continue;
             }
-            let record = column.record(row).ok_or(SearchError::SizeOverflow)?;
+            let record = column.record_from_descriptors(descriptor, next_descriptor).ok_or(SearchError::SizeOverflow)?;
             self.clp_scratch.clear();
             append_clp_message_bounded(
                 record.logtype(),

@@ -7,6 +7,7 @@ use std::iter::FusedIterator;
 use super::dictionary::ArrayDictionary;
 use super::packed_stream::ColumnSlot;
 use crate::encoded_numeric::NumericColumn;
+use super::clp_descriptors::{Descriptors, DescriptorCursor};
 use super::dictionary::LogTypeDictionary;
 use super::dictionary::LogTypeDictionaryEntry;
 use super::dictionary::LogTypeVariableKind;
@@ -858,7 +859,7 @@ impl<'table, 'archive> ClpStringRecord<'table, 'archive> {
 /// A zero-copy CLP string or unstructured-array column.
 #[derive(Clone, Copy, Debug)]
 pub struct ClpStringColumn<'table, 'archive> {
-    descriptors: NumericColumn<'table>,
+    descriptors: Descriptors<'table>,
     encoded_variables: I64Column<'table>,
     variable_dictionary: &'archive VariableDictionary,
     logtype_dictionary: LogTypeDictionaryRef<'archive>,
@@ -867,14 +868,14 @@ pub struct ClpStringColumn<'table, 'archive> {
 impl<'table, 'archive> ClpStringColumn<'table, 'archive> {
     /// Returns the number of records.
     #[must_use]
-    pub const fn len(self) -> usize {
+    pub fn len(self) -> usize {
         self.descriptors.len()
     }
 
     /// Returns whether the column contains no records.
     #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.descriptors.len() == 0
+    pub fn is_empty(self) -> bool {
+        self.descriptors.is_empty()
     }
 
     /// Returns one decoded descriptor.
@@ -904,12 +905,23 @@ impl<'table, 'archive> ClpStringColumn<'table, 'archive> {
     /// way needs no scan of the logtype.
     #[must_use]
     pub fn record(self, index: usize) -> Option<ClpStringRecord<'table, 'archive>> {
-        let descriptor = self.descriptor(index)?;
+        self.record_from_descriptors(self.descriptor(index)?, self.descriptor(index + 1))
+    }
+
+    pub(crate) fn descriptors(self) -> impl Iterator<Item=ClpDescriptor> + 'table {
+        self.descriptors.iter().map(|raw| ClpDescriptor { raw })
+    }
+
+    pub fn cursor(self) -> ClpStringCursor<'table, 'archive> {
+        ClpStringCursor { column: self, descriptors: self.descriptors.cursor() }
+    }
+
+    pub(crate) fn record_from_descriptors(self, descriptor: ClpDescriptor, next: Option<ClpDescriptor>) -> Option<ClpStringRecord<'table, 'archive>> {
         let logtype = self
             .logtype_dictionary
             .entry(u64::from(descriptor.logtype_id()))?;
         let start = usize::try_from(descriptor.encoded_variable_offset()).ok()?;
-        let end = match self.descriptor(index + 1) {
+        let end = match next {
             Some(next) => usize::try_from(next.encoded_variable_offset()).ok()?,
             None => self.encoded_variables.len(),
         };
@@ -919,6 +931,19 @@ impl<'table, 'archive> ClpStringColumn<'table, 'archive> {
             logtype,
             encoded_variables: self.encoded_variables.slice(start, count)?,
         })
+    }
+}
+
+/// Cursor for reconstructing selected CLP records without re-decoding adjacent descriptors.
+pub struct ClpStringCursor<'table, 'archive> {
+    column: ClpStringColumn<'table, 'archive>,
+    descriptors: DescriptorCursor<'table>,
+}
+impl<'table, 'archive> ClpStringCursor<'table, 'archive> {
+    pub fn record(&mut self, row: usize) -> Option<ClpStringRecord<'table, 'archive>> {
+        let descriptor = ClpDescriptor { raw: self.descriptors.get(row)? };
+        let next = self.descriptors.get(row + 1).map(|raw| ClpDescriptor { raw });
+        self.column.record_from_descriptors(descriptor, next)
     }
 }
 
@@ -1544,7 +1569,7 @@ fn take_clp_string_column<'table, 'archive>(
     limits: ColumnLimits,
     total_encoded_variables: &mut u64,
 ) -> Result<ClpStringColumn<'table, 'archive>, ColumnError> {
-    let descriptors = NumericColumn::plain(cursor.take_fixed(context, message_count, U64_SIZE)?);
+    let descriptors = Descriptors::Numeric(NumericColumn::plain(cursor.take_fixed(context, message_count, U64_SIZE)?));
     let encoded_variable_count = cursor.take_u64(context)?;
     check_encoded_variable_count(encoded_variable_count, context, limits, total_encoded_variables)?;
     let encoded_variable_count =
@@ -1709,7 +1734,7 @@ fn validate_finite_floats(
 }
 
 fn validate_clp_descriptors(
-    descriptors: NumericColumn<'_>,
+    descriptors: Descriptors<'_>,
     encoded_variables: I64Column<'_>,
     context: ColumnContext,
     variable_dictionary: &VariableDictionary,
