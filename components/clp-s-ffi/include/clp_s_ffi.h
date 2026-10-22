@@ -1033,6 +1033,38 @@ clp_s_status clp_s_v5_numeric_summary(
     uint32_t (*cancel)(void *), void *context, clp_s_v5_numeric_summary_result *out,
     clp_s_error_buffer *error);
 
+/* Batched numeric aggregation. One archive/catalog open for all requested
+ * fields; a single projected scan for outputs not answered by summaries.
+ * Node DAG is postorder, maximum depth 64, maximum 4096 nodes.
+ * op: 0 field, 1 constant, 2 cast, 3 add, 4 subtract, 5 multiply, 6 divide,
+ * 7 equal, 8 not-equal, 9 less, 10 less-equal, 11 greater, 12 greater-equal,
+ * 13 AND, 14 OR, 15 IS NULL, 16 IS NOT NULL, 17 aggregate FILTER mask (left value evaluated eagerly, right predicate).
+ * Types use v5 codes plus 7 BOOLEAN. Field.left is a field index; other
+ * nonconstant operands are earlier node indexes. Constant bits hold signed
+ * i128 words, an f64 bit pattern, or boolean 0/1; right=1 means NULL.
+ * outputs contains node indexes; sum_required has one byte per output.
+ * predicate=-1 means unfiltered. Only TRUE rows qualify (SQL null semantics).
+ * out has output_count writable entries. All slices and callback context must
+ * remain valid for this synchronous call. No input pointer is retained.
+ */
+typedef struct clp_s_v6_numeric_field {
+    uint8_t const *path;
+    size_t path_length;
+    uint32_t type;
+} clp_s_v6_numeric_field;
+typedef struct clp_s_v6_numeric_node {
+    uint32_t op, type, left, right;
+    uint64_t bits[2];
+} clp_s_v6_numeric_node;
+clp_s_status clp_s_v6_numeric_aggregate(
+    uint8_t const *path, size_t path_length,
+    clp_s_v6_numeric_field const *fields, size_t field_count,
+    clp_s_v6_numeric_node const *nodes, size_t node_count,
+    uint32_t const *outputs, uint8_t const *sum_required, size_t output_count, int32_t predicate,
+    uint64_t max_compressed, uint64_t max_decompressed, uint32_t force_scan,
+    uint32_t (*cancel)(void *), void *context, clp_s_v5_numeric_summary_result *out,
+    clp_s_error_buffer *error);
+
 #ifdef __cplusplus
 }
 #endif

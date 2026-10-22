@@ -16,7 +16,7 @@ pub struct ClpNumericSummary {
     pub from_metadata: u64,
     pub supported: u64,
 }
-fn bounds(typ: u32) -> Option<(i128, i128)> {
+pub(super) fn bounds(typ: u32) -> Option<(i128, i128)> {
     Some(match typ {
         0 => (i128::from(i64::MIN), i128::from(i64::MAX)),
         1 => (0, i128::from(u64::MAX)),
@@ -27,7 +27,7 @@ fn bounds(typ: u32) -> Option<(i128, i128)> {
         _ => return None,
     })
 }
-fn failure(message: impl ToString) -> ApiError {
+pub(super) fn failure(message: impl ToString) -> ApiError {
     ApiError::Archive(message.to_string())
 }
 fn combine(a: &mut IntegerSummary, b: &IntegerSummary, lo: i128, hi: i128) -> Option<bool> {
@@ -48,98 +48,122 @@ fn combine(a: &mut IntegerSummary, b: &IntegerSummary, lo: i128, hi: i128) -> Op
     a.merge(b)?;
     Some(true)
 }
+struct SummaryContext {
+    catalog: clp_s::archive::ArchiveCatalog,
+    summaries: NumericSummaries,
+    index: std::collections::HashMap<(i32, u32), usize>,
+}
+impl SummaryContext {
+    fn open(archive: &ClpSArchive) -> Result<Option<Self>, ApiError> {
+        let catalog = archive
+            .open_reader()?
+            .read_catalog(ArchiveCatalogLimits::default().with_skip_dictionaries(true))
+            .map_err(failure)?;
+        let summaries = catalog
+            .metadata()
+            .numeric_summaries()
+            .and_then(|bytes| NumericSummaries::decode(bytes).ok())
+            .unwrap_or(NumericSummaries {
+                version: 1,
+                columns: vec![],
+            });
+        let mut index = std::collections::HashMap::new();
+        for (i, column) in summaries.columns.iter().enumerate() {
+            if index.insert((column.schema, column.node), i).is_some() {
+                return Ok(None);
+            }
+        }
+        Ok(Some(Self {
+            catalog,
+            summaries,
+            index,
+        }))
+    }
+    fn field(&self, field: &str, typ: u32) -> Result<Option<ClpNumericSummary>, ApiError> {
+        let catalog = &self.catalog;
+        let parts: Vec<_> = field.split('.').collect();
+        let nodes = columnar::resolve_path(catalog.schema_tree(), &parts);
+        let mut ints = IntegerSummary::default();
+        let mut floats = FloatSummary::default();
+        for table in catalog.table_metadata().schema_tables() {
+            let schema = catalog
+                .schema_map()
+                .get(table.schema_id())
+                .ok_or_else(|| failure("missing schema"))?;
+            let matching: Vec<_> = schema
+                .entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    SchemaEntry::Node(id) if nodes.contains(id) => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            // Repeated keys or array layouts must use the existing projection semantics.
+            if matching.len() > 1 {
+                return Ok(None);
+            }
+            for node in matching {
+                let kind = catalog
+                    .schema_tree()
+                    .get(node as usize)
+                    .ok_or_else(|| failure("missing node"))?
+                    .node_type();
+                if kind == NodeType::Timestamp {
+                    return Ok(Some(ClpNumericSummary::default()));
+                }
+                if kind == NodeType::DictionaryFloat {
+                    return Ok(None);
+                }
+                let needed = if typ == 3 {
+                    matches!(kind, NodeType::Float | NodeType::FormattedFloat)
+                } else {
+                    matches!(kind, NodeType::Integer | NodeType::MixedInteger)
+                };
+                if !needed {
+                    continue;
+                }
+                let Some(position) = self.index.get(&(table.schema_id(), node)) else {
+                    return Ok(None);
+                };
+                let summary = &self.summaries.columns[*position];
+                let n = summary
+                    .negative
+                    .count
+                    .checked_add(summary.nonnegative.count)
+                    .and_then(|n| n.checked_add(summary.unsigned.count))
+                    .and_then(|n| n.checked_add(summary.float.count));
+                if n != Some(table.message_count()) {
+                    return Ok(None);
+                }
+                if typ == 3 {
+                    floats
+                        .merge(&summary.float)
+                        .ok_or_else(|| failure("summary count overflow"))?;
+                } else {
+                    let (lo, hi) =
+                        bounds(typ).ok_or_else(|| failure("unsupported numeric mapping"))?;
+                    for bucket in [&summary.negative, &summary.nonnegative, &summary.unsigned] {
+                        if combine(&mut ints, bucket, lo, hi) != Some(true) {
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Some(result(ints, floats, typ, true)))
+    }
+}
 fn metadata_summary(
     archive: &ClpSArchive,
     field: &str,
     typ: u32,
 ) -> Result<Option<ClpNumericSummary>, ApiError> {
-    let catalog = archive
-        .open_reader()?
-        .read_catalog(ArchiveCatalogLimits::default().with_skip_dictionaries(true))
-        .map_err(failure)?;
-    let Some(bytes) = catalog.metadata().numeric_summaries() else {
-        return Ok(None);
-    };
-    // Unknown or malformed optional summaries cannot authorize skipping the values.
-    let Ok(summaries) = NumericSummaries::decode(bytes) else {
-        return Ok(None);
-    };
-    let parts: Vec<_> = field.split('.').collect();
-    let nodes = columnar::resolve_path(catalog.schema_tree(), &parts);
-    let mut ints = IntegerSummary::default();
-    let mut floats = FloatSummary::default();
-    let mut index = std::collections::HashMap::new();
-    for column in &summaries.columns {
-        if index.insert((column.schema, column.node), column).is_some() {
-            return Ok(None);
-        }
+    match SummaryContext::open(archive)? {
+        Some(ctx) => ctx.field(field, typ),
+        None => Ok(None),
     }
-    for table in catalog.table_metadata().schema_tables() {
-        let schema = catalog
-            .schema_map()
-            .get(table.schema_id())
-            .ok_or_else(|| failure("missing schema"))?;
-        let matching: Vec<_> = schema
-            .entries()
-            .iter()
-            .filter_map(|entry| match entry {
-                SchemaEntry::Node(id) if nodes.contains(id) => Some(*id),
-                _ => None,
-            })
-            .collect();
-        // Repeated keys or array layouts must use the existing projection semantics.
-        if matching.len() > 1 {
-            return Ok(None);
-        }
-        for node in matching {
-            let kind = catalog
-                .schema_tree()
-                .get(node as usize)
-                .ok_or_else(|| failure("missing node"))?
-                .node_type();
-            if kind == NodeType::Timestamp {
-                return Ok(Some(ClpNumericSummary::default()));
-            }
-            if kind == NodeType::DictionaryFloat {
-                return Ok(None);
-            }
-            let needed = if typ == 3 {
-                matches!(kind, NodeType::Float | NodeType::FormattedFloat)
-            } else {
-                matches!(kind, NodeType::Integer | NodeType::MixedInteger)
-            };
-            if !needed {
-                continue;
-            }
-            let Some(summary) = index.get(&(table.schema_id(), node)) else {
-                return Ok(None);
-            };
-            let n = summary
-                .negative
-                .count
-                .checked_add(summary.nonnegative.count)
-                .and_then(|n| n.checked_add(summary.unsigned.count))
-                .and_then(|n| n.checked_add(summary.float.count));
-            if n != Some(table.message_count()) {
-                return Ok(None);
-            }
-            if typ == 3 {
-                floats
-                    .merge(&summary.float)
-                    .ok_or_else(|| failure("summary count overflow"))?;
-            } else {
-                let (lo, hi) = bounds(typ).ok_or_else(|| failure("unsupported numeric mapping"))?;
-                for bucket in [&summary.negative, &summary.nonnegative, &summary.unsigned] {
-                    if combine(&mut ints, bucket, lo, hi) != Some(true) {
-                        return Ok(None);
-                    }
-                }
-            }
-        }
-    }
-    Ok(Some(result(ints, floats, typ, true)))
 }
-fn result(
+pub(super) fn result(
     ints: IntegerSummary,
     floats: FloatSummary,
     typ: u32,
@@ -301,3 +325,6 @@ pub unsafe extern "C" fn clp_s_v5_numeric_summary(
         })
     }
 }
+
+#[path = "numeric_program.rs"]
+mod program;
