@@ -618,6 +618,7 @@ pub struct CompiledQuery<'query, 'archive> {
     predicates: Vec<CompiledPredicate>,
     lists: Vec<CompiledList>,
     authoritative_timestamp_range: Option<CompiledAuthoritativeTimestampRange>,
+    archive_may_match: bool,
 }
 
 impl ParsedQuery {
@@ -675,7 +676,7 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
             compile_authoritative_timestamp_range(catalog, options)?;
         let mut builder = Compiler::new(query, catalog, options, schema_index, matches)?;
         builder.compile_nodes()?;
-        Ok(Self {
+        let mut compiled = Self {
             query,
             catalog,
             options,
@@ -683,7 +684,10 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
             predicates: builder.predicates,
             lists: builder.lists,
             authoritative_timestamp_range,
-        })
+            archive_may_match: true,
+        };
+        compiled.archive_may_match = compiled.compute_archive_may_match();
+        Ok(compiled)
     }
 
     /// Matches one lazily decoded schema table in physical row order.
@@ -1251,7 +1255,7 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
         &self,
         schema: &crate::archive::SchemaDefinition,
     ) -> Result<bool, SearchError> {
-        Ok(Tri::False != self.evaluate_schema_program(schema)?)
+        Ok(Tri::False != self.evaluate_schema_program(schema)? && self.may_match_archive())
     }
 
     /// Returns whether the compiled root might match at least one physical archive row.
@@ -1259,25 +1263,48 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
     /// This deliberately recognizes only roots that can be proven empty without table data. A
     /// conservative `true` keeps all other expressions on the ordinary table evaluator path.
     pub(crate) fn may_match_archive(&self) -> bool {
-        let predicate_index = match self.nodes.get(self.query.root().index()).copied() {
-            Some(CompiledNode::Predicate(predicate_index)) => predicate_index,
-            Some(CompiledNode::Not(operand)) => {
-                let Some(CompiledNode::Predicate(predicate_index)) =
-                    self.nodes.get(operand.index()).copied()
-                else {
-                    return true;
-                };
-                let Some(compiled) = self.predicates.get(predicate_index) else {
-                    return true;
-                };
-                let ResolvedPath::Schema(schema) = &compiled.resolved else {
-                    return true;
-                };
-                // The C++ schema matcher rejects a wholly unresolved path even below a root NOT.
-                return self.schema_path_present(schema);
+        self.archive_may_match
+    }
+
+    fn compute_archive_may_match(&self) -> bool {
+        if let Some(CompiledNode::Not(operand)) = self.nodes.get(self.query.root().index()).copied() {
+            if let Some(CompiledNode::Predicate(index)) = self.nodes.get(operand.index()).copied() {
+                if let Some(compiled) = self.predicates.get(index) {
+                    if let ResolvedPath::Schema(schema) = &compiled.resolved {
+                        // Preserve C++'s wholly unresolved root-NOT behaviour.
+                        return self.schema_path_present(schema);
+                    }
+                }
             }
-            _ => return true,
-        };
+            return true;
+        }
+        // Propagate impossibility through positive AND/OR trees. A dictionary
+        // miss in any mandatory conjunct proves the entire archive empty,
+        // even beside an expensive OR/NOT subtree. These are possibility bits,
+        // not truth values: NOT must stay unknown, never invert a miss.
+        let mut possible = Vec::new();
+        if possible.try_reserve_exact(self.nodes.len()).is_err() {
+            return true;
+        }
+        for node in &self.nodes {
+            let value = match *node {
+                CompiledNode::Predicate(index) => self.predicate_may_match_archive(index),
+                CompiledNode::Boolean { operator, left, right } => {
+                    let left = possible.get(left.index()).copied().unwrap_or(true);
+                    let right = possible.get(right.index()).copied().unwrap_or(true);
+                    match operator {
+                        BooleanOperator::And => left && right,
+                        BooleanOperator::Or => left || right,
+                    }
+                }
+                CompiledNode::Not(_) | CompiledNode::List(_) => true,
+            };
+            possible.push(value);
+        }
+        possible.get(self.query.root().index()).copied().unwrap_or(true)
+    }
+
+    fn predicate_may_match_archive(&self, predicate_index: usize) -> bool {
         let Some(compiled) = self.predicates.get(predicate_index) else {
             return true;
         };

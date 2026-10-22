@@ -1450,6 +1450,33 @@ mod tests {
     }
 
     #[test]
+    fn dictionary_misses_prune_boolean_trees_without_inverting_negation() {
+        for query in [
+            "c:never-present AND (c:other OR NOT c:another)",
+            "(c:other OR NOT c:another) AND c:never-present",
+            "c:never-present OR c:also-never-present",
+        ] {
+            let mut sink = CoordinateSink::default();
+            let stats = run_search(query, &mut sink, &ArchiveSearchOptions::default()).unwrap();
+            assert_eq!(ArchiveSearchStats::default(), stats, "{query}");
+            // Dictionary pruning follows sink setup, preserving the CLI's
+            // observable empty-output behaviour from the C++ implementation.
+            assert_eq!(1, sink.begin_calls, "{query}");
+            assert!(sink.batches.is_empty(), "{query}");
+        }
+        for query in [
+            "c:never-present OR NOT c:also-never-present",
+            "NOT (c:never-present OR c:also-never-present)",
+            "NOT c:never-present AND c:*",
+        ] {
+            let mut sink = CoordinateSink::default();
+            let stats = run_search(query, &mut sink, &ArchiveSearchOptions::default()).unwrap();
+            assert_eq!(1, stats.matching_rows(), "{query}");
+            assert_eq!(1, stats.tables_scanned(), "{query}");
+        }
+    }
+
+    #[test]
     fn schema_preflight_requires_one_schema_to_satisfy_each_conjunct() {
         let mut sink = CoordinateSink::default();
         let stats = run_search("a:* AND b:*", &mut sink, &ArchiveSearchOptions::default())
