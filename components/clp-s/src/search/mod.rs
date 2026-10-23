@@ -15,6 +15,7 @@ mod jsonl;
 mod kv_ir;
 mod lexer;
 mod msgpack;
+mod numeric_pruning;
 mod parser;
 mod projection;
 mod reducer;

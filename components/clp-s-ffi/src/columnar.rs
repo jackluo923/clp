@@ -2138,49 +2138,53 @@ mod prefilter_reuse_tests {
             let extra = if n % 2 == 0 { ",\"optional\":1" } else { "" };
             writeln!(source, "{{\"n\":{n},\"ci\":42,\"cf\":2.5,\"text\":\"hello {n}\"{extra}}}").unwrap();
         }
-        let mut writer = clp_s::writer::OpenArchive::new(Cursor::new(Vec::new()),
-            clp_s::writer::WriterOptions::default().with_separate_columns_min_size(1)
-                .with_adaptive_numeric_columns(true));
-        let mut parser = clp_s::ingest::ParseManyReader::new(source.as_bytes(), Default::default());
-        parser.read_to_end(&mut clp_s::ingest::JsonArchiveSink::new(&mut writer,
-            clp_s::ingest::JsonArchiveOptions::default().with_retain_float_format(false))).unwrap();
-        let bytes = writer.finish().unwrap().into_inner().into_inner();
-        for whole_projection in [false, true] {
-            for mode in [2, 3, 4] {
-                for (query, expected) in [("n >= 0", (0..10003).collect::<Vec<i64>>()),
-                    ("n >= 2047 AND n < 4099", (2047..4099).collect()),
-                    ("n > 20000", Vec::new())] {
-                    let reads = Rc::new(RefCell::new(Vec::new()));
-                    let reader = RecordingReader { inner: SingleFileArchiveReader::open(Cursor::new(bytes.clone())).unwrap(),
-                        reads: reads.clone(), whole_projection };
-                    let mut scan = ProjectedScanner::open(Box::new(reader), parse_kql(query, KqlLimits::default()).unwrap(),
-                        &Default::default(), &["n".into(), "ci".into(), "cf".into(), "text".into()]).unwrap();
-                    let mut actual = Vec::new();
-                    if mode == 2 {
-                        while let Some((cells, _)) = scan.next_row().unwrap() {
-                            actual.push(cells[0].integer);
-                            assert_eq!(cells[1].integer, 42);
-                            assert_eq!(cells[2].real, 2.5);
-                        }
-                    } else {
-                        while let Some((columns, _, rows)) = scan.next_columns_with_constants(mode == 4).unwrap() {
-                            assert_eq!(columns[0].kind, kind::INTEGER);
-                            // SAFETY: Copy from live numeric column views before advancing.
-                            unsafe {
-                                for row in 0..rows { actual.push(columns[0].data.cast::<i64>().add(row).read_unaligned()); }
+        // Exercise both a decoded empty prefilter and the earlier metadata-only rejection.
+        for summaries in [false, true] {
+            let mut writer = clp_s::writer::OpenArchive::new(Cursor::new(Vec::new()),
+                clp_s::writer::WriterOptions::default().with_separate_columns_min_size(1)
+                    .with_adaptive_numeric_columns(true).with_numeric_summaries(summaries));
+            let mut parser = clp_s::ingest::ParseManyReader::new(source.as_bytes(), Default::default());
+            parser.read_to_end(&mut clp_s::ingest::JsonArchiveSink::new(&mut writer,
+                clp_s::ingest::JsonArchiveOptions::default().with_retain_float_format(false))).unwrap();
+            let bytes = writer.finish().unwrap().into_inner().into_inner();
+            for whole_projection in [false, true] {
+                for mode in [2, 3, 4] {
+                    for (query, expected) in [("n >= 0", (0..10003).collect::<Vec<i64>>()),
+                        ("n >= 2047 AND n < 4099", (2047..4099).collect()),
+                        ("n > 20000", Vec::new())] {
+                        let reads = Rc::new(RefCell::new(Vec::new()));
+                        let reader = RecordingReader { inner: SingleFileArchiveReader::open(Cursor::new(bytes.clone())).unwrap(),
+                            reads: reads.clone(), whole_projection };
+                        let mut scan = ProjectedScanner::open(Box::new(reader), parse_kql(query, KqlLimits::default()).unwrap(),
+                            &Default::default(), &["n".into(), "ci".into(), "cf".into(), "text".into()]).unwrap();
+                        let mut actual = Vec::new();
+                        if mode == 2 {
+                            while let Some((cells, _)) = scan.next_row().unwrap() {
+                                actual.push(cells[0].integer);
+                                assert_eq!(cells[1].integer, 42);
+                                assert_eq!(cells[2].real, 2.5);
                             }
-                            assert!(scan.prefilter_matches.is_none(), "cached bitmap consumed");
+                        } else {
+                            while let Some((columns, _, rows)) = scan.next_columns_with_constants(mode == 4).unwrap() {
+                                assert_eq!(columns[0].kind, kind::INTEGER);
+                                // SAFETY: Copy from live numeric column views before advancing.
+                                unsafe {
+                                    for row in 0..rows { actual.push(columns[0].data.cast::<i64>().add(row).read_unaligned()); }
+                                }
+                                assert!(scan.prefilter_matches.is_none(), "cached bitmap consumed");
+                            }
                         }
-                    }
-                    actual.sort_unstable();
-                    assert_eq!(actual, expected, "{query}, mode={mode}, whole={whole_projection}");
-                    let reads = reads.borrow();
-                    assert_eq!(reads.len(), if expected.is_empty() || whole_projection { 2 } else { 4 });
-                    if !whole_projection && !expected.is_empty() {
-                        for pair in reads.chunks_exact(2) {
-                            assert_eq!(pair[0].0, pair[1].0);
-                            assert!(pair[0].1.iter().zip(&pair[1].1).all(|(a, b)| !(*a && *b)),
-                                "a column was decompressed twice: {pair:?}");
+                        actual.sort_unstable();
+                        assert_eq!(actual, expected, "{query}, mode={mode}, whole={whole_projection}");
+                        let reads = reads.borrow();
+                        assert_eq!(reads.len(), if expected.is_empty() && summaries { 0 }
+                            else if expected.is_empty() || whole_projection { 2 } else { 4 });
+                        if !whole_projection && !expected.is_empty() {
+                            for pair in reads.chunks_exact(2) {
+                                assert_eq!(pair[0].0, pair[1].0);
+                                assert!(pair[0].1.iter().zip(&pair[1].1).all(|(a, b)| !(*a && *b)),
+                                    "a column was decompressed twice: {pair:?}");
+                            }
                         }
                     }
                 }

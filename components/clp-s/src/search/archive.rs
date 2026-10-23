@@ -8,6 +8,7 @@ use std::io;
 use std::iter::FusedIterator;
 
 use super::CompiledQuery;
+use super::DictionaryMatches;
 use super::MatchBitmap;
 use super::MatchingRows;
 use super::ParsedQuery;
@@ -417,10 +418,16 @@ pub fn search_archive<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
     let mut scan = ScanPosition::default();
     let mut pending_output = None;
     let mut sink_begun = false;
+    let mut dictionary_matches = DictionaryMatches::new();
     loop {
-        let compiled = query
-            .compile_for_archive(&catalog, options.search)
-            .map_err(ArchiveSearchError::Compile)?;
+        // Cache predicate matches only while its dictionaries are complete and stable. The
+        // output-prefix path can grow the variable dictionary and keeps independent compilation.
+        let compiled = if prefix_output {
+            query.compile_for_archive(&catalog, options.search)
+        } else {
+            query.compile_for_archive_reusing(&catalog, options.search, &mut dictionary_matches)
+        }
+        .map_err(ArchiveSearchError::Compile)?;
         let wanted = match output {
             Some(ref wanted) => Dictionaries::clone(wanted),
             None => output

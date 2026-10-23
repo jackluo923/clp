@@ -624,6 +624,7 @@ pub struct CompiledQuery<'query, 'archive> {
     timestamp_windows: Vec<(u32, i64, i64)>,
     /// The archive's timestamp chunk index, decoded only when a window can use it.
     timestamp_chunks: Option<crate::timestamp_chunks::TimestampChunks>,
+    numeric_pruning: super::numeric_pruning::NumericPruning,
 }
 
 impl ParsedQuery {
@@ -730,7 +731,14 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
             pattern_cache,
             timestamp_windows: Vec::new(),
             timestamp_chunks: None,
+            numeric_pruning: super::numeric_pruning::NumericPruning::default(),
         };
+        if query.nodes().iter().any(|node| {
+            matches!(node.kind(), ExpressionKind::Predicate(predicate)
+                if matches!(predicate.value(), Literal::Integer { .. } | Literal::Unsigned { .. }))
+        }) {
+            compiled.numeric_pruning = super::numeric_pruning::NumericPruning::new(catalog);
+        }
         compiled.archive_may_match = compiled.compute_archive_may_match();
         compiled.timestamp_windows = compiled.compute_timestamp_windows();
         if !compiled.timestamp_windows.is_empty() {
@@ -1363,7 +1371,7 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
             .get(predicate_index)
             .ok_or(SearchError::SizeOverflow)?;
         let predicate = self.predicate_ref(compiled)?;
-        Ok(self.evaluate_schema_leaf(&compiled.resolved, compiled.negated, predicate, schema))
+        Ok(self.evaluate_schema_leaf(&compiled.resolved, compiled.negated, predicate, schema, true))
     }
 
     fn evaluate_schema_list(
@@ -1395,7 +1403,7 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
         let mut aggregate = None;
         for literal in list.values() {
             let predicate = PredicateRef::equality(list.path(), literal);
-            let value = self.evaluate_schema_leaf(resolved, compiled.negated, predicate, schema);
+            let value = self.evaluate_schema_leaf(resolved, compiled.negated, predicate, schema, false);
             aggregate =
                 Some(aggregate.map_or(value, |current| combine_tri(current, value, operator)));
         }
@@ -1408,6 +1416,7 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
         negated: bool,
         predicate: PredicateRef<'_>,
         schema: &crate::archive::SchemaDefinition,
+        prune_numeric: bool,
     ) -> Tri {
         let ResolvedPath::Schema(resolved) = resolved else {
             return Tri::Unknown;
@@ -1440,6 +1449,14 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
                 .get(node_id as usize)
                 .is_some_and(|node| {
                     let node_type = node.node_type();
+                    if prune_numeric
+                        && !negated
+                        && self.numeric_pruning.excludes(
+                            schema.id(), node_id, predicate.operator(), predicate.value(),
+                        )
+                    {
+                        return false;
+                    }
                     if !negated && node_type == NodeType::ClpString {
                         if let Some(template) = self.catalog.metadata().template_index()
                             .and_then(|index| index.template(schema.id(), node_id)) {
@@ -2481,13 +2498,15 @@ impl<'query, 'archive, 'cache> Compiler<'query, 'archive, 'cache> {
         )?;
         // An archive storing UUIDs as binary renders their text only for a pattern that needs it.
         // An exact literal compares against their bytes, and no number parses from a UUID.
-        let exact = (DictionaryMatchKind::String == kind
-            && dictionary.has_binary_uuids()
-            && !self.options.ignore_case())
-        .then(|| variable_pattern(predicate).or_else(|| clp_pattern(predicate)))
-        .flatten()
-        .and_then(exact_pattern);
+        // Prepare each pattern once, rather than reclassifying its literal (including scanning
+        // for spaces) for every entry. Exact strings use byte equality on every dictionary,
+        // whether or not this archive contains binary UUIDs.
+        let pattern = (DictionaryMatchKind::String == kind)
+            .then(|| variable_pattern(predicate).or_else(|| clp_pattern(predicate)))
+            .flatten();
+        let exact = pattern.and_then(exact_pattern);
         let exact_uuid = exact.as_deref().and_then(crate::archive::canonical_uuid);
+        let ignore_case = self.options.ignore_case();
         let mut matching_ids = Vec::new();
         for entry in (0..dictionary.len() as u64).filter_map(|id| {
             let binary = dictionary.binary_uuid(id);
@@ -2495,14 +2514,18 @@ impl<'query, 'archive, 'cache> Compiler<'query, 'archive, 'cache> {
                 (DictionaryMatchKind::Float | DictionaryMatchKind::Timestamp(_), Some(_), _) => {
                     Some(false)
                 }
-                (DictionaryMatchKind::String, Some(uuid), Some(_)) => {
+                (DictionaryMatchKind::String, Some(uuid), Some(_)) if !ignore_case => {
                     Some(exact_uuid.is_some_and(|literal| literal == uuid))
                 }
-                (DictionaryMatchKind::String, None, Some(literal)) => Some(
-                    dictionary
-                        .entry(id)
-                        .is_some_and(|entry| entry.value() == literal),
-                ),
+                (DictionaryMatchKind::String, None, Some(literal)) => {
+                    Some(dictionary.entry(id).is_some_and(|entry| {
+                        if ignore_case {
+                            entry.value().eq_ignore_ascii_case(literal)
+                        } else {
+                            entry.value() == literal
+                        }
+                    }))
+                }
                 _ => None,
             };
             match decided {
@@ -2514,7 +2537,15 @@ impl<'query, 'archive, 'cache> Compiler<'query, 'archive, 'cache> {
             let (entry, decided) = entry;
             let is_match = decided.unwrap_or_else(|| match kind {
                 DictionaryMatchKind::String => {
-                    string_value_matches(entry.value(), predicate, self.options.ignore_case())
+                    if let Some(literal) = exact.as_deref() {
+                        if ignore_case {
+                            entry.value().eq_ignore_ascii_case(literal)
+                        } else {
+                            entry.value() == literal
+                        }
+                    } else {
+                        pattern.is_some_and(|pattern| wildcard_match(entry.value(), pattern, ignore_case))
+                    }
                 }
                 DictionaryMatchKind::Float => std::str::from_utf8(entry.value())
                     .ok()
@@ -6065,6 +6096,33 @@ mod tests {
         assert_eq!([0, 2, 4], matched_ids(&bytes, "s:mixed", true).as_slice());
         assert_eq!([1], matched_ids(&bytes, "s:École", true).as_slice());
         assert_eq!(Vec::<i64>::new(), matched_ids(&bytes, "s:école", true));
+    }
+
+    #[test]
+    fn prepared_dictionary_literals_match_wildcards_with_escapes_case_and_uuids() {
+        for uuids in [false, true] {
+            let mut values = vec!["Alpha", "alpha", "literal*?", "path\\name", "École", "école", "xyz"];
+            if uuids { values.push("34c75dc7-30ee-42e1-9f1e-58cf1667f88e"); }
+            let mut writer = OpenArchive::new(Cursor::new(Vec::new()), WriterOptions::default());
+            for (id, value) in values.iter().enumerate() {
+                writer.append_record(RecordRef::new(&[
+                    FieldRef::new(b"id", ValueRef::I64(id as i64)),
+                    FieldRef::new(b"value", ValueRef::String(value.as_bytes())),
+                ])).unwrap();
+            }
+            let bytes = writer.finish().unwrap().into_inner().into_inner();
+            for pattern in ["Alpha", "ALPHA", r"literal\*\?", r"path\\name", "École", "école",
+                "34c75dc7-30ee-42e1-9f1e-58cf1667f88e", "34C75DC7-30EE-42E1-9F1E-58CF1667F88E", "absent", "A*", "*?z"] {
+                for ignore_case in [false, true] {
+                    let expected: Vec<i64> = values.iter().enumerate().filter_map(|(id, value)|
+                        wildcard_match(value.as_bytes(), pattern, ignore_case).then_some(id as i64)).collect();
+                    let query = format!("value:\"{pattern}\"");
+                    assert_eq!(matched_ids(&bytes, &query, ignore_case), expected, "{query}, case={ignore_case}, uuids={uuids}");
+                    let inverted: Vec<i64> = (0..values.len() as i64).filter(|id| !expected.contains(id)).collect();
+                    assert_eq!(matched_ids(&bytes, &format!("NOT {query}"), ignore_case), inverted, "NOT {query}");
+                }
+            }
+        }
     }
 
     #[test]
