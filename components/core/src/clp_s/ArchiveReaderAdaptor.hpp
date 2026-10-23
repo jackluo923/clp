@@ -86,6 +86,14 @@ public:
     std::unique_ptr<clp::ReaderInterface> checkout_reader_for_section(std::string_view section);
 
     /**
+     * Opens a bounded section cursor that owns its position and can survive reads of other
+     * sections. Only supported for seekable inputs. The cursor needs no checkin; interleaved
+     * reads must be serialized, and ordinary checked-out readers must be checked in first.
+     */
+    auto open_independent_reader_for_section(std::string_view section)
+            -> std::unique_ptr<clp::ReaderInterface>;
+
+    /**
      * Checks in a reader for a given section of the archive.
      * @param section
      * @throw OperationFailed if no reader is checked out, or if the section being checked in does
@@ -196,7 +204,8 @@ private:
      * @throw OperationFailed if the requested section does not exist in ArchiveFileInfo, if
      *        a forward-only input would require a backward seek, or on any I/O error.
      */
-    std::unique_ptr<clp::ReaderInterface> checkout_reader_for_sfa_section(std::string_view section);
+    std::unique_ptr<clp::ReaderInterface>
+    checkout_reader_for_sfa_section(std::string_view section, bool independent = false);
 
     /**
      * Tries to read the header for the archive from the given reader.

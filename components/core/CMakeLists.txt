@@ -684,6 +684,7 @@ set(SOURCE_FILES_unitTest
         tests/test-AdaptiveColumn.cpp
         tests/test-NumericColumnView.cpp
         tests/test-SelectiveDictionaryReads.cpp
+        tests/test-OutputColumnReads.cpp
         tests/test-MetadataCounts.cpp
         src/clp_s/aggregators.cpp
         src/clp_s/OutputHandlerImpl.cpp
@@ -744,6 +745,7 @@ if(CLP_ENABLE_TESTS)
             )
     set_source_files_properties(
             tests/test-MetadataCounts.cpp
+            tests/test-OutputColumnReads.cpp
             PROPERTIES
             COMPILE_DEFINITIONS "CLP_BUILD_CLPP_DECOMPOSITION=$<BOOL:${CLP_BUILD_CLPP_DECOMPOSITION}>"
             )

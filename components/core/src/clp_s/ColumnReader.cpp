@@ -3,6 +3,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <variant>
 
@@ -154,6 +155,20 @@ auto DictionaryIdColumnReader::get_variable_id(uint64_t row) -> uint64_t {
     return m_encoded_values ? m_encoded_values->bits_at(row) : m_variables[row];
 }
 
+auto DictionaryIdColumnReader::maximum_variable_id() const -> std::optional<uint64_t> {
+    if (m_encoded_values) {
+        return m_encoded_values->maximum_unsigned();
+    }
+    if (m_variables.size() == 0) {
+        return std::nullopt;
+    }
+    uint64_t maximum{};
+    for (size_t i{0}; i < m_variables.size(); ++i) {
+        maximum = std::max(maximum, m_variables[i]);
+    }
+    return maximum;
+}
+
 auto DictionaryFloatColumnReader::extract_value(uint64_t cur_message)
         -> std::variant<int64_t, double, std::string, uint8_t> {
     return value_for_id(get_variable_id(cur_message));
@@ -238,6 +253,48 @@ auto ClpStringColumnReader::extract_escaped_string_value_into_buffer(
 auto ClpStringColumnReader::get_encoded_id(uint64_t cur_message) -> int64_t {
     auto value = m_logtypes[cur_message];
     return ClpStringColumnWriter::get_encoded_log_dict_id(value);
+}
+
+auto ClpStringColumnReader::maximum_variable_id() -> std::optional<uint64_t> {
+    std::optional<uint64_t> maximum;
+    uint64_t cached_id{std::numeric_limits<uint64_t>::max()};
+    size_t variable_count{};
+    std::vector<size_t> dictionary_positions;
+    for (size_t row{0}; row < m_logtypes.size(); ++row) {
+        auto const descriptor{m_logtypes[row]};
+        auto const id{ClpStringColumnWriter::get_encoded_log_dict_id(descriptor)};
+        if (id != cached_id) {
+            auto& entry{m_log_dict->get_entry(id)};
+            if (!entry.initialized()) {
+                entry.decode_log_type();
+            }
+            variable_count = entry.get_num_variables();
+            dictionary_positions.clear();
+            size_t variable{};
+            for (size_t i{0}; i < entry.get_num_placeholders(); ++i) {
+                clp::ir::VariablePlaceholder kind{};
+                entry.get_placeholder_info(i, kind);
+                if (kind == clp::ir::VariablePlaceholder::Dictionary) {
+                    dictionary_positions.push_back(variable);
+                }
+                if (kind != clp::ir::VariablePlaceholder::Escape) {
+                    ++variable;
+                }
+            }
+            cached_id = id;
+        }
+        auto const offset{ClpStringColumnWriter::get_encoded_offset(descriptor)};
+        if (offset > m_encoded_vars.size() || variable_count > m_encoded_vars.size() - offset) {
+            throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);
+        }
+        for (auto const position : dictionary_positions) {
+            auto const variable_id{clp::EncodedVariableInterpreter::decode_var_dict_id(
+                    m_encoded_vars[offset + position]
+            )};
+            maximum = std::max(maximum.value_or(0), variable_id);
+        }
+    }
+    return maximum;
 }
 
 auto ClpStringColumnReader::get_encoded_vars(uint64_t cur_message) -> UnalignedMemSpan<int64_t> {

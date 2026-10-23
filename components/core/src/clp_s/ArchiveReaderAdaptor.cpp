@@ -27,6 +27,53 @@
 #include "SingleFileArchiveDefs.hpp"
 
 namespace clp_s {
+namespace {
+/** A seekable section with an independent logical position over a shared archive source. */
+class SectionCursor : public clp::ReaderInterface {
+public:
+    SectionCursor(std::shared_ptr<clp::ReaderInterface> source, size_t begin, size_t end)
+            : m_source{std::move(source)},
+              m_begin{begin},
+              m_end{end},
+              m_pos{begin} {}
+
+    auto try_get_pos(size_t& pos) -> clp::ErrorCode override {
+        pos = m_pos;
+        return clp::ErrorCode_Success;
+    }
+
+    auto try_seek_from_begin(size_t pos) -> clp::ErrorCode override {
+        if (pos < m_begin || pos > m_end) {
+            return clp::ErrorCode_BadParam;
+        }
+        m_pos = pos;
+        return clp::ErrorCode_Success;
+    }
+
+    auto try_read(char* data, size_t size, size_t& read) -> clp::ErrorCode override {
+        read = 0;
+        if (size == 0) {
+            return clp::ErrorCode_Success;
+        }
+        if (m_pos == m_end) {
+            return clp::ErrorCode_EndOfFile;
+        }
+        if (auto const rc{m_source->try_seek_from_begin(m_pos)}; rc != clp::ErrorCode_Success) {
+            return rc;
+        }
+        auto const rc{m_source->try_read(data, std::min(size, m_end - m_pos), read)};
+        m_pos += read;
+        return rc;
+    }
+
+private:
+    std::shared_ptr<clp::ReaderInterface> m_source;
+    size_t m_begin;
+    size_t m_end;
+    size_t m_pos;
+};
+}  // namespace
+
 ArchiveReaderAdaptor::ArchiveReaderAdaptor(
         Path const& archive_path,
         NetworkAuthOption const& network_auth
@@ -321,9 +368,19 @@ std::unique_ptr<clp::ReaderInterface> ArchiveReaderAdaptor::checkout_reader_for_
     return reader;
 }
 
-std::unique_ptr<clp::ReaderInterface> ArchiveReaderAdaptor::checkout_reader_for_sfa_section(
-        std::string_view section
-) {
+auto ArchiveReaderAdaptor::open_independent_reader_for_section(std::string_view section)
+        -> std::unique_ptr<clp::ReaderInterface> {
+    if (requires_ordered_section_reads() || m_current_reader_holder.has_value()) {
+        throw OperationFailed(ErrorCodeNotReady, __FILENAME__, __LINE__);
+    }
+    if (m_single_file_archive) {
+        return checkout_reader_for_sfa_section(section, true);
+    }
+    return std::make_unique<clp::FileReader>(m_archive_path.path + std::string{section});
+}
+
+std::unique_ptr<clp::ReaderInterface>
+ArchiveReaderAdaptor::checkout_reader_for_sfa_section(std::string_view section, bool independent) {
     auto it = std::find_if(
             m_archive_file_info.files.begin(),
             m_archive_file_info.files.end(),
@@ -362,6 +419,10 @@ std::unique_ptr<clp::ReaderInterface> ArchiveReaderAdaptor::checkout_reader_for_
 
     if (next_file_offset < file_offset) {
         throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);
+    }
+
+    if (independent) {
+        return std::make_unique<SectionCursor>(m_reader, file_offset, next_file_offset);
     }
 
     if (curr_pos > file_offset && requires_ordered_section_reads()) {

@@ -170,6 +170,7 @@ public:
         m_num_messages = num_messages;
         m_cur_message = 0;
         m_serializer_initialized = false;
+        m_output_schema_initialized = false;
         m_ordered_schema = ordered_schema;
         delete_columns();
         m_column_map.clear();
@@ -184,6 +185,9 @@ public:
         m_local_schema_tree.clear();
         m_json_serializer.clear();
         m_reconstruction_targets.clear();
+        m_loaded_columns.clear();
+        m_decoded_columns.clear();
+        m_stream_buffer.reset();
         m_global_schema_tree = std::move(schema_tree);
         m_projection = std::move(projection);
         m_should_marshal_records = should_marshal_records;
@@ -238,6 +242,8 @@ public:
      * columns must not be accessed until loaded by another call.
      * @param adaptive_dictionary Whether separate dictionary-ID columns carry integer codec
      * headers.
+     * @param append Preserve loaded columns and their decoding state while adding a selection
+     * from the same separate-column buffer.
      */
     void load(
             std::shared_ptr<char[]> stream_buffer,
@@ -246,8 +252,31 @@ public:
             std::span<size_t const> column_sizes = {},
             bool adaptive = false,
             std::span<uint8_t const> selection = {},
-            bool adaptive_dictionary = false
+            bool adaptive_dictionary = false,
+            bool append = false
     );
+
+    /** Physical columns used by the output plan, including repeated fields and reconstruction. */
+    auto select_output_columns(bool metadata) -> std::vector<uint8_t>;
+
+    /** Whether the projected output contains a CLP+ field requiring string shape metadata. */
+    auto needs_log_shapes_for_output() -> bool;
+
+    auto get_columns() const -> std::vector<BaseColumnReader*> const& { return m_columns; }
+
+    auto get_loaded_columns() const -> std::vector<uint8_t> const& { return m_loaded_columns; }
+
+    /** Binds shape metadata loaded after the filter has found its first match. */
+    auto set_reconstruction_dictionaries(
+            LogShapeDictionaryReader const* shapes,
+            clpp::ParentRuleShapesArray const* parents
+    ) -> void {
+        m_log_shape_dict = shapes;
+        m_parent_rule_shapes = parents;
+    }
+
+    /** Advances to the next matching row without reconstructing or consuming it. */
+    auto find_next_message(FilterClass& filter) -> bool;
 
     /** Selects every physical occurrence of the requested field IDs. */
     auto select_columns(std::unordered_set<int32_t> const& ids) const -> std::vector<uint8_t> {
@@ -370,6 +399,8 @@ public:
     bool done() const { return m_cur_message >= m_num_messages; }
 
 private:
+    auto initialize_output_schema() -> void;
+
     // Types
     /**
      * A leaf column targeted for decomposed output.
@@ -665,6 +696,7 @@ private:
     std::vector<BaseColumnReader*> m_reordered_columns;
     std::shared_ptr<char[]> m_stream_buffer;
     std::vector<std::vector<char>> m_decoded_columns;
+    std::vector<uint8_t> m_loaded_columns;
 
     BaseColumnReader* m_timestamp_column;
     std::function<epochtime_t()> m_get_timestamp;
@@ -678,6 +710,7 @@ private:
     JsonSerializer m_json_serializer;
     bool m_should_marshal_records{true};
     bool m_serializer_initialized{false};
+    bool m_output_schema_initialized{false};
     std::shared_ptr<search::Projection> m_projection;
 
     // Keyed by the object root's schema-tree node ID.

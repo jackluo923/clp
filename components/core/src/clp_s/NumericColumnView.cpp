@@ -62,6 +62,33 @@ auto NumericColumnView::read_word(std::span<char const> bytes, size_t offset) ->
     return read<uint64_t>(bytes, offset);
 }
 
+auto NumericColumnView::maximum_unsigned() const -> std::optional<uint64_t> {
+    if (m_rows == 0) {
+        return std::nullopt;
+    }
+    uint64_t maximum{};
+    switch (m_kind) {
+        case Kind::Constant:
+            return m_base;
+        case Kind::FrameOfReference:
+            for_each_code([&](size_t, uint64_t offset) {
+                maximum = std::max(maximum, m_base + offset);
+            });
+            break;
+        case Kind::Dictionary:
+            for (size_t i{0}; i < m_values.size(); i += 8) {
+                maximum = std::max(maximum, read_word(m_values, i));
+            }
+            break;
+        case Kind::RunLength:
+            for (size_t i{0}; i < m_values.size(); i += 12) {
+                maximum = std::max(maximum, read_word(m_values, i));
+            }
+            break;
+    }
+    return maximum;
+}
+
 auto NumericColumnView::validate_unsigned_range(uint64_t upper_bound) const -> void {
     if (m_rows == 0) {
         return;

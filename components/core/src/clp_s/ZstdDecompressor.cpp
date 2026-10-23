@@ -124,6 +124,7 @@ ZstdDecompressor::try_read(char const* buf, size_t num_bytes_to_read, size_t& nu
             );
             return ErrorCodeFailure;
         }
+        m_frame_finished = error == 0;
     }
 
     // Update decompression stream position
@@ -131,6 +132,46 @@ ZstdDecompressor::try_read(char const* buf, size_t num_bytes_to_read, size_t& nu
 
     num_bytes_read = decompressed_stream_block.pos;
     return ErrorCodeSuccess;
+}
+
+auto ZstdDecompressor::try_finish_frame() -> ErrorCode {
+    if (m_input_type != InputType::ClpReader) {
+        return ErrorCodeUnsupported;
+    }
+    while (!m_frame_finished) {
+        char extra{};
+        ZSTD_outBuffer output{&extra, 1, 0};
+        auto const consumed{m_compressed_stream_block.pos};
+        auto const rc{
+                ZSTD_decompressStream(m_decompression_stream, &output, &m_compressed_stream_block)
+        };
+        if (ZSTD_isError(rc) || output.pos != 0) {
+            return ErrorCodeCorrupt;
+        }
+        m_frame_finished = rc == 0;
+        if (m_frame_finished) {
+            break;
+        }
+        if (m_compressed_stream_block.pos == m_compressed_stream_block.size) {
+            size_t size{};
+            auto const read_rc{
+                    m_reader->try_read(m_file_read_buffer.get(), m_file_read_buffer_capacity, size)
+            };
+            if (read_rc != clp::ErrorCode_Success || size == 0) {
+                return ErrorCodeTruncated;
+            }
+            m_compressed_stream_block = {m_file_read_buffer.get(), size, 0};
+        } else if (consumed == m_compressed_stream_block.pos) {
+            return ErrorCodeCorrupt;
+        }
+    }
+    if (m_compressed_stream_block.pos != m_compressed_stream_block.size) {
+        return ErrorCodeCorrupt;
+    }
+    char extra{};
+    size_t size{};
+    auto const rc{m_reader->try_read(&extra, 1, size)};
+    return rc == clp::ErrorCode_EndOfFile && size == 0 ? ErrorCodeSuccess : ErrorCodeCorrupt;
 }
 
 ErrorCode ZstdDecompressor::try_read_string(size_t str_length, std::string& str) {
@@ -271,6 +312,7 @@ ErrorCode ZstdDecompressor::open(std::string const& compressed_file_path) {
 }
 
 void ZstdDecompressor::reset_stream() {
+    m_frame_finished = false;
     if (InputType::File == m_input_type) {
         if (auto rc = m_file_reader->try_seek_from_begin(m_file_reader_initial_pos);
             ErrorCodeSuccess != rc && ErrorCodeEndOfFile != rc)

@@ -172,14 +172,21 @@ void SchemaReader::load(
         std::span<size_t const> column_sizes,
         bool adaptive,
         std::span<uint8_t const> selection,
-        bool adaptive_dictionary
+        bool adaptive_dictionary,
+        bool append
 ) {
+    if (append && (stream_buffer != m_stream_buffer || column_sizes.empty())) {
+        throw OperationFailed(ErrorCodeBadParam, __FILENAME__, __LINE__);
+    }
     m_stream_buffer = stream_buffer;
     BufferViewReader buffer_reader{m_stream_buffer.get() + offset, uncompressed_size};
     if (!selection.empty() && selection.size() != m_columns.size()) {
         throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);
     }
-    m_decoded_columns.clear();
+    if (!append) {
+        m_decoded_columns.clear();
+        m_loaded_columns.assign(m_columns.size(), 0);
+    }
     if (!column_sizes.empty()) {
         if (column_sizes.size() != m_columns.size()) {
             throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);
@@ -190,6 +197,7 @@ void SchemaReader::load(
         auto* reader{m_columns[i]};
         if (column_sizes.empty()) {
             reader->load(buffer_reader, m_num_messages);
+            m_loaded_columns[i] = 1;
             continue;
         }
         auto const size{column_sizes[i]};
@@ -204,6 +212,10 @@ void SchemaReader::load(
         if (!selection.empty() && !selection[i]) {
             continue;
         }
+        if (append && m_loaded_columns[i]) {
+            continue;
+        }
+        m_loaded_columns[i] = 1;
         auto const type{reader->get_type()};
         if (adaptive_dictionary
             && (type == NodeType::VarString || type == NodeType::DictionaryFloat))
@@ -435,34 +447,11 @@ bool SchemaReader::get_next_message(std::string& message) {
         return false;
     }
 
-    if (false == m_serializer_initialized) {
-        initialize_serializer();
-    }
-    message = generate_json_string(m_cur_message);
-
-    if (message.back() != '\n') {
-        message += '\n';
-    }
-
-    ++m_cur_message;
-    return true;
-}
-
-bool SchemaReader::get_next_message(std::string& message, FilterClass& filter) {
-    while (m_cur_message < m_num_messages && false == filter.filter(m_cur_message)) {
-        ++m_cur_message;
-    }
-
-    if (m_cur_message >= m_num_messages) {
-        return false;
-    }
-
     if (m_should_marshal_records) {
         if (false == m_serializer_initialized) {
             initialize_serializer();
         }
         message = generate_json_string(m_cur_message);
-
         if (message.back() != '\n') {
             message += '\n';
         }
@@ -470,6 +459,17 @@ bool SchemaReader::get_next_message(std::string& message, FilterClass& filter) {
 
     ++m_cur_message;
     return true;
+}
+
+auto SchemaReader::find_next_message(FilterClass& filter) -> bool {
+    while (m_cur_message < m_num_messages && false == filter.filter(m_cur_message)) {
+        ++m_cur_message;
+    }
+    return m_cur_message < m_num_messages;
+}
+
+bool SchemaReader::get_next_message(std::string& message, FilterClass& filter) {
+    return find_next_message(filter) && get_next_message(message);
 }
 
 bool SchemaReader::get_next_message_with_metadata(
@@ -892,12 +892,10 @@ auto SchemaReader::generate_structured_object_template(
     return column_idx;
 }
 
-void SchemaReader::initialize_serializer() {
-    if (m_serializer_initialized) {
+auto SchemaReader::initialize_output_schema() -> void {
+    if (m_output_schema_initialized) {
         return;
     }
-
-    m_serializer_initialized = true;
 
     for (int32_t global_column_id : m_ordered_schema) {
         if (m_projection->matches_node(global_column_id)) {
@@ -941,6 +939,21 @@ void SchemaReader::initialize_serializer() {
         }
     }
 
+    m_output_schema_initialized = true;
+}
+
+auto SchemaReader::needs_log_shapes_for_output() -> bool {
+    initialize_output_schema();
+    return std::ranges::any_of(m_local_schema_tree.get_nodes(), [](auto const& node) {
+        return node.get_type() == NodeType::LogMessage;
+    });
+}
+
+void SchemaReader::initialize_serializer() {
+    if (m_serializer_initialized) {
+        return;
+    }
+    initialize_output_schema();
     // TODO: this code will have to change once we allow mixing log lines parsed by different
     // parsers and if we add support for serializing auto-generated keys in regular JSON.
     if (auto subtree_root = m_local_schema_tree.get_object_subtree_node_id_for_namespace(
@@ -950,6 +963,32 @@ void SchemaReader::initialize_serializer() {
     {
         generate_json_template(subtree_root);
     }
+    m_serializer_initialized = true;
+}
+
+auto SchemaReader::select_output_columns(bool metadata) -> std::vector<uint8_t> {
+    std::unordered_set<BaseColumnReader*> needed;
+    if (m_should_marshal_records) {
+        initialize_serializer();
+        needed.insert(m_reordered_columns.begin(), m_reordered_columns.end());
+        for (auto const& shape : m_reconstruction_targets) {
+            for (auto const& segment : shape.segments) {
+                if (auto const* column{std::get_if<BaseColumnReader*>(&segment)}) {
+                    needed.insert(*column);
+                }
+            }
+        }
+    }
+    if (metadata) {
+        needed.insert(m_timestamp_column);
+        needed.insert(m_log_event_idx_column);
+    }
+    std::vector<uint8_t> selection;
+    selection.reserve(m_columns.size());
+    for (auto* column : m_columns) {
+        selection.push_back(needed.contains(column));
+    }
+    return selection;
 }
 
 void SchemaReader::generate_json_template(int32_t id) {

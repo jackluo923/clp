@@ -39,6 +39,9 @@ public:
     /** Validates unsigned references against an exclusive bound without expanding row values. */
     auto validate_unsigned_range(uint64_t upper_bound) const -> void;
 
+    /** Highest unsigned value; dictionary and run codecs inspect each stored value once. */
+    [[nodiscard]] auto maximum_unsigned() const -> std::optional<uint64_t>;
+
     /**
      * ORs matching rows into a bitmap of zero/one bytes. Existing matches from other occurrences of
      * the field remain set. The predicate receives the original integer/double bits, and is

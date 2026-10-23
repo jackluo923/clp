@@ -234,6 +234,9 @@ public:
 
     auto get_variable_id(uint64_t row) -> uint64_t;
 
+    /** Inspects references without requiring any variable dictionary values to be loaded. */
+    auto maximum_variable_id() const -> std::optional<uint64_t>;
+
     auto encoded_values() -> NumericColumnView const* {
         validate_ids();
         return m_encoded_values ? &*m_encoded_values : nullptr;
@@ -340,6 +343,9 @@ public:
      * @return Encoded variables in a span
      */
     auto get_encoded_vars(uint64_t cur_message) -> UnalignedMemSpan<int64_t>;
+
+    /** Inspects dictionary placeholders using logtypes, without looking up variable values. */
+    auto maximum_variable_id() -> std::optional<uint64_t>;
 
 private:
     std::shared_ptr<VariableDictionaryReader> m_var_dict;

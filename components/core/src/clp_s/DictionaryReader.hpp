@@ -4,6 +4,8 @@
 #define CLP_S_DICTIONARYREADER_HPP
 
 #include <iterator>
+#include <limits>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -53,7 +55,17 @@ public:
     void read_entries(bool lazy = false);
 
     /**
-     * @return All dictionary entries
+     * Loads at least this many leading entries, resuming the decoder on later calls.
+     * Missing IDs in a partial dictionary are not evidence of absence. Predicate preparation
+     * must call read_entries(). Extension can invalidate entry pointers and references.
+     * Forward-only sources load the complete dictionary. The unread tail is validated on demand.
+     */
+    auto read_entries_prefix(uint64_t minimum_entries, bool lazy = true) -> void;
+
+    [[nodiscard]] auto is_complete() const -> bool { return m_complete; }
+
+    /**
+     * @return Loaded dictionary entries. Check is_complete() before treating missing IDs as absent.
      */
     std::vector<EntryType> const& get_entries() const { return m_entries; }
 
@@ -96,6 +108,12 @@ protected:
     std::string m_dictionary_path;
     ZstdDecompressor m_dictionary_decompressor;
     std::vector<EntryType> m_entries;
+
+private:
+    std::unique_ptr<clp::ReaderInterface> m_prefix_reader;
+    uint64_t m_declared_entries{};
+    bool m_complete{false};
+    bool m_failed{false};
 };
 
 using LogShapeDictionaryReader = DictionaryReader<clpp::log_shape_id_t, VariableDictionaryEntry>;
@@ -111,6 +129,9 @@ void DictionaryReader<DictionaryIdType, EntryType>::open(std::string const& dict
     }
 
     m_dictionary_path = dictionary_path;
+    m_entries.clear();
+    m_complete = false;
+    m_failed = false;
     m_is_open = true;
 }
 
@@ -120,12 +141,24 @@ void DictionaryReader<DictionaryIdType, EntryType>::close() {
         throw OperationFailed(ErrorCodeNotReady, __FILENAME__, __LINE__);
     }
     m_is_open = false;
+    m_dictionary_decompressor.close();
+    m_prefix_reader.reset();
 }
 
 template <typename DictionaryIdType, typename EntryType>
 void DictionaryReader<DictionaryIdType, EntryType>::read_entries(bool lazy) {
     if (false == m_is_open) {
         throw OperationFailed(ErrorCodeNotInit, __FILENAME__, __LINE__);
+    }
+    if (m_failed) {
+        throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);
+    }
+    if (m_complete) {
+        return;
+    }
+    if (m_prefix_reader) {
+        read_entries_prefix(std::numeric_limits<uint64_t>::max(), lazy);
+        return;
     }
 
     constexpr size_t cDecompressorFileReadBufferCapacity = 64 * 1024;  // 64 KiB
@@ -144,6 +177,59 @@ void DictionaryReader<DictionaryIdType, EntryType>::read_entries(bool lazy) {
 
     m_dictionary_decompressor.close();
     m_adaptor.checkin_reader_for_section(m_dictionary_path);
+    m_complete = true;
+}
+
+template <typename DictionaryIdType, typename EntryType>
+auto DictionaryReader<DictionaryIdType, EntryType>::read_entries_prefix(
+        uint64_t minimum_entries,
+        bool lazy
+) -> void {
+    if (!m_is_open || m_failed) {
+        throw OperationFailed(ErrorCodeNotReady, __FILENAME__, __LINE__);
+    }
+    if (m_complete || minimum_entries <= m_entries.size()) {
+        return;
+    }
+    if (m_adaptor.requires_ordered_section_reads()) {
+        read_entries(lazy);
+        return;
+    }
+    try {
+        if (!m_prefix_reader) {
+            m_prefix_reader = m_adaptor.open_independent_reader_for_section(m_dictionary_path);
+            m_prefix_reader->read_numeric_value(m_declared_entries, false);
+            if (m_declared_entries > m_entries.max_size()) {
+                throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);
+            }
+            m_dictionary_decompressor.open(
+                    *m_prefix_reader,
+                    minimum_entries >= m_declared_entries ? 64 * 1024 : 16 * 1024
+            );
+        }
+        auto const requested{std::min(minimum_entries, m_declared_entries)};
+        auto const previous{m_entries.size()};
+        // Allocate the known prefix in one step, as the full reader does. Growing one entry at
+        // a time repeatedly moves the entry table when output needs most of a large dictionary.
+        m_entries.resize(requested);
+        for (size_t i{previous}; i < requested; ++i) {
+            m_entries[i].read_from_file(m_dictionary_decompressor, i, lazy);
+        }
+        if (m_entries.size() == m_declared_entries) {
+            auto const rc{m_dictionary_decompressor.try_finish_frame()};
+            if (rc != ErrorCodeSuccess) {
+                throw OperationFailed(rc, __FILENAME__, __LINE__);
+            }
+            m_dictionary_decompressor.close();
+            m_prefix_reader.reset();
+            m_complete = true;
+        }
+    } catch (...) {
+        m_dictionary_decompressor.close();
+        m_prefix_reader.reset();
+        m_failed = true;
+        throw;
+    }
 }
 
 template <typename DictionaryIdType, typename EntryType>

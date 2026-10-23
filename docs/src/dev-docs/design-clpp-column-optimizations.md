@@ -4,15 +4,15 @@
 
 This port reduces how much data C++ CLP+ stores, reads, and evaluates. It builds on the [CLP+ wildcard optimizations](design-clpp-wildcard-search-implementation.md): search loads the dictionaries needed to prepare a query, rejects encoded record tables (ERTs) that cannot match, counts an ERT directly when metadata proves every row matches, and reads the required columns from the remaining ERTs. Adaptive encodings reduce column sizes and let eligible predicates run without expanding every value.
 
-The source is [`jackluo923/separate-columns` through `ff72ff6b`](https://github.com/jackluo923/clp/tree/ff72ff6b). The implementation reuses the Rust numeric payload layouts and adapts its ERT range proofs to existing C++ integer summaries, while retaining the C++ query evaluator, parsing integration, and reconstruction behavior. Dictionary-ID codecs use a separately versioned C++ archive extension; this does not add support for current Rust archives.
+The ports draw on [`jackluo923/separate-columns` through `ffe8e6aa`](https://github.com/jackluo923/clp/tree/ffe8e6aa). The implementation reuses the Rust numeric payload layouts and adapts its ERT range proofs to existing C++ integer summaries, while retaining the C++ query evaluator, parsing integration, and reconstruction behavior. Dictionary-ID codecs use a separately versioned C++ archive extension; this does not add support for current Rust archives.
 
 | Optimization | Rust commits | C++ treatment |
 |---|---|---|
-| Separate column frames and selective reads | `fbe2f9ce`, `3ce1b648` | Ported for count queries with resolved field dependencies; ordinary output and metadata-producing queries read all columns |
+| Separate column frames and selective reads | `fbe2f9ce`, `3ce1b648`, `f652e684` | Ported for predicates, projected records, and output metadata; output-only frames load after an ERT matches |
 | Count proven matches from ERT metadata | `0d2b46ef` | Ported through the C++ evaluator's proof of the complete query; only count handlers accept a bulk count |
 | Prove range predicates from ERT summaries and remove covered column dependencies | `54abc872`, `cc292f7a` | Adapted to existing CLP+ integer summaries; timestamp summaries and numeric aggregate pushdown remain separate work |
 | Encode and scan dictionary-ID columns | `12828b82`, `a4c6b36c` | Ported for variable strings and dictionary-backed floats; legacy CLP-string descriptor buffers retain their layout |
-| Load only the dictionaries a query needs | `2a6168a7`, `3ce1b648` | Ported for count queries on local directory archives, local single-file archives, and memory buffers; forward-only inputs retain ordered loading |
+| Load only the dictionaries a query needs | `2a6168a7`, `3ce1b648`, `ffe8e6aa` | Predicate dictionaries remain complete; output dictionaries load after a match, with resumable variable-dictionary prefixes for separate-column ERTs |
 | Choose numeric encodings by compressed size | `15a57e03` | Ported for integer and double columns |
 | Construct candidates one at a time | `51bbd4e5` | Ported; reuse a Zstd context and candidate buffers rather than retaining all encodings |
 | Value-sorted float dictionaries with byte-wide codes | `267fc8d3` | Ported as an additional lossless candidate |
@@ -73,9 +73,11 @@ The writer and archive bytes are unchanged. Packed ERTs can be skipped or counte
 
 Separate ERTs store one Zstd frame per physical column. Table metadata gives each frame's compressed and uncompressed size, allowing the reader to seek past frames that the query does not need.
 
-After schema resolution and constant propagation, `QueryRunner` gathers the field IDs still used by the expression. For a count query without output metadata, `ArchiveReader` selects the corresponding physical columns, including repeated occurrences of a field. `PackedStreamReader` decompresses only those frames, and `SchemaReader` prepares their column readers before evaluation.
+After schema resolution and constant propagation, `QueryRunner` gathers the field IDs still used by the expression. `ArchiveReader` selects the corresponding physical columns, including repeated occurrences of a field. `PackedStreamReader` decompresses only those frames, and `SchemaReader` prepares their column readers before evaluation.
 
-Field wildcards with unresolved dependencies retain the complete read path. Queries that reconstruct strings or return timestamp/order metadata also read all columns.
+For record output, the first matching row triggers a second read of only the missing output columns. The existing JSON output plan supplies these dependencies: its column readers cover projected fields and repeated array elements, and its compiled string shapes identify the columns needed for CLP+ reconstruction. Timestamp and record-order columns are included when the output handler needs metadata. A shape-only projection can therefore omit variable columns that a reconstructed string would need. The initial column readers, decoded buffers, and filter bitmap remain valid throughout this preparation; neither predicate frames nor the filter need to be evaluated again.
+
+An ERT with no matches never loads output-only frames. Counts need no output columns. Unresolved field wildcards conservatively read all potentially searched columns, and packed ERTs still require their shared frame. Forward-only inputs read output columns during their initial pass because returning to an earlier frame is unsupported.
 
 The reader validates frame extents, column counts, codec tags, dictionary indices, run totals, and integer reconstruction bounds. Separate streams must contain exactly one ERT at offset zero. Rereading the current separate stream can load columns omitted by an earlier selection.
 
@@ -83,11 +85,17 @@ The reader validates frame extents, column counts, codec tags, dictionary indice
 
 Reading fewer column frames does not help if search first decompresses a large dictionary for an unrelated field. For example, counting `seq: 999` needs the integer `seq` column, even when the same ERT has a text column backed by a large string shape dictionary.
 
-After resolving fields and matching ERTs, `SchemaMatch::prepare_dictionaries` derives dictionary dependencies from each ERT's query. An integer or ordinary double predicate needs no string dictionary. Variable strings and dictionary-backed floats need the variable dictionary. A CLP-string predicate needs both variable and logtype dictionaries; an unstructured-array predicate needs the variable and array dictionaries. Resolved field-existence predicates need no dictionary values, but existence checks inside unstructured arrays still need the array's dictionaries. Queries that reconstruct records or return metadata prepare dictionaries for all columns in the matched ERTs, and unresolved field wildcards conservatively retain those dependencies too.
+After resolving fields and matching ERTs, `SchemaMatch::prepare_dictionaries` derives dictionary dependencies from each ERT's query. An integer or ordinary double predicate needs no string dictionary. Variable strings and dictionary-backed floats need the variable dictionary. A CLP-string predicate needs both variable and logtype dictionaries; an unstructured-array predicate needs the variable and array dictionaries. Resolved field-existence predicates need no dictionary values, but existence checks inside unstructured arrays still need the array's dictionaries. Unresolved field wildcards conservatively retain all potentially searched dictionary dependencies.
 
-Local single-file archives and memory buffers can seek back to a dictionary requested during later query preparation, so advancing to metadata no longer forces every preceding dictionary to load. Directory archives already allow independent section access. Forward-only inputs, including network streams and readers whose seek capabilities are unknown, retain the existing ordered loading path. All required dictionaries are prepared before the reader opens the ERT data section.
+Dictionaries used only for output load after an ERT matches, according to its output plan. Local single-file archives and memory buffers use bounded section cursors that retain independent positions, allowing dictionary reads between table reads. Directory archives use independent files. Forward-only inputs, including network streams and readers whose seek capabilities are unknown, retain ordered loading.
 
-This optimization changes neither the writer nor the archive format and applies to existing packed archives as well as separate-column archives. A needed dictionary is still loaded in full: per-field dictionaries and selective reads within a dictionary remain separate porting work.
+For a separate-column ERT, search can also load a prefix of the variable dictionary. It finds the highest dictionary ID referenced by the output columns, then decodes entries from ID zero through that ID. For example, references through ID 99 require the first 100 entries, even if the archive contains a million entries. Constants, dictionaries, and runs expose their highest ID without expanding every row. Legacy CLP-string and array columns use their placeholder types to distinguish dictionary references from encoded numbers.
+
+The dictionary reader retains its Zstd decoder, compressed input buffer, and decoded entries. A later ERT can extend the prefix without rereading compressed bytes or copying the existing entries into a new snapshot. Predicate preparation always loads the complete variable dictionary, so an unloaded entry cannot be mistaken for an absent value during equality, wildcard, or negated searches.
+
+Prefix discovery includes every row in the selected output columns, preserving whole-column validation of adaptive dictionary IDs. A high ID in a nonmatching row can therefore force a complete dictionary read. Packed ERTs and unsupported discovery retain full-dictionary loading after a match. The decoder validates consumed entries immediately and validates the frame ending, checksum, and trailing data when the complete prefix is requested; an unread tail remains unchecked. Decompression buffering may read beyond the last requested entry.
+
+These changes use existing archive bytes and do not require a writer option or format version. The largest savings occur when the predicate needs no variable dictionary and the output references only early dictionary entries. Per-field dictionaries remain separate porting work.
 
 ## Searching numeric columns without expanding them
 
@@ -156,7 +164,7 @@ The new reader rejects unknown extension versions and archive versions newer tha
 Build and test inside the project's `clp-core-dependencies-x86-manylinux_2_28:dev` image with the C++ dependencies mounted. Configure `CLP_BUILD_CLPP_DECOMPOSITION=ON` and `CLP_BUILD_TESTING=ON`, then build `clp-s` and `unitTest`.
 
 ```sh
-unitTest '[AdaptiveColumn],[NumericColumnView],[DictionaryIdSet],[DictionaryColumns],[SeparateColumns],[SelectiveDictionaries],[MetadataCounts],[IntegerRangeProofs],[ColumnValueFilter]'
+unitTest '[AdaptiveColumn],[NumericColumnView],[DictionaryIdSet],[DictionaryColumns],[SeparateColumns],[SelectiveDictionaries],[OutputColumns],[DictionaryPrefix],[MetadataCounts],[IntegerRangeProofs],[ColumnValueFilter]'
 
 python3 components/core/tools/benchmarks/clpp-column-port.py \
     --baseline /path/to/baseline/clp-s \
@@ -169,6 +177,8 @@ python3 components/core/tools/benchmarks/clpp-column-port.py \
 The benchmark harness generates a deterministic numeric fixture, compares baseline, unchanged storage, separate-frame storage, and adaptive storage, and checks ordered extraction and query counts. It also verifies that the new binary reads baseline archives. Query timings include process startup and use a warmup followed by three interleaved runs per configuration. Ingest timings are medians of three runs; extraction is checked once per configuration. Measurements use warm caches on a shared host, so small timing differences should not be treated as stable gains.
 
 Unit coverage includes every numeric wire scheme, signed integer limits, floating-point bit patterns, truncated payloads, invalid frame metadata, exact dictionary membership, and archive round trips with both archive containers and array layouts. Selective-read tests verify that count queries leave damaged unused dictionaries unread while reconstruction rejects them, and cover forward-only inputs, memory buffers, reader reuse, and logical expressions. Metadata-count tests cover logical expressions, time bounds, array members, output requirements, and damaged record data that must remain unread for proven counts. Integer-range tests cover endpoint inclusivity, fractional operands, signed limits, repeated fields, missing fields, mixed types, and queries combining metadata counts with scans. They also damage one integer frame to verify that a proven predicate leaves it unread while another column is scanned. Dictionary-column tests compare compact scans against decoded scans and verify reference validation, reader reuse, and exact float-text extraction. Numeric codec mutation checks also run under AddressSanitizer and UndefinedBehaviorSanitizer.
+
+Output-read tests make unused frames unreadable, check that required frames are read at most once, and verify incremental dictionary reads across interleaved sections. They cover exact float text, repeated array elements, output timestamps and record indices, CLP+ projections, and corrupted dictionary tails. The `clpp-output-reads.py` harness compares exact result bytes and interleaves baseline and candidate searches over the same archives, including low and high dictionary IDs, narrow projections, zero matches, wildcard predicates, full output, and count controls.
 
 ### Compression results
 
@@ -300,3 +310,31 @@ The harness checks every query count and records a warmup followed by seven inte
 | Hive | `message: *PacketResponder* AND message.blockID.blockNum >= 0` | 758 | 34.4 ms | 32.7 ms | 1.05× |
 
 The fully covered and impossible numeric ranges avoid record data entirely. The mixed predicate still scans `sensor`, but separate-column storage lets it skip `seq` after proving `seq >= 0`. On packed storage, the same mixed predicate improves only from 41.6 ms to 39.7 ms because the shared frame still has to be decompressed. Partial ranges and the `seq: 999` equality control show no meaningful improvement. The Hive compound wildcard saves little because the remaining query preparation still dominates. These gains depend on what an ERT's bounds can prove; compression ratio and archive bytes are unchanged.
+
+### Effect of projected output and dictionary prefixes
+
+The output-read comparison uses C++ commit `44cab052` as the baseline. Both binaries read the same archives, created by that baseline with separate frames and adaptive dictionary-ID columns. The prefix fixture has 1,000 early-value records, two later matching ERTs, and 30,000 unrelated records that contribute distinct 256-character strings to the dictionary. The wide fixture has 30,000 records with two numeric fields and eight string fields. The Hive cases use the existing adaptive archive described above.
+
+The harness checks exact output bytes, then reports medians from seven interleaved runs after a warmup. Times include CLI startup and captured output, with warm caches on a shared host. Builds and tests finish before measurement.
+
+| Workload | Search and output | Baseline | Optimized | Speedup |
+|---|---|---:|---:|---:|
+| Prefix fixture | `id:1`, whole records | 18.6 ms | 7.7 ms | 2.42× |
+| Prefix fixture | `id > 0 AND id < 3`, project `value` | 19.3 ms | 8.8 ms | 2.19× |
+| Prefix fixture | `id:3`, references near the dictionary's end | 18.6 ms | 18.9 ms | 0.98× |
+| Prefix fixture | `value:ear*`, requires the dictionary for filtering | 18.6 ms | 19.5 ms | 0.95× |
+| Wide fixture | `seq:100`, project `seq` and `value` | 43.8 ms | 8.6 ms | 5.08× |
+| Wide fixture | `seq:101`, no matching records | 44.3 ms | 8.3 ms | 5.31× |
+| Wide fixture | `seq:100`, whole record | 44.9 ms | 43.8 ms | 1.03× |
+| Hive | `message:*PacketResponder*`, project `shape(message)` | 64.3 ms | 32.5 ms | 1.98× |
+
+Early dictionary IDs avoid decoding the large tail. Numeric projections avoid string frames and their dictionaries entirely, and zero matches avoid all output-only preparation. The Hive shape projection avoids variable columns needed for string reconstruction. High IDs and predicates that search dictionary values still need a complete dictionary; the latter shows a small slowdown in this run. Returning every wide record remains close at 66.0 ms versus 66.6 ms, as do numeric counts at 8.6 ms versus 8.5 ms. Hive output of reconstructed matching strings changes from 62.1 ms to 63.2 ms. These controls show why the output mode and dictionary dependencies matter more than the number of matching records alone.
+
+```sh
+python3 components/core/tools/benchmarks/clpp-output-reads.py \
+    --baseline /path/to/baseline/clp-s \
+    --candidate /path/to/modified/clp-s \
+    --output /path/to/new-results-directory \
+    --clpp-archive /path/to/hive-adaptive-archive \
+    --repeats 7
+```

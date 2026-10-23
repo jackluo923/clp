@@ -142,7 +142,12 @@ void PackedStreamReader::open_packed_streams(std::shared_ptr<ArchiveReaderAdapto
             throw OperationFailed(ErrorCodeNotReady, __FILENAME__, __LINE__);
     }
     m_adaptor = adaptor;
-    m_packed_stream_reader = m_adaptor->checkout_reader_for_section(constants::cArchiveTablesFile);
+    m_packed_stream_reader
+            = m_adaptor->requires_ordered_section_reads()
+                      ? m_adaptor->checkout_reader_for_section(constants::cArchiveTablesFile)
+                      : m_adaptor->open_independent_reader_for_section(
+                                constants::cArchiveTablesFile
+                        );
     if (auto rc = m_packed_stream_reader->try_get_pos(m_begin_offset);
         clp::ErrorCode::ErrorCode_Success != rc)
     {
@@ -161,9 +166,10 @@ void PackedStreamReader::close() {
             needs_checkin = false;
             break;
     }
-    if (needs_checkin) {
+    if (needs_checkin && m_adaptor->requires_ordered_section_reads()) {
         m_adaptor->checkin_reader_for_section(constants::cArchiveTablesFile);
     }
+    m_packed_stream_reader.reset();
     m_adaptor.reset();
     m_prev_stream_id = 0ULL;
     m_begin_offset = 0ULL;

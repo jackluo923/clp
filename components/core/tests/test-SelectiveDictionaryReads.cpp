@@ -212,6 +212,11 @@ TEST_CASE(
         reader->open(stream, "streaming", {});
         REQUIRE(run_query(reader, query) == 1);
         REQUIRE(stream->backward_seeks == 0);
+        auto output_stream{std::make_shared<ForwardOnlyReader>(archive.string())};
+        auto output_reader{std::make_shared<clp_s::ArchiveReader>()};
+        output_reader->open(output_stream, "streaming-output", {});
+        REQUIRE(run_query(output_reader, query, true) == 1);
+        REQUIRE(output_stream->backward_seeks == 0);
     }
     // A buffer supports late reads of earlier sections, as a local file does.
     corrupt_dictionary(archive, clp_s::constants::cArchiveLogDictFile);

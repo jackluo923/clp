@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -399,8 +400,7 @@ auto ArchiveReader::get_column_value_filter(int32_t schema_id, int32_t node_id)
 }
 
 void ArchiveReader::open_packed_streams() {
-    // The stream reader holds the tables section open for the rest of the scan, so any section
-    // consulted per table must already be in memory.
+    // Forward-only inputs need these sections before opening the tables section.
     std::ignore = get_column_value_filter(0, 0);
     ensure_section_readable(constants::cArchiveTablesFile);
     m_stream_reader.open_packed_streams(m_archive_reader_adaptor);
@@ -425,7 +425,10 @@ SchemaReader& ArchiveReader::read_schema_table(
 
     auto const& schema_metadata = m_id_to_schema_metadata[schema_id];
     std::vector<uint8_t> selection;
-    if (required_columns && m_stream_reader.is_separate(schema_metadata.stream_id())) {
+    if (required_columns && m_stream_reader.is_separate(schema_metadata.stream_id())
+        && (!m_archive_reader_adaptor->requires_ordered_section_reads()
+            || (!should_marshal_records && !should_extract_timestamp)))
+    {
         selection = m_schema_reader.select_columns(*required_columns);
     }
     auto stream_buffer = read_stream(schema_metadata.stream_id(), true, selection);
@@ -439,6 +442,102 @@ SchemaReader& ArchiveReader::read_schema_table(
             m_archive_reader_adaptor->get_header().version >= cAdaptiveDictionaryVersion
     );
     return m_schema_reader;
+}
+
+auto ArchiveReader::prepare_schema_output(bool metadata, bool marshal_records) -> void {
+    if (marshal_records && m_clpp && m_schema_reader.needs_log_shapes_for_output()) {
+        m_schema_reader.set_reconstruction_dictionaries(
+                get_log_shape_dictionary().get(),
+                m_archive_reader_adaptor->has_section(constants::cArchiveParentRuleShapesFile)
+                        ? &get_parent_rule_shapes()
+                        : nullptr
+        );
+    }
+    auto const selected{m_schema_reader.select_output_columns(metadata)};
+    auto const& loaded{m_schema_reader.get_loaded_columns()};
+    std::vector<uint8_t> missing(selected.size());
+    bool needs_columns{false};
+    for (size_t i{0}; i < selected.size(); ++i) {
+        missing[i] = selected[i] && !loaded[i];
+        needs_columns |= missing[i] != 0;
+    }
+    auto const& table{m_id_to_schema_metadata.at(m_schema_reader.get_schema_id())};
+    if (needs_columns) {
+        auto buffer{read_stream(table.stream_id(), true, missing)};
+        m_schema_reader.load(
+                buffer,
+                table.stream_offset(),
+                table.uncompressed_size(),
+                m_stream_reader.get_column_sizes(table.stream_id()),
+                m_archive_reader_adaptor->get_header().version >= cAdaptiveNumericVersion,
+                missing,
+                m_archive_reader_adaptor->get_header().version >= cAdaptiveDictionaryVersion,
+                true
+        );
+    }
+    bool needs_variables{false};
+    auto const& columns{m_schema_reader.get_columns()};
+    for (size_t i{0}; i < columns.size(); ++i) {
+        if (!selected[i]) {
+            continue;
+        }
+        switch (columns[i]->get_type()) {
+            case NodeType::ClpString:
+                get_log_type_dictionary();
+                needs_variables = true;
+                break;
+            case NodeType::UnstructuredArray:
+                get_array_dictionary();
+                needs_variables = true;
+                break;
+            case NodeType::VarString:
+            case NodeType::DictionaryFloat:
+                needs_variables = true;
+                break;
+            default:
+                break;
+        }
+    }
+    if (!needs_variables || m_var_dict->is_complete()) {
+        return;
+    }
+    if (!m_stream_reader.is_separate(table.stream_id())
+        || m_archive_reader_adaptor->requires_ordered_section_reads())
+    {
+        get_variable_dictionary();
+        return;
+    }
+    std::optional<uint64_t> maximum;
+    try {
+        for (size_t i{0}; i < columns.size(); ++i) {
+            if (!selected[i]) {
+                continue;
+            }
+            std::optional<uint64_t> id;
+            if (auto* ids{dynamic_cast<DictionaryIdColumnReader*>(columns[i])}) {
+                id = ids->maximum_variable_id();
+            } else if (auto* strings{dynamic_cast<ClpStringColumnReader*>(columns[i])}) {
+                id = strings->maximum_variable_id();
+            }
+            if (id) {
+                maximum = std::max(maximum.value_or(0), *id);
+            }
+        }
+    } catch (TraceableException const&) {
+        // Discovery is speculative: preserve access-time validation of unselected rows.
+        get_variable_dictionary();
+        return;
+    }
+    if (maximum) {
+        if (*maximum == std::numeric_limits<uint64_t>::max()) {
+            get_variable_dictionary();
+        } else {
+            m_var_dict->read_entries_prefix(*maximum + 1);
+            if (m_var_dict->is_complete()) {
+                m_read_sections.emplace(constants::cArchiveVarDictFile);
+            }
+        }
+    }
 }
 
 std::vector<std::shared_ptr<SchemaReader>> ArchiveReader::read_all_tables() {

@@ -84,9 +84,7 @@ bool Output::filter() {
 
     {
         PROFILE_SCOPE("search_read_dictionaries");
-        m_match->prepare_dictionaries(
-                m_should_marshal_records || m_output_handler->should_output_metadata()
-        );
+        m_match->prepare_dictionaries(false);
     }
     {
         PROFILE_SCOPE("query_runner_global_init");
@@ -137,8 +135,7 @@ bool Output::filter() {
                     schema_id,
                     m_output_handler->should_output_metadata(),
                     m_should_marshal_records,
-                    !m_should_marshal_records && !m_output_handler->should_output_metadata()
-                                    && m_archive_reader->has_separate_columns(schema_id)
+                    m_archive_reader->has_separate_columns(schema_id)
                             ? m_query_runner.get_required_columns()
                             : std::nullopt
             );
@@ -150,24 +147,31 @@ bool Output::filter() {
             ++m_result_metrics.num_query_runner_filters;
         }
 
-        bool schema_has_match{false};
-        if (m_output_handler->should_output_metadata()) {
+        bool const schema_has_match{reader.find_next_message(filter)};
+        if (schema_has_match
+            && (m_should_marshal_records || m_output_handler->should_output_metadata()))
+        {
+            m_archive_reader->prepare_schema_output(
+                    m_output_handler->should_output_metadata(),
+                    m_should_marshal_records
+            );
+        }
+        if (schema_has_match && m_output_handler->should_output_metadata()) {
             epochtime_t timestamp{};
             int64_t log_event_idx{};
-            while (reader.get_next_message_with_metadata(message, timestamp, log_event_idx, filter))
-            {
-                schema_has_match = true;
+            do {
+                reader.get_next_message_with_metadata(message, timestamp, log_event_idx);
                 ++m_result_metrics.num_archive_records_matching_query;
                 m_result_metrics.num_bytes_output += message.size();
                 m_output_handler->write(message, timestamp, archive_id, log_event_idx);
-            }
-        } else {
-            while (reader.get_next_message(message, filter)) {
-                schema_has_match = true;
+            } while (reader.find_next_message(filter));
+        } else if (schema_has_match) {
+            do {
+                reader.get_next_message(message);
                 ++m_result_metrics.num_archive_records_matching_query;
                 m_result_metrics.num_bytes_output += message.size();
                 m_output_handler->write(message);
-            }
+            } while (reader.find_next_message(filter));
         }
         if (schema_has_match) {
             ++m_result_metrics.num_schemas_with_matches;

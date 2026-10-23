@@ -105,6 +105,12 @@ public:
      */
     ErrorCode try_read_string(size_t str_length, std::string& str);
 
+    /**
+     * Validates the end of a single frame after its expected payload has been consumed.
+     * Rejects extra output, truncated frames, checksum failures, and trailing compressed bytes.
+     */
+    auto try_finish_frame() -> ErrorCode;
+
 private:
     // Enum class
     enum class InputType {
@@ -138,6 +144,7 @@ private:
     size_t m_file_read_buffer_capacity;
 
     ZSTD_inBuffer m_compressed_stream_block{};
+    bool m_frame_finished{false};
 
     size_t m_decompressed_stream_pos;
     size_t m_unused_decompressed_stream_block_size;

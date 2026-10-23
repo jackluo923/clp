@@ -121,7 +121,8 @@ public:
      * @param should_extract_timestamp
      * @param should_marshal_records
      * @param required_columns Field IDs needed by the query, or nullopt to load all columns.
-     * Only separate-column ERTs support a selection.
+     * Only separate-column ERTs support a selection. Before emitting a matching row, call
+     * prepare_schema_output() to load any missing projection and metadata dependencies.
      * @return the schema reader
      */
     SchemaReader& read_schema_table(
@@ -130,6 +131,9 @@ public:
             bool should_marshal_records,
             std::optional<std::unordered_set<int32_t>> const& required_columns = std::nullopt
     );
+
+    /** Loads missing output columns and their dictionaries after the current ERT has a match. */
+    auto prepare_schema_output(bool metadata, bool marshal_records) -> void;
 
     /** Whether this ERT supports reading individual columns after metadata has been loaded. */
     [[nodiscard]] auto has_separate_columns(int32_t schema_id) const -> bool {
