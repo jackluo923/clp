@@ -3,15 +3,16 @@
 #ifndef CLP_S_DICTIONARYREADER_HPP
 #define CLP_S_DICTIONARYREADER_HPP
 
-#include <iterator>
+#include <algorithm>
+#include <array>
 #include <limits>
+#include <locale>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
 
-#include <boost/algorithm/string/case_conv.hpp>
 #include <string_utils/string_utils.hpp>
 
 #include <clp/Defs.h>
@@ -273,13 +274,25 @@ DictionaryReader<DictionaryIdType, EntryType>::get_entry_matching_value(
     }
 
     std::vector<EntryType const*> entries;
-    std::string search_string_uppercase;
-    std::ignore = boost::algorithm::to_upper_copy(
-            std::back_inserter(search_string_uppercase),
-            search_string
-    );
+    // Exact matching historically uses the C++ locale's uppercase mapping (Boost), while
+    // wildcard matching uses the C locale's lowercase mapping. Preserve both conventions.
+    std::array<char, 256> uppercase;
+    std::locale const locale;
+    auto const& facet{std::use_facet<std::ctype<char>>(locale)};
+    for (size_t i{}; i < uppercase.size(); ++i) {
+        uppercase[i] = facet.toupper(static_cast<char>(i));
+    }
+    std::string search_string_uppercase{search_string};
+    for (auto& c : search_string_uppercase) {
+        c = uppercase[static_cast<unsigned char>(c)];
+    }
     for (auto const& entry : m_entries) {
-        if (boost::algorithm::to_upper_copy(entry.get_value()) == search_string_uppercase) {
+        if (std::ranges::equal(
+                    entry.get_value(),
+                    search_string_uppercase,
+                    [&](char a, char b) { return uppercase[static_cast<unsigned char>(a)] == b; }
+            ))
+        {
             entries.push_back(&entry);
         }
     }
@@ -292,13 +305,9 @@ void DictionaryReader<DictionaryIdType, EntryType>::get_entries_matching_wildcar
         bool ignore_case,
         std::unordered_set<EntryType const*>& entries
 ) const {
+    clp::string_utils::PreparedWildcard const matcher{wildcard_string, !ignore_case};
     for (auto const& entry : m_entries) {
-        if (clp::string_utils::wildcard_match_unsafe(
-                    entry.get_value(),
-                    wildcard_string,
-                    !ignore_case
-            ))
-        {
+        if (matcher.matches(entry.get_value())) {
             entries.insert(&entry);
         }
     }

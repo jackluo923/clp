@@ -375,6 +375,11 @@ auto ArchiveReader::get_rule_value_index() -> clpp::RuleValueIndex const* {
     return &m_clpp->rule_value_index.value();
 }
 
+auto ArchiveReader::can_read_column_value_filters_independently() const -> bool {
+    return m_clpp.has_value() && !m_archive_reader_adaptor->requires_ordered_section_reads()
+           && m_archive_reader_adaptor->has_section(constants::cArchiveColumnValueFiltersFile);
+}
+
 auto ArchiveReader::get_column_value_filter(int32_t schema_id, int32_t node_id)
         -> ColumnValueFilter const* {
     if (false == m_clpp.has_value()

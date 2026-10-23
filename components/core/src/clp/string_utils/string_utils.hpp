@@ -1,6 +1,7 @@
 #ifndef CLP_STRING_UTILS_STRING_UTILS_HPP
 #define CLP_STRING_UTILS_STRING_UTILS_HPP
 
+#include <array>
 #include <charconv>
 #include <concepts>
 #include <cstddef>
@@ -152,6 +153,24 @@ auto to_lower(std::string& str) -> void;
  */
 [[nodiscard]] auto
 wildcard_match_unsafe_case_sensitive(std::string_view tame, std::string_view wild) -> bool;
+
+/**
+ * Reuses a wildcard pattern across many strings without allocating for each match. The pattern
+ * must satisfy wildcard_match_unsafe_case_sensitive's cleanup requirements. Case-insensitive
+ * matching captures the C locale's byte-wise lowercase mapping at construction, preserving
+ * wildcard_match_unsafe's behavior without copying and lowercasing every input string.
+ */
+class PreparedWildcard {
+public:
+    explicit PreparedWildcard(std::string_view pattern, bool case_sensitive = true);
+
+    [[nodiscard]] auto matches(std::string_view value) const -> bool;
+
+private:
+    std::string m_pattern;
+    bool m_case_sensitive;
+    std::array<char, 256> m_case_fold{};
+};
 
 /**
  * Converts the given string to a 64-bit integer if possible

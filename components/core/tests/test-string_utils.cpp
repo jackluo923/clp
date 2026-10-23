@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <random>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -519,6 +520,47 @@ SCENARIO("Test case sensitive wild card match in all possible ways", "[wildcard]
         GIVEN("A case-insensitive algorithm test") {
             bool const is_case_sensitive{false};
             REQUIRE(wildcard_match_unsafe("mississippi", "*issip*PI", is_case_sensitive));
+        }
+    }
+}
+
+TEST_CASE("Prepared wildcard preserves byte-wise matching", "[wildcard][PreparedWildcard]") {
+    using clp::string_utils::PreparedWildcard;
+    // Exercise every byte, including NUL and high bytes, both as literals and next to wildcards.
+    for (unsigned pattern_byte{}; pattern_byte < 256; ++pattern_byte) {
+        std::string literal;
+        char const c{static_cast<char>(pattern_byte)};
+        if (c == '*' || c == '?' || c == '\\') {
+            literal.push_back('\\');
+        }
+        literal.push_back(c);
+        for (bool const sensitive : {false, true}) {
+            PreparedWildcard const exact{literal, sensitive};
+            PreparedWildcard const contains{"*" + literal + "*", sensitive};
+            for (unsigned value_byte{}; value_byte < 256; ++value_byte) {
+                std::string const value(1, static_cast<char>(value_byte));
+                bool const expected{wildcard_match_unsafe(value, literal, sensitive)};
+                REQUIRE(exact.matches(value) == expected);
+                REQUIRE(contains.matches(value) == expected);
+            }
+        }
+    }
+    // Differential coverage for backtracking, escaped wildcards, empty strings and high bytes.
+    std::mt19937 random{20'261'023};
+    std::string const alphabet{"abAB*?\\\0\x80\xff", 10};
+    auto next_string = [&]() {
+        std::string result(random() % 24, '\0');
+        for (auto& c : result) {
+            c = alphabet[random() % alphabet.size()];
+        }
+        return result;
+    };
+    for (size_t i{}; i < 5000; ++i) {
+        auto const value{next_string()};
+        auto const pattern{clean_up_wildcard_search_string(next_string())};
+        for (bool const sensitive : {false, true}) {
+            REQUIRE(PreparedWildcard{pattern, sensitive}.matches(value)
+                    == wildcard_match_unsafe(value, pattern, sensitive));
         }
     }
 }

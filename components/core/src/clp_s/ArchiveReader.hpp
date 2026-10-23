@@ -206,6 +206,9 @@ public:
      */
     auto get_column_value_filter(int32_t schema_id, int32_t node_id) -> ColumnValueFilter const*;
 
+    /** Whether column summaries can be read without first consuming dictionary sections. */
+    [[nodiscard]] auto can_read_column_value_filters_independently() const -> bool;
+
     /**
      * Writes decoded messages to a file.
      * @param writer

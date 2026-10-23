@@ -2,9 +2,9 @@
 
 ## Scope
 
-This port reduces how much data C++ CLP+ stores, reads, and evaluates. It builds on the [CLP+ wildcard optimizations](design-clpp-wildcard-search-implementation.md): search loads the dictionaries needed to prepare a query, rejects encoded record tables (ERTs) that cannot match, counts an ERT directly when metadata proves every row matches, and reads the required columns from the remaining ERTs. Adaptive encodings reduce column sizes and let eligible predicates run without expanding every value.
+This port reduces how much data C++ CLP+ stores, reads, and evaluates. It builds on the [CLP+ wildcard optimizations](design-clpp-wildcard-search-implementation.md): search first checks whether integer summaries rule out every candidate encoded record table (ERT), then loads the dictionaries needed to prepare any remaining query. It rejects ERTs that cannot match, counts an ERT directly when metadata proves every row matches, and reads the required columns from the remaining ERTs. Adaptive encodings reduce column sizes and let eligible predicates run without expanding every value.
 
-The ports draw on [`jackluo923/separate-columns` through `ffe8e6aa`](https://github.com/jackluo923/clp/tree/ffe8e6aa). The implementation reuses the Rust numeric payload layouts and adapts its ERT range proofs to existing C++ integer summaries, while retaining the C++ query evaluator, parsing integration, and reconstruction behavior. Dictionary-ID codecs use a separately versioned C++ archive extension; this does not add support for current Rust archives.
+The ports draw on [`jackluo923/separate-columns` through `75367842`](https://github.com/jackluo923/clp/tree/75367842). The implementation reuses the Rust numeric payload layouts and adapts its ERT range proofs to existing C++ integer summaries, while retaining the C++ query evaluator, parsing integration, and reconstruction behavior. Dictionary-ID codecs use a separately versioned C++ archive extension; this does not add support for current Rust archives.
 
 | Optimization | Rust commits | C++ treatment |
 |---|---|---|
@@ -13,6 +13,8 @@ The ports draw on [`jackluo923/separate-columns` through `ffe8e6aa`](https://git
 | Prove range predicates from ERT summaries and remove covered column dependencies | `54abc872`, `cc292f7a` | Adapted to existing CLP+ integer summaries; timestamp summaries and numeric aggregate pushdown remain separate work |
 | Encode and scan dictionary-ID columns | `12828b82`, `a4c6b36c` | Ported for variable strings and dictionary-backed floats; legacy CLP-string descriptor buffers retain their layout |
 | Load only the dictionaries a query needs | `2a6168a7`, `3ce1b648`, `ffe8e6aa` | Predicate dictionaries remain complete; output dictionaries load after a match, with resumable variable-dictionary prefixes for separate-column ERTs |
+| Reject impossible archives before loading predicate dictionaries | `de53a8f2`, `75367842` | Integer proofs run before dictionary preparation; CLP+ string shape rejection already runs during schema matching |
+| Prepare and reuse dictionary string predicates | `de53a8f2` | Exact-literal matching and query caches already exist; prepared case folding removes per-entry string allocations |
 | Choose numeric encodings by compressed size | `15a57e03` | Ported for integer and double columns |
 | Construct candidates one at a time | `51bbd4e5` | Ported; reuse a Zstd context and candidate buffers rather than retaining all encodings |
 | Value-sorted float dictionaries with byte-wide codes | `267fc8d3` | Ported as an additional lossless candidate |
@@ -69,6 +71,16 @@ This adaptation requires an existing integer summary. Missing or empty summaries
 
 The writer and archive bytes are unchanged. Packed ERTs can be skipped or counted in full; skipping an individual column frame requires separate-column storage. The Rust changes also use timestamp summaries and aggregate metadata, which this integer adaptation does not introduce.
 
+## Rejecting archives before loading predicate dictionaries
+
+Consider `seq > 100 AND state:busy` when every candidate ERT has `seq` values below 100. The integer summaries prove the result empty, so searching the variable dictionary for `busy` would be wasted work. `Output` now asks `QueryRunner::may_match_before_dictionaries` to check those summaries before loading predicate dictionaries or preparing string queries. Schema resolution and CLP+ string shape preparation still precede this check.
+
+This pass reuses the existing integer equality, numeric-prefix wildcard, and range proofs. It evaluates each candidate ERT's resolved expression without changing that expression. Every other predicate remains unknown: an unloaded dictionary is never treated as empty. A false integer condition rules out an AND, but `seq > 100 OR state:busy` still requires the dictionary. NOT reverses proven truth values and leaves unknown values unknown.
+
+Search finishes with an empty result only when every candidate ERT is proven impossible. If any ERT remains possible, dictionary preparation and the normal per-ERT evaluator continue. This pass does not remove dictionary dependencies from individual surviving branches. The output handler is finalized even for an empty result, and telemetry reports `metadata_pruning` with no scanned ERTs.
+
+The check applies to both packed and separate-column CLP+ archives with existing column summaries. Forward-only inputs and archives without those summaries retain ordinary preparation. CLP+ string shape rejection already happens before predicate dictionary loading; the Rust precheck for legacy CLP-string templates is separate work. Archive bytes and compression ratios are unchanged.
+
 ## Reading fewer columns
 
 Separate ERTs store one Zstd frame per physical column. Table metadata gives each frame's compressed and uncompressed size, allowing the reader to seek past frames that the query does not need.
@@ -96,6 +108,14 @@ The dictionary reader retains its Zstd decoder, compressed input buffer, and dec
 Prefix discovery includes every row in the selected output columns, preserving whole-column validation of adaptive dictionary IDs. A high ID in a nonmatching row can therefore force a complete dictionary read. Packed ERTs and unsupported discovery retain full-dictionary loading after a match. The decoder validates consumed entries immediately and validates the frame ending, checksum, and trailing data when the complete prefix is requested; an unread tail remains unchecked. Decompression buffering may read beyond the last requested entry.
 
 These changes use existing archive bytes and do not require a writer option or format version. The largest savings occur when the predicate needs no variable dictionary and the output references only early dictionary entries. Per-field dictionaries remain separate porting work.
+
+## Preparing dictionary string matches
+
+String predicates search the variable dictionary once, then reuse the matching dictionary IDs across ERTs. Exact literals already bypass wildcard matching. Case-insensitive matching now also avoids allocating and converting a string for every dictionary entry.
+
+For exact literals, the reader builds a byte-to-uppercase table, converts the query once, and compares dictionary bytes through the table. Length mismatches and unequal bytes can reject an entry immediately. For wildcards, `PreparedWildcard` converts the pattern once and folds dictionary bytes as the existing matcher visits them; it does not copy the complete entry. The same wildcard algorithm handles escapes and backtracking in both case modes.
+
+The two paths retain their existing case-conversion conventions: exact literals use the C++ locale's uppercase mapping, while wildcards use the C locale's lowercase mapping. Neither introduces Unicode case folding. Preparing the mapping once preserves NUL bytes, non-ASCII bytes, escaped wildcards, and the existing matching-ID caches. These reader changes apply to ordinary C++ CLP-S archives as well as CLP+ archives.
 
 ## Searching numeric columns without expanding them
 
@@ -164,7 +184,7 @@ The new reader rejects unknown extension versions and archive versions newer tha
 Build and test inside the project's `clp-core-dependencies-x86-manylinux_2_28:dev` image with the C++ dependencies mounted. Configure `CLP_BUILD_CLPP_DECOMPOSITION=ON` and `CLP_BUILD_TESTING=ON`, then build `clp-s` and `unitTest`.
 
 ```sh
-unitTest '[AdaptiveColumn],[NumericColumnView],[DictionaryIdSet],[DictionaryColumns],[SeparateColumns],[SelectiveDictionaries],[OutputColumns],[DictionaryPrefix],[MetadataCounts],[IntegerRangeProofs],[ColumnValueFilter]'
+unitTest '[AdaptiveColumn],[NumericColumnView],[DictionaryIdSet],[DictionaryColumns],[SeparateColumns],[SelectiveDictionaries],[OutputColumns],[DictionaryPrefix],[MetadataCounts],[IntegerRangeProofs],[ColumnValueFilter],[MetadataPreflight],[DictionaryMatching],[wildcard]'
 
 python3 components/core/tools/benchmarks/clpp-column-port.py \
     --baseline /path/to/baseline/clp-s \
@@ -179,6 +199,8 @@ The benchmark harness generates a deterministic numeric fixture, compares baseli
 Unit coverage includes every numeric wire scheme, signed integer limits, floating-point bit patterns, truncated payloads, invalid frame metadata, exact dictionary membership, and archive round trips with both archive containers and array layouts. Selective-read tests verify that count queries leave damaged unused dictionaries unread while reconstruction rejects them, and cover forward-only inputs, memory buffers, reader reuse, and logical expressions. Metadata-count tests cover logical expressions, time bounds, array members, output requirements, and damaged record data that must remain unread for proven counts. Integer-range tests cover endpoint inclusivity, fractional operands, signed limits, repeated fields, missing fields, mixed types, and queries combining metadata counts with scans. They also damage one integer frame to verify that a proven predicate leaves it unread while another column is scanned. Dictionary-column tests compare compact scans against decoded scans and verify reference validation, reader reuse, and exact float-text extraction. Numeric codec mutation checks also run under AddressSanitizer and UndefinedBehaviorSanitizer.
 
 Output-read tests make unused frames unreadable, check that required frames are read at most once, and verify incremental dictionary reads across interleaved sections. They cover exact float text, repeated array elements, output timestamps and record indices, CLP+ projections, and corrupted dictionary tails. The `clpp-output-reads.py` harness compares exact result bytes and interleaves baseline and candidate searches over the same archives, including low and high dictionary IDs, narrow projections, zero matches, wildcard predicates, full output, and count controls.
+
+Preflight tests make variable dictionaries, array dictionaries, and record data unreadable for queries that summaries prove impossible. They cover multiple ERTs, AND/OR/NOT, integer limits, fractional comparisons, packed and separate storage, missing summaries, output finalization, and forward-only inputs. Dictionary-matching tests compare results with the previous conversion behavior, including a custom C++ locale. Prepared wildcard tests cover every byte value and randomized patterns with escapes and backtracking.
 
 ### Compression results
 
@@ -336,5 +358,31 @@ python3 components/core/tools/benchmarks/clpp-output-reads.py \
     --candidate /path/to/modified/clp-s \
     --output /path/to/new-results-directory \
     --clpp-archive /path/to/hive-adaptive-archive \
+    --repeats 7
+```
+
+### Effect of early pruning and prepared dictionary matching
+
+The baseline is C++ commit `d3d01624`. It writes two archives of the same 30,000 records: one with packed ERTs and one with adaptive separate columns. Each record has a sequential integer and a distinct mixed-case string of 245 or 246 bytes; an optional field splits the records into two ERTs. Both readers consume identical archive bytes. The harness checks exact count-output bytes and reports medians from seven interleaved runs after a warmup, including CLI startup on a shared host with warm caches. Builds and tests finish before measurement.
+
+These results use the adaptive separate-column archive:
+
+| Query | Baseline | Optimized | Speedup |
+|---|---:|---:|---:|
+| Impossible integer range AND exact string | 19.5 ms | 8.3 ms | 2.34× |
+| Impossible integer range AND string wildcard | 22.2 ms | 8.3 ms | 2.68× |
+| Exact string, case-insensitive | 51.6 ms | 20.5 ms | 2.52× |
+| Prefix wildcard, case-insensitive | 36.8 ms | 20.7 ms | 1.77× |
+| Substring wildcard, case-insensitive | 40.3 ms | 24.1 ms | 1.67× |
+| Impossible integer range OR matching string wildcard | 20.3 ms | 20.2 ms | 1.00× |
+| Prefix wildcard, case-sensitive | 20.0 ms | 20.3 ms | 0.99× |
+
+Early pruning avoids reading and searching the variable dictionary for impossible conjunctions, including a negated range proven false. OR retains dictionary work because its string condition can still match. Case-insensitive searches still read the dictionary but avoid converting every complete entry; exact and prefix comparisons can stop at the first unequal byte. Numeric equality and metadata-count controls remain close at 7.5 ms versus 7.3 ms and 7.3 ms versus 7.4 ms. Packed archives show similar gains: the impossible conjunction drops from 19.1 ms to 8.2 ms, and case-insensitive exact matching drops from 52.1 ms to 21.1 ms. These are search improvements; neither change affects archive size.
+
+```sh
+python3 components/core/tools/benchmarks/clpp-dictionary-preflight.py \
+    --baseline /path/to/baseline/clp-s \
+    --candidate /path/to/modified/clp-s \
+    --output /path/to/new-results-directory \
     --repeats 7
 ```

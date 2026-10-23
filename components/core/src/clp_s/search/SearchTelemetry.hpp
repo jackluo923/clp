@@ -22,6 +22,7 @@ constexpr std::string_view cTerminationStageSchemaMatching{"schema_matching"};
 constexpr std::string_view cTerminationStageErtScan{"ert_scan"};
 constexpr std::string_view cTerminationStageDictionarySearch{"dictionary_search"};
 constexpr std::string_view cTerminationStageMetadataCount{"metadata_count"};
+constexpr std::string_view cTerminationStageMetadataPruning{"metadata_pruning"};
 
 /**
  * Counts of how the columns referenced by a query's predicates use wildcards.

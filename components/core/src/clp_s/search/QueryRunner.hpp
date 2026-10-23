@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <span>
 #include <stack>
 #include <string>
 #include <unordered_map>
@@ -82,6 +83,14 @@ public:
      * Initializes the query processing context that is common to all schemas.
      */
     void global_init();
+
+    /**
+     * Returns false only when integer summaries prove every candidate ERT impossible. Runs before
+     * global_init without mutating the queries or using unloaded dictionaries as evidence of
+     * absence. Archives without summaries and forward-only inputs retain ordinary preparation.
+     */
+    [[nodiscard]] auto may_match_before_dictionaries(std::span<int32_t const> schemas) const
+            -> bool;
 
     /**
      * Initializes the query processing context for a given schema.
@@ -445,13 +454,19 @@ private:
     auto constant_propagate(std::shared_ptr<ast::Expression> const& expr) -> EvaluatedValue;
 
     /**
-     * Decides an equality filter ahead of the scan using the current schema table's column value
-     * filter, when the archive has one for the filter's column.
-     * @param filter
-     * @return EvaluatedValue::False (EvaluatedValue::True for an inverted filter) if no value
-     * stored in the column can satisfy the filter; EvaluatedValue::Unknown otherwise.
+     * Evaluates an expression using only integer summaries. Other predicates remain unknown.
      */
-    auto evaluate_with_column_value_filter(ast::FilterExpr* filter) -> EvaluatedValue;
+    auto evaluate_metadata_expression(ast::Expression* expr, int32_t schema_id) const
+            -> EvaluatedValue;
+
+    /**
+     * Decides equality or integer range predicates using an ERT's column value filter.
+     * @param filter
+     * @param schema_id
+     * @return The proven truth value, including inversion, or EvaluatedValue::Unknown.
+     */
+    auto evaluate_with_column_value_filter(ast::FilterExpr* filter, int32_t schema_id) const
+            -> EvaluatedValue;
 
     /**
      * Populates searched wildcard columns

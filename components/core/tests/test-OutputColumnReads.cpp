@@ -129,6 +129,8 @@ struct Results {
     std::vector<std::string> rows;
     std::vector<int64_t> timestamps;
     std::vector<int64_t> indices;
+    bool finished{false};
+    std::string termination_stage;
 };
 
 class Sink : public clp_s::search::OutputHandler {
@@ -144,6 +146,11 @@ public:
         write(value);
         m_result.timestamps.push_back(timestamp);
         m_result.indices.push_back(index);
+    }
+
+    auto finish() -> clp_s::ErrorCode override {
+        m_result.finished = true;
+        return clp_s::ErrorCodeSuccess;
     }
 
 private:
@@ -185,7 +192,9 @@ auto search(
     Results result;
     clp_s::search::Output
             output{match, expr, reader, std::make_unique<Sink>(result, metadata, marshal), false};
-    REQUIRE(output.filter());
+    bool const success{output.filter()};
+    REQUIRE(success);
+    result.termination_stage = output.get_termination_stage();
     reader->close();
     return result;
 }
@@ -472,6 +481,48 @@ TEST_CASE("Completing a dictionary prefix validates the frame tail", "[clp-s][Di
 }
 
 #if CLP_BUILD_CLPP_DECOMPOSITION
+TEST_CASE(
+        "Metadata preflight checks all ERTs and finishes empty output",
+        "[clpp][MetadataPreflight]"
+) {
+    auto const separate{GENERATE(false, true)};
+    std::filesystem::path const root{"test-preflight-output"};
+    TestOutputCleaner cleanup{{root.string()}};
+    auto const archive{create_archive(
+            root,
+            "{\"seq\":1,\"state\":\"busy\"}\n"
+            "{\"seq\":200,\"state\":\"busy\",\"other\":true}\n"
+            "{\"seq\":-1,\"state\":\"idle\",\"last\":true}\n",
+            true,
+            separate,
+            separate,
+            false,
+            true
+    )};
+    REQUIRE(search(open(archive, true), "seq > 100 AND state:busy").rows.size() == 1);
+    auto const bytes{bytes_from(archive)};
+    std::vector<Range> const forbidden{
+            section_range(archive, clp_s::constants::cArchiveVarDictFile),
+            section_range(archive, clp_s::constants::cArchiveArrayDictFile),
+            section_range(archive, clp_s::constants::cArchiveTablesFile)
+    };
+    for (bool const marshal : {false, true}) {
+        auto source{std::make_shared<AuditedBuffer>(bytes)};
+        source->forbidden = forbidden;
+        auto reader{std::make_shared<clp_s::ArchiveReader>()};
+        reader->open(source, "preflight-empty", {.m_experimental = true});
+        auto const result{search(reader, "seq > 1000 AND state:busy", {}, false, marshal)};
+        REQUIRE(result.rows.empty());
+        REQUIRE(result.finished);
+        REQUIRE(result.termination_stage == clp_s::search::cTerminationStageMetadataPruning);
+    }
+    auto source{std::make_shared<AuditedBuffer>(bytes)};
+    source->forbidden = forbidden;
+    auto reader{std::make_shared<clp_s::ArchiveReader>()};
+    reader->open(source, "preflight-possible", {.m_experimental = true});
+    REQUIRE_THROWS(search(reader, "seq > 100 AND state:busy"));
+}
+
 TEST_CASE(
         "CLP+ output plans select reconstruction and shape dependencies",
         "[clpp][OutputColumns]"

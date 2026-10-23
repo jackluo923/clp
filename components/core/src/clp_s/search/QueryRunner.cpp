@@ -149,6 +149,57 @@ void QueryRunner::global_init() {
     populate_string_queries(m_expr);
 }
 
+auto QueryRunner::may_match_before_dictionaries(std::span<int32_t const> schemas) const -> bool {
+    if (!m_archive_reader->can_read_column_value_filters_independently()) {
+        return true;
+    }
+    return std::ranges::any_of(schemas, [&](int32_t schema_id) {
+        return EvaluatedValue::False
+               != evaluate_metadata_expression(
+                       m_match->get_query_for_schema(schema_id).get(),
+                       schema_id
+               );
+    });
+}
+
+auto QueryRunner::evaluate_metadata_expression(Expression* expr, int32_t schema_id) const
+        -> EvaluatedValue {
+    if (auto* filter{dynamic_cast<FilterExpr*>(expr)}; filter != nullptr) {
+        // Dictionary-ID bounds are not string bounds. Even an empty, unloaded dictionary says
+        // nothing about whether a string predicate matches.
+        if (filter->get_column()->get_literal_type() != LiteralType::IntegerT) {
+            return EvaluatedValue::Unknown;
+        }
+        return evaluate_with_column_value_filter(filter, schema_id);
+    }
+    bool const is_and{dynamic_cast<AndExpr*>(expr) != nullptr};
+    if (!is_and && dynamic_cast<OrExpr*>(expr) == nullptr) {
+        return EvaluatedValue::Unknown;
+    }
+    bool unknown{false};
+    auto result{is_and ? EvaluatedValue::True : EvaluatedValue::False};
+    for (auto const& operand : expr->get_op_list()) {
+        auto const value{
+                evaluate_metadata_expression(dynamic_cast<Expression*>(operand.get()), schema_id)
+        };
+        if ((is_and && value == EvaluatedValue::False)
+            || (!is_and && value == EvaluatedValue::True))
+        {
+            result = value;
+            unknown = false;
+            break;
+        }
+        unknown |= value == EvaluatedValue::Unknown;
+    }
+    if (unknown) {
+        return EvaluatedValue::Unknown;
+    }
+    if (expr->is_inverted()) {
+        return result == EvaluatedValue::True ? EvaluatedValue::False : EvaluatedValue::True;
+    }
+    return result;
+}
+
 auto QueryRunner::schema_init(int32_t schema_id) -> EvaluatedValue {
     m_expr_clp_query.clear();
     m_expr_var_match_map.clear();
@@ -1244,7 +1295,7 @@ EvaluatedValue QueryRunner::constant_propagate(std::shared_ptr<Expression> const
             // FIXME: have an edgecase to handle with NEXISTS on pure wildcard columns
             return EvaluatedValue::True;
         }
-        if (auto const value{evaluate_with_column_value_filter(filter.get())};
+        if (auto const value{evaluate_with_column_value_filter(filter.get(), m_schema)};
             EvaluatedValue::Unknown != value)
         {
             return value;
@@ -1376,7 +1427,8 @@ EvaluatedValue QueryRunner::constant_propagate(std::shared_ptr<Expression> const
     return EvaluatedValue::Unknown;
 }
 
-auto QueryRunner::evaluate_with_column_value_filter(FilterExpr* filter) -> EvaluatedValue {
+auto QueryRunner::evaluate_with_column_value_filter(FilterExpr* filter, int32_t schema_id) const
+        -> EvaluatedValue {
     auto const op{filter->get_operation()};
     bool const is_range{
             FilterOperation::LT == op || FilterOperation::LTE == op || FilterOperation::GT == op
@@ -1395,7 +1447,7 @@ auto QueryRunner::evaluate_with_column_value_filter(FilterExpr* filter) -> Evalu
         return EvaluatedValue::Unknown;
     }
     auto const* value_filter{
-            m_archive_reader->get_column_value_filter(m_schema, column->get_column_id())
+            m_archive_reader->get_column_value_filter(schema_id, column->get_column_id())
     };
     if (nullptr == value_filter) {
         return EvaluatedValue::Unknown;

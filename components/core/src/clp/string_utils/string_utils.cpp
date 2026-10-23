@@ -25,20 +25,25 @@ namespace {
  * @param tame_bookmark
  * @param tame_end
  * @param wild_current
+ * @param fold Converts a literal input byte to the pattern's case convention.
  * @return true on success, false if wild cannot match tame
  */
+template <typename Fold>
 [[nodiscard]] inline auto advance_tame_to_next_match(
         char const*& tame_current,
         char const*& tame_bookmark,
         char const* tame_end,
-        char const*& wild_current
+        char const*& wild_current,
+        Fold const& fold
 ) -> bool;
 
+template <typename Fold>
 inline auto advance_tame_to_next_match(
         char const*& tame_current,
         char const*& tame_bookmark,
         char const* tame_end,
-        char const*& wild_current
+        char const*& wild_current,
+        Fold const& fold
 ) -> bool {
     auto w = *wild_current;
     if (clp::string_utils::cSingleCharWildcard != w) {
@@ -61,7 +66,7 @@ inline auto advance_tame_to_next_match(
                 // e.g. "*abc" doesn't match "zab"
                 return false;
             }
-            auto t = *tame_current;
+            auto t = fold(*tame_current);
             if (t == w) {
                 break;
             }
@@ -239,8 +244,10 @@ auto wildcard_match_unsafe(string_view tame, string_view wild, bool case_sensiti
  * 3. checks if the two match. If not, the search repeats with the next group in
  *    tame.
  */
+namespace {
 // NOLINTBEGIN(readability-function-cognitive-complexity)
-auto wildcard_match_unsafe_case_sensitive(string_view tame, string_view wild) -> bool {
+template <typename Fold>
+auto wildcard_match_impl(string_view tame, string_view wild, Fold const& fold) -> bool {
     auto const tame_length = tame.length();
     auto const wild_length = wild.length();
     char const* tame_current{tame.data()};
@@ -275,7 +282,13 @@ auto wildcard_match_unsafe_case_sensitive(string_view tame, string_view wild) ->
             // Set wild and tame bookmarks
             wild_bookmark = wild_current;
             if (false
-                == advance_tame_to_next_match(tame_current, tame_bookmark, tame_end, wild_current))
+                == advance_tame_to_next_match(
+                        tame_current,
+                        tame_bookmark,
+                        tame_end,
+                        wild_current,
+                        fold
+                ))
             {
                 return false;
             }
@@ -291,7 +304,7 @@ auto wildcard_match_unsafe_case_sensitive(string_view tame, string_view wild) ->
             }
 
             // Handle a mismatch
-            t = *tame_current;
+            t = fold(*tame_current);
             if (false == ((false == is_escaped && cSingleCharWildcard == w) || t == w)) {
                 if (nullptr == wild_bookmark) {
                     // No bookmark to return to
@@ -306,7 +319,8 @@ auto wildcard_match_unsafe_case_sensitive(string_view tame, string_view wild) ->
                             tame_current,
                             tame_bookmark,
                             tame_end,
-                            wild_current
+                            wild_current,
+                            fold
                     ))
                 {
                     return false;
@@ -335,7 +349,13 @@ auto wildcard_match_unsafe_case_sensitive(string_view tame, string_view wild) ->
             // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic)
             tame_current = tame_bookmark + 1;
             if (false
-                == advance_tame_to_next_match(tame_current, tame_bookmark, tame_end, wild_current))
+                == advance_tame_to_next_match(
+                        tame_current,
+                        tame_bookmark,
+                        tame_end,
+                        wild_current,
+                        fold
+                ))
             {
                 return false;
             }
@@ -344,4 +364,31 @@ auto wildcard_match_unsafe_case_sensitive(string_view tame, string_view wild) ->
 }
 
 // NOLINTEND(readability-function-cognitive-complexity)
+}  // namespace
+
+auto wildcard_match_unsafe_case_sensitive(string_view tame, string_view wild) -> bool {
+    return wildcard_match_impl(tame, wild, [](char c) { return c; });
+}
+
+PreparedWildcard::PreparedWildcard(std::string_view pattern, bool case_sensitive)
+        : m_pattern{pattern},
+          m_case_sensitive{case_sensitive} {
+    if (!m_case_sensitive) {
+        for (size_t i{}; i < m_case_fold.size(); ++i) {
+            m_case_fold[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(i)));
+        }
+        for (auto& c : m_pattern) {
+            c = m_case_fold[static_cast<unsigned char>(c)];
+        }
+    }
+}
+
+auto PreparedWildcard::matches(std::string_view value) const -> bool {
+    if (m_case_sensitive) {
+        return wildcard_match_unsafe_case_sensitive(value, m_pattern);
+    }
+    return wildcard_match_impl(value, m_pattern, [this](char c) {
+        return m_case_fold[static_cast<unsigned char>(c)];
+    });
+}
 }  // namespace clp::string_utils

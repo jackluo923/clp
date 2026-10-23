@@ -83,6 +83,13 @@ bool Output::filter() {
     }
 
     {
+        PROFILE_SCOPE("search_metadata_preflight");
+        if (!m_query_runner.may_match_before_dictionaries(matched_schemas)) {
+            m_termination_stage = cTerminationStageMetadataPruning;
+            return finish();
+        }
+    }
+    {
         PROFILE_SCOPE("search_read_dictionaries");
         m_match->prepare_dictionaries(false);
     }
@@ -189,6 +196,10 @@ bool Output::filter() {
                           : m_result_metrics.num_schemas_counted_from_metadata != 0
                                   ? cTerminationStageMetadataCount
                                   : cTerminationStageDictionarySearch;
+    return finish();
+}
+
+auto Output::finish() -> bool {
     auto ecode = m_output_handler->finish();
     if (ErrorCode::ErrorCodeSuccess != ecode) {
         SPDLOG_ERROR(

@@ -66,6 +66,9 @@ public:
     }
 
 private:
+    /** Finishes the output handler, including when metadata proves an empty result. */
+    auto finish() -> bool;
+
     QueryRunner m_query_runner;
     std::shared_ptr<ArchiveReader> m_archive_reader;
     std::shared_ptr<ast::Expression> m_expr;

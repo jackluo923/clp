@@ -746,6 +746,7 @@ if(CLP_ENABLE_TESTS)
     set_source_files_properties(
             tests/test-MetadataCounts.cpp
             tests/test-OutputColumnReads.cpp
+            tests/test-SelectiveDictionaryReads.cpp
             PROPERTIES
             COMPILE_DEFINITIONS "CLP_BUILD_CLPP_DECOMPOSITION=$<BOOL:${CLP_BUILD_CLPP_DECOMPOSITION}>"
             )
