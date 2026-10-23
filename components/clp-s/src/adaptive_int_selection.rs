@@ -33,7 +33,7 @@ pub(crate) struct CandidateAnalysis<'a> {
 impl CandidateAnalysis<'_> {
     /// Reuse the basic statistics from the detailed pass; do not scan the column a second time.
     pub(crate) fn candidates(&self) -> impl Iterator<Item = Vec<u8>> + '_ {
-        candidates_from_stats(self.values, self.stats)
+        candidates_from_stats(self.values, self.stats.as_ref())
     }
 
     pub(crate) fn delta_candidates(&self) -> DeltaCandidateSelection {
@@ -50,7 +50,7 @@ pub(crate) fn analyze_candidates(values: &[i64]) -> CandidateAnalysis<'_> {
         })
     });
     let mut delta = deltas.finish(values.len());
-    if stats.is_some_and(|stats| stats.min != stats.max) {
+    if stats.as_ref().is_some_and(|stats| stats.min != stats.max) {
         // Small nonzero varints are useful even when zero runs are absent. Do not gate solely
         // on the zero count. Raw-size rejection is deliberately loose; Zstd still picks the
         // winner among all surviving candidates and the unchanged ordinary menu.

@@ -32,8 +32,9 @@
 //!   infinities rule it out.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use crate::adaptive_int::{AdaptiveDecodeError, bit_width_for, pack_bits, packed_len, unpack_bits};
+use crate::adaptive_int::{AdaptiveDecodeError, bit_width_for, pack_bits_iter, packed_len, unpack_bits};
 use crate::encoding_effort::EncodingEffort;
 
 const PLAIN: u8 = 0;
@@ -77,21 +78,59 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, AdaptiveDecodeError> {
     Ok(u32::from_le_bytes(slice.try_into().expect("4-byte slice")))
 }
 
-/// One-pass statistics: distinct count (for dictionary/constant) and run count (for RLE).
-fn scan(bits: &[u64]) -> (Option<usize>, usize) {
+/// A complete, bounded dictionary in first-appearance order. Keep the index built during the
+/// statistics pass so each dictionary candidate can use it without rebuilding the map.
+struct Dictionary {
+    values: Vec<u64>,
+    index_of: HashMap<u64, usize>,
+}
+
+struct Stats {
+    dictionary: Option<Dictionary>,
+    runs: usize,
+    decimal_possible: bool,
+}
+
+impl Stats {
+    fn cardinality(&self) -> Option<usize> {
+        self.dictionary.as_ref().map(|dictionary| dictionary.values.len())
+    }
+}
+
+/// All decimal modes reject negative zero, nonfinite values and magnitudes at least 2^53.
+/// Positive IEEE bit patterns have the same order as finite magnitudes, so this needs no cast
+/// or floating-point arithmetic. These are necessary conditions, not an approximate fit test.
+fn decimal_value_possible(bits: u64) -> bool {
+    bits != (-0.0_f64).to_bits() && bits & 0x7fff_ffff_ffff_ffff < MAX_MANTISSA.to_bits()
+}
+
+/// One-pass bounded dictionary, run count and cheap exact decimal eligibility flags.
+fn scan(bits: &[u64]) -> Stats {
     let mut runs = 1usize;
-    let mut distinct: HashMap<u64, ()> = HashMap::new();
-    distinct.insert(bits[0], ());
+    let mut dictionary = Some(Dictionary {
+        values: vec![bits[0]],
+        index_of: HashMap::from([(bits[0], 0)]),
+    });
+    let mut decimal_possible = decimal_value_possible(bits[0]);
     for window in bits.windows(2) {
-        if window[0] != window[1] {
-            runs += 1;
+        if window[0] == window[1] {
+            continue;
         }
-        if distinct.len() <= MAX_DICT_CARDINALITY {
-            distinct.insert(window[1], ());
+        runs += 1;
+        decimal_possible &= decimal_value_possible(window[1]);
+        if let Some(dict) = &mut dictionary {
+            if let std::collections::hash_map::Entry::Vacant(entry) = dict.index_of.entry(window[1]) {
+                if dict.values.len() == MAX_DICT_CARDINALITY {
+                    // Do not retain an incomplete dictionary or allow it to grow with the input.
+                    dictionary = None;
+                } else {
+                    entry.insert(dict.values.len());
+                    dict.values.push(window[1]);
+                }
+            }
         }
     }
-    let small_cardinality = (distinct.len() <= MAX_DICT_CARDINALITY).then_some(distinct.len());
-    (small_cardinality, runs)
+    Stats { dictionary, runs, decimal_possible }
 }
 
 fn encode_plain(bits: &[u64]) -> Vec<u8> {
@@ -122,54 +161,54 @@ fn encode_constant(value: u64) -> Vec<u8> {
     out
 }
 
-fn encode_dict(bits: &[u64], cardinality: usize) -> Vec<u8> {
-    let mut table: Vec<u64> = Vec::with_capacity(cardinality);
-    let mut index_of: HashMap<u64, u64> = HashMap::with_capacity(cardinality);
-    let mut indices: Vec<u64> = Vec::with_capacity(bits.len());
-    for &v in bits {
-        let idx = *index_of.entry(v).or_insert_with(|| {
-            table.push(v);
-            (table.len() - 1) as u64
-        });
-        indices.push(idx);
-    }
+fn dictionary_indices<'a>(bits: &'a [u64], dictionary: &'a Dictionary) -> impl Iterator<Item = usize> + 'a {
+    let mut previous = None;
+    bits.iter().map(move |&value| {
+        if let Some((last, index)) = previous {
+            if last == value { return index; }
+        }
+        let index = dictionary.index_of[&value];
+        previous = Some((value, index));
+        index
+    })
+}
+
+fn encode_dict(bits: &[u64], dictionary: &Dictionary) -> Vec<u8> {
+    let table = &dictionary.values;
     let idx_width = bit_width_for((table.len() as u64).saturating_sub(1));
     let mut out =
         Vec::with_capacity(1 + 4 + table.len() * 8 + 1 + packed_len(bits.len(), idx_width));
     out.push(DICT);
     out.extend_from_slice(&(table.len() as u32).to_le_bytes());
-    for &v in &table {
+    for &v in table {
         out.extend_from_slice(&v.to_le_bytes());
     }
     out.push(idx_width);
-    pack_bits(&indices, idx_width, &mut out);
+    pack_bits_iter(dictionary_indices(bits, dictionary).map(|index| index as u64), idx_width, &mut out);
     out
 }
 
 /// A `DICT` stream whose table is sorted by value and whose indices are 8 or 16 bits wide. Only
 /// for a column of at most 65,536 distinct values.
-fn encode_sorted_dict(bits: &[u64], cardinality: usize) -> Vec<u8> {
-    let mut table: Vec<u64> = Vec::with_capacity(cardinality);
-    let mut seen: HashMap<u64, ()> = HashMap::with_capacity(cardinality);
-    for &v in bits {
-        if seen.insert(v, ()).is_none() {
-            table.push(v);
-        }
-    }
+fn encode_sorted_dict(bits: &[u64], dictionary: &Dictionary) -> Vec<u8> {
+    let table = &dictionary.values;
+    let mut order: Vec<usize> = (0..table.len()).collect();
     // Total order on the values; bit patterns are distinct, so ties cannot occur.
-    table.sort_unstable_by(|a, b| f64::from_bits(*a).total_cmp(&f64::from_bits(*b)));
-    let index_of: HashMap<u64, u64> = table.iter().enumerate().map(|(i, &v)| (v, i as u64)).collect();
-    let indices: Vec<u64> = bits.iter().map(|v| index_of[v]).collect();
+    order.sort_unstable_by(|&a, &b| f64::from_bits(table[a]).total_cmp(&f64::from_bits(table[b])));
+    let mut remap = vec![0u64; table.len()];
+    for (sorted, &original) in order.iter().enumerate() {
+        remap[original] = sorted as u64;
+    }
     let idx_width = if table.len() <= 1 << 8 { 8 } else { 16 };
     let mut out =
         Vec::with_capacity(1 + 4 + table.len() * 8 + 1 + packed_len(bits.len(), idx_width));
     out.push(DICT);
     out.extend_from_slice(&(table.len() as u32).to_le_bytes());
-    for &v in &table {
-        out.extend_from_slice(&v.to_le_bytes());
+    for &original in &order {
+        out.extend_from_slice(&table[original].to_le_bytes());
     }
     out.push(idx_width);
-    pack_bits(&indices, idx_width, &mut out);
+    pack_bits_iter(dictionary_indices(bits, dictionary).map(|index| remap[index]), idx_width, &mut out);
     out
 }
 
@@ -215,32 +254,65 @@ fn mantissa(bits: u64, header: u8) -> Option<i64> {
     (decimal_value(mantissa, header) == bits).then_some(mantissa)
 }
 
-/// The `DECIMAL` header and mantissas of a column, at the smallest scale that reproduces every
-/// value, rounding to doubles or, failing that, when every value is a widened float, to floats. A
-/// value exact at one scale is at every larger one, so the scale only grows as values are checked.
-fn decimal_mantissas(bits: &[u64]) -> Option<(u8, Vec<i64>)> {
+/// Materialize integers only after every distinct pattern has passed the exact reconstruction
+/// check. Adjacent equal patterns reuse their integer without either hashing or redoing math.
+fn proven_mantissas(bits: &[u64], header: u8) -> Vec<i64> {
+    let power = POWERS[usize::from(header & 0x0f)];
+    let mut previous = None;
+    bits.iter().map(|&value| {
+        if let Some((last, integer)) = previous {
+            if last == value { return integer; }
+        }
+        let integer = (f64::from_bits(value) * power).round() as i64;
+        previous = Some((value, integer));
+        integer
+    }).collect()
+}
+
+/// A complete dictionary is a proof over the full column, not a sample. If the cardinality cap
+/// was exceeded, retain the original full-row check rather than treating the partial set as proof.
+fn verified_mantissas(bits: &[u64], header: u8, stats: &Stats) -> Option<Vec<i64>> {
+    if let Some(dictionary) = &stats.dictionary {
+        dictionary.values.iter().all(|&value| mantissa(value, header).is_some())
+            .then(|| proven_mantissas(bits, header))
+    } else {
+        bits.iter().map(|&value| mantissa(value, header)).collect()
+    }
+}
+
+/// Preserve the legacy row-order scale search and its first successful representation, including
+/// repeated values encountered after the scale changes. Only the final exact check can be reduced
+/// to distinct values: removing repeats from the scale search could change its chosen header.
+fn decimal_mantissas_with_stats(bits: &[u64], stats: &Stats) -> Option<(u8, Vec<i64>)> {
+    if !stats.decimal_possible { return None; }
     let at = |kind: u8| {
         let mut scale = 0;
+        let mut previous = None;
         for &b in bits {
+            if previous == Some(b) { continue; }
             while mantissa(b, kind | scale).is_none() {
                 scale += 1;
                 if usize::from(scale) == POWERS.len() {
                     return None;
                 }
             }
+            previous = Some(b);
         }
         let header = kind | scale;
-        bits.iter()
-            .map(|&b| mantissa(b, header))
-            .collect::<Option<Vec<_>>>()
+        verified_mantissas(bits, header, stats)
             .map(|mantissas| (header, mantissas))
     };
     at(0).or_else(|| {
-        bits.iter()
+        stats.dictionary.as_ref().map_or(bits, |dictionary| &dictionary.values).iter()
             .all(|&b| f64::from(f64::from_bits(b) as f32).to_bits() == b)
             .then(|| at(SINGLE))
             .flatten()
     })
+}
+
+#[cfg(test)]
+fn decimal_mantissas(bits: &[u64]) -> Option<(u8, Vec<i64>)> {
+    decimal_mantissas_with_stats(bits, &scan(bits))
 }
 
 fn encode_decimal(header: u8, packed: Vec<u8>) -> Vec<u8> {
@@ -255,8 +327,8 @@ fn encode_decimal(header: u8, packed: Vec<u8>) -> Vec<u8> {
 /// every emitted candidate is verified against every input bit pattern. Unlike division,
 /// multiplication by rounded reciprocals is not monotonic in the scale, so check each scale
 /// independently and do not carry a previous successful scale forward between values.
-fn multiplication_mantissas(bits: &[u64], max_scale: u8) -> Option<(u8, Vec<i64>)> {
-    if bits.len() < 2 { return None; }
+fn multiplication_mantissas_with_stats(bits: &[u64], max_scale: u8, stats: &Stats) -> Option<(u8, Vec<i64>)> {
+    if bits.len() < 2 || !stats.decimal_possible { return None; }
     let samples = bits.len().min(256);
     for scale in 0..=max_scale {
         let header = MULTIPLY | scale;
@@ -267,11 +339,17 @@ fn multiplication_mantissas(bits: &[u64], max_scale: u8) -> Option<(u8, Vec<i64>
         }) {
             continue;
         }
-        if let Some(values) = bits.iter().map(|&b| mantissa(b, header)).collect::<Option<Vec<_>>>() {
+        if let Some(values) = verified_mantissas(bits, header, stats) {
             return Some((header, values));
         }
     }
     None
+}
+
+#[cfg(test)]
+fn multiplication_mantissas(bits: &[u64], max_scale: u8) -> Option<(u8, Vec<i64>)> {
+    if bits.len() < 2 { return None; }
+    multiplication_mantissas_with_stats(bits, max_scale, &scan(bits))
 }
 
 fn encode_decimal_planes(header: u8, mantissas: &[i64]) -> Vec<u8> {
@@ -293,40 +371,41 @@ fn encode_decimal_planes(header: u8, mantissas: &[i64]) -> Vec<u8> {
 #[must_use]
 #[allow(dead_code)] // Retained for baseline research examples and codec regression tests.
 pub fn candidates(bits: &[u64], decimal: bool) -> impl Iterator<Item = Vec<u8>> + '_ {
-    legacy_candidates(bits, decimal, EncodingEffort::Balanced)
+    let stats = (!bits.is_empty()).then(|| Arc::new(scan(bits)));
+    legacy_candidates(bits, decimal, EncodingEffort::Balanced, stats)
 }
 
 fn legacy_candidates(
-    bits: &[u64], decimal: bool, effort: EncodingEffort,
+    bits: &[u64], decimal: bool, effort: EncodingEffort, stats: Option<Arc<Stats>>,
 ) -> impl Iterator<Item = Vec<u8>> + '_ {
-    let stats = (!bits.is_empty()).then(|| scan(bits));
     let decimal = decimal
-        && stats.is_some_and(|(cardinality, _)| cardinality != Some(1))
+        && stats.as_ref().is_some_and(|stats| stats.cardinality() != Some(1) && stats.decimal_possible)
         && bits.len() >= 2;
+    let fixed_stats = stats.clone();
     let fixed = (0..5).filter_map(move |scheme| {
-        let Some((cardinality, runs)) = stats else {
+        let Some(stats) = &fixed_stats else {
             return (scheme == 0).then(|| vec![PLAIN]);
         };
-        if cardinality == Some(1) {
+        if stats.cardinality() == Some(1) {
             return (scheme == 0).then(|| encode_constant(bits[0]));
         }
         match scheme {
             0 => Some(encode_plain(bits)),
             1 => Some(encode_byte_stream_split(bits)),
-            2 => cardinality
-                .filter(|&n| n < bits.len())
-                .map(|n| encode_dict(bits, n)),
-            3 if runs * 2 < bits.len() => Some(encode_rle(bits, runs)),
-            4 => cardinality
-                .filter(|&n| n < bits.len() && n <= 1 << 16)
-                .map(|n| encode_sorted_dict(bits, n)),
+            2 => stats.dictionary.as_ref()
+                .filter(|dictionary| dictionary.values.len() < bits.len())
+                .map(|dictionary| encode_dict(bits, dictionary)),
+            3 if stats.runs * 2 < bits.len() => Some(encode_rle(bits, stats.runs)),
+            4 => stats.dictionary.as_ref()
+                .filter(|dictionary| dictionary.values.len() < bits.len())
+                .map(|dictionary| encode_sorted_dict(bits, dictionary)),
             _ => None,
         }
     });
     // Searched for only once the fixed schemes have been measured.
     let decimals = std::iter::once(())
         .filter(move |()| decimal)
-        .filter_map(move |()| decimal_mantissas(bits))
+        .filter_map(move |()| decimal_mantissas_with_stats(bits, stats.as_ref().expect("nonempty decimal column")))
         .flat_map(move |(header, mantissas)| {
             crate::adaptive_int::candidates_with_effort(&mantissas, effort)
                 .map(|packed| encode_decimal(header, packed))
@@ -344,10 +423,15 @@ fn legacy_candidates(
 pub fn candidates_with_effort(
     bits: &[u64], effort: EncodingEffort,
 ) -> impl Iterator<Item = Vec<u8>> + '_ {
-    let base = legacy_candidates(bits, effort == EncodingEffort::Exhaustive, effort);
+    let stats = (!bits.is_empty()).then(|| Arc::new(scan(bits)));
+    let base = legacy_candidates(bits, effort == EncodingEffort::Exhaustive, effort, stats.clone());
     let multiplication = std::iter::once(())
-        .filter(move |()| effort != EncodingEffort::Fast && bits.windows(2).any(|w| w[0] != w[1]))
-        .filter_map(move |()| multiplication_mantissas(bits, if effort == EncodingEffort::Balanced { 6 } else { 15 }))
+        .filter(move |()| effort != EncodingEffort::Fast)
+        .filter_map(move |()| {
+            let stats = stats.as_ref()?;
+            if stats.cardinality() == Some(1) { return None; }
+            multiplication_mantissas_with_stats(bits, if effort == EncodingEffort::Balanced { 6 } else { 15 }, stats)
+        })
         .flat_map(move |(header, mantissas)| {
             let mut streams: Vec<_> = if effort == EncodingEffort::Balanced {
                 crate::adaptive_int::packed_delta_candidate(&mantissas)
@@ -627,7 +711,7 @@ mod tests {
     fn sorted_dictionaries_order_values_and_align_indices() {
         let values = [2.5_f64, -1.0, 7.25, -1.0, 2.5, 100.0, -0.0, 0.0];
         let bits: Vec<u64> = values.iter().map(|v| v.to_bits()).collect();
-        let stream = encode_sorted_dict(&bits, 6);
+        let stream = encode_sorted_dict(&bits, scan(&bits).dictionary.as_ref().unwrap());
         assert_eq!(bits, decode(&stream, bits.len()).unwrap());
         let table: Vec<f64> = stream[5..5 + 6 * 8]
             .chunks_exact(8)
@@ -639,7 +723,7 @@ mod tests {
         assert_eq!(&[3, 0, 4, 0, 3, 5, 1, 2], &stream[5 + 6 * 8 + 1..]);
         // More than 256 distinct values take 16-bit indices.
         let many: Vec<u64> = (0..1000).map(|i| f64::from(999 - i % 300).to_bits()).collect();
-        let stream = encode_sorted_dict(&many, 300);
+        let stream = encode_sorted_dict(&many, scan(&many).dictionary.as_ref().unwrap());
         assert_eq!(16, stream[5 + 300 * 8]);
         assert_eq!(many, decode(&stream, many.len()).unwrap());
         let mut le = Vec::new();
@@ -800,5 +884,75 @@ mod tests {
         let extremes = [(-(MAX_MANTISSA - 1.0)).to_bits(), (MAX_MANTISSA - 1.0).to_bits()];
         assert_eq!(Some((MULTIPLY, vec![-9_007_199_254_740_991, 9_007_199_254_740_991])), multiplication_mantissas(&extremes, 6));
         round_trip_effort(&extremes, EncodingEffort::Balanced);
+    }
+
+    #[test]
+    fn reused_dictionary_preserves_first_appearance_and_repeated_codes() {
+        let palette = [3.25_f64.to_bits(), (-0.0_f64).to_bits(), 0.0_f64.to_bits(),
+            0x7ff0_0000_0000_0001, 0xfff8_dead_beef_0000];
+        let values: Vec<_> = [0usize, 0, 1, 2, 1, 3, 4, 0].into_iter()
+            .flat_map(|index| [palette[index]; 129]).collect();
+        let stats = scan(&values);
+        let dictionary = stats.dictionary.as_ref().unwrap();
+        assert_eq!(dictionary.values, palette);
+        assert_eq!(stats.cardinality(), Some(palette.len()));
+        assert_eq!(stats.runs, 7);
+        assert!(!stats.decimal_possible);
+        assert_eq!(dictionary_indices(&values, dictionary).collect::<Vec<_>>(),
+            [0usize, 0, 1, 2, 1, 3, 4, 0].into_iter().flat_map(|index| [index; 129]).collect::<Vec<_>>());
+        for encoded in [encode_dict(&values, dictionary), encode_sorted_dict(&values, dictionary)] {
+            assert_eq!(decode(&encoded, values.len()).unwrap(), values);
+            assert_eq!(u32::from_le_bytes(encoded[1..5].try_into().unwrap()) as usize, palette.len());
+        }
+        // IEEE-pattern equality retains both zeros and both NaN payloads as separate keys.
+        assert_eq!(dictionary.index_of.len(), 5);
+    }
+
+    #[test]
+    fn bounded_dictionary_and_high_cardinality_decimal_fallback() {
+        let mut values: Vec<_> = (0..MAX_DICT_CARDINALITY).map(|value| (value as f64).to_bits()).collect();
+        let capped = scan(&values);
+        assert_eq!(capped.cardinality(), Some(MAX_DICT_CARDINALITY));
+        assert_eq!(capped.dictionary.as_ref().unwrap().index_of.len(), MAX_DICT_CARDINALITY);
+        values.push((MAX_DICT_CARDINALITY as f64).to_bits());
+        values.push((MAX_DICT_CARDINALITY as f64 + 1.0).to_bits());
+        let overflow = scan(&values);
+        assert!(overflow.dictionary.is_none());
+        assert!(overflow.decimal_possible);
+        let (header, integers) = multiplication_mantissas_with_stats(&values, 6, &overflow).unwrap();
+        assert_eq!(header, MULTIPLY);
+        assert_eq!(integers, (0..values.len() as i64).collect::<Vec<_>>());
+
+        // This finite pattern passes the cheap flags but no decimal scale. It is absent from
+        // the 256 samples, after the dictionary has exceeded its cap, requiring full-row proof.
+        values[MAX_DICT_CARDINALITY] = f64::MIN_POSITIVE.to_bits();
+        let overflow = scan(&values);
+        assert!(overflow.dictionary.is_none());
+        assert!(overflow.decimal_possible);
+        assert!(multiplication_mantissas_with_stats(&values, 15, &overflow).is_none());
+        values.push(f64::NAN.to_bits());
+        assert!(!scan(&values).decimal_possible, "eligibility checks continue after dropping the dictionary");
+    }
+
+    #[test]
+    fn distinct_decimal_proof_checks_unsampled_values_and_preserves_mantissas() {
+        let source = [35.0_f64 * 0.01, -37.0_f64 * 0.01, 1.25, 0.0];
+        let mut values: Vec<_> = (0..4097).map(|index| source[index % source.len()].to_bits()).collect();
+        let stats = scan(&values);
+        assert_eq!(stats.cardinality(), Some(4));
+        let (header, integers) = multiplication_mantissas_with_stats(&values, 6, &stats).unwrap();
+        assert_eq!(header, MULTIPLY | 2);
+        assert_eq!(integers, (0..values.len()).map(|index| [35, -37, 125, 0][index % 4]).collect::<Vec<_>>());
+        assert_eq!(verified_mantissas(&values, header, &stats),
+            values.iter().map(|&value| mantissa(value, header)).collect::<Option<Vec<_>>>());
+
+        // Index 1 is not a sample. The complete distinct table must still reject it before
+        // generating any unchecked row mantissas; finite/min-max checks alone cannot do so.
+        values[1] = f64::MIN_POSITIVE.to_bits();
+        let stats = scan(&values);
+        assert_eq!(stats.cardinality(), Some(5));
+        assert!(stats.decimal_possible);
+        assert!(multiplication_mantissas_with_stats(&values, 15, &stats).is_none());
+        assert!(candidates_with_effort(&values, EncodingEffort::Balanced).all(|bytes| bytes[0] != DECIMAL));
     }
 }

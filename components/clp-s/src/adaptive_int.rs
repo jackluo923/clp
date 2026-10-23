@@ -82,11 +82,12 @@ pub(crate) fn bit_width_for(max: u64) -> u8 {
 }
 
 /// LSB-first bit-packing of `values`, each occupying `width` bits, appended to `out`.
+#[allow(dead_code)] // Retained for research examples and bit-packing tests.
 pub(crate) fn pack_bits(values: &[u64], width: u8, out: &mut Vec<u8>) {
     pack_bits_iter(values.iter().copied(), width, out);
 }
 
-fn pack_bits_iter(values: impl IntoIterator<Item = u64>, width: u8, out: &mut Vec<u8>) {
+pub(crate) fn pack_bits_iter(values: impl IntoIterator<Item = u64>, width: u8, out: &mut Vec<u8>) {
     if width == 0 {
         return;
     }
@@ -170,7 +171,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, AdaptiveDecodeError> {
 }
 
 /// One-pass column statistics used to pick which schemes to try.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Stats {
     min: i64,
     max: i64,
@@ -180,6 +181,16 @@ struct Stats {
     runs: usize,
     /// `Some((min_delta, max_delta))` when every first difference fit in `i64`; else `None`.
     delta_range: Option<(i64, i64)>,
+    /// First-appearance IDs, retained only while the dictionary stays within its size limit.
+    dictionary: Option<Dictionary>,
+    /// Wrapping delta ranges for local packing; empty when there is only one restart block.
+    block_delta_ranges: Vec<(i64, i64)>,
+}
+
+#[derive(Clone)]
+struct Dictionary {
+    table: Vec<i64>,
+    index_of: HashMap<i64, u64>,
 }
 
 fn scan(values: &[i64]) -> Stats {
@@ -192,11 +203,19 @@ fn scan_observed(values: &[i64], mut observe: impl FnMut(usize, i64, i64)) -> St
     let mut min = values[0];
     let mut max = values[0];
     let mut runs = 1usize;
-    let mut distinct: HashMap<i64, ()> = HashMap::new();
+    let mut dictionary = Some(Dictionary {
+        table: vec![values[0]],
+        index_of: HashMap::from([(values[0], 0)]),
+    });
+    let collect_blocks = values.len() > crate::delta_blocks::ROWS;
+    let mut block_delta_ranges = Vec::new();
+    if collect_blocks {
+        block_delta_ranges.reserve(values.len().div_ceil(crate::delta_blocks::ROWS));
+        block_delta_ranges.push((0, 0));
+    }
     let mut overflow = false;
     let mut min_delta = i64::MAX;
     let mut max_delta = i64::MIN;
-    distinct.insert(values[0], ());
     for (index, window) in values.windows(2).enumerate() {
         let (prev, cur) = (window[0], window[1]);
         observe(index + 1, prev, cur);
@@ -208,11 +227,34 @@ fn scan_observed(values: &[i64], mut observe: impl FnMut(usize, i64, i64)) -> St
         }
         if cur != prev {
             runs += 1;
+            let mut exceeded_limit = false;
+            if let Some(dictionary) = &mut dictionary {
+                if let std::collections::hash_map::Entry::Vacant(entry) = dictionary.index_of.entry(cur) {
+                    if dictionary.table.len() == MAX_DICT_CARDINALITY {
+                        exceeded_limit = true;
+                    } else {
+                        entry.insert(dictionary.table.len() as u64);
+                        dictionary.table.push(cur);
+                    }
+                }
+            }
+            if exceeded_limit { dictionary = None; }
         }
-        if distinct.len() <= MAX_DICT_CARDINALITY {
-            distinct.insert(cur, ());
+        let block_row = (index + 1) % crate::delta_blocks::ROWS;
+        if block_row == 0 {
+            if collect_blocks { block_delta_ranges.push((0, 0)); }
+            continue;
         }
-        if (index + 1) % crate::delta_blocks::ROWS == 0 { continue; }
+        if collect_blocks {
+            let delta = cur.wrapping_sub(prev);
+            let range = block_delta_ranges.last_mut().expect("current restart block");
+            if block_row == 1 {
+                *range = (delta, delta);
+            } else {
+                range.0 = range.0.min(delta);
+                range.1 = range.1.max(delta);
+            }
+        }
         match cur.checked_sub(prev) {
             Some(delta) => {
                 if delta < min_delta {
@@ -225,7 +267,7 @@ fn scan_observed(values: &[i64], mut observe: impl FnMut(usize, i64, i64)) -> St
             None => overflow = true,
         }
     }
-    let small_cardinality = (distinct.len() <= MAX_DICT_CARDINALITY).then_some(distinct.len());
+    let small_cardinality = dictionary.as_ref().map(|dictionary| dictionary.table.len());
     let delta_range = (!overflow && values.len() >= 2).then_some((min_delta, max_delta));
     Stats {
         min,
@@ -233,6 +275,8 @@ fn scan_observed(values: &[i64], mut observe: impl FnMut(usize, i64, i64)) -> St
         small_cardinality,
         runs,
         delta_range,
+        dictionary,
+        block_delta_ranges,
     }
 }
 
@@ -299,9 +343,10 @@ fn encode_fixed_delta(values: &[i64]) -> Vec<u8> {
     out
 }
 
-fn encode_local_delta(values: &[i64]) -> Vec<u8> {
+fn encode_local_delta(values: &[i64], ranges: Option<&[(i64, i64)]>) -> Vec<u8> {
     use crate::delta_blocks::{LOCAL_WIDTH, ROWS, SCHEME};
     let blocks = values.len().div_ceil(ROWS);
+    debug_assert!(ranges.is_none_or(|ranges| ranges.len() == blocks));
     let mut out = Vec::with_capacity(10 + (blocks + 1) * 8 + values.len() * 8 + blocks * 9);
     out.push(SCHEME);
     out.extend_from_slice(&(values.len() as u64).to_le_bytes());
@@ -311,9 +356,11 @@ fn encode_local_delta(values: &[i64]) -> Vec<u8> {
         let offset = (out.len() - 1) as u64; // Offsets are relative to the payload after the scheme tag.
         out[10 + index * 8..18 + index * 8].copy_from_slice(&offset.to_le_bytes());
         let deltas = || block.windows(2).map(|w| w[1].wrapping_sub(w[0]));
-        let mut range = deltas();
-        let first = range.next().unwrap_or(0);
-        let (min, max) = range.fold((first, first), |(lo, hi), v| (lo.min(v), hi.max(v)));
+        let (min, max) = ranges.map(|ranges| ranges[index]).unwrap_or_else(|| {
+            let mut range = deltas();
+            let first = range.next().unwrap_or(0);
+            range.fold((first, first), |(lo, hi), v| (lo.min(v), hi.max(v)))
+        });
         let width = bit_width_for((max as u64).wrapping_sub(min as u64));
         out.extend_from_slice(&min.to_le_bytes());
         out.push(width);
@@ -332,7 +379,7 @@ pub(crate) fn packed_delta_candidate(values: &[i64]) -> Option<Vec<u8>> {
         return None;
     }
     if values.len() > crate::delta_blocks::ROWS {
-        return Some(encode_local_delta(values));
+        return Some(encode_local_delta(values, None));
     }
     let (min, max) = values.windows(2).try_fold((i64::MAX, i64::MIN), |(min, max), pair| {
         let delta = pair[1].checked_sub(pair[0])?;
@@ -341,26 +388,26 @@ pub(crate) fn packed_delta_candidate(values: &[i64]) -> Option<Vec<u8>> {
     encode_delta(values, min, max)
 }
 
-fn encode_dict(values: &[i64], cardinality: usize) -> Vec<u8> {
-    let mut table: Vec<i64> = Vec::with_capacity(cardinality);
-    let mut index_of: HashMap<i64, u64> = HashMap::with_capacity(cardinality);
-    let mut indices: Vec<u64> = Vec::with_capacity(values.len());
-    for &v in values {
-        let idx = *index_of.entry(v).or_insert_with(|| {
-            table.push(v);
-            (table.len() - 1) as u64
-        });
-        indices.push(idx);
-    }
+fn encode_dict(values: &[i64], dictionary: &Dictionary) -> Vec<u8> {
+    let table = &dictionary.table;
     let idx_width = bit_width_for((table.len() as u64).saturating_sub(1));
     let mut out = Vec::with_capacity(1 + 4 + table.len() * 8 + 1 + packed_len(values.len(), idx_width));
     out.push(DICT);
     out.extend_from_slice(&(table.len() as u32).to_le_bytes());
-    for &v in &table {
+    for &v in table {
         out.extend_from_slice(&v.to_le_bytes());
     }
     out.push(idx_width);
-    pack_bits(&indices, idx_width, &mut out);
+    let mut previous = None;
+    let mut index = 0;
+    let indices = values.iter().map(|&value| {
+        if previous != Some(value) {
+            index = dictionary.index_of[&value];
+            previous = Some(value);
+        }
+        index
+    });
+    pack_bits_iter(indices, idx_width, &mut out);
     out
 }
 
@@ -400,38 +447,40 @@ pub fn candidates_with_effort(values: &[i64], effort: EncodingEffort) -> impl It
     candidates_from_stats_with_effort(values, stats, effort)
 }
 
-fn candidates_from_stats(values: &[i64], stats: Option<Stats>) -> impl Iterator<Item = Vec<u8>> + '_ {
-    candidates_from_stats_with_effort(values, stats, EncodingEffort::Balanced)
+fn candidates_from_stats<'a>(values: &'a [i64], stats: Option<&'a Stats>) -> impl Iterator<Item = Vec<u8>> + 'a {
+    (0..7).filter_map(move |scheme| candidate_from_stats(values, stats, scheme, EncodingEffort::Balanced))
 }
 
 fn candidates_from_stats_with_effort(values: &[i64], stats: Option<Stats>, effort: EncodingEffort) -> impl Iterator<Item = Vec<u8>> + '_ {
     // Keep the historical candidate and tie-break order, but construct only the candidate
     // being measured. Losing buffers are released before the next encoding is generated.
-    (0..7).filter_map(move |scheme| {
-        let Some(stats) = &stats else {
-            return (scheme == 0).then(|| vec![PLAIN]);
-        };
-        if stats.small_cardinality == Some(1) {
-            return (scheme == 0).then(|| encode_constant(values[0]));
-        }
-        match scheme {
-            0 => Some(encode_plain(values)),
-            1 => span(stats.min, stats.max).map(|span| encode_for(values, stats.min, span)),
-            2 if effort != EncodingEffort::Fast || values.len() <= crate::delta_blocks::ROWS => stats
-                .delta_range
-                .and_then(|(min, max)| encode_delta(values, min, max)),
-            3 => stats
-                .small_cardinality
-                .filter(|&n| n < values.len())
-                .map(|n| encode_dict(values, n)),
-            4 if stats.runs * 2 < values.len()
-                || (effort == EncodingEffort::Exhaustive && stats.runs < values.len()) => Some(encode_rle(values, stats.runs)),
-            // Append to preserve historical tie-breaking between existing codecs.
-            5 => Some(encode_fixed_delta(values)),
-            6 if values.len() > crate::delta_blocks::ROWS => Some(encode_local_delta(values)),
-            _ => None,
-        }
-    })
+    (0..7).filter_map(move |scheme| candidate_from_stats(values, stats.as_ref(), scheme, effort))
+}
+
+fn candidate_from_stats(values: &[i64], stats: Option<&Stats>, scheme: u8, effort: EncodingEffort) -> Option<Vec<u8>> {
+    let Some(stats) = stats else {
+        return (scheme == 0).then(|| vec![PLAIN]);
+    };
+    if stats.small_cardinality == Some(1) {
+        return (scheme == 0).then(|| encode_constant(values[0]));
+    }
+    match scheme {
+        0 => Some(encode_plain(values)),
+        1 => span(stats.min, stats.max).map(|span| encode_for(values, stats.min, span)),
+        2 if effort != EncodingEffort::Fast || values.len() <= crate::delta_blocks::ROWS => stats
+            .delta_range
+            .and_then(|(min, max)| encode_delta(values, min, max)),
+        3 => stats
+            .small_cardinality
+            .filter(|&n| n < values.len())
+            .map(|_| encode_dict(values, stats.dictionary.as_ref().expect("bounded dictionary"))),
+        4 if stats.runs * 2 < values.len()
+            || (effort == EncodingEffort::Exhaustive && stats.runs < values.len()) => Some(encode_rle(values, stats.runs)),
+        // Append to preserve historical tie-breaking between existing codecs.
+        5 => Some(encode_fixed_delta(values)),
+        6 if values.len() > crate::delta_blocks::ROWS => Some(encode_local_delta(values, Some(&stats.block_delta_ranges))),
+        _ => None,
+    }
 }
 
 /// Decodes a column stream produced by any of the [`candidates`] schemes back into `row_count`
@@ -809,6 +858,83 @@ mod tests {
     fn high_cardinality_distinct() {
         let values: Vec<i64> = (0i64..5000).map(|i| i.wrapping_mul(2_654_435_761)).collect();
         round_trip(&values);
+    }
+
+    // Independent copy of the previous dictionary construction, including first-appearance IDs.
+    fn reference_dictionary(values: &[i64]) -> Vec<u8> {
+        let mut table = Vec::new();
+        let mut index_of = HashMap::new();
+        let indices: Vec<u64> = values.iter().map(|&value| {
+            *index_of.entry(value).or_insert_with(|| {
+                table.push(value);
+                (table.len() - 1) as u64
+            })
+        }).collect();
+        let width = bit_width_for(table.len().saturating_sub(1) as u64);
+        let mut out = vec![DICT];
+        out.extend_from_slice(&(table.len() as u32).to_le_bytes());
+        for value in table { out.extend_from_slice(&value.to_le_bytes()); }
+        out.push(width);
+        pack_bits(&indices, width, &mut out);
+        out
+    }
+
+    #[test]
+    fn retained_dictionary_preserves_first_appearance_bits_and_cardinality_limit() {
+        for cardinality in [1, 2, 255, 256, MAX_DICT_CARDINALITY] {
+            let mut values: Vec<_> = (0..cardinality).rev().flat_map(|v| [v as i64 - 100; 3]).collect();
+            values.extend_from_slice(&[values[0], values[0], *values.last().unwrap()]);
+            let stats = scan(&values);
+            assert_eq!(stats.small_cardinality, Some(cardinality));
+            let dictionary = stats.dictionary.as_ref().unwrap();
+            assert_eq!(dictionary.table.len(), cardinality);
+            assert_eq!(dictionary.table[0], values[0]);
+            let wire = encode_dict(&values, dictionary);
+            assert_eq!(wire, reference_dictionary(&values));
+            assert_eq!(decode(&wire, values.len()).unwrap(), values);
+        }
+        let extremes = [i64::MIN, i64::MIN, i64::MAX, 0, i64::MAX, -1];
+        let stats = scan(&extremes);
+        assert_eq!(encode_dict(&extremes, stats.dictionary.as_ref().unwrap()), reference_dictionary(&extremes));
+
+        let mut above_limit: Vec<_> = (0..=MAX_DICT_CARDINALITY as i64).collect();
+        above_limit.extend_from_slice(&[0, 0, 1]);
+        let stats = scan(&above_limit);
+        assert_eq!(stats.small_cardinality, None);
+        assert!(stats.dictionary.is_none(), "release the bounded map after its limit is exceeded");
+        assert!(candidates(&above_limit).all(|wire| wire[0] != DICT));
+    }
+
+    #[test]
+    fn cached_block_ranges_match_independent_wrapping_scan_at_restarts() {
+        let rows = crate::delta_blocks::ROWS;
+        for length in [rows - 1, rows, rows + 1, rows + 2, rows * 2, rows * 2 + 1] {
+            let values: Vec<_> = (0..length).map(|row| {
+                match row / rows {
+                    0 => (row as i64).wrapping_mul(3),
+                    1 => [i64::MIN, i64::MAX, 0, -1][row % 4],
+                    _ => i64::MIN,
+                }
+            }).collect();
+            let stats = scan(&values);
+            if length <= rows {
+                assert!(stats.block_delta_ranges.is_empty());
+                continue;
+            }
+            assert_eq!(stats.block_delta_ranges.len(), length.div_ceil(rows));
+            assert_eq!(stats.block_delta_ranges[0], (3, 3));
+            if length == rows + 1 { assert_eq!(stats.block_delta_ranges[1], (0, 0)); }
+            let cached = encode_local_delta(&values, Some(&stats.block_delta_ranges));
+            let rescanned = encode_local_delta(&values, None);
+            assert_eq!(cached, rescanned, "local encoding bytes changed at length {length}");
+            assert_eq!(decode(&cached, length).unwrap(), values);
+        }
+        // Overflow across an anchor is excluded from both global and local delta statistics.
+        let mut values = vec![i64::MIN; rows];
+        values.extend([i64::MAX, i64::MAX]);
+        let stats = scan(&values);
+        assert_eq!(stats.delta_range, Some((0, 0)));
+        assert_eq!(stats.block_delta_ranges, vec![(0, 0), (0, 0)]);
     }
 
     #[test]
