@@ -189,6 +189,43 @@ fn number_events_preserve_every_source_byte_without_conversion() {
 }
 
 #[test]
+fn parser_retains_exact_integer_values_and_raw_overflow_tokens() {
+    use super::parser::{parse_document, StoredEvent};
+    use crate::integer::IntegerValue;
+    // Parsed integers fit the previous event storage; avoid trading rescans for wider events.
+    #[cfg(target_pointer_width = "64")]
+    assert_eq!(std::mem::size_of::<StoredEvent>(), 40);
+    let mut cases = vec!["0".to_string(), "-0".to_string(), i64::MIN.to_string(), i64::MAX.to_string(),
+        (1u64 << 63).to_string(), u64::MAX.to_string(), "18446744073709551616".into(),
+        "-9223372036854775809".into(), "999999999999999999999999".into(),
+        "1.2300".into(), "999999999999999999999999.0".into(), "1E+009".into()];
+    let mut state = 0x123456789abcdefu64;
+    for _ in 0..1000 {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        cases.push(state.to_string());
+        cases.push((state as i64).to_string());
+    }
+    for token in cases {
+        // The following field puts unrelated digits at the integer scanner's lookahead.
+        let input = format!("{{\"n\":{token},\"other\":1234567890123456789}}");
+        let mut events = Vec::new();
+        parse_document(input.as_bytes(), NdjsonLimits::default(), &mut String::new(), &mut events, &mut Vec::new()).unwrap();
+        let expected = if token.starts_with('-') {
+            token.parse::<i64>().ok().map(IntegerValue::Signed)
+        } else {
+            token.parse::<u64>().ok().map(|v| if v <= i64::MAX as u64 { IntegerValue::Signed(v as i64) } else { IntegerValue::Unsigned(v) })
+        };
+        match events[2] {
+            StoredEvent::Integer { value, .. } => assert_eq!(Some(value), expected, "{token}"),
+            StoredEvent::Number { .. } => assert!(expected.is_none(), "{token}"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        let JsonEvent::Number(raw) = events[2].resolve(input.as_bytes(), "") else { panic!("numeric event") };
+        assert_eq!(raw, token.as_bytes());
+    }
+}
+
+#[test]
 fn string_and_key_events_expose_exact_tokens_and_decoded_unicode() {
     let input = r#"{"a\n":"x\u0061\uD83D\uDE00","é":"line\nquote\"slash\\"}
 "#;

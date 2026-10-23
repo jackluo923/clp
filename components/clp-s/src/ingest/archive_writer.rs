@@ -1226,6 +1226,7 @@ impl<'record> JsonRecordEvents<'record> {
                     syntax,
                     false,
                 )?,
+                StoredEvent::Integer { value, .. } => ValueRef::MixedInteger(value),
                 StoredEvent::Boolean(value) => ValueRef::Bool(value),
                 StoredEvent::Null => ValueRef::Null,
                 StoredEvent::ObjectKeySource(_) | StoredEvent::ObjectKeyDecoded { .. } => {
@@ -1256,6 +1257,26 @@ impl<'record> JsonRecordEvents<'record> {
         syntax: ValidatedJsonNumberSyntax,
     ) -> Result<FieldRef<'record>, JsonRecordEventError> {
         let value = self.number_value(event_index, source, syntax, true)?;
+        self.scalar_field(event_index, value)
+    }
+
+    fn integer_field(
+        &mut self,
+        event_index: usize,
+        source: &'record [u8],
+        value: crate::integer::IntegerValue,
+    ) -> Result<FieldRef<'record>, JsonRecordEventError> {
+        let value = if let Some(resolver) = self.matching_timestamp_resolver() {
+            let (timestamp, prevalidated) = resolver.resolve_parsed_integer(source, value)
+                .map_err(|source| JsonRecordEventError::Timestamp { json_event_index: event_index, source })?;
+            if prevalidated {
+                ValueRef::PrevalidatedTimestamp(PrevalidatedTimestampRef::new(timestamp))
+            } else {
+                ValueRef::Timestamp(timestamp)
+            }
+        } else {
+            ValueRef::MixedInteger(value)
+        };
         self.scalar_field(event_index, value)
     }
 
@@ -1509,6 +1530,11 @@ impl<'record> JsonRecordEvents<'record> {
                 consumer
                     .value(field)
                     .map_err(JsonRecordDispatchError::Append)?;
+                Ok(true)
+            }
+            StoredEvent::Integer { raw, value } => {
+                let field = self.integer_field(event_index, raw.bytes(self.events.raw_json()), value)?;
+                consumer.value(field).map_err(JsonRecordDispatchError::Append)?;
                 Ok(true)
             }
             StoredEvent::Boolean(value) => {

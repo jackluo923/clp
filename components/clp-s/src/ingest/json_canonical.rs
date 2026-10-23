@@ -546,6 +546,14 @@ impl CanonicalJsonScratch {
                 .map_err(CanonicalJsonError::Escape)
             }
             NodeKind::Number => {
+                if let super::parser::StoredEvent::Integer { value, .. } = self.events[node.event_index] {
+                    let mut buffer = itoa::Buffer::new();
+                    let text = match value {
+                        crate::integer::IntegerValue::Signed(value) => buffer.format(value),
+                        crate::integer::IntegerValue::Unsigned(value) => buffer.format(value),
+                    };
+                    return Self::append_output_literal(&mut self.output, text.as_bytes(), output_limit);
+                }
                 let (JsonEvent::Number(value), Some(syntax)) = (
                     self.events[node.event_index].resolve(source, &self.decoded),
                     self.events[node.event_index].number_syntax(),

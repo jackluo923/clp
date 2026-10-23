@@ -63,6 +63,10 @@ pub(super) enum StoredEvent {
         raw: Span,
         syntax: ValidatedJsonNumberSyntax,
     },
+    Integer {
+        raw: Span,
+        value: crate::integer::IntegerValue,
+    },
     Boolean(bool),
     Null,
 }
@@ -96,7 +100,7 @@ impl StoredEvent {
                 raw.bytes(raw_json),
                 decoded_span.string(decoded),
             )),
-            Self::Number { raw, .. } => JsonEvent::Number(raw.bytes(raw_json)),
+            Self::Number { raw, .. } | Self::Integer { raw, .. } => JsonEvent::Number(raw.bytes(raw_json)),
             Self::Boolean(value) => JsonEvent::Boolean(value),
             Self::Null => JsonEvent::Null,
         }
@@ -105,6 +109,7 @@ impl StoredEvent {
     pub(super) const fn number_syntax(self) -> Option<ValidatedJsonNumberSyntax> {
         match self {
             Self::Number { syntax, .. } => Some(syntax),
+            Self::Integer { .. } => Some(ValidatedJsonNumberSyntax::new(None, None)),
             _ => None,
         }
     }
@@ -363,8 +368,8 @@ impl Parser<'_, '_> {
             }
             b'-' | b'0'..=b'9' => {
                 self.add_value()?;
-                let (raw, syntax) = self.parse_number()?;
-                self.push_event(StoredEvent::Number { raw, syntax })
+                let event = self.parse_number()?;
+                self.push_event(event)
             }
             b't' => {
                 self.add_value()?;
@@ -450,9 +455,11 @@ impl Parser<'_, '_> {
         Ok(())
     }
 
-    fn parse_number(&mut self) -> Result<(Span, ValidatedJsonNumberSyntax), ParseFailure> {
+    fn parse_number(&mut self) -> Result<StoredEvent, ParseFailure> {
         let start = self.offset;
+        let negative = self.peek() == Some(b'-');
         self.consume_if(b'-');
+        let mut magnitude = Some(0u64);
         match self.peek() {
             Some(b'0') => {
                 self.offset += 1;
@@ -464,8 +471,24 @@ impl Parser<'_, '_> {
                 }
             }
             Some(b'1'..=b'9') => {
-                self.offset += 1;
-                self.consume_ascii_digits();
+                let mut value = 0u64;
+                // Every sequence of at most 19 digits fits u64. A non-digit (or EOF) at
+                // position 20 proves that bound, so ordinary values need no checked multiply.
+                if !self.source.get(self.offset + 19).is_some_and(u8::is_ascii_digit) {
+                    while let Some(digit @ b'0'..=b'9') = self.peek() {
+                        let digit = u64::from(digit - b'0');
+                        value = value * 10 + digit;
+                        self.offset += 1;
+                    }
+                    magnitude = Some(value);
+                } else {
+                    // Keep scanning after overflow: a long mantissa can still be a valid float.
+                    while let Some(digit @ b'0'..=b'9') = self.peek() {
+                        magnitude = magnitude.and_then(|v| v.checked_mul(10))
+                            .and_then(|v| v.checked_add(u64::from(digit - b'0')));
+                        self.offset += 1;
+                    }
+                }
             }
             Some(_) => {
                 return Err(Self::syntax(
@@ -515,10 +538,24 @@ impl Parser<'_, '_> {
         }
 
         self.check_scalar_token(start, self.offset)?;
-        Ok((
-            Span::new(start, self.offset),
-            ValidatedJsonNumberSyntax::new(dot_position, exponent_position),
-        ))
+        let raw = Span::new(start, self.offset);
+        let syntax = ValidatedJsonNumberSyntax::new(dot_position, exponent_position);
+        if !syntax.is_float() && let Some(magnitude) = magnitude {
+            use crate::integer::IntegerValue;
+            let value = if negative {
+                if magnitude <= 1u64 << 63 {
+                    Some(IntegerValue::Signed((magnitude as i64).wrapping_neg()))
+                } else { None }
+            } else if magnitude <= i64::MAX as u64 {
+                Some(IntegerValue::Signed(magnitude as i64))
+            } else {
+                Some(IntegerValue::Unsigned(magnitude))
+            };
+            if let Some(value) = value { return Ok(StoredEvent::Integer { raw, value }); }
+        }
+        // Out-of-domain integers remain valid raw JSON events. The selected consumer decides
+        // whether to reject them, retain an array lexeme, or canonicalize through a float.
+        Ok(StoredEvent::Number { raw, syntax })
     }
 
     fn parse_string(&mut self) -> Result<(Span, Option<Span>), ParseFailure> {

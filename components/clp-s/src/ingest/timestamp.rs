@@ -472,6 +472,19 @@ impl JsonTimestampResolver {
         self.resolve_classified_number(source_str, classified)
     }
 
+    pub(super) fn resolve_parsed_integer<'a>(
+        &'a self,
+        source: &'a [u8],
+        value: crate::integer::IntegerValue,
+    ) -> Result<(TimestampRef<'a>, bool), JsonTimestampError> {
+        let source = str::from_utf8(source).map_err(|_| JsonTimestampError::InvalidUtf8)?;
+        let classified = match value {
+            crate::integer::IntegerValue::Signed(value) => ClassifiedJsonNumber::Integer(value),
+            crate::integer::IntegerValue::Unsigned(value) => ClassifiedJsonNumber::Unsigned(value),
+        };
+        self.resolve_classified_number(source, classified)
+    }
+
     fn resolve_classified_number<'a>(
         &'a self,
         source: &'a str,
