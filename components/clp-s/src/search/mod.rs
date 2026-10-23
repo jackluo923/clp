@@ -10,6 +10,7 @@ mod archive;
 mod array;
 mod ast;
 mod clp_pattern;
+mod dictionary_ids;
 mod jsonl;
 mod kv_ir;
 mod lexer;

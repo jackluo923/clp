@@ -26,6 +26,7 @@ use super::dictionary::DictionaryLimits;
 use super::dictionary::DictionarySection;
 use super::dictionary::LogTypeDictionary;
 use super::dictionary::VariableDictionary;
+use super::dictionary::VariableDictionaryPrefix;
 use super::dictionary::decode_array_dictionary;
 use super::dictionary::decode_logtype_dictionary;
 use super::dictionary::decode_logtype_dictionary_fields;
@@ -242,6 +243,7 @@ pub struct DirectoryArchiveReader<S: DirectoryArchiveSource> {
     members: Vec<S::Reader>,
     member_sizes: [u64; MEMBER_COUNT],
     layout: SingleFileArchiveLayout,
+    variable_dictionary_prefix: Option<VariableDictionaryPrefix>,
 }
 
 impl<S: DirectoryArchiveSource> DirectoryArchiveReader<S> {
@@ -334,6 +336,7 @@ impl<S: DirectoryArchiveSource> DirectoryArchiveReader<S> {
             members,
             member_sizes,
             layout,
+            variable_dictionary_prefix: None,
         };
         let metadata = reader
             .read_metadata(metadata_limits)
@@ -638,8 +641,37 @@ impl<S: DirectoryArchiveSource> DirectoryArchiveReader<S> {
         metadata: &ArchiveMetadata,
         limits: DictionaryLimits,
     ) -> Result<VariableDictionary, DictionaryError> {
+        if self.variable_dictionary_prefix.is_some() {
+            return self.read_variable_dictionary_prefix(metadata, limits, u64::MAX);
+        }
         let compressed = self.dictionary_reader(metadata, DictionarySection::Variable)?;
         decode_variable_dictionary(compressed, limits)
+    }
+
+    /// Loads a leading variable dictionary prefix and retains decoding state across calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns section, resource, framing, or I/O errors for the consumed prefix. The unread tail
+    /// is validated only when requested; requesting past the declared count loads it completely.
+    pub fn read_variable_dictionary_prefix(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        limits: DictionaryLimits,
+        minimum_entries: u64,
+    ) -> Result<VariableDictionary, DictionaryError> {
+        let member = DirectoryArchiveMember::VariableDictionary;
+        // Reuse the complete reader's metadata/member bounds validation before any cached read.
+        let size = self.dictionary_reader(metadata, DictionarySection::Variable)?.limit();
+        let mut cache = self.variable_dictionary_prefix.take();
+        let result = VariableDictionaryPrefix::read(
+            &mut cache, 0..size, limits, minimum_entries,
+            |offset, bytes| self.reader_for_member_range(member, offset..offset + bytes.len() as u64)?.read_exact(bytes),
+        );
+        if result.is_ok() {
+            self.variable_dictionary_prefix = cache;
+        }
+        result
     }
 
     /// Decompresses and validates `/log.dict`.

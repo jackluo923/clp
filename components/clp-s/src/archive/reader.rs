@@ -15,6 +15,7 @@ use super::dictionary::DictionaryLimits;
 use super::dictionary::DictionarySection;
 use super::dictionary::LogTypeDictionary;
 use super::dictionary::VariableDictionary;
+use super::dictionary::VariableDictionaryPrefix;
 use super::dictionary::decode_array_dictionary;
 use super::dictionary::decode_logtype_dictionary;
 use super::dictionary::decode_logtype_dictionary_fields;
@@ -63,6 +64,7 @@ use super::table_metadata::decode_table_metadata;
 pub struct SingleFileArchiveReader<R> {
     source: R,
     layout: SingleFileArchiveLayout,
+    variable_dictionary_prefix: Option<VariableDictionaryPrefix>,
 }
 
 impl<R: Read + Seek> SingleFileArchiveReader<R> {
@@ -114,7 +116,7 @@ impl<R: Read + Seek> SingleFileArchiveReader<R> {
         let layout =
             SingleFileArchiveLayout::new(header, archive_size).map_err(OpenError::Layout)?;
 
-        Ok(Self { source, layout })
+        Ok(Self { source, layout, variable_dictionary_prefix: None })
     }
 
     /// Returns the validated outer archive layout.
@@ -456,8 +458,39 @@ impl<R: Read + Seek> SingleFileArchiveReader<R> {
         metadata: &ArchiveMetadata,
         limits: DictionaryLimits,
     ) -> Result<VariableDictionary, DictionaryError> {
+        if self.variable_dictionary_prefix.is_some() {
+            return self.read_variable_dictionary_prefix(metadata, limits, u64::MAX);
+        }
         let compressed = self.dictionary_reader(metadata, DictionarySection::Variable)?;
         decode_variable_dictionary(compressed, limits)
+    }
+
+    /// Loads at least the requested leading variable dictionary entries, resuming a retained
+    /// decoder when a later call asks for more. Other section reads may occur between calls.
+    ///
+    /// The unread entry tail is intentionally not validated until requested. Requests beyond the
+    /// declared count return a complete dictionary so ordinary ID validation still rejects them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same bounds, resource, framing, and I/O errors as the full dictionary reader
+    /// for the headers and entry prefix it consumes.
+    pub fn read_variable_dictionary_prefix(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        limits: DictionaryLimits,
+        minimum_entries: u64,
+    ) -> Result<VariableDictionary, DictionaryError> {
+        let range = self.dictionary_range(metadata, DictionarySection::Variable)?;
+        let mut cache = self.variable_dictionary_prefix.take();
+        let result = VariableDictionaryPrefix::read(
+            &mut cache, range, limits, minimum_entries,
+            |offset, bytes| self.reader_for_range(offset..offset + bytes.len() as u64)?.read_exact(bytes),
+        );
+        if result.is_ok() {
+            self.variable_dictionary_prefix = cache;
+        }
+        result
     }
 
     /// Decompresses `/log.dict`, validates escaping, and counts unescaped placeholders.
@@ -523,6 +556,15 @@ impl<R: Read + Seek> SingleFileArchiveReader<R> {
         metadata: &ArchiveMetadata,
         dictionary: DictionarySection,
     ) -> Result<Take<&mut R>, DictionaryError> {
+        let range = self.dictionary_range(metadata, dictionary)?;
+        self.reader_for_range(range).map_err(DictionaryError::Io)
+    }
+
+    fn dictionary_range(
+        &self,
+        metadata: &ArchiveMetadata,
+        dictionary: DictionarySection,
+    ) -> Result<Range<u64>, DictionaryError> {
         let section =
             metadata
                 .directory()
@@ -538,7 +580,7 @@ impl<R: Read + Seek> SingleFileArchiveReader<R> {
                 section: dictionary,
             });
         }
-        self.reader_for_range(range).map_err(DictionaryError::Io)
+        Ok(range)
     }
 }
 

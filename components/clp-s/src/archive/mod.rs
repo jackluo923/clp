@@ -58,6 +58,7 @@ pub use column::IdColumn;
 pub use column::U64Column;
 pub use column::decode_schema_table;
 pub use column::is_value_bearing;
+pub(crate) use column::maximum_variable_dictionary_id;
 pub use dictionary::ArrayDictionary;
 pub(crate) use dictionary::BINARY_UUID_LENGTH;
 pub(crate) use dictionary::BINARY_UUIDS_MARKER;

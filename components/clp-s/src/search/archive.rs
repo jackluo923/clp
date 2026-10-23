@@ -13,6 +13,7 @@ use super::MatchingRows;
 use super::ParsedQuery;
 use super::SearchError;
 use super::SearchOptions;
+use super::dictionary_ids::{VariableDictionaryRequirement, variable_dictionary_prefix};
 use crate::ArchiveReader;
 use crate::archive::ArchiveCatalog;
 use crate::archive::ArchiveCatalogError;
@@ -362,8 +363,9 @@ pub trait ArchiveMatchSink {
 /// Searches every physical schema table in one archive without materializing decoded JSON.
 ///
 /// The parsed query is archive-independent and may be reused across calls. This function loads
-/// one validated catalog, compiles the query exactly once against it, and then retains only one
-/// decompressed packed stream plus one table bitmap at a time. Results follow the C++ physical
+/// one validated catalog and compiles the query against it, rebinding after lazy dictionary
+/// loads. It retains only one decompressed packed stream plus one table bitmap at a time.
+/// Results follow the C++ physical
 /// packed-stream, schema-table, and row ordering rather than log-event order. A direct root
 /// predicate proven impossible from schema and dictionary metadata returns before packed-stream
 /// decompression, as does a wholly unresolved predicate directly below root `NOT`. The sink's
@@ -404,11 +406,16 @@ pub fn search_archive<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
         &mut loaded,
     )?;
 
-    // The output's dictionaries are worked out once the filter is compiled, from the tables it
-    // can match. A projected output is narrow, so they load before the scan; whole records may
-    // need many more, so those wait until a row matches.
+    // Predicate dictionaries must remain complete: compilation may scan their entries. When
+    // the filter does not use the variable dictionary, output can instead discover its required
+    // IDs in the selected columns and load only that prefix after rows match.
+    let prefix_output = !filter_dictionaries.variable;
+    // The output's log/array dictionaries are worked out once the filter is compiled, from the
+    // tables it can match. A projected output is narrow, so they load before the scan; whole
+    // records may need many more, so those wait until a row matches.
     let mut output = None;
     let mut scan = ScanPosition::default();
+    let mut pending_output = None;
     let mut sink_begun = false;
     loop {
         let compiled = query
@@ -424,6 +431,10 @@ pub fn search_archive<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
                 )?)
                 .clone(),
         };
+        let mut before_output_ids = wanted.clone();
+        if prefix_output {
+            before_output_ids.variable = false;
+        }
         if !sink_begun {
             if !compiled
                 .reaches_match_sink()
@@ -438,9 +449,9 @@ pub fn search_archive<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
                 return Ok(ArchiveSearchStats::default());
             }
         }
-        if output_nodes.is_some() && !loaded.covers(&wanted) {
+        if output_nodes.is_some() && !loaded.covers(&before_output_ids) {
             drop(compiled);
-            load_dictionaries(reader, &mut catalog, &options.catalog, &wanted, &mut loaded)?;
+            load_dictionaries(reader, &mut catalog, &options.catalog, &before_output_ids, &mut loaded)?;
             continue;
         }
         let outcome = scan_streams(
@@ -451,9 +462,11 @@ pub fn search_archive<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
             options,
             ScanSettings {
                 columns,
-                all_dictionaries_loaded: loaded.covers(&wanted),
+                all_dictionaries_loaded: loaded.covers(&before_output_ids),
+                prefix_output: prefix_output && wanted.variable && !loaded.variable,
             },
             &mut scan,
+            &mut pending_output,
         )?;
         drop(compiled);
         match outcome {
@@ -461,7 +474,24 @@ pub fn search_archive<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
             // A match needs the dictionaries its output is read through. Load them and resume at
             // the stream holding the match, which wrote nothing before stopping.
             ScanOutcome::NeedsDictionaries => {
-                load_dictionaries(reader, &mut catalog, &options.catalog, &wanted, &mut loaded)?;
+                load_dictionaries(reader, &mut catalog, &options.catalog, &before_output_ids, &mut loaded)?;
+            }
+            ScanOutcome::NeedsVariableDictionary { minimum_entries } => {
+                let dictionary = match minimum_entries {
+                    Some(entries) => reader.read_variable_dictionary_prefix(
+                        catalog.metadata(), options.catalog.variable_dictionary(), entries,
+                    ),
+                    None => reader.read_variable_dictionary(
+                        catalog.metadata(), options.catalog.variable_dictionary(),
+                    ),
+                }.map_err(|source| ArchiveSearchError::Catalog(
+                    ArchiveCatalogError::VariableDictionary(source),
+                ))?;
+                // The full-reader trait method promises the entire dictionary. Custom readers
+                // may represent a legitimate empty section with VariableDictionary::empty(),
+                // whose incomplete marker is also used internally for unloaded catalogs.
+                loaded.variable = minimum_entries.is_none() || dictionary.is_complete();
+                catalog.set_variable_dictionary(dictionary);
             }
         }
     }
@@ -501,6 +531,17 @@ enum ScanOutcome {
     /// A table in the stream at the saved position matched while dictionaries were missing. The
     /// position is that stream's start, and nothing from it has reached the sink.
     NeedsDictionaries,
+    /// The retained matching table needs a larger variable-dictionary prefix, or a complete
+    /// dictionary when the layout cannot be inspected safely before normal table decoding.
+    NeedsVariableDictionary { minimum_entries: Option<u64> },
+}
+
+/// Keeps the completed output columns and their already evaluated bitmap across dictionary
+/// loading and query rebinding. Loading a prefix must not re-read or decompress those columns.
+struct PendingOutput {
+    stream_index: usize,
+    stream: crate::archive::DecodedPackedStream,
+    bitmap: Option<MatchBitmap>,
 }
 
 /// The columns a table can be matched from alone, or `None` when matching may read any.
@@ -562,8 +603,12 @@ impl StreamColumns<'_> {
 #[derive(Clone, Copy)]
 struct ScanSettings<'a> {
     columns: StreamColumns<'a>,
-    /// Whether every dictionary a match is written through is loaded.
+    /// Whether the required log/array and predicate dictionaries are loaded. Output-only
+    /// variable dictionary entries may still need to be discovered from the completed columns.
     all_dictionaries_loaded: bool,
+    /// Predicate compilation is independent of the variable dictionary, allowing output-only
+    /// references to be loaded after the matching table's columns have been read.
+    prefix_output: bool,
 }
 
 /// What matching a separate-column stream's table from its filter columns alone found.
@@ -664,6 +709,7 @@ fn scan_streams<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
     options: &ArchiveSearchOptions,
     scan: ScanSettings<'_>,
     position: &mut ScanPosition,
+    pending_output: &mut Option<PendingOutput>,
 ) -> Result<ScanOutcome, ArchiveSearchError> {
     let table_metadata = catalog.table_metadata();
     let stream_count = table_metadata.packed_streams().len();
@@ -698,38 +744,88 @@ fn scan_streams<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
             continue;
         }
 
-        // A separate-column stream holds one table. The columns its filter reads are read alone
-        // first, so a stream without a match costs only those. One with a match keeps them and
-        // its bitmap, and reads only the remaining output columns.
-        let mut prefiltered = None;
-        if let [table] = tables
-            && let Some(mask) = scan.columns.matching_mask(catalog, table)
-        {
-            match prefilter_by_columns(reader, catalog, compiled, options, &mask, position)? {
-                Prefilter::Unmatched => continue,
-                Prefilter::Matched { stream, bitmap } => {
-                    // Do not prepare all output columns only to discard them when lazy
-                    // dictionaries require a restart. No row from this stream reached the sink.
-                    if !scan.all_dictionaries_loaded {
-                        *position = stream_start;
-                        return Ok(ScanOutcome::NeedsDictionaries);
+        let pending = pending_output.take();
+        let resumed = pending.is_some();
+        let (stream, mut cached_bitmap) = if let Some(pending) = pending {
+            debug_assert_eq!(pending.stream_index, stream_index);
+            (pending.stream, pending.bitmap)
+        } else {
+            // A separate-column stream holds one table. Match from its filter columns first,
+            // retaining those columns and the bitmap when output needs further columns.
+            let mut prefiltered = None;
+            if let [table] = tables
+                && let Some(mask) = scan.columns.matching_mask(catalog, table)
+            {
+                match prefilter_by_columns(reader, catalog, compiled, options, &mask, position)? {
+                    Prefilter::Unmatched => continue,
+                    Prefilter::Matched { stream, bitmap } => {
+                        if !scan.all_dictionaries_loaded {
+                            *position = stream_start;
+                            return Ok(ScanOutcome::NeedsDictionaries);
+                        }
+                        prefiltered = Some((stream, bitmap));
                     }
-                    prefiltered = Some((stream, bitmap));
+                    Prefilter::Unexpected => {}
                 }
-                Prefilter::Unexpected => {}
+            }
+            // Strict whole-column validation needs dictionary references before decoding shared
+            // layouts. Otherwise keep output dictionaries lazy until a row actually matches.
+            if scan.prefix_output && prefiltered.is_none()
+                && options.columns.validates_dictionary_references()
+            {
+                return Ok(if scan.all_dictionaries_loaded {
+                    ScanOutcome::NeedsVariableDictionary { minimum_entries: None }
+                } else {
+                    ScanOutcome::NeedsDictionaries
+                });
+            }
+            match prefiltered {
+                Some((filtered, bitmap)) => {
+                    let output = tables.first().and_then(|table| scan.columns.output_mask(catalog, table));
+                    match complete_stream(reader, catalog, stream_index, filtered, output.as_deref(), options)? {
+                        Some(stream) => (stream, Some(bitmap)),
+                        None => (read_stream(reader, catalog, stream_index, None, options)?, None),
+                    }
+                }
+                None => (read_stream(reader, catalog, stream_index, None, options)?, None),
+            }
+        };
+        let output_ids_discovered = resumed || cached_bitmap.is_some();
+        if scan.prefix_output && !resumed && cached_bitmap.is_some() {
+            // Include every referenced row in each loaded column, not just emitted rows, so
+            // callers enabling whole-column dictionary validation retain the same guarantees.
+            let requirement = match variable_dictionary_prefix(catalog, stream_id, &stream, options.columns) {
+                Ok(requirement) => requirement,
+                // Discovery is speculative. Preserve ordinary access-time validation when a
+                // damaged reference in an unselected row need not otherwise be inspected.
+                Err(_) if !options.columns.validates_dictionary_references() => {
+                    VariableDictionaryRequirement::FullFallback
+                }
+                Err(source) => return Err(ArchiveSearchError::TableStream { stream_id, source }),
+            };
+            let request = match requirement {
+                VariableDictionaryRequirement::Prefix(Some(id))
+                    if id >= catalog.variable_dictionary().len() as u64 => {
+                        Some(ScanOutcome::NeedsVariableDictionary {
+                            // u64::MAX is an invalid ID; a full read lets normal validation
+                            // diagnose it without overflowing the requested prefix length.
+                            minimum_entries: id.checked_add(1),
+                        })
+                    }
+                VariableDictionaryRequirement::FullFallback => {
+                    Some(ScanOutcome::NeedsVariableDictionary { minimum_entries: None })
+                }
+                _ => None,
+            };
+            if let Some(request) = request {
+                *pending_output = Some(PendingOutput {
+                    stream_index,
+                    stream,
+                    bitmap: cached_bitmap,
+                });
+                return Ok(request);
             }
         }
-
-        let (stream, mut cached_bitmap) = match prefiltered {
-            Some((filtered, bitmap)) => {
-                let output = tables.first().and_then(|table| scan.columns.output_mask(catalog, table));
-                match complete_stream(reader, catalog, stream_index, filtered, output.as_deref(), options)? {
-                    Some(stream) => (stream, Some(bitmap)),
-                    None => (read_stream(reader, catalog, stream_index, None, options)?, None),
-                }
-            }
-            None => (read_stream(reader, catalog, stream_index, None, options)?, None),
-        };
         position.stats.add_stream(stream.len())?;
         let decoded_tables = catalog
             .schema_tables(stream_id, &stream, options.columns)
@@ -762,6 +858,14 @@ fn scan_streams<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
                     if !scan.all_dictionaries_loaded {
                         *position = stream_start;
                         return Ok(ScanOutcome::NeedsDictionaries);
+                    }
+                    if scan.prefix_output && !output_ids_discovered {
+                        // Shared/grouped layouts cannot discover IDs before ordinary decoding.
+                        // The first actual match requests the complete output dictionary; a
+                        // zero-hit stream never reads it. No output has been emitted on this
+                        // pass, so restoring the stream position preserves physical ordering.
+                        *position = stream_start;
+                        return Ok(ScanOutcome::NeedsVariableDictionary { minimum_entries: None });
                     }
                     sink.write_matches(ArchiveTableMatches {
                         catalog,

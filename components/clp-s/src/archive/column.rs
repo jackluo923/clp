@@ -1604,6 +1604,123 @@ fn take_dictionary_id_column<'table, 'archive>(
     dictionary_id_column(ids, context, dictionary, validate_float, validate_references)
 }
 
+/// Finds the highest variable-dictionary ID referenced by a loaded, prepared column.
+///
+/// This reads IDs and logtype placeholder metadata without looking up variable values. It
+/// deliberately includes every stored row so normal table decoding can retain its existing
+/// whole-column validation policy. The caller still decodes and validates the table normally.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn maximum_variable_dictionary_id(
+    bytes: &[u8],
+    slot: &ColumnSlot,
+    node_type: NodeType,
+    node_id: u32,
+    column_index: usize,
+    rows: usize,
+    logtypes: &LogTypeDictionary,
+    arrays: &ArrayDictionary,
+    limits: ColumnLimits,
+) -> Result<Option<u64>, ColumnError> {
+    let context = ColumnContext { column_index, node_id };
+    let invalid = || corrupt(context, None, ColumnCorruption::InvalidAdaptiveNumeric);
+    if matches!(node_type, NodeType::VarString | NodeType::DictionaryFloat) {
+        if slot.clp_layout.is_some() { return Err(invalid()); }
+        let values = match slot.numeric_encoding {
+            Some(encoding) => NumericColumn::encoded(bytes, rows, encoding).map_err(|_| invalid())?,
+            None => {
+                if bytes.len() != slot.stored_rows(rows).checked_mul(8).ok_or(ColumnError::SizeOverflow)? {
+                    return Err(invalid());
+                }
+                NumericColumn::plain(bytes)
+            }
+        };
+        // Constants, runs, and value dictionaries avoid walking every repeated row. A
+        // conservative bound may include an unused value-table entry, which is safe.
+        return Ok(values.max_u64().or_else(|| values.iter().max()));
+    }
+    if !matches!(node_type, NodeType::ClpString | NodeType::UnstructuredArray) {
+        return Ok(None);
+    }
+    if slot.numeric_encoding.is_some() { return Err(invalid()); }
+    let (descriptors, variables) = if let Some(layout) = &slot.clp_layout {
+        if node_type != NodeType::ClpString { return Err(invalid()); }
+        let views = layout.views(bytes, rows).map_err(|_| invalid())?;
+        check_encoded_variable_count(layout.variable_count as u64, context, limits, &mut 0)?;
+        views
+    } else {
+        let mut cursor = TableCursor::new(bytes);
+        let descriptors = Descriptors::Numeric(NumericColumn::plain(cursor.take_fixed(context, slot.stored_rows(rows), 8)?));
+        let count = cursor.take_u64(context)?;
+        check_encoded_variable_count(count, context, limits, &mut 0)?;
+        let count = usize::try_from(count).map_err(|_| ColumnError::SizeOverflow)?;
+        let variables = NumericColumn::plain(cursor.take_fixed(context, count, 8)?);
+        if cursor.remaining() != 0 {
+            return Err(ColumnError::TrailingTableBytes { remaining: cursor.remaining() });
+        }
+        (descriptors, variables)
+    };
+    let logtypes = match node_type {
+        NodeType::ClpString => LogTypeDictionaryRef::Log(logtypes.for_field(node_id)),
+        NodeType::UnstructuredArray => LogTypeDictionaryRef::Array(arrays),
+        _ => unreachable!(),
+    };
+    maximum_clp_dictionary_id(descriptors, variables, context, logtypes)
+}
+
+fn maximum_clp_dictionary_id(
+    descriptors: Descriptors<'_>,
+    variables: NumericColumn<'_>,
+    context: ColumnContext,
+    logtypes: LogTypeDictionaryRef<'_>,
+) -> Result<Option<u64>, ColumnError> {
+    let mut maximum = None;
+    let mut expected_offset = 0u64;
+    let mut cached_id = u64::MAX;
+    let mut kinds = Vec::new();
+    let mut dictionary_positions = Vec::new();
+    let mut variable_count = 0u64;
+    for (row, raw) in descriptors.iter().enumerate() {
+        let descriptor = ClpDescriptor { raw };
+        let id = u64::from(descriptor.logtype_id());
+        if cached_id != id {
+            let entry = logtypes.entry(id).ok_or_else(|| corrupt(context, Some(row),
+                ColumnCorruption::UnknownLogType { section: logtypes.section(), id }))?;
+            kinds.clear();
+            entry.variable_kinds_into(&mut kinds).map_err(|_| corrupt(context, Some(row),
+                ColumnCorruption::DanglingLogTypeEscape { section: logtypes.section(), id }))?;
+            dictionary_positions.clear();
+            dictionary_positions.extend(kinds.iter().enumerate().filter_map(|(i, kind)|
+                (*kind == LogTypeVariableKind::Dictionary).then_some(i)));
+            variable_count = entry.placeholder_counts().encoded_variables();
+            cached_id = id;
+        }
+        let offset = descriptor.encoded_variable_offset();
+        if offset != expected_offset {
+            return Err(corrupt(context, Some(row), ColumnCorruption::NonCanonicalEncodedVariableOffset {
+                expected: expected_offset, actual: offset,
+            }));
+        }
+        let end = offset.checked_add(variable_count).ok_or(ColumnError::SizeOverflow)?;
+        if end > variables.len() as u64 {
+            return Err(corrupt(context, Some(row), ColumnCorruption::EncodedVariableSpanOutOfBounds {
+                offset, count: variable_count, total: variables.len() as u64,
+            }));
+        }
+        let offset = usize::try_from(offset).map_err(|_| ColumnError::SizeOverflow)?;
+        for &position in &dictionary_positions {
+            let id = variables.get(offset + position).ok_or(ColumnError::SizeOverflow)?;
+            maximum = Some(maximum.map_or(id, |previous: u64| previous.max(id)));
+        }
+        expected_offset = end;
+    }
+    if expected_offset != variables.len() as u64 {
+        return Err(corrupt(context, None, ColumnCorruption::EncodedVariableCountMismatch {
+            referenced: expected_offset, declared: variables.len() as u64,
+        }));
+    }
+    Ok(maximum)
+}
+
 /// Checks that every ID names a dictionary entry (and, for dictionary floats, a finite number).
 /// A compact column is checked once per distinct ID or run, or from its bounds, not per row.
 fn dictionary_id_column<'table, 'archive>(
@@ -2837,6 +2954,89 @@ mod tests {
 
     fn push_i64(bytes: &mut Vec<u8>, value: i64) {
         bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn dictionary_id_requirement(bytes: &[u8], slot: &ColumnSlot, kind: NodeType,
+        rows: usize, resources: &Resources) -> Result<Option<u64>, ColumnError> {
+        maximum_variable_dictionary_id(bytes, slot, kind, 0, 0, rows,
+            &resources.logtype, &resources.array, ColumnLimits::default())
+    }
+
+    fn plain_slot(bytes: &[u8]) -> ColumnSlot {
+        ColumnSlot { clp_layout: None, numeric_encoding: None,
+            size: bytes.len(), stored: bytes.len(), loaded: true }
+    }
+
+    #[test]
+    fn dictionary_prefix_ids_keep_unsigned_bits_and_support_adaptive_codecs() {
+        let resources = resources(&[], &[], &[], &[]);
+        for values in [vec![1i64, 7, 2, 7], vec![9; 20], vec![1, -1, 2], vec![i64::MIN]] {
+            let expected = values.iter().map(|&value| value as u64).max();
+            for encoded in crate::adaptive_int::candidates(&values) {
+                let mut bytes = Vec::new();
+                let numeric_encoding = crate::encoded_numeric::prepare(&encoded, values.len(), false, &mut bytes).unwrap();
+                if numeric_encoding.is_none() {
+                    crate::adaptive_int::decode_to_le(&encoded, values.len(), &mut bytes).unwrap();
+                }
+                let slot = ColumnSlot { clp_layout: None, numeric_encoding,
+                    size: values.len() * 8, stored: bytes.len(), loaded: true };
+                for kind in [NodeType::VarString, NodeType::DictionaryFloat] {
+                    assert_eq!(dictionary_id_requirement(&bytes, &slot, kind, values.len(), &resources).unwrap(), expected);
+                }
+            }
+        }
+        let bytes = [0u8; 7];
+        assert!(dictionary_id_requirement(&bytes, &plain_slot(&bytes), NodeType::VarString, 1, &resources).is_err());
+        assert_eq!(dictionary_id_requirement(&[], &plain_slot(&[]), NodeType::Integer, 0, &resources).unwrap(), None);
+    }
+
+    #[test]
+    fn dictionary_prefix_clp_uses_placeholder_kinds_for_legacy_compact_and_array_columns() {
+        let resources = resources(&[], &[b"value=\x12 integer=\x11 float=\x13 escaped=\\\x12"],
+            &[b"[\"\x12\",\x11,\x13]"], &[]);
+        let descriptors = [0i64, 3i64 << 24];
+        let variables = [7, -1, encoded_float(125, 3, 2), 2, i64::MAX, encoded_float(5, 1, 1)];
+        let mut legacy = descriptors.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+        legacy.extend_from_slice(&(variables.len() as u64).to_le_bytes());
+        legacy.extend(variables.iter().flat_map(|value| value.to_le_bytes()));
+        for kind in [NodeType::ClpString, NodeType::UnstructuredArray] {
+            assert_eq!(dictionary_id_requirement(&legacy, &plain_slot(&legacy), kind, 2, &resources).unwrap(), Some(7));
+        }
+        for ds in crate::adaptive_int::candidates(&descriptors) {
+            for vs in crate::adaptive_int::candidates(&variables) {
+                let mut compact = (ds.len() as u64).to_le_bytes().to_vec();
+                compact.extend_from_slice(&ds);
+                compact.extend_from_slice(&(variables.len() as u64).to_le_bytes());
+                compact.extend_from_slice(&vs);
+                let layout = super::super::ClpColumnLayout::prepare(&compact, 2, ColumnLimits::default()).unwrap();
+                let slot = ColumnSlot { clp_layout: Some(std::sync::Arc::new(layout)),
+                    numeric_encoding: None, size: legacy.len(), stored: compact.len(), loaded: true };
+                assert_eq!(dictionary_id_requirement(&compact, &slot, NodeType::ClpString, 2, &resources).unwrap(), Some(7));
+            }
+        }
+        // A negative dictionary variable is an out-of-range unsigned ID, not an integer token.
+        legacy[24..32].copy_from_slice(&(-1i64).to_le_bytes());
+        assert_eq!(dictionary_id_requirement(&legacy, &plain_slot(&legacy), NodeType::ClpString, 2, &resources).unwrap(), Some(u64::MAX));
+    }
+
+    #[test]
+    fn dictionary_prefix_clp_rejects_bad_spans_and_needs_no_values_for_numeric_placeholders() {
+        let resources = resources(&[], &[b"number=\x11"], &[], &[]);
+        let mut bytes = 0u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&(-1i64).to_le_bytes());
+        assert_eq!(dictionary_id_requirement(&bytes, &plain_slot(&bytes), NodeType::ClpString, 1, &resources).unwrap(), None);
+        bytes[..8].copy_from_slice(&(1u64 << 24).to_le_bytes());
+        assert!(matches!(dictionary_id_requirement(&bytes, &plain_slot(&bytes), NodeType::ClpString, 1, &resources),
+            Err(ColumnError::Corrupt { reason: ColumnCorruption::NonCanonicalEncodedVariableOffset { .. }, .. })));
+        bytes[..8].copy_from_slice(&1u64.to_le_bytes());
+        assert!(matches!(dictionary_id_requirement(&bytes, &plain_slot(&bytes), NodeType::ClpString, 1, &resources),
+            Err(ColumnError::Corrupt { reason: ColumnCorruption::UnknownLogType { .. }, .. })));
+        bytes[..8].copy_from_slice(&0u64.to_le_bytes());
+        bytes[8..16].copy_from_slice(&0u64.to_le_bytes());
+        bytes.truncate(16);
+        assert!(matches!(dictionary_id_requirement(&bytes, &plain_slot(&bytes), NodeType::ClpString, 1, &resources),
+            Err(ColumnError::Corrupt { reason: ColumnCorruption::EncodedVariableSpanOutOfBounds { .. }, .. })));
     }
 
     fn push_u64(bytes: &mut Vec<u8>, value: u64) {

@@ -1,3 +1,6 @@
+mod prefix;
+pub(super) use prefix::VariableDictionaryPrefix;
+
 use std::error::Error;
 use std::fmt;
 use std::fmt::Display;
@@ -189,6 +192,7 @@ impl DictionaryStorage {
 /// per dictionary entry.
 #[derive(Clone, Debug)]
 pub struct VariableDictionary {
+    complete: bool,
     storage: DictionaryStorage,
     /// Bytes the dictionary frame decoded to. An entry stored as a binary UUID has a range of 36
     /// bytes at or past this, which addresses its text in `rendered` rather than `storage`.
@@ -208,6 +212,7 @@ impl VariableDictionary {
     #[must_use]
     pub const fn empty() -> Self {
         Self {
+            complete: false,
             storage: DictionaryStorage {
                 bytes: StorageBytes::Owned(Vec::new()),
                 ranges: Vec::new(),
@@ -219,7 +224,16 @@ impl VariableDictionary {
         }
     }
 
-    /// Returns the number of variable dictionary entries.
+    /// Whether all declared entries and the complete dictionary frame were validated.
+    ///
+    /// A prefix dictionary deliberately leaves its unrequested tail unread. Missing IDs in a
+    /// partial dictionary must not be treated as absent from the archive.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// Returns the number of loaded variable dictionary entries.
     #[must_use]
     pub const fn len(&self) -> usize {
         self.storage.entry_count()
@@ -597,6 +611,7 @@ pub(super) fn decode_variable_dictionary<R: Read>(
     if BINARY_UUIDS_MARKER != first {
         let storage = decode_entry_sequence(section, limits, first, None)?;
         return Ok(VariableDictionary {
+            complete: true,
             frame_len: storage.bytes.as_slice().len(),
             storage,
             uuids: Vec::new(),
@@ -674,6 +689,7 @@ pub(super) fn decode_variable_dictionary<R: Read>(
     let uuids = columns;
     let storage = decode_entry_sequence(section, limits, entry_count, Some(&uuids))?;
     Ok(VariableDictionary {
+        complete: true,
         frame_len: storage.bytes.as_slice().len(),
         storage,
         uuids,

@@ -511,6 +511,24 @@ pub trait ArchiveReader {
         limits: DictionaryLimits,
     ) -> Result<VariableDictionary, DictionaryError>;
 
+    /// Loads at least the first `minimum_entries` variable dictionary entries. A partial result
+    /// reports [`VariableDictionary::is_complete`] as false; its missing IDs are not proof that
+    /// the archive lacks those entries. Implementations may retain and extend their decoded
+    /// prefix across calls. The default implementation loads and validates the whole dictionary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a section decode error for the consumed dictionary headers and prefix.
+    fn read_variable_dictionary_prefix(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        limits: DictionaryLimits,
+        minimum_entries: u64,
+    ) -> Result<VariableDictionary, DictionaryError> {
+        let _ = minimum_entries;
+        self.read_variable_dictionary(metadata, limits)
+    }
+
     /// Decodes `/log.dict` on its own; see [`Self::read_variable_dictionary`].
     ///
     /// # Errors
@@ -631,6 +649,14 @@ impl<R: Read + Seek> ArchiveReader for SingleFileArchiveReader<R> {
     ) -> Result<VariableDictionary, DictionaryError> {
         Self::read_variable_dictionary(self, metadata, limits)
     }
+    fn read_variable_dictionary_prefix(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        limits: DictionaryLimits,
+        minimum_entries: u64,
+    ) -> Result<VariableDictionary, DictionaryError> {
+        Self::read_variable_dictionary_prefix(self, metadata, limits, minimum_entries)
+    }
     fn read_log_type_dictionary(
         &mut self,
         metadata: &ArchiveMetadata,
@@ -697,6 +723,14 @@ impl<S: DirectoryArchiveSource> ArchiveReader for DirectoryArchiveReader<S> {
         limits: DictionaryLimits,
     ) -> Result<VariableDictionary, DictionaryError> {
         Self::read_variable_dictionary(self, metadata, limits)
+    }
+    fn read_variable_dictionary_prefix(
+        &mut self,
+        metadata: &ArchiveMetadata,
+        limits: DictionaryLimits,
+        minimum_entries: u64,
+    ) -> Result<VariableDictionary, DictionaryError> {
+        Self::read_variable_dictionary_prefix(self, metadata, limits, minimum_entries)
     }
     fn read_log_type_dictionary(
         &mut self,
