@@ -349,8 +349,10 @@ pub trait ArchiveMatchSink {
 
     /// The schema nodes this sink writes for a matched row, or `None` when it may write any.
     ///
-    /// The search loads only the dictionaries these nodes are read through before handing over
-    /// matches. The default, `None`, loads them all.
+    /// The search loads only these output columns and their dictionaries after matching, where
+    /// the archive stores independently readable columns. Predicate columns are retained too.
+    /// `Some(vec![])` needs no output columns (for example, a count). The default, `None`, loads
+    /// them all. Sinks selecting columns must support partially loaded tables.
     fn output_nodes(&self, schema_tree: &crate::archive::SchemaTree) -> Option<Vec<u32>> {
         let _ = schema_tree;
         None
@@ -391,6 +393,7 @@ pub fn search_archive<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
     let output_nodes = sink.output_nodes(catalog.schema_tree());
     let columns = StreamColumns {
         filter: filter.columns(options.search),
+        output: output_nodes.as_deref(),
     };
     let filter_dictionaries = filter.dictionaries(catalog.schema_tree());
     load_dictionaries(
@@ -504,6 +507,7 @@ enum ScanOutcome {
 #[derive(Clone, Copy)]
 struct StreamColumns<'a> {
     filter: Option<&'a std::collections::BTreeSet<u32>>,
+    output: Option<&'a [u32]>,
 }
 
 impl StreamColumns<'_> {
@@ -515,8 +519,25 @@ impl StreamColumns<'_> {
         catalog: &ArchiveCatalog,
         table: &crate::archive::SchemaTableMetadata,
     ) -> Option<Vec<bool>> {
-        use crate::archive::SchemaEntry;
         let filter = self.filter?;
+        Self::mask(catalog, table, |node| filter.contains(&node))
+    }
+
+    fn output_mask(
+        self,
+        catalog: &ArchiveCatalog,
+        table: &crate::archive::SchemaTableMetadata,
+    ) -> Option<Vec<bool>> {
+        let output = self.output?;
+        Self::mask(catalog, table, |node| output.contains(&node))
+    }
+
+    fn mask(
+        catalog: &ArchiveCatalog,
+        table: &crate::archive::SchemaTableMetadata,
+        selected: impl Fn(u32) -> bool,
+    ) -> Option<Vec<bool>> {
+        use crate::archive::SchemaEntry;
         let frames = catalog
             .table_metadata()
             .separate_columns_for(table.stream_id())?
@@ -530,7 +551,7 @@ impl StreamColumns<'_> {
                 continue;
             };
             if crate::archive::is_value_bearing(tree.get(node as usize)?.node_type()) {
-                mask.push(filter.contains(&node));
+                mask.push(selected(node));
             }
         }
         (mask.len() == frames).then_some(mask)
@@ -608,18 +629,23 @@ fn prefilter_by_columns<A: ArchiveReader + ?Sized>(
     Ok(Prefilter::Unmatched)
 }
 
-/// Completes a filter-only stream with the columns it did not load, or `None` when its layout
-/// cannot be completed that way and the stream must be read whole.
+/// Completes a filter-only stream with the output columns it did not load. A missing output
+/// mask requests every column. Returns `None` when its layout cannot be completed this way.
 fn complete_stream<A: ArchiveReader + ?Sized>(
     reader: &mut A,
     catalog: &ArchiveCatalog,
     stream_index: usize,
     filtered: crate::archive::DecodedPackedStream,
+    output: Option<&[bool]>,
     options: &ArchiveSearchOptions,
 ) -> Result<Option<crate::archive::DecodedPackedStream>, ArchiveSearchError> {
     let Some(missing) = filtered
         .column_layout()
-        .map(|layout| layout.iter().map(|slot| !slot.loaded).collect::<Vec<_>>())
+        .map(|layout| {
+            layout.iter().enumerate().map(|(index, slot)| {
+                !slot.loaded && output.is_none_or(|mask| mask.get(index).copied().unwrap_or(true))
+            }).collect::<Vec<_>>()
+        })
     else {
         return Ok(None);
     };
@@ -674,21 +700,30 @@ fn scan_streams<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
 
         // A separate-column stream holds one table. The columns its filter reads are read alone
         // first, so a stream without a match costs only those. One with a match keeps them and
-        // its bitmap, and reads only the remaining columns.
+        // its bitmap, and reads only the remaining output columns.
         let mut prefiltered = None;
         if let [table] = tables
             && let Some(mask) = scan.columns.matching_mask(catalog, table)
         {
             match prefilter_by_columns(reader, catalog, compiled, options, &mask, position)? {
                 Prefilter::Unmatched => continue,
-                Prefilter::Matched { stream, bitmap } => prefiltered = Some((stream, bitmap)),
+                Prefilter::Matched { stream, bitmap } => {
+                    // Do not prepare all output columns only to discard them when lazy
+                    // dictionaries require a restart. No row from this stream reached the sink.
+                    if !scan.all_dictionaries_loaded {
+                        *position = stream_start;
+                        return Ok(ScanOutcome::NeedsDictionaries);
+                    }
+                    prefiltered = Some((stream, bitmap));
+                }
                 Prefilter::Unexpected => {}
             }
         }
 
         let (stream, mut cached_bitmap) = match prefiltered {
             Some((filtered, bitmap)) => {
-                match complete_stream(reader, catalog, stream_index, filtered, options)? {
+                let output = tables.first().and_then(|table| scan.columns.output_mask(catalog, table));
+                match complete_stream(reader, catalog, stream_index, filtered, output.as_deref(), options)? {
                     Some(stream) => (stream, Some(bitmap)),
                     None => (read_stream(reader, catalog, stream_index, None, options)?, None),
                 }

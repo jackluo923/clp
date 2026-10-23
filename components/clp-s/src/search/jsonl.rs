@@ -236,8 +236,10 @@ impl<'sink, 'options, S: JsonlRecordSink + ?Sized> SearchJsonlAdapter<'sink, 'op
             .ok_or(SearchJsonlAdapterError::SizeOverflow)?;
         let scratch = std::mem::take(&mut self.scratch);
         let mut writer = program
-            .writer_with_scratch(
+            .writer_projected_with_scratch(
                 matches.table().table(),
+                matches.table().schema(),
+                matches.catalog().schema_tree(),
                 matches.catalog().timestamp_patterns(),
                 scratch,
             )

@@ -10,6 +10,7 @@
 //! behavior, which can intentionally produce output that is not valid UTF-8 JSON.
 //! Pre-v0.5 deprecated date-pattern semantics are intentionally rejected when binding a table.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::fmt::Display;
@@ -20,6 +21,8 @@ use crate::ExtractionPlan;
 use crate::ExtractionPosition;
 use crate::archive::BooleanColumn;
 use crate::archive::ClpStringColumn;
+use crate::archive::ClpStringCursor;
+use crate::archive::ClpMessageTemplate;
 use crate::archive::ColumnData;
 use crate::archive::DeltaI64Values;
 use crate::archive::EncodedVariableError;
@@ -318,6 +321,43 @@ impl RecordProgram {
     ) -> Result<RecordWriter<'program, 'table, 'archive, 'catalog>, RecordBindError> {
         bind_writer(self, table, timestamps, scratch)
     }
+
+    /// Binds search output to a partially loaded table, retaining the original physical
+    /// column indexes. Schema-entry positions distinguish repeated nodes in structured arrays.
+    pub(crate) fn writer_projected_with_scratch<'program, 'table, 'archive, 'catalog>(
+        &'program self,
+        table: &SchemaTable<'table, 'archive>,
+        schema: &crate::archive::SchemaDefinition,
+        schema_tree: &SchemaTree,
+        timestamps: &'catalog TimestampPatternCatalog,
+        scratch: RecordScratch,
+    ) -> Result<RecordWriter<'program, 'table, 'archive, 'catalog>, RecordBindError> {
+        if !table.is_projected() {
+            return self.writer_with_scratch(table, timestamps, scratch);
+        }
+        let physical_entries = || schema.entries().iter().enumerate().filter_map(|(index, entry)| {
+            let crate::archive::SchemaEntry::Node(node_id) = *entry else { return None; };
+            schema_tree.get(node_id as usize)
+                .filter(|node| crate::archive::is_value_bearing(node.node_type()))
+                .map(|_| index)
+        });
+        let actual = physical_entries().count();
+        if actual != self.column_count {
+            return Err(RecordBindError::ColumnCountMismatch {
+                expected: self.column_count,
+                actual,
+            });
+        }
+        let mut decoded = table.columns().iter().copied().peekable();
+        let columns = physical_entries().map(|entry_index| {
+            if decoded.peek().is_some_and(|column| column.schema_entry_index() == entry_index) {
+                decoded.next()
+            } else {
+                None
+            }
+        });
+        bind_writer_columns(self, columns, table.message_count(), timestamps, scratch)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -379,6 +419,7 @@ pub struct RecordWriter<'program, 'table, 'archive, 'catalog> {
     current: Vec<ColumnCursor<'table, 'archive>>,
     trial: Vec<ColumnCursor<'table, 'archive>>,
     scratch: RecordScratch,
+    templates: ClpTemplateCache,
     next_row: usize,
     row_count: usize,
 }
@@ -411,6 +452,7 @@ impl RecordWriter<'_, '_, '_, '_> {
             timestamps: self.timestamps,
             cursors: &mut self.trial,
             scratch: &mut self.scratch,
+            templates: &mut self.templates,
             row_index: self.next_row,
             output,
             output_start: original_len,
@@ -538,15 +580,53 @@ enum ColumnCursor<'table, 'archive> {
     DictionaryFloat(crate::archive::DictionaryValueCursor<'table, 'archive>),
     Boolean(BooleanColumn<'table>),
     VarString(crate::archive::DictionaryValueCursor<'table, 'archive>),
-    ClpString(ClpStringColumn<'table, 'archive>),
+    ClpString(ClpStringCursor<'table, 'archive>),
     /// A CLP string written as its logtype template.
     /// A CLP string written as a template; `true` parses a string stored whole.
     ClpShape(ClpStringColumn<'table, 'archive>, bool),
-    UnstructuredArray(ClpStringColumn<'table, 'archive>),
+    UnstructuredArray(ClpStringCursor<'table, 'archive>),
     Timestamp {
         epochs: DeltaI64Values<'table>,
         pattern_ids: U64Column<'table>,
     },
+}
+
+/// Parsed templates are immutable rendering plans, not transactional row state. Bound both
+/// their count and a conservative allocation estimate; unusually large/diverse templates use
+/// the existing interpreter. Column identity matters because dictionary IDs can be field-local.
+#[derive(Default)]
+struct ClpTemplateCache {
+    plans: HashMap<(usize, u64), ClpMessageTemplate>,
+    estimated_bytes: usize,
+}
+
+impl ClpTemplateCache {
+    fn get_or_compile(
+        &mut self,
+        column_index: usize,
+        logtype: crate::archive::LogTypeDictionaryEntry<'_>,
+    ) -> Option<&ClpMessageTemplate> {
+        const MAX_PLANS: usize = 256;
+        const MAX_ESTIMATED_BYTES: usize = MEBIBYTE;
+        let key = (column_index, logtype.id());
+        if !self.plans.contains_key(&key) {
+            // A placeholder can add a literal Vec, a kind byte and allocation slack. This
+            // deliberately overestimates their cost without parsing the template twice.
+            let estimated = logtype.escaped_value().len().checked_add(1)?.checked_mul(128)?;
+            if self.plans.len() == MAX_PLANS
+                || estimated > MAX_ESTIMATED_BYTES.saturating_sub(self.estimated_bytes)
+            {
+                return None;
+            }
+            // A cache miss must not make an otherwise valid record fail. Compilation errors
+            // also fall back so the interpreter preserves its error-precedence behavior.
+            self.plans.try_reserve(1).ok()?;
+            let plan = ClpMessageTemplate::compile(logtype).ok()?;
+            self.plans.insert(key, plan);
+            self.estimated_bytes += estimated;
+        }
+        self.plans.get(&key)
+    }
 }
 
 struct RowContext<'writer, 'program, 'table, 'archive, 'catalog> {
@@ -554,6 +634,7 @@ struct RowContext<'writer, 'program, 'table, 'archive, 'catalog> {
     timestamps: &'catalog TimestampPatternCatalog,
     cursors: &'writer mut [ColumnCursor<'table, 'archive>],
     scratch: &'writer mut RecordScratch,
+    templates: &'writer mut ClpTemplateCache,
     row_index: usize,
     output: &'writer mut Vec<u8>,
     output_start: usize,
@@ -591,6 +672,7 @@ fn append_row(context: &mut RowContext<'_, '_, '_, '_, '_>) -> Result<(), Record
             context.program.float_format,
             context.program.limits.scratch_bytes,
             context.scratch,
+            context.templates,
             &mut output,
         )?;
         literal_start = step.literal_end;
@@ -680,6 +762,7 @@ fn append_dynamic_value(
     float_format: FloatFormat,
     scratch_limit: usize,
     scratch: &mut RecordScratch,
+    templates: &mut ClpTemplateCache,
     output: &mut BoundedRecordOutput<'_>,
 ) -> Result<(), RecordError> {
     match cursor {
@@ -742,13 +825,14 @@ fn append_dynamic_value(
             output.append_json_string(value, byte_policy, step)
         }
         ColumnCursor::ClpString(column) => append_clp_value(
-            *column,
+            column,
             step,
             row_index,
             true,
             byte_policy,
             scratch_limit,
             scratch,
+            templates,
             output,
         ),
         ColumnCursor::ClpShape(column, parsed) => append_clp_shape(
@@ -762,13 +846,14 @@ fn append_dynamic_value(
             output,
         ),
         ColumnCursor::UnstructuredArray(column) => append_clp_value(
-            *column,
+            column,
             step,
             row_index,
             false,
             byte_policy,
             scratch_limit,
             scratch,
+            templates,
             output,
         ),
         ColumnCursor::Timestamp {
@@ -844,26 +929,36 @@ fn append_original_float(
 
 #[allow(clippy::too_many_arguments)]
 fn append_clp_value(
-    column: ClpStringColumn<'_, '_>,
+    column: &mut ClpStringCursor<'_, '_>,
     step: ValueStep,
     row_index: usize,
     quoted: bool,
     byte_policy: JsonBytePolicy,
     scratch_limit: usize,
     scratch: &mut RecordScratch,
+    templates: &mut ClpTemplateCache,
     output: &mut BoundedRecordOutput<'_>,
 ) -> Result<(), RecordError> {
     let record = column
         .record(row_index)
         .ok_or_else(|| missing(step, row_index))?;
     scratch.bytes.clear();
-    append_clp_message_bounded(
-        record.logtype(),
-        column.variable_dictionary(),
-        &record.encoded_variables(),
-        &mut scratch.bytes,
-        scratch_limit,
-    )
+    let rendered = match templates.get_or_compile(step.column_index, record.logtype()) {
+        Some(template) => template.append(
+            column.variable_dictionary(),
+            &record.encoded_variables(),
+            &mut scratch.bytes,
+            scratch_limit,
+        ),
+        None => append_clp_message_bounded(
+            record.logtype(),
+            column.variable_dictionary(),
+            &record.encoded_variables(),
+            &mut scratch.bytes,
+            scratch_limit,
+        ),
+    };
+    rendered
     .map_err(|source| RecordError::ClpValue {
         column_index: step.column_index,
         node_id: step.node_id,
@@ -985,6 +1080,22 @@ fn bind_writer<'program, 'table, 'archive, 'catalog>(
             actual: table.len(),
         });
     }
+    bind_writer_columns(
+        program,
+        table.columns().iter().copied().map(Some),
+        table.message_count(),
+        timestamps,
+        scratch,
+    )
+}
+
+fn bind_writer_columns<'program, 'table, 'archive, 'catalog>(
+    program: &'program RecordProgram,
+    columns: impl Iterator<Item = Option<crate::archive::Column<'table, 'archive>>>,
+    row_count: usize,
+    timestamps: &'catalog TimestampPatternCatalog,
+    scratch: RecordScratch,
+) -> Result<RecordWriter<'program, 'table, 'archive, 'catalog>, RecordBindError> {
     if program.literals.len() > program.limits.record_bytes {
         return Err(RecordBindError::LimitExceeded {
             resource: RecordResource::RecordBytes,
@@ -995,39 +1106,39 @@ fn bind_writer<'program, 'table, 'archive, 'catalog>(
 
     let mut current = reserve_cursor_vec(program.column_count)?;
     let mut trial = reserve_cursor_vec(program.column_count)?;
-    for (column_index, (column, expected)) in table
-        .columns()
-        .iter()
-        .copied()
+    for (column_index, (column, expected)) in columns
         .zip(&program.expected_columns)
         .enumerate()
     {
         let cursor = match expected {
-            Some(expected) => bind_column(
-                column_index,
-                column.node_id(),
-                column.node_type(),
-                column.data(),
-                *expected,
-                program.limits.scratch_bytes,
-            )?,
+            Some(expected) => {
+                let column = column.ok_or(RecordBindError::MissingColumn {
+                    column_index,
+                    node_id: expected.node_id,
+                })?;
+                let cursor = bind_column(
+                    column_index,
+                    column.node_id(),
+                    column.node_type(),
+                    column.data(),
+                    *expected,
+                    program.limits.scratch_bytes,
+                )?;
+                match (cursor, column.data()) {
+                    (ColumnCursor::ClpString(_), ColumnData::ClpString(data))
+                        if program.shape_nodes.binary_search(&column.node_id()).is_ok() =>
+                    {
+                        ColumnCursor::ClpShape(data, false)
+                    }
+                    (ColumnCursor::ClpString(_), ColumnData::ClpString(data))
+                        if program.parsed_shape_nodes.binary_search(&column.node_id()).is_ok() =>
+                    {
+                        ColumnCursor::ClpShape(data, true)
+                    }
+                    (cursor, _) => cursor,
+                }
+            }
             None => ColumnCursor::Unused,
-        };
-        let cursor = match cursor {
-            ColumnCursor::ClpString(data)
-                if program.shape_nodes.binary_search(&column.node_id()).is_ok() =>
-            {
-                ColumnCursor::ClpShape(data, false)
-            }
-            ColumnCursor::ClpString(data)
-                if program
-                    .parsed_shape_nodes
-                    .binary_search(&column.node_id())
-                    .is_ok() =>
-            {
-                ColumnCursor::ClpShape(data, true)
-            }
-            cursor => cursor,
         };
         trial.push(cursor.clone());
         current.push(cursor);
@@ -1039,8 +1150,9 @@ fn bind_writer<'program, 'table, 'archive, 'catalog>(
         current,
         trial,
         scratch,
+        templates: ClpTemplateCache::default(),
         next_row: 0,
-        row_count: table.message_count(),
+        row_count,
     })
 }
 
@@ -1099,8 +1211,8 @@ fn bind_column<'table, 'archive>(
         ColumnData::DictionaryFloat(column) => Ok(ColumnCursor::DictionaryFloat(column.cursor())),
         ColumnData::Boolean(column) => Ok(ColumnCursor::Boolean(column)),
         ColumnData::VarString(column) => Ok(ColumnCursor::VarString(column.cursor())),
-        ColumnData::ClpString(column) => Ok(ColumnCursor::ClpString(column)),
-        ColumnData::UnstructuredArray(column) => Ok(ColumnCursor::UnstructuredArray(column)),
+        ColumnData::ClpString(column) => Ok(ColumnCursor::ClpString(column.cursor())),
+        ColumnData::UnstructuredArray(column) => Ok(ColumnCursor::UnstructuredArray(column.cursor())),
         ColumnData::Timestamp(column) => Ok(timestamp_cursor(column)),
         ColumnData::DeprecatedDateString(_) => {
             Err(RecordBindError::UnsupportedDeprecatedDateString {
@@ -1851,6 +1963,13 @@ pub enum RecordBindError {
         /// Decoded table column count.
         actual: usize,
     },
+    /// A partially loaded table omitted a physical column used by the record program.
+    MissingColumn {
+        /// Physical column index in the complete schema.
+        column_index: usize,
+        /// Referenced schema-tree node.
+        node_id: u32,
+    },
     /// A referenced physical column belongs to a different schema-tree node.
     NodeIdMismatch {
         /// Physical column index.
@@ -1911,6 +2030,10 @@ impl Display for RecordBindError {
             Self::ColumnCountMismatch { expected, actual } => write!(
                 formatter,
                 "record program expects {expected} columns, table has {actual}"
+            ),
+            Self::MissingColumn { column_index, node_id } => write!(
+                formatter,
+                "record column {column_index} (node {node_id}) was omitted from the projected table"
             ),
             Self::NodeIdMismatch {
                 column_index,
@@ -2354,7 +2477,15 @@ mod tests {
 
     fn all_value_archive() -> Vec<u8> {
         let table = all_value_table();
-        let packed_stream = zstd(&table);
+        all_value_archive_with_strings(
+            &table,
+            &[b"1e+03", b"-0.0", b"a\"b", "snowman:\u{2603}".as_bytes()],
+            b"msg \x11",
+        )
+    }
+
+    fn all_value_archive_with_strings(table: &[u8], variables: &[&[u8]], logtype: &[u8]) -> Vec<u8> {
+        let packed_stream = zstd(table);
         let mut table_metadata = 1_u64.to_le_bytes().to_vec();
         table_metadata.extend_from_slice(&0_u64.to_le_bytes());
         table_metadata.extend_from_slice(
@@ -2373,8 +2504,8 @@ mod tests {
             zstd(&all_value_schema_tree()),
             zstd(&all_value_schema_map()),
             zstd(&table_metadata),
-            dictionary(&[b"1e+03", b"-0.0", b"a\"b", "snowman:\u{2603}".as_bytes()]),
-            dictionary(&[b"msg \x11"]),
+            dictionary(variables),
+            dictionary(&[logtype]),
             dictionary(&[b"[1,true]"]),
             packed_stream,
         ];
@@ -2730,6 +2861,48 @@ mod tests {
                 .expect("bulk skip reports exhaustion")
         );
         assert_eq!(2, bulk_skipping_writer.next_row_index());
+    }
+
+    #[test]
+    fn cached_clp_templates_preserve_utf8_errors_escaping_and_retry_state() {
+        let mut bytes = all_value_table();
+        // Both records select dictionary variables; preceding columns retain their original
+        // values, so the projected delta cursor must roll back with a failed CLP record.
+        const CLP_VARIABLES: usize = 16 + 16 + 16 + 20 + 16 + 2 + 16 + 16 + 8;
+        bytes[CLP_VARIABLES..CLP_VARIABLES + 8].copy_from_slice(&2_i64.to_le_bytes());
+        bytes[CLP_VARIABLES + 8..CLP_VARIABLES + 16].copy_from_slice(&3_i64.to_le_bytes());
+        let fixture = all_value_archive_with_strings(
+            &bytes,
+            &[b"1e+03", b"-0.0", b"bad\xff", b"good\n\"quote\""],
+            b"prefix \" \\\\ \x12 tail\n",
+        );
+        let mut archive = SingleFileArchiveReader::open(Cursor::new(fixture)).unwrap();
+        let catalog = archive.read_catalog(ArchiveCatalogLimits::default()).unwrap();
+        let stream = archive.read_packed_stream(catalog.metadata(), catalog.table_metadata(), 0,
+            PackedStreamLimits::default()).unwrap();
+        let table = catalog.schema_tables(0, &stream, ColumnLimits::default()).unwrap().next().unwrap().unwrap();
+        let plan = ExtractionPlan::compile(table.schema(), catalog.schema_tree(), ExtractionPlanLimits::default())
+            .unwrap().project_selected_nodes(&[2, 8]).unwrap();
+        let program = RecordProgram::compile(&plan, catalog.schema_tree(), RecordLimits::default()).unwrap();
+        let mut writer = program.writer(table.table(), catalog.timestamp_patterns()).unwrap();
+        let mut output = b"existing".to_vec();
+        for _ in 0..2 {
+            assert!(matches!(writer.append_next_record(&mut output),
+                Err(RecordError::JsonString { source: JsonEscapeError::InvalidUtf8 { .. }, .. })));
+            assert_eq!(output, b"existing");
+            assert_eq!(writer.next_row_index(), 0);
+        }
+        assert!(writer.skip_next_record().unwrap());
+        output.clear();
+        writer.append_next_record(&mut output).unwrap();
+        assert_eq!(output, br#"{"delta":7,"clp":"prefix \" \\ good\n\"quote\" tail\n"}"#);
+
+        let program = RecordProgram::compile_with_byte_policy(&plan, catalog.schema_tree(),
+            JsonBytePolicy::PreserveInvalidUtf8, RecordLimits::default()).unwrap();
+        let mut writer = program.writer(table.table(), catalog.timestamp_patterns()).unwrap();
+        output.clear();
+        writer.append_next_record(&mut output).unwrap();
+        assert_eq!(output, b"{\"delta\":10,\"clp\":\"prefix \\\" \\\\ bad\xff tail\\n\"}");
     }
 
     #[test]

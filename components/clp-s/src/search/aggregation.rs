@@ -600,6 +600,21 @@ impl ArchiveMatchSink for AggregationSink<'_> {
     fn write_matches(&mut self, matches: ArchiveTableMatches<'_, '_, '_>) -> io::Result<()> {
         self.write_aggregation(matches).map_err(io::Error::other)
     }
+
+    fn output_nodes(&self, tree: &crate::archive::SchemaTree) -> Option<Vec<u32>> {
+        match &self.plan.operation {
+            PlanOperation::Count => Some(Vec::new()),
+            // The authoritative timestamp is selected from archive metadata, not a named field.
+            PlanOperation::CountByTime { .. } => None,
+            PlanOperation::Extreme { field, .. } | PlanOperation::Unique { field } => {
+                let ResolvedProjection::Selected(mut nodes) = field.projection.resolve(tree).ok()? else {
+                    return None;
+                };
+                retain_object_reachable_nodes(&mut nodes, tree).ok()?;
+                Some(nodes)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]

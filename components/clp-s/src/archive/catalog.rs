@@ -318,8 +318,10 @@ impl ArchiveCatalog {
     }
 
     /// Prepares adaptive numeric columns for [`Self::schema_tables`]. Constants, dictionaries,
-    /// frame-of-reference integers, and runs retain compact reader-only layouts; other codecs decode to canonical 8-byte
-    /// little-endian values. Archive bytes and writer encodings are unchanged.
+    /// frame-of-reference integers, and runs retain compact reader-only layouts; other numeric
+    /// codecs decode to canonical 8-byte little-endian values. Adaptive CLP strings retain compact
+    /// descriptor/variable views regardless of the other columns being read. Archive bytes and
+    /// writer encodings are unchanged.
     ///
     /// Call this after [`SingleFileArchiveReader::read_packed_stream`] only for archives whose
     /// version [`supports_adaptive_numeric`](super::ArchiveVersion::supports_adaptive_numeric); a
@@ -414,11 +416,13 @@ impl ArchiveCatalog {
             return Ok(stream);
         }
 
-        // Preserve compact numeric encodings where supported, decode other numeric codecs,
-        // and copy nonnumeric columns verbatim.
+        // Preserve compact numeric and CLP-string encodings where supported, decode other
+        // numeric codecs, and copy nonnumeric columns verbatim. A full-record projection mixes
+        // strings with other types; it must not expand every string's descriptors and variables
+        // merely because an unrelated column also needs preparing.
         let bytes = stream.as_bytes();
         let numeric_size = message_count.checked_mul(8).ok_or(TableStreamError::SizeOverflow)?;
-        // Reserve the retained representation once. CLP strings can grow this buffer.
+        // Reserve the retained representation once.
         let mut capacity_offset = 0usize;
         let capacity = layout.iter().enumerate().try_fold(0usize, |sum, (index, slot)| {
             let numeric = matches!(node_types.get(index), Some(NodeType::Integer | NodeType::Float))
@@ -445,6 +449,7 @@ impl ArchiveCatalog {
             let start = output.len();
             let mut size = slot.size;
             let mut numeric_encoding = None;
+            let mut clp_layout = None;
             if !slot.loaded {
                 // A projected-out column occupies no bytes.
             } else if node_type == Some(NodeType::MixedInteger) {
@@ -478,8 +483,11 @@ impl ArchiveCatalog {
                 size = output.len() - start;
                 changed = true;
             } else if strings && node_type == Some(NodeType::ClpString) && !stored.is_empty() {
-                decode_adaptive_clp_string(stored, message_count, limits, &mut output).map_err(decode_err)?;
-                size = output.len() - start;
+                let view = super::ClpColumnLayout::prepare(stored, message_count, limits)
+                    .map_err(decode_err)?;
+                size = view.logical_size(message_count).map_err(|_| TableStreamError::SizeOverflow)?;
+                output.extend_from_slice(stored);
+                clp_layout = Some(std::sync::Arc::new(view));
                 changed = true;
             } else if node_type == Some(NodeType::Float) && !stored.is_empty() {
                 crate::adaptive_float::decode_to_le(stored, message_count, &mut output).map_err(decode_err)?;
@@ -488,7 +496,7 @@ impl ArchiveCatalog {
             } else {
                 output.extend_from_slice(stored);
             }
-            output_layout.push(ColumnSlot { clp_layout: None, size, stored: output.len() - start, loaded: slot.loaded, numeric_encoding });
+            output_layout.push(ColumnSlot { clp_layout, size, stored: output.len() - start, loaded: slot.loaded, numeric_encoding });
         }
         if !changed { return Ok(stream); }
         Ok(DecodedPackedStream::from_column_buffer(output, output_layout))
@@ -770,50 +778,6 @@ fn decode_grouped_clp_strings(
         next_variable += count;
     }
     Ok(plain)
-}
-
-/// Inverts an adaptive CLP-string column to its plain layout: the descriptors as 8-byte values,
-/// the variable count, then the variables as 8-byte values. The stored form holds the encoded
-/// descriptors' length, the descriptors, the variable count, then the encoded variables, each
-/// run in one of the integer schemes.
-fn decode_adaptive_clp_string(
-    stored: &[u8],
-    rows: usize,
-    limits: ColumnLimits,
-    output: &mut Vec<u8>,
-) -> Result<(), crate::adaptive_int::AdaptiveDecodeError> {
-    use crate::adaptive_int::AdaptiveDecodeError;
-    let read_u64 = |bytes: &[u8], at: usize| -> Result<u64, AdaptiveDecodeError> {
-        bytes
-            .get(at..at + 8)
-            .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("8-byte chunk")))
-            .ok_or(AdaptiveDecodeError::Truncated)
-    };
-    let descriptor_length =
-        usize::try_from(read_u64(stored, 0)?).map_err(|_| AdaptiveDecodeError::Malformed)?;
-    let descriptors_end = descriptor_length
-        .checked_add(8)
-        .ok_or(AdaptiveDecodeError::Malformed)?;
-    let descriptors = stored
-        .get(8..descriptors_end)
-        .ok_or(AdaptiveDecodeError::Truncated)?;
-    let count = read_u64(stored, descriptors_end)?;
-    // The count sizes an allocation, so it is bounded as the plain column decoder bounds it.
-    if count > limits.max_encoded_variables_per_column() {
-        return Err(AdaptiveDecodeError::Malformed);
-    }
-    let count = usize::try_from(count).map_err(|_| AdaptiveDecodeError::Malformed)?;
-    let variables = &stored[descriptors_end + 8..];
-    // Decode directly into the final stream buffer instead of retaining expanded descriptor
-    // and variable vectors plus a second full-size byte buffer before copying it yet again.
-    crate::adaptive_int::decode_to_le(descriptors, rows, output)?;
-    output.extend_from_slice(&(count as u64).to_le_bytes());
-    if count == 0 {
-        if !variables.is_empty() { return Err(AdaptiveDecodeError::Malformed); }
-    } else {
-        crate::adaptive_int::decode_to_le(variables, count, output)?;
-    }
-    Ok(())
 }
 
 /// Layout-independent inputs needed to assemble an [`ArchiveCatalog`].

@@ -27,6 +27,7 @@ pub use catalog::ArchiveCatalogLimits;
 pub use column::BooleanColumn;
 pub use column::ClpDescriptor;
 pub use column::ClpStringColumn;
+pub use column::ClpStringCursor;
 pub use column::ClpStringRecord;
 pub use column::Column;
 pub use compact_clp::ClpColumnLayout;

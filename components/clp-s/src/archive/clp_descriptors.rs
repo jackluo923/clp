@@ -125,6 +125,7 @@ impl<'a> Delta<'a> {
 }
 /// Forward cursors reuse the previous value for adjacent selected rows. Sparse
 /// jumps use checkpoints, so reconstruction never walks all rejected rows again.
+#[derive(Clone, Debug)]
 pub(crate) struct DescriptorCursor<'a> {
     column: Descriptors<'a>,
     last: Option<(usize, u64)>,

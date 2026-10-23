@@ -987,11 +987,16 @@ impl<'table, 'archive> ClpStringColumn<'table, 'archive> {
 }
 
 /// Cursor for reconstructing selected CLP records without re-decoding adjacent descriptors.
+#[derive(Clone, Debug)]
 pub struct ClpStringCursor<'table, 'archive> {
     column: ClpStringColumn<'table, 'archive>,
     descriptors: DescriptorCursor<'table>,
 }
 impl<'table, 'archive> ClpStringCursor<'table, 'archive> {
+    pub(crate) fn variable_dictionary(&self) -> &'archive VariableDictionary {
+        self.column.variable_dictionary()
+    }
+
     pub fn record(&mut self, row: usize) -> Option<ClpStringRecord<'table, 'archive>> {
         let descriptor = ClpDescriptor { raw: self.descriptors.get(row)? };
         let next = self.descriptors.get(row + 1).map(|raw| ClpDescriptor { raw });
