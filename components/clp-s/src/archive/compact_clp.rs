@@ -6,6 +6,7 @@ use std::ops::Range;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Storage {
+    BlockDelta { range: Range<usize>, checkpoints: std::sync::OnceLock<Vec<u64>> },
     Delta {
         range: Range<usize>,
         checkpoints: std::sync::OnceLock<Vec<u64>>,
@@ -22,6 +23,11 @@ enum Storage {
 
 impl Storage {
     fn prepare_descriptors(stored: &[u8], range: Range<usize>, rows: usize) -> Result<Self, Error> {
+        if stored.get(range.start) == Some(&crate::delta_blocks::SCHEME) {
+            let range = range.start + 1..range.end;
+            crate::delta_blocks::View::new(stored.get(range.clone()).ok_or(Error::Truncated)?, rows)?;
+            return Ok(Self::BlockDelta { range, checkpoints: std::sync::OnceLock::new() });
+        }
         if rows > 0 && stored.get(range.start) == Some(&2) {
             let range = range.start + 1..range.end;
             let checkpoints = std::sync::OnceLock::new();
@@ -40,6 +46,8 @@ impl Storage {
         rows: usize,
     ) -> Result<super::clp_descriptors::Descriptors<'a>, Error> {
         match self {
+            Self::BlockDelta { range, checkpoints } => super::clp_descriptors::Descriptors::blocked(
+                stored.get(range.clone()).ok_or(Error::Truncated)?, rows, checkpoints),
             Self::Delta { range, checkpoints } => super::clp_descriptors::Descriptors::delta(
                 stored.get(range.clone()).ok_or(Error::Truncated)?,
                 rows,
@@ -60,7 +68,15 @@ impl Storage {
             });
         }
         let (&tag, _) = bytes.split_first().ok_or(Error::Truncated)?;
-        if matches!(tag, 0 | 1 | 3 | 5) {
+        // CLP variable spans are exposed as independent short slices. Nonconstant deltas
+        // would repeatedly walk a chunk for each message's slice, so retain the established
+        // canonical fallback here. Constant-stride blocks support direct access without it.
+        if tag == crate::delta_blocks::SCHEME && bytes.get(9) != Some(&0) {
+            let mut output = Vec::new();
+            crate::adaptive_int::decode_to_le(bytes, rows, &mut output)?;
+            return Ok(Self::Prepared { bytes: output, encoding: None });
+        }
+        if matches!(tag, 0 | 1 | 3 | 5 | 6) {
             let end = if tag == 0 {
                 range
                     .start
@@ -91,7 +107,7 @@ impl Storage {
 
     fn view<'a>(&'a self, stored: &'a [u8], rows: usize) -> Result<NumericColumn<'a>, Error> {
         let (bytes, encoding) = match self {
-            Self::Delta { .. } => return Err(Error::Malformed),
+            Self::Delta { .. } | Self::BlockDelta { .. } => return Err(Error::Malformed),
             Self::Borrowed { range, encoding } => (
                 stored.get(range.clone()).ok_or(Error::Truncated)?,
                 *encoding,

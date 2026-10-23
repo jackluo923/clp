@@ -23,7 +23,8 @@
 //!   it does integers; filters still test each distinct value once.
 //! - `RLE` — `(value, run-length)` pairs (long constant runs).
 //! - `CONSTANT` — a single value (the whole column is one number).
-//! - `DECIMAL` — the integers `m` and one scale `k` such that every value is `m / 10^k`, rounded
+//! - `DECIMAL` — the integers `m` and one scale `k` such that every value is `m / 10^k`, or
+//!   `m * (1 / 10^k)` with a rounded reciprocal, rounded
 //!   to a double, or to a float when the column holds only floats (values a converter widened from
 //!   float32), with the integers in one of the integer schemes. Sensor readings and prices usually
 //!   have a few decimal digits, so their mantissas are small integers that compress as integer
@@ -33,6 +34,7 @@
 use std::collections::HashMap;
 
 use crate::adaptive_int::{AdaptiveDecodeError, bit_width_for, pack_bits, packed_len, unpack_bits};
+use crate::encoding_effort::EncodingEffort;
 
 const PLAIN: u8 = 0;
 const BYTE_STREAM_SPLIT: u8 = 1;
@@ -43,6 +45,10 @@ const DECIMAL: u8 = 5;
 
 /// `DECIMAL` header bit: values are rounded to a float, then widened.
 const SINGLE: u8 = 0x80;
+/// `DECIMAL` header bit: multiply by the rounded reciprocal instead of dividing.
+const MULTIPLY: u8 = 0x40;
+/// `DECIMAL` header bit: mantissas are eight byte planes, without an integer scheme tag.
+const BYTE_PLANES: u8 = 0x20;
 
 /// Powers of ten a decimal scale divides by. Each is an exact double, as is every mantissa below
 /// [`MAX_MANTISSA`], so `m / 10^k` is one correctly rounded division.
@@ -187,7 +193,14 @@ fn encode_rle(bits: &[u64], runs: usize) -> Vec<u8> {
 
 /// The value `mantissa` stands for under a `DECIMAL` header, as a raw bit pattern.
 fn decimal_value(mantissa: i64, header: u8) -> u64 {
-    let value = mantissa as f64 / POWERS[usize::from(header & 0x0f)];
+    let power = POWERS[usize::from(header & 0x0f)];
+    // Multiplication by a rounded reciprocal is intentionally distinct from division. DBC
+    // converters commonly produce the former, and the two operations can differ by one ULP.
+    let value = if header & MULTIPLY != 0 {
+        mantissa as f64 * (1.0 / power)
+    } else {
+        mantissa as f64 / power
+    };
     if header & SINGLE == 0 { value.to_bits() } else { f64::from(value as f32).to_bits() }
 }
 
@@ -238,12 +251,54 @@ fn encode_decimal(header: u8, packed: Vec<u8>) -> Vec<u8> {
     out
 }
 
+/// Find a scale for exact multiplication. Sampling can only discard an optional candidate;
+/// every emitted candidate is verified against every input bit pattern. Unlike division,
+/// multiplication by rounded reciprocals is not monotonic in the scale, so check each scale
+/// independently and do not carry a previous successful scale forward between values.
+fn multiplication_mantissas(bits: &[u64], max_scale: u8) -> Option<(u8, Vec<i64>)> {
+    if bits.len() < 2 { return None; }
+    let samples = bits.len().min(256);
+    for scale in 0..=max_scale {
+        let header = MULTIPLY | scale;
+        // Include both endpoints and spread interior samples over the entire physical column.
+        if !(0..samples).all(|i| {
+            let position = (i as u128 * (bits.len() - 1) as u128 / (samples - 1) as u128) as usize;
+            mantissa(bits[position], header).is_some()
+        }) {
+            continue;
+        }
+        if let Some(values) = bits.iter().map(|&b| mantissa(b, header)).collect::<Option<Vec<_>>>() {
+            return Some((header, values));
+        }
+    }
+    None
+}
+
+fn encode_decimal_planes(header: u8, mantissas: &[i64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + mantissas.len() * 8);
+    out.push(DECIMAL);
+    out.push(header | BYTE_PLANES);
+    for plane in 0..8 {
+        for &value in mantissas {
+            out.push(((value as u64) >> (8 * plane)) as u8);
+        }
+    }
+    out
+}
+
 /// Lazily encoded candidates worth zstd-measuring for this float column, each a full scheme byte +
 /// payload. `bits` are the raw `f64::to_bits` patterns; `decimal` also offers the `DECIMAL`
 /// scheme, once per integer scheme of its mantissas, after the others. The caller compresses each and keeps the
 /// smallest.
 #[must_use]
+#[allow(dead_code)] // Retained for baseline research examples and codec regression tests.
 pub fn candidates(bits: &[u64], decimal: bool) -> impl Iterator<Item = Vec<u8>> + '_ {
+    legacy_candidates(bits, decimal, EncodingEffort::Balanced)
+}
+
+fn legacy_candidates(
+    bits: &[u64], decimal: bool, effort: EncodingEffort,
+) -> impl Iterator<Item = Vec<u8>> + '_ {
     let stats = (!bits.is_empty()).then(|| scan(bits));
     let decimal = decimal
         && stats.is_some_and(|(cardinality, _)| cardinality != Some(1))
@@ -272,15 +327,45 @@ pub fn candidates(bits: &[u64], decimal: bool) -> impl Iterator<Item = Vec<u8>> 
     let decimals = std::iter::once(())
         .filter(move |()| decimal)
         .filter_map(move |()| decimal_mantissas(bits))
-        .flat_map(|(header, mantissas)| {
-            crate::adaptive_int::candidates(&mantissas)
+        .flat_map(move |(header, mantissas)| {
+            crate::adaptive_int::candidates_with_effort(&mantissas, effort)
                 .map(|packed| encode_decimal(header, packed))
                 .collect::<Vec<_>>()
         });
     fixed.chain(decimals)
 }
 
-/// Whether `candidate` is a `DECIMAL` stream, which only archive version 0.11 readers decode.
+/// Adaptive candidates controlled by a shared integer/float effort setting. Fast retains the
+/// established float codecs. Balanced adds sample-gated exact multiplication through scale 6
+/// with packed deltas or byte planes. Exhaustive also searches scales through 15, measures all
+/// integer schemes for the mantissas, and offers the legacy division/float32 modes.
+/// The caller measures final compressed size and retains the existing codec whenever it wins.
+#[must_use]
+pub fn candidates_with_effort(
+    bits: &[u64], effort: EncodingEffort,
+) -> impl Iterator<Item = Vec<u8>> + '_ {
+    let base = legacy_candidates(bits, effort == EncodingEffort::Exhaustive, effort);
+    let multiplication = std::iter::once(())
+        .filter(move |()| effort != EncodingEffort::Fast && bits.windows(2).any(|w| w[0] != w[1]))
+        .filter_map(move |()| multiplication_mantissas(bits, if effort == EncodingEffort::Balanced { 6 } else { 15 }))
+        .flat_map(move |(header, mantissas)| {
+            let mut streams: Vec<_> = if effort == EncodingEffort::Balanced {
+                crate::adaptive_int::packed_delta_candidate(&mantissas)
+                    .map(|packed| encode_decimal(header, packed))
+                    .into_iter().collect()
+            } else {
+                crate::adaptive_int::candidates_with_effort(&mantissas, effort)
+                    .map(|packed| encode_decimal(header, packed))
+                    .collect()
+            };
+            streams.push(encode_decimal_planes(header, &mantissas));
+            streams
+        });
+    base.chain(multiplication)
+}
+
+/// Whether `candidate` is a `DECIMAL` stream. Multiplication and byte planes require readers
+/// newer than the original version 0.11 decimal implementation.
 #[must_use]
 pub fn is_decimal(candidate: &[u8]) -> bool {
     candidate.first() == Some(&DECIMAL)
@@ -289,13 +374,27 @@ pub fn is_decimal(candidate: &[u8]) -> bool {
 /// The values of a `DECIMAL` payload: its header, then its mantissas in an integer scheme.
 fn decimal_values(
     rest: &[u8], row_count: usize,
-) -> Result<impl Iterator<Item = u64>, AdaptiveDecodeError> {
+) -> Result<impl Iterator<Item = u64> + '_, AdaptiveDecodeError> {
     let (&header, packed) = rest.split_first().ok_or(AdaptiveDecodeError::Truncated)?;
-    if header & !SINGLE >= POWERS.len() as u8 {
+    if header & 0x10 != 0 || header & (SINGLE | MULTIPLY) == (SINGLE | MULTIPLY) {
         return Err(AdaptiveDecodeError::Malformed);
     }
-    let mantissas = crate::adaptive_int::decode(packed, row_count)?;
-    Ok(mantissas.into_iter().map(move |m| decimal_value(m, header)))
+    let mantissas = if header & BYTE_PLANES == 0 {
+        Some(crate::adaptive_int::decode(packed, row_count)?)
+    } else {
+        let size = row_count.checked_mul(8).ok_or(AdaptiveDecodeError::Malformed)?;
+        if packed.len() < size { return Err(AdaptiveDecodeError::Truncated); }
+        None
+    };
+    Ok((0..row_count).map(move |row| {
+        let mantissa = match &mantissas {
+            Some(values) => values[row],
+            None => (0..8).fold(0i64, |value, plane| {
+                value | (i64::from(packed[plane * row_count + row]) << (8 * plane))
+            }),
+        };
+        decimal_value(mantissa, header)
+    }))
 }
 
 /// Decodes a column stream produced by any of the [`candidates`] schemes into `row_count` raw
@@ -600,5 +699,106 @@ mod tests {
         rle.extend_from_slice(&0u64.to_le_bytes());
         rle.extend_from_slice(&100u32.to_le_bytes());
         assert_eq!(decode(&rle, 3), Err(AdaptiveDecodeError::Malformed));
+    }
+
+    fn round_trip_effort(bits: &[u64], effort: EncodingEffort) -> Vec<Vec<u8>> {
+        let candidates: Vec<_> = candidates_with_effort(bits, effort).collect();
+        assert!(!candidates.is_empty());
+        let expected: Vec<_> = bits.iter().flat_map(|value| value.to_le_bytes()).collect();
+        for candidate in &candidates {
+            assert_eq!(decode(candidate, bits.len()).unwrap(), bits, "scheme {:?}", &candidate[..candidate.len().min(2)]);
+            let mut le = vec![0xa5; 3];
+            decode_to_le(candidate, bits.len(), &mut le).unwrap();
+            assert_eq!(&le[..3], &[0xa5; 3]);
+            assert_eq!(&le[3..], &expected);
+            for end in (0..candidate.len()).filter(|&i| i < 32 || i + 1 == candidate.len() || i % 997 == 0) {
+                assert_eq!(decode(&candidate[..end], bits.len()).map(|_| ()),
+                    decode_to_le(&candidate[..end], bits.len(), &mut Vec::new()),
+                    "truncation {end}, header {:?}", &candidate[..candidate.len().min(2)]);
+            }
+        }
+        candidates
+    }
+
+    #[test]
+    fn multiplication_uses_original_reconstruction_arithmetic() {
+        // Multiplying by the rounded reciprocal reproduces DBC arithmetic exactly. Dividing
+        // the same integer by the power of ten would silently change the lowest mantissa bit.
+        let values: Vec<_> = [-37i64, 0, 35, 79].into_iter()
+            .map(|value| (value as f64 * 0.01).to_bits()).collect();
+        assert_ne!((35.0_f64 / 100.0).to_bits(), values[2]);
+        assert_eq!(Some((MULTIPLY | 2, vec![-37, 0, 35, 79])), multiplication_mantissas(&values, 6));
+        let encoded = round_trip_effort(&values, EncodingEffort::Balanced);
+        assert!(encoded.iter().any(|bytes| bytes[..2] == [DECIMAL, MULTIPLY | 2]));
+        assert!(encoded.iter().any(|bytes| bytes[..2] == [DECIMAL, MULTIPLY | BYTE_PLANES | 2]));
+        assert!(candidates_with_effort(&values, EncodingEffort::Fast).all(|bytes| bytes[0] != DECIMAL));
+    }
+
+    #[test]
+    fn multiplication_effort_gates_rare_scales_and_preserves_legacy_candidates() {
+        let values: Vec<_> = [123_456_789i64, 123_456_791, -123_456_789].into_iter()
+            .map(|value| (value as f64 * 1e-8).to_bits()).collect();
+        assert!(multiplication_mantissas(&values, 6).is_none());
+        assert_eq!(Some((MULTIPLY | 8, vec![123_456_789, 123_456_791, -123_456_789])), multiplication_mantissas(&values, 15));
+        assert!(round_trip_effort(&values, EncodingEffort::Balanced).iter().all(|bytes| bytes[0] != DECIMAL));
+        assert!(round_trip_effort(&values, EncodingEffort::Exhaustive).iter()
+            .any(|bytes| bytes[0] == DECIMAL && bytes[1] & MULTIPLY != 0));
+        assert_eq!(candidates(&values, false).collect::<Vec<_>>(),
+            candidates_with_effort(&values, EncodingEffort::Fast).collect::<Vec<_>>());
+        assert!(candidates(&values, true).all(|bytes| bytes[0] != DECIMAL || bytes[1] & (MULTIPLY | BYTE_PLANES) == 0));
+    }
+
+    #[test]
+    fn multiplication_rejects_special_values_overflow_and_unsampled_exceptions() {
+        for special in [(-0.0_f64).to_bits(), f64::INFINITY.to_bits(), f64::NEG_INFINITY.to_bits(),
+            0x7ff0_0000_0000_0001, 0xfff8_dead_beef_0000, f64::MAX.to_bits(), MAX_MANTISSA.to_bits(),
+            (-MAX_MANTISSA).to_bits(), 1u64] {
+            let mut values: Vec<_> = (0..1024).map(|value| (f64::from(value) * 0.01).to_bits()).collect();
+            // Position 1 is absent from the 256 evenly spread samples: a passing sample must
+            // never replace the mandatory full-column exact reconstruction check.
+            values[1] = special;
+            assert!(multiplication_mantissas(&values, 15).is_none(), "bits {special:x}");
+            for effort in [EncodingEffort::Fast, EncodingEffort::Balanced, EncodingEffort::Exhaustive] {
+                assert!(round_trip_effort(&values, effort).iter()
+                    .all(|bytes| bytes[0] != DECIMAL || bytes[1] & MULTIPLY == 0));
+            }
+        }
+    }
+
+    #[test]
+    fn multiplication_empty_constant_and_planes_validate_headers() {
+        for effort in [EncodingEffort::Fast, EncodingEffort::Balanced, EncodingEffort::Exhaustive] {
+            assert_eq!(round_trip_effort(&[], effort), vec![vec![PLAIN]]);
+            for value in [(-0.0_f64).to_bits(), 0x7ff0_0000_0000_0001, 1.25_f64.to_bits()] {
+                let candidates = round_trip_effort(&[value; 8], effort);
+                assert_eq!(candidates.len(), 1);
+                assert_eq!(candidates[0][0], CONSTANT);
+            }
+        }
+        for header in [0x10, MULTIPLY | 0x10, BYTE_PLANES | 0x10, SINGLE | MULTIPLY, SINGLE | MULTIPLY | BYTE_PLANES] {
+            assert_eq!(decode(&[DECIMAL, header], 0), Err(AdaptiveDecodeError::Malformed));
+            assert_eq!(decode_to_le(&[DECIMAL, header], 0, &mut Vec::new()), Err(AdaptiveDecodeError::Malformed));
+        }
+        assert_eq!(decode(&[DECIMAL, MULTIPLY | BYTE_PLANES], 1), Err(AdaptiveDecodeError::Truncated));
+        assert_eq!(decode(&[DECIMAL, MULTIPLY | BYTE_PLANES], usize::MAX), Err(AdaptiveDecodeError::Malformed));
+    }
+
+    #[test]
+    fn multiplication_packed_deltas_cross_restart_blocks() {
+        let bits: Vec<_> = (0..65_545).map(|value| ((value as f64 - 32_000.0) * 0.01).to_bits()).collect();
+        let candidates: Vec<_> = candidates_with_effort(&bits, EncodingEffort::Balanced)
+            .filter(|candidate| candidate[0] == DECIMAL).collect();
+        assert_eq!(candidates.len(), 2);
+        for candidate in candidates {
+            assert_eq!(decode(&candidate, bits.len()).unwrap(), bits);
+            let mut bytes = Vec::new();
+            decode_to_le(&candidate, bits.len(), &mut bytes).unwrap();
+            assert_eq!(bytes, bits.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>());
+        }
+        // The exact-integer boundary is inclusive up to 2^53-1, and sign bits in byte planes
+        // must reconstruct the signed mantissa rather than an unsigned conversion to f64.
+        let extremes = [(-(MAX_MANTISSA - 1.0)).to_bits(), (MAX_MANTISSA - 1.0).to_bits()];
+        assert_eq!(Some((MULTIPLY, vec![-9_007_199_254_740_991, 9_007_199_254_740_991])), multiplication_mantissas(&extremes, 6));
+        round_trip_effort(&extremes, EncodingEffort::Balanced);
     }
 }

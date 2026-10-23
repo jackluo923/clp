@@ -3,14 +3,15 @@
 //! For every timestamp column of every schema table, the minimum and maximum epoch nanoseconds of
 //! each run of `chunk_rows` consecutive rows, in row order. A query's time window then bounds the
 //! rows that can match: a table none of whose chunks meets the window is skipped, and the rest are
-//! evaluated only over the span from the first to the last chunk that meets it. The columns are
-//! stored as before, so the index costs only its bounds. Readers that predate it skip the packet.
+//! evaluated only in the chunks that meet it, including disjoint runs. The index is independent
+//! of Zstd frames. New timestamp delta streams place absolute anchors at the same chunk boundaries;
+//! legacy streams remain readable but need their preceding delta chain to reach a selected row.
 use serde::{Deserialize, Serialize};
 
 pub const PACKET_TYPE: u8 = 0x81;
 
 /// Rows per chunk the writer uses. Readers take the value recorded in each packet.
-pub const CHUNK_ROWS: u32 = 65_536;
+pub const CHUNK_ROWS: u32 = crate::delta_blocks::ROWS as u32;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TimestampChunks {
@@ -107,6 +108,23 @@ impl TimestampChunks {
     #[must_use]
     pub fn column(&self, schema: i32, node: u32) -> Option<&ChunkColumn> {
         self.columns.iter().find(|column| column.schema == schema && column.node == node)
+    }
+
+    /// Disjoint candidate ranges, coalescing adjacent chunks. `None` means no usable index.
+    pub fn row_ranges(&self, schema: i32, node: u32, rows: usize, low: i64, high: i64)
+        -> Option<Vec<(usize, usize)>> {
+        let column = self.column(schema, node)?;
+        let chunk_rows = self.chunk_rows as usize;
+        if column.bounds.len() != rows.div_ceil(chunk_rows) { return None; }
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for (chunk, &[min, max]) in column.bounds.iter().enumerate() {
+            if low > high || min > high || max < low { continue; }
+            let start = chunk * chunk_rows;
+            let end = start.saturating_add(chunk_rows).min(rows);
+            if let Some(last) = ranges.last_mut().filter(|last| last.1 == start) { last.1 = end; }
+            else { ranges.push((start, end)); }
+        }
+        Some(ranges)
     }
 
     /// The rows of a `rows`-row table whose `node` values can lie in `[low, high]`.

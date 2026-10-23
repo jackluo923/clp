@@ -1,3 +1,4 @@
+use crate::timestamp_precision::{TimestampPrecision, TimestampRounding};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
@@ -117,9 +118,17 @@ pub struct TimestampRangeEntry {
     key: String,
     column_ids: Vec<i32>,
     bounds: TimestampBounds,
+    storage_precision: TimestampPrecision,
+    rounding: TimestampRounding,
+    restart_rows: usize,
 }
 
 impl TimestampRangeEntry {
+    /// Unit of the physical timestamp ticks (legacy fields use nanoseconds).
+    pub const fn storage_precision(&self) -> TimestampPrecision { self.storage_precision }
+    /// Quantization policy used by the writer.
+    pub const fn rounding(&self) -> TimestampRounding { self.rounding }
+
     /// Returns the authoritative column descriptor encoded by this entry.
     #[must_use]
     pub fn key(&self) -> &str {
@@ -173,6 +182,16 @@ pub struct TimestampDictionary {
 }
 
 impl TimestampDictionary {
+    pub(crate) fn restart_rows(&self, node: u32) -> usize {
+        self.ranges.iter().find(|r| r.column_ids.contains(&(node as i32))).map_or(0, |r| r.restart_rows)
+    }
+
+    /// Physical unit recorded for a timestamp node. Legacy dictionaries imply nanoseconds.
+    pub fn storage_precision(&self, node: u32) -> TimestampPrecision {
+        self.ranges.iter().find(|r| r.column_ids.iter().any(|id| *id >= 0 && *id as u32 == node))
+            .map_or(TimestampPrecision::Nanoseconds, |r| r.storage_precision)
+    }
+
     /// Decodes an owned timestamp-dictionary payload without duplicating its raw bytes.
     ///
     /// # Errors
@@ -333,9 +352,19 @@ fn decode_range(
     }
 
     let encoding = reader.read_u64("timestamp encoding")?;
+    let mut storage_precision = TimestampPrecision::Nanoseconds;
+    let mut rounding = TimestampRounding::Truncate;
     let bounds = match encoding {
         0 => TimestampBounds::Unknown,
-        1 => {
+        1 | 3 | 4 => {
+            if encoding >= 3 {
+                let scale = reader.read_u64("timestamp storage precision")?;
+                let mode = reader.read_u64("timestamp rounding")?;
+                storage_precision = TimestampPrecision::from_nanoseconds_per_tick(scale)
+                    .ok_or(TimestampDictionaryError::InvalidStoragePrecision { range_index, scale, rounding: mode })?;
+                rounding = TimestampRounding::from_wire(mode)
+                    .ok_or(TimestampDictionaryError::InvalidStoragePrecision { range_index, scale, rounding: mode })?;
+            }
             let start = reader.read_i64("integer epoch start")?;
             let end = reader.read_i64("integer epoch end")?;
             if start > end {
@@ -368,6 +397,9 @@ fn decode_range(
         key,
         column_ids,
         bounds,
+        storage_precision,
+        rounding,
+        restart_rows: if encoding == 4 { crate::delta_blocks::ROWS } else { 0 },
     })
 }
 
@@ -513,6 +545,8 @@ impl Display for TimestampDictionaryResource {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum TimestampDictionaryError {
+    /// A timestamp field specifies an unsupported physical unit or quantization policy.
+    InvalidStoragePrecision { range_index: u64, scale: u64, rounding: u64 },
     /// An encoded field ended before its fixed or declared size.
     Truncated {
         /// Field being decoded.
@@ -656,6 +690,8 @@ impl Display for TimestampDictionaryError {
                 formatter,
                 "timestamp dictionary range {range_index} repeats column ID {column_id}"
             ),
+            Self::InvalidStoragePrecision { range_index, scale, rounding } => write!(formatter,
+                "timestamp dictionary range {range_index} has invalid storage scale {scale} or rounding {rounding}"),
             Self::UnknownEncoding { range_index, value } => write!(
                 formatter,
                 "timestamp dictionary range {range_index} uses unknown encoding {value}"
@@ -733,6 +769,21 @@ mod tests {
         );
         for column_id in column_ids {
             append_i32(*column_id, output);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_precision_and_rounding() {
+        for (scale, rounding) in [(0, 0), (i64::MAX as u64 + 1, 0), (1, 2)] {
+            let mut payload = Vec::new();
+            append_u64(1, &mut payload);
+            append_range_prefix(b"ts", &[1], &mut payload);
+            for value in [3, scale, rounding] { append_u64(value, &mut payload); }
+            append_i64(0, &mut payload);
+            append_i64(1, &mut payload);
+            append_u64(0, &mut payload);
+            assert!(matches!(TimestampDictionary::decode(payload, TimestampDictionaryLimits::default()),
+                Err(TimestampDictionaryError::InvalidStoragePrecision { .. })));
         }
     }
 
@@ -848,14 +899,14 @@ mod tests {
         let mut payload = Vec::new();
         append_u64(1, &mut payload);
         append_range_prefix(b"ts", &[1], &mut payload);
-        append_u64(3, &mut payload);
+        append_u64(5, &mut payload);
         append_u64(0, &mut payload);
 
         assert!(matches!(
             TimestampDictionary::decode(payload, TimestampDictionaryLimits::default()),
             Err(TimestampDictionaryError::UnknownEncoding {
                 range_index: 0,
-                value: 3
+                value: 5
             })
         ));
     }

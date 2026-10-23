@@ -80,6 +80,7 @@ fn timestamp_prefilters_match_source_integers_in_every_unit() {
         (r"\L", 1_000_000),
         (r"\C", 1_000),
         (r"\N", 1),
+        (r"\K{100000}", 100_000),
     ] {
         let bytes = timestamp_bytes(&[pattern], &epochs, false);
         let cat = catalog(&bytes);

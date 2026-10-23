@@ -2404,13 +2404,7 @@ pub unsafe extern "C" fn clp_s_v7_prepared_archive_free(prepared: *mut ClpSV7Pre
 fn timestamp_integer_scale(patterns: &[clp_s::archive::TimestampPatternEntry]) -> i64 {
     let mut scale = 0;
     for pattern in patterns {
-        let current = match pattern.raw() {
-            r"\E" => 1_000_000_000,
-            r"\L" => 1_000_000,
-            r"\C" => 1_000,
-            r"\N" => 1,
-            _ => return 0,
-        };
+        let Some(current) = clp_s::timestamp::integer_pattern_scale(pattern.raw()) else { return 0; };
         if scale != 0 && scale != current {
             return 0;
         }

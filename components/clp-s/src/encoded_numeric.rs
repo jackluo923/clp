@@ -1,4 +1,4 @@
-//! Reader-only numeric representations. No tags or bytes written to archives change.
+//! Compact numeric views over decompressed encoded bytes.
 use std::iter::FusedIterator;
 use crate::adaptive_int::{AdaptiveDecodeError as Error, unpack_bits_iter};
 
@@ -13,11 +13,14 @@ pub enum NumericEncoding {
     Dictionary,
     /// Value/end pairs; cumulative ends replace the wire run lengths.
     RunEnds,
+    /// Persisted absolute anchors and packed deltas, independently restartable per chunk.
+    BlockDelta,
 }
 
 pub(crate) fn encoding(bytes: &[u8], float: bool) -> Option<NumericEncoding> {
     match (bytes.first().copied()?, float) {
         (5, false) | (3, true) => Some(NumericEncoding::Constant),
+        (crate::delta_blocks::SCHEME, false) => Some(NumericEncoding::BlockDelta),
         (1, false) => Some(NumericEncoding::FrameOfReference),
         (3, false) | (2, true) => Some(NumericEncoding::Dictionary),
         (4, _) => Some(NumericEncoding::RunEnds),
@@ -131,6 +134,10 @@ pub(crate) fn prepare(bytes: &[u8], rows: usize, float: bool, out: &mut Vec<u8>)
     let Some(encoding) = encoding(bytes, float) else { return Ok(None); };
     let rest = &bytes[1..];
     match encoding {
+        NumericEncoding::BlockDelta => {
+            let view = crate::delta_blocks::View::new(rest, rows)?;
+            out.extend_from_slice(&rest[..view.wire_len()]);
+        }
         NumericEncoding::Constant => out.extend_from_slice(rest.get(..8).ok_or(Error::Truncated)?),
         NumericEncoding::FrameOfReference => {
             let (_, width, _) = frame_of_reference(rest, rows)?;
@@ -186,6 +193,7 @@ impl<'a> NumericColumn<'a> {
     /// Validate independently: public table-decoder callers may supply their own slots.
     pub(crate) fn encoded(bytes: &'a [u8], rows: usize, encoding: NumericEncoding) -> Result<Self, Error> {
         match encoding {
+            NumericEncoding::BlockDelta => { crate::delta_blocks::View::new(bytes, rows)?; }
             NumericEncoding::Constant => { u64_at(bytes, 0)?; }
             NumericEncoding::FrameOfReference => { frame_of_reference(bytes, rows)?; }
             NumericEncoding::Dictionary => {
@@ -227,6 +235,7 @@ impl<'a> NumericColumn<'a> {
             return None;
         }
         match self.encoding {
+            Some(NumericEncoding::BlockDelta) => None,
             None => self.bytes.as_chunks::<8>().0.iter().map(|bytes| u64::from_le_bytes(*bytes)).max(),
             Some(NumericEncoding::Constant) => u64_at(self.bytes, 0).ok(),
             Some(NumericEncoding::FrameOfReference) => {
@@ -252,6 +261,22 @@ impl<'a> NumericColumn<'a> {
         let max_offset = (1_i128 << self.bytes[8]) - 1;
         let high = i64::try_from(i128::from(base) + max_offset).ok()?;
         Some((base, high))
+    }
+    pub(crate) fn linear(self) -> Option<(u64, u64)> {
+        if self.is_block_delta() {
+            let (first, step) = self.delta_view().linear()?;
+            Some((first.checked_add(step.checked_mul(self.offset as u64)?)?, step))
+        } else { self.constant().map(|v| (v, 0)) }
+    }
+    pub(crate) fn is_block_delta(self) -> bool { self.encoding == Some(NumericEncoding::BlockDelta) }
+    fn delta_view(self) -> crate::delta_blocks::View<'a> {
+        crate::delta_blocks::View::from_validated(self.bytes, self.offset + self.len)
+    }
+    pub(crate) fn get_with_previous(self, previous: Option<(usize, u64)>, row: usize) -> Option<u64> {
+        if row >= self.len { return None; }
+        if self.encoding == Some(NumericEncoding::BlockDelta) {
+            self.delta_view().from_previous(previous.map(|(at, value)| (at + self.offset, value)), row + self.offset)
+        } else { self.get(row) }
     }
     /// Returns the value at `row`, keeping `run` as a cursor into a run-encoded column so that
     /// reads in increasing row order cost amortized O(1) rather than a search per row. Other
@@ -322,6 +347,7 @@ impl<'a> NumericColumn<'a> {
         if index >= self.len { return None; }
         let row = self.offset + index;
         Some(match self.encoding {
+            Some(NumericEncoding::BlockDelta) => self.delta_view().get(row)?,
             None => u64_at(self.bytes, row * 8).unwrap(),
             Some(NumericEncoding::Constant) => u64_at(self.bytes, 0).unwrap(),
             Some(NumericEncoding::FrameOfReference) => u64_at(self.bytes, 0).unwrap()
@@ -338,7 +364,7 @@ impl<'a> NumericColumn<'a> {
         Some(match self.encoding? {
             NumericEncoding::Constant => check(u64_at(self.bytes, 0).unwrap()),
             // Arbitrary validators are not monotone; endpoints cannot prove them.
-            NumericEncoding::FrameOfReference => return None,
+            NumericEncoding::BlockDelta | NumericEncoding::FrameOfReference => return None,
             NumericEncoding::Dictionary => {
                 let (_, values, _, _) = dictionary(self.bytes).unwrap();
                 values.chunks_exact(8).all(|v| check(u64::from_le_bytes(v.try_into().unwrap())))
@@ -358,6 +384,7 @@ impl<'a> NumericColumn<'a> {
     pub(crate) fn append_bits(self, output: &mut Vec<u64>) {
         output.reserve(self.len);
         match self.encoding {
+            Some(NumericEncoding::BlockDelta) => output.extend(self.delta_view().iter_from(self.offset).take(self.len)),
             None => output.extend(self.bytes.as_chunks::<8>().0.iter().copied().map(u64::from_le_bytes)),
             Some(NumericEncoding::Constant) => output.resize(output.len() + self.len, u64_at(self.bytes, 0).unwrap()),
             Some(NumericEncoding::FrameOfReference) => {
@@ -390,7 +417,8 @@ impl<'a> NumericColumn<'a> {
         let (front_run, back_run) = if self.len != 0 && self.encoding == Some(NumericEncoding::RunEnds) {
             (self.find_run(self.offset), self.find_run(self.offset + self.len - 1))
         } else { (0, 0) };
-        NumericIter { column: self, front: 0, back: self.len, front_run, back_run }
+        NumericIter { column: self, front: 0, back: self.len, front_run, back_run, front_value: None, back_value: None,
+            delta: self.is_block_delta().then(|| self.delta_view()) }
     }
 
     /// OR matching rows into an existing bitmap without expanding values. Returns
@@ -404,6 +432,11 @@ impl<'a> NumericColumn<'a> {
         let bitmap = &mut bitmap[..count];
         let start = self.offset + skip;
         match encoding {
+            NumericEncoding::BlockDelta => {
+                for (dest, value) in bitmap.iter_mut().zip(self.delta_view().iter_from(start)) {
+                    if matches(value) { *dest = truth; }
+                }
+            }
             NumericEncoding::Constant => {
                 if matches(u64_at(self.bytes, 0).unwrap()) { bitmap.fill(truth); }
             }
@@ -461,6 +494,9 @@ pub(crate) struct NumericIter<'a> {
     back: usize,
     front_run: usize,
     back_run: usize,
+    front_value: Option<(usize, u64)>,
+    back_value: Option<(usize, u64)>,
+    delta: Option<crate::delta_blocks::View<'a>>,
 }
 impl Iterator for NumericIter<'_> {
     type Item = u64;
@@ -471,7 +507,19 @@ impl Iterator for NumericIter<'_> {
         if self.column.encoding == Some(NumericEncoding::RunEnds) {
             while self.column.run_end(self.front_run) <= self.column.offset + row { self.front_run += 1; }
             Some(self.column.run_value(self.front_run))
+        } else if let Some(delta) = self.delta {
+            let row = row + self.column.offset;
+            let value = delta.from_previous(self.front_value, row)?;
+            self.front_value = Some((row, value));
+            Some(value)
         } else { self.column.get(row) }
+    }
+    fn nth(&mut self, n: usize) -> Option<u64> {
+        self.front = self.front.saturating_add(n).min(self.back);
+        if self.column.encoding == Some(NumericEncoding::RunEnds) && self.front < self.back {
+            self.front_run = self.column.find_run(self.column.offset + self.front);
+        }
+        self.next()
     }
     fn size_hint(&self) -> (usize, Option<usize>) { let n = self.back - self.front; (n, Some(n)) }
 }
@@ -484,8 +532,21 @@ impl DoubleEndedIterator for NumericIter<'_> {
                 self.back_run -= 1;
             }
             Some(self.column.run_value(self.back_run))
+        } else if let Some(delta) = self.delta {
+            let row = self.back + self.column.offset;
+            let value = delta.from_previous(self.back_value, row)?;
+            self.back_value = Some((row, value));
+            Some(value)
         } else { self.column.get(self.back) }
     }
+    fn nth_back(&mut self, n: usize) -> Option<u64> {
+        self.back = self.back.saturating_sub(n).max(self.front);
+        if self.column.encoding == Some(NumericEncoding::RunEnds) && self.front < self.back {
+            self.back_run = self.column.find_run(self.column.offset + self.back - 1);
+        }
+        self.next_back()
+    }
+
 }
 impl ExactSizeIterator for NumericIter<'_> {}
 impl FusedIterator for NumericIter<'_> {}

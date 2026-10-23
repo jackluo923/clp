@@ -12,7 +12,10 @@
 //! Schemes:
 //! - `PLAIN` — raw 8-byte little-endian (today's behaviour; always a safe fallback).
 //! - `FOR` — frame-of-reference: subtract the column minimum, bit-pack the offsets.
-//! - `DELTA` — store the first value, then frame-of-reference + bit-pack the first differences.
+//! - `DELTA` — legacy continuous first differences (read only).
+//! - `BLOCK_DELTA` — an absolute value per 65,536 rows, then packed first differences.
+//!   Also tried with raw 64-bit differences: Zstd can favor their regular byte layout.
+//!   Multi-chunk columns also try independent delta minima/widths per chunk.
 //! - `DICT` — a table of the distinct values plus bit-packed indices into it.
 //! - `RLE` — `(value, run-length)` pairs.
 //! - `CONSTANT` — a single value (the whole column is one number).
@@ -22,6 +25,16 @@
 
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
+
+use crate::encoding_effort::EncodingEffort;
+
+// Detailed planning is currently used by the experimental timestamp codec benchmark. Keep it
+// separate from the default path so existing encoders do not pay for statistics they cannot use.
+#[allow(dead_code)]
+#[path = "adaptive_int_selection.rs"]
+mod selection;
+#[allow(unused_imports)]
+pub(crate) use selection::analyze_candidates;
 
 const PLAIN: u8 = 0;
 const FOR: u8 = 1;
@@ -157,6 +170,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, AdaptiveDecodeError> {
 }
 
 /// One-pass column statistics used to pick which schemes to try.
+#[derive(Clone, Copy)]
 struct Stats {
     min: i64,
     max: i64,
@@ -169,6 +183,12 @@ struct Stats {
 }
 
 fn scan(values: &[i64]) -> Stats {
+    scan_observed(values, |_, _, _| {})
+}
+
+/// The optional observer shares the existing scan, including transitions into restart anchors.
+/// The empty observer in `scan` is monomorphized away on the normal encoding path.
+fn scan_observed(values: &[i64], mut observe: impl FnMut(usize, i64, i64)) -> Stats {
     let mut min = values[0];
     let mut max = values[0];
     let mut runs = 1usize;
@@ -177,8 +197,9 @@ fn scan(values: &[i64]) -> Stats {
     let mut min_delta = i64::MAX;
     let mut max_delta = i64::MIN;
     distinct.insert(values[0], ());
-    for window in values.windows(2) {
+    for (index, window) in values.windows(2).enumerate() {
         let (prev, cur) = (window[0], window[1]);
+        observe(index + 1, prev, cur);
         if cur < min {
             min = cur;
         }
@@ -191,6 +212,7 @@ fn scan(values: &[i64]) -> Stats {
         if distinct.len() <= MAX_DICT_CARDINALITY {
             distinct.insert(cur, ());
         }
+        if (index + 1) % crate::delta_blocks::ROWS == 0 { continue; }
         match cur.checked_sub(prev) {
             Some(delta) => {
                 if delta < min_delta {
@@ -248,19 +270,75 @@ fn encode_for(values: &[i64], min: i64, span: u64) -> Vec<u8> {
 }
 
 fn encode_delta(values: &[i64], min_delta: i64, max_delta: i64) -> Option<Vec<u8>> {
-    let span = span(min_delta, max_delta)?;
-    let width = bit_width_for(span);
-    let mut out = Vec::with_capacity(1 + 8 + 8 + 1 + packed_len(values.len() - 1, width));
-    out.push(DELTA);
-    out.extend_from_slice(&values[0].to_le_bytes());
+    let width = bit_width_for(span(min_delta, max_delta)?);
+    let mut out = vec![crate::delta_blocks::SCHEME];
     out.extend_from_slice(&min_delta.to_le_bytes());
     out.push(width);
-    let offsets = values.windows(2).map(|w| {
-        let delta = w[1] - w[0];
-        (delta as u64).wrapping_sub(min_delta as u64)
-    });
-    pack_bits_iter(offsets, width, &mut out);
+    for block in values.chunks(crate::delta_blocks::ROWS) {
+        out.extend_from_slice(&block[0].to_le_bytes());
+        pack_bits_iter(block.windows(2).map(|w| ((w[1] - w[0]) as u64).wrapping_sub(min_delta as u64)), width, &mut out);
+    }
     Some(out)
+}
+
+fn encode_fixed_delta(values: &[i64]) -> Vec<u8> {
+    // Existing block-delta layout with minimum=0 and width=64: the offsets are
+    // little-endian delta words, without bit packing or minimum subtraction.
+    let mut out = Vec::with_capacity(10 + values.len() * 8);
+    out.push(crate::delta_blocks::SCHEME);
+    out.extend_from_slice(&0i64.to_le_bytes());
+    out.push(64);
+    for block in values.chunks(crate::delta_blocks::ROWS) {
+        out.extend_from_slice(&block[0].to_le_bytes());
+        for pair in block.windows(2) {
+            // Modular differences preserve every signed/unsigned bit pattern,
+            // including transitions across the signed boundary.
+            out.extend_from_slice(&pair[1].wrapping_sub(pair[0]).to_le_bytes());
+        }
+    }
+    out
+}
+
+fn encode_local_delta(values: &[i64]) -> Vec<u8> {
+    use crate::delta_blocks::{LOCAL_WIDTH, ROWS, SCHEME};
+    let blocks = values.len().div_ceil(ROWS);
+    let mut out = Vec::with_capacity(10 + (blocks + 1) * 8 + values.len() * 8 + blocks * 9);
+    out.push(SCHEME);
+    out.extend_from_slice(&(values.len() as u64).to_le_bytes());
+    out.push(LOCAL_WIDTH);
+    out.resize(10 + (blocks + 1) * 8, 0);
+    for (index, block) in values.chunks(ROWS).enumerate() {
+        let offset = (out.len() - 1) as u64; // Offsets are relative to the payload after the scheme tag.
+        out[10 + index * 8..18 + index * 8].copy_from_slice(&offset.to_le_bytes());
+        let deltas = || block.windows(2).map(|w| w[1].wrapping_sub(w[0]));
+        let mut range = deltas();
+        let first = range.next().unwrap_or(0);
+        let (min, max) = range.fold((first, first), |(lo, hi), v| (lo.min(v), hi.max(v)));
+        let width = bit_width_for((max as u64).wrapping_sub(min as u64));
+        out.extend_from_slice(&min.to_le_bytes());
+        out.push(width);
+        out.extend_from_slice(&block[0].to_le_bytes());
+        pack_bits_iter(deltas().map(|v| (v as u64).wrapping_sub(min as u64)), width, &mut out);
+    }
+    let end = (out.len() - 1) as u64;
+    out[10 + blocks * 8..18 + blocks * 8].copy_from_slice(&end.to_le_bytes());
+    out
+}
+
+/// Build only the packed-delta candidate, without collecting dictionary cardinality or runs.
+/// Float mantissas use this path when the effort policy requests the measured decimal pair.
+pub(crate) fn packed_delta_candidate(values: &[i64]) -> Option<Vec<u8>> {
+    if values.len() < 2 {
+        return None;
+    }
+    if values.len() > crate::delta_blocks::ROWS {
+        return Some(encode_local_delta(values));
+    }
+    let (min, max) = values.windows(2).try_fold((i64::MAX, i64::MIN), |(min, max), pair| {
+        let delta = pair[1].checked_sub(pair[0])?;
+        Some((min.min(delta), max.max(delta)))
+    })?;
+    encode_delta(values, min, max)
 }
 
 fn encode_dict(values: &[i64], cardinality: usize) -> Vec<u8> {
@@ -308,11 +386,28 @@ fn encode_rle(values: &[i64], runs: usize) -> Vec<u8> {
 /// column. The caller compresses each and keeps the smallest. `PLAIN` is always present as a floor,
 /// except for a constant column, where `CONSTANT` alone is unbeatable.
 #[must_use]
+#[allow(dead_code)] // Retained for baseline research examples and codec regression tests.
 pub fn candidates(values: &[i64]) -> impl Iterator<Item = Vec<u8>> + '_ {
+    candidates_with_effort(values, EncodingEffort::Balanced)
+}
+
+/// Candidate search effort is independent of the Zstd compression level. Fast retains fixed-width
+/// deltas and one packed-delta layout per column; balanced retains every established candidate; exhaustive also
+/// measures RLE when repeated values occur too sparsely for the usual eligibility threshold.
+#[must_use]
+pub fn candidates_with_effort(values: &[i64], effort: EncodingEffort) -> impl Iterator<Item = Vec<u8>> + '_ {
     let stats = (!values.is_empty()).then(|| scan(values));
+    candidates_from_stats_with_effort(values, stats, effort)
+}
+
+fn candidates_from_stats(values: &[i64], stats: Option<Stats>) -> impl Iterator<Item = Vec<u8>> + '_ {
+    candidates_from_stats_with_effort(values, stats, EncodingEffort::Balanced)
+}
+
+fn candidates_from_stats_with_effort(values: &[i64], stats: Option<Stats>, effort: EncodingEffort) -> impl Iterator<Item = Vec<u8>> + '_ {
     // Keep the historical candidate and tie-break order, but construct only the candidate
     // being measured. Losing buffers are released before the next encoding is generated.
-    (0..5).filter_map(move |scheme| {
+    (0..7).filter_map(move |scheme| {
         let Some(stats) = &stats else {
             return (scheme == 0).then(|| vec![PLAIN]);
         };
@@ -322,14 +417,18 @@ pub fn candidates(values: &[i64]) -> impl Iterator<Item = Vec<u8>> + '_ {
         match scheme {
             0 => Some(encode_plain(values)),
             1 => span(stats.min, stats.max).map(|span| encode_for(values, stats.min, span)),
-            2 => stats
+            2 if effort != EncodingEffort::Fast || values.len() <= crate::delta_blocks::ROWS => stats
                 .delta_range
                 .and_then(|(min, max)| encode_delta(values, min, max)),
             3 => stats
                 .small_cardinality
                 .filter(|&n| n < values.len())
                 .map(|n| encode_dict(values, n)),
-            4 if stats.runs * 2 < values.len() => Some(encode_rle(values, stats.runs)),
+            4 if stats.runs * 2 < values.len()
+                || (effort == EncodingEffort::Exhaustive && stats.runs < values.len()) => Some(encode_rle(values, stats.runs)),
+            // Append to preserve historical tie-breaking between existing codecs.
+            5 => Some(encode_fixed_delta(values)),
+            6 if values.len() > crate::delta_blocks::ROWS => Some(encode_local_delta(values)),
             _ => None,
         }
     })
@@ -367,6 +466,9 @@ pub fn decode(bytes: &[u8], row_count: usize) -> Result<Vec<i64>, AdaptiveDecode
                 .into_iter()
                 .map(|off| (min as u64).wrapping_add(off) as i64)
                 .collect())
+        }
+        crate::delta_blocks::SCHEME => {
+            Ok(crate::delta_blocks::View::new(rest, row_count)?.iter_from(0).map(|v| v as i64).collect())
         }
         DELTA => {
             if row_count == 0 {
@@ -453,6 +555,11 @@ pub(crate) fn decode_to_le(
             out.reserve(size);
             for offset in offsets { out.extend_from_slice(&min.wrapping_add(offset).to_le_bytes()); }
         }
+        crate::delta_blocks::SCHEME => {
+            for value in crate::delta_blocks::View::new(rest, row_count)?.iter_from(0) {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
         DELTA => {
             if row_count == 0 { return Ok(()); }
             let mut running = read_i64(rest, 0)? as u64;
@@ -521,9 +628,10 @@ mod tests {
         for scheme in [
             super::PLAIN,
             super::FOR,
-            super::DELTA,
+            crate::delta_blocks::SCHEME,
             super::DICT,
             super::RLE,
+            crate::delta_blocks::SCHEME,
         ] {
             let candidate = candidates.next().expect("candidate in historical order");
             assert_eq!(scheme, candidate[0]);
@@ -531,6 +639,74 @@ mod tests {
         }
         assert_eq!(None, candidates.next());
         assert_eq!(None, candidates.next());
+    }
+
+    #[test]
+    fn effort_menus_are_nested_and_keep_balanced_candidates() {
+        for rows in [20, crate::delta_blocks::ROWS + 4] {
+            // One repeated pair in four values: RLE is eligible only at exhaustive effort.
+            let values: Vec<_> = (0..rows).map(|i| [1, 1, 3, 2][i % 4]).collect();
+            let fast: Vec<_> = super::candidates_with_effort(&values, EncodingEffort::Fast).collect();
+            let balanced: Vec<_> = super::candidates_with_effort(&values, EncodingEffort::Balanced).collect();
+            let exhaustive: Vec<_> = super::candidates_with_effort(&values, EncodingEffort::Exhaustive).collect();
+            if rows > crate::delta_blocks::ROWS {
+                assert!(fast.len() < balanced.len());
+            } else {
+                assert_eq!(fast, balanced);
+            }
+            assert!(balanced.len() < exhaustive.len());
+            assert!(fast.iter().all(|wire| balanced.contains(wire)));
+            assert!(balanced.iter().all(|wire| exhaustive.contains(wire)));
+            assert_eq!(balanced, super::candidates(&values).collect::<Vec<_>>());
+            let fixed = encode_fixed_delta(&values);
+            assert!(fast.contains(&fixed));
+            let delta_candidates: Vec<_> = fast.iter().filter(|wire| wire[0] == crate::delta_blocks::SCHEME && wire.as_slice() != fixed.as_slice()).collect();
+            assert_eq!(delta_candidates.len(), 1);
+            assert_eq!(delta_candidates[0][9] == crate::delta_blocks::LOCAL_WIDTH,
+                rows > crate::delta_blocks::ROWS);
+            assert!(exhaustive.iter().any(|wire| wire[0] == RLE));
+            for wire in exhaustive {
+                assert_eq!(super::decode(&wire, values.len()).unwrap(), values);
+            }
+        }
+    }
+
+    #[test]
+    fn every_effort_preserves_empty_constant_and_extreme_columns() {
+        for values in [vec![], vec![i64::MIN; 4], vec![i64::MAX],
+            vec![i64::MIN, i64::MAX, 0, 0, -1, 1]] {
+            for effort in [EncodingEffort::Fast, EncodingEffort::Balanced, EncodingEffort::Exhaustive] {
+                let candidates: Vec<_> = super::candidates_with_effort(&values, effort).collect();
+                assert!(!candidates.is_empty());
+                if values.is_empty() || values.iter().all(|v| *v == values[0]) {
+                    assert_eq!(candidates.len(), 1);
+                }
+                for wire in candidates {
+                    assert_eq!(super::decode(&wire, values.len()).unwrap(), values);
+                    let mut bytes = Vec::new();
+                    super::decode_to_le(&wire, values.len(), &mut bytes).unwrap();
+                    assert_eq!(bytes, values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_delta_only_candidate_handles_boundaries_and_overflow() {
+        assert!(packed_delta_candidate(&[]).is_none());
+        assert!(packed_delta_candidate(&[42]).is_none());
+        assert!(packed_delta_candidate(&[i64::MIN, i64::MAX]).is_none());
+        for rows in [2, crate::delta_blocks::ROWS, crate::delta_blocks::ROWS + 1] {
+            let values: Vec<_> = (0..rows).map(|i| (i / 3) as i64).collect();
+            let wire = packed_delta_candidate(&values).unwrap();
+            assert_eq!(decode(&wire, rows).unwrap(), values);
+            assert_eq!(wire[9] == crate::delta_blocks::LOCAL_WIDTH,
+                rows > crate::delta_blocks::ROWS);
+        }
+        let extremes: Vec<_> = (0..crate::delta_blocks::ROWS + 1)
+            .map(|i| if i % 2 == 0 { i64::MIN } else { i64::MAX }).collect();
+        let wire = packed_delta_candidate(&extremes).unwrap();
+        assert_eq!(decode(&wire, extremes.len()).unwrap(), extremes);
     }
     use super::*;
 
@@ -605,6 +781,28 @@ mod tests {
     fn negatives_and_extremes() {
         round_trip(&[i64::MIN, i64::MAX, 0, -1, 1, i64::MIN, i64::MAX]);
         round_trip(&[-100, -50, -50, -50, 0, 50, 100]);
+    }
+
+    #[test]
+    fn fixed_delta_words_wrap_and_restart_without_a_new_wire_tag() {
+        let rows = crate::delta_blocks::ROWS;
+        let values: Vec<_> = (0..rows + 2)
+            .map(|i| [i64::MIN, i64::MAX, -1, 0, 1][i % 5])
+            .collect();
+        let wire = encode_fixed_delta(&values);
+        assert_eq!(wire.len(), 10 + values.len() * 8);
+        assert_eq!(&wire[..10], &[crate::delta_blocks::SCHEME, 0, 0, 0, 0, 0, 0, 0, 0, 64]);
+        for row in [0, 1, 2, rows - 1, rows, rows + 1] {
+            let word = i64::from_le_bytes(wire[10 + row * 8..18 + row * 8].try_into().unwrap());
+            assert_eq!(word, if row % rows == 0 { values[row] }
+                else { values[row].wrapping_sub(values[row - 1]) });
+        }
+        assert_eq!(decode(&wire, values.len()).unwrap(), values);
+        let mut output = Vec::new();
+        decode_to_le(&wire, values.len(), &mut output).unwrap();
+        assert_eq!(output, values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+        assert!(decode(&wire[..wire.len() - 1], values.len()).is_err());
+        assert!(candidates(&values).any(|candidate| candidate == wire));
     }
 
     #[test]

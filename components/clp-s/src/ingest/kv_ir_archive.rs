@@ -710,7 +710,7 @@ impl KvIrArchiveStats {
 struct SchemaNode {
     key: Vec<u8>,
     parent: u32,
-    timestamp_prefix_length: Option<u32>,
+    timestamp_resolver_index: Option<std::num::NonZeroU32>,
     node_type: KvIrNodeType,
 }
 
@@ -720,7 +720,7 @@ impl SchemaNode {
             parent: 0,
             key: Vec::new(),
             node_type: KvIrNodeType::Object,
-            timestamp_prefix_length: None,
+            timestamp_resolver_index: None,
         }
     }
 
@@ -728,10 +728,6 @@ impl SchemaNode {
         usize::try_from(self.parent).expect("validated schema parent ID fits usize")
     }
 
-    fn timestamp_prefix_length(&self) -> Option<usize> {
-        self.timestamp_prefix_length
-            .and_then(|length| usize::try_from(length).ok())
-    }
 }
 
 #[derive(Debug, Default)]
@@ -799,7 +795,7 @@ impl SchemaTree {
             key,
             parent: node.parent_id(),
             node_type: node.node_type(),
-            timestamp_prefix_length: None,
+            timestamp_resolver_index: None,
         });
         self.update_timestamp_prefix(actual, node.namespace(), resolver);
         Ok(())
@@ -811,9 +807,7 @@ impl SchemaTree {
         resolver: Option<&KvIrTimestampResolver>,
     ) {
         if let Some(root) = self.nodes.first_mut() {
-            root.timestamp_prefix_length = resolver
-                .is_some_and(|resolver| resolver.namespace() == Some(namespace))
-                .then_some(0);
+            root.timestamp_resolver_index = None;
         }
         for node_id in 1..self.nodes.len() {
             self.update_timestamp_prefix(node_id, namespace, resolver);
@@ -826,21 +820,18 @@ impl SchemaTree {
         namespace: KvIrNamespace,
         resolver: Option<&KvIrTimestampResolver>,
     ) {
-        let Some(resolver) = resolver.filter(|value| value.namespace() == Some(namespace)) else {
-            self.nodes[node_id].timestamp_prefix_length = None;
-            return;
-        };
-        let parent = self.nodes[node_id].parent();
-        let Some(prefix_length) = self.nodes[parent].timestamp_prefix_length else {
-            self.nodes[node_id].timestamp_prefix_length = None;
-            return;
-        };
-        let prefix_index = usize::try_from(prefix_length).ok();
-        self.nodes[node_id].timestamp_prefix_length = prefix_index
-            .and_then(|prefix_index| resolver.path().components().get(prefix_index))
-            .is_some_and(|component| component.as_bytes() == self.nodes[node_id].key)
-            .then(|| prefix_length.checked_add(1))
-            .flatten();
+        // Resolve once per schema node; data rows use the cached resolver index.
+        self.nodes[node_id].timestamp_resolver_index = resolver.and_then(|root| {
+            root.resolvers().enumerate().find_map(|(index, field)| {
+                if field.namespace() != Some(namespace) { return None; }
+                let mut current = node_id;
+                for component in field.path().components().iter().rev() {
+                    if current == 0 || self.nodes[current].key != component.as_bytes() { return None; }
+                    current = self.nodes[current].parent();
+                }
+                (current == 0).then(|| std::num::NonZeroU32::new(u32::try_from(index + 1).expect("bounded timestamp fields")).unwrap())
+            })
+        });
     }
 }
 
@@ -854,6 +845,7 @@ struct ScratchSpan {
 struct PlannedTimestamp {
     epoch_nanoseconds: i64,
     pattern: &'static str,
+    resolver_index: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1569,10 +1561,8 @@ where
         let mut timestamp = None;
         let unstructured_array =
             self.tree(namespace).nodes[node_id].node_type == KvIrNodeType::UnstructuredArray;
-        let timestamp_resolver = resolver.filter(|resolver| {
-            self.tree(namespace).nodes[node_id].timestamp_prefix_length()
-                == Some(resolver.path().components().len())
-        });
+        let timestamp_index = self.tree(namespace).nodes[node_id].timestamp_resolver_index.map(|v| (v.get() - 1) as usize);
+        let timestamp_resolver = resolver.zip(timestamp_index).map(|(r, i)| r.resolver_at(i));
         match pair.value().kind() {
             super::KvIrValueKind::Float { bits } if !f64::from_bits(bits).is_finite() => {
                 return Err(KvIrArchiveFailure::Unsupported {
@@ -1586,13 +1576,14 @@ where
                 timestamp = Some(Self::resolve_integer_timestamp(
                     namespace,
                     pair.node_id(),
+                    timestamp_resolver.unwrap(),
                     value.value(),
                 )?);
                 reconstructed = Some(span);
             }
             super::KvIrValueKind::Float { bits } if timestamp_resolver.is_some() => {
                 let span = self.reconstruct_fixed_nine_float(f64::from_bits(bits))?;
-                timestamp = Some(self.resolve_float_timestamp(namespace, pair.node_id(), span)?);
+                timestamp = Some(self.resolve_float_timestamp(namespace, pair.node_id(), timestamp_resolver.unwrap(), span)?);
                 reconstructed = Some(span);
             }
             super::KvIrValueKind::String(value) if timestamp_resolver.is_some() => {
@@ -1600,6 +1591,7 @@ where
                 timestamp = Some(Self::resolve_string_timestamp(
                     namespace,
                     pair.node_id(),
+                    timestamp_resolver.unwrap(),
                     value,
                 )?);
                 reconstructed = Some(span);
@@ -1611,6 +1603,7 @@ where
                 timestamp = Some(Self::resolve_string_timestamp(
                     namespace,
                     pair.node_id(),
+                    timestamp_resolver.unwrap(),
                     &self.reconstructed[text.decoded.start..text.decoded.end],
                 )?);
                 reconstructed = Some(text.lexeme);
@@ -1631,6 +1624,7 @@ where
             }
             _ => {}
         }
+        if let Some(timestamp) = &mut timestamp { timestamp.resolver_index = timestamp_index.unwrap(); }
         self.push_plan(PlannedEvent::Value {
             namespace,
             node_id,
@@ -1697,9 +1691,10 @@ where
     fn resolve_integer_timestamp(
         namespace: KvIrNamespace,
         node_id: u32,
+        resolver: &KvIrTimestampResolver,
         value: i64,
     ) -> Result<PlannedTimestamp, KvIrArchiveFailure> {
-        KvIrTimestampResolver::resolve_integer(value)
+        resolver.integer(value)
             .map(planned_timestamp)
             .map_err(|source| timestamp_failure(namespace, node_id, source))
     }
@@ -1708,11 +1703,12 @@ where
         &self,
         namespace: KvIrNamespace,
         node_id: u32,
+        resolver: &KvIrTimestampResolver,
         lexeme: ScratchSpan,
     ) -> Result<PlannedTimestamp, KvIrArchiveFailure> {
         let lexeme = str::from_utf8(&self.reconstructed[lexeme.start..lexeme.end])
             .expect("fixed float formatting is UTF-8");
-        KvIrTimestampResolver::resolve_fixed_nine_float(lexeme)
+        resolver.float(lexeme)
             .map(planned_timestamp)
             .map_err(|source| timestamp_failure(namespace, node_id, source))
     }
@@ -1720,9 +1716,10 @@ where
     fn resolve_string_timestamp(
         namespace: KvIrNamespace,
         node_id: u32,
+        resolver: &KvIrTimestampResolver,
         value: &[u8],
     ) -> Result<PlannedTimestamp, KvIrArchiveFailure> {
-        KvIrTimestampResolver::resolve_string(value)
+        resolver.string(value)
             .map(planned_timestamp)
             .map_err(|source| timestamp_failure(namespace, node_id, source))
     }
@@ -2484,13 +2481,13 @@ impl<'record> PlannedRecordEvents<'record> {
                     .expect("resolved timestamp lexemes are UTF-8");
                 let resolver = self
                     .timestamp_resolver
-                    .expect("timestamp plans retain their resolver");
-                ValueRef::Timestamp(TimestampRef::new(
+                    .expect("timestamp plans retain their resolver").resolver_at(timestamp.resolver_index);
+                ValueRef::Timestamp(resolver.configure_value(TimestampRef::new(
                     timestamp.epoch_nanoseconds,
                     lexeme,
-                    timestamp.pattern,
+                    resolver.resolved_pattern(timestamp.pattern),
                     resolver.path().descriptor(),
-                ))
+                )))
             },
         )
     }
@@ -2511,6 +2508,7 @@ fn value_ref(pair: KvIrPair<'_>) -> ValueRef<'_> {
 
 const fn planned_timestamp(value: KvIrResolvedTimestamp) -> PlannedTimestamp {
     PlannedTimestamp {
+        resolver_index: 0,
         epoch_nanoseconds: value.epoch_nanoseconds,
         pattern: value.pattern,
     }
@@ -3343,6 +3341,37 @@ mod tests {
             .read_metadata(MetadataLimits::default())
             .expect("read unmatched timestamp metadata");
         assert_eq!(metadata.timestamp_dictionary().ranges(), []);
+    }
+
+    #[test]
+    fn multiple_kv_timestamp_fields_keep_namespace_input_units_and_storage_separate() {
+        use crate::timestamp_precision::{TimestampFieldSpec, TimestampStorage, TimestampPrecision};
+        let make = |raw: &str, priority| {
+            let spec = TimestampFieldSpec::parse(raw, TimestampStorage::default()).unwrap();
+            spec.path.with_field_options(spec.storage, priority)
+        };
+        let resolver = make("@seq:precision=ms", 0)
+            .with_additional(vec![make("ratio:precision=s:rounding=nearest", 1)]);
+        let input = decode_hex(FOUR_BYTE_ORACLE_HEX);
+        let options = ArchiveSetOptions::new(WriterOptions::default(), u64::MAX);
+        let mut writer = ArchiveSetWriter::new(MemorySink::default(), StatsSink::default(), options);
+        {
+            let adapter = KvIrArchiveSetSink::new(&mut writer, KvIrArchiveOptions::default());
+            let mut adapter = adapter.with_timestamp_resolver(&resolver);
+            KvIrReader::new(Cursor::new(input), KvIrOptions::default()).read_to_end(&mut adapter).unwrap();
+        }
+        let (sink, _) = writer.finish().unwrap().into_parts();
+        let json = String::from_utf8(extract(&sink.archives[0])).unwrap();
+        assert!(json.contains("\"ratio\":1.000000000"), "{json}");
+        let mut reader = SingleFileArchiveReader::open(Cursor::new(&sink.archives[0])).unwrap();
+        let meta = reader.read_metadata(MetadataLimits::default()).unwrap();
+        let ranges = meta.timestamp_dictionary().ranges();
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].key(), "@seq");
+        assert_eq!(ranges[0].bounds(), crate::archive::TimestampBounds::Epoch { start: 7, end: 7 });
+        assert_eq!(ranges[0].storage_precision(), TimestampPrecision::Milliseconds);
+        assert_eq!(ranges[1].key(), "ratio");
+        assert_eq!(ranges[1].storage_precision(), TimestampPrecision::Seconds);
     }
 
     #[test]

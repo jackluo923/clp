@@ -54,6 +54,15 @@ impl ArchiveVersion {
     /// Float columns stored as decimal mantissas and a scale (0.10 plus that adaptive scheme).
     pub const DECIMAL_FLOATS: Self = Self::new(0, 11, 0);
 
+    /// Timestamp fields record their physical tick units and quantization policy.
+    pub const TIMESTAMP_PRECISION: Self = Self::new(0, 12, 0);
+    /// Chunk restart anchors for adaptive deltas and native timestamp deltas.
+    pub const DELTA_RESTARTS: Self = Self::new(0, 13, 0);
+    /// Adaptive delta columns can choose independent bit widths per restart chunk.
+    pub const LOCAL_DELTA_WIDTHS: Self = Self::new(0, 14, 0);
+    /// Exact multiplication-based decimal floats and byte-plane decimal mantissas.
+    pub const MULTIPLY_DECIMAL_FLOATS: Self = Self::new(0, 15, 0);
+
     /// Creates a version from its semantic components.
     #[must_use]
     pub const fn new(major: u8, minor: u8, patch: u16) -> Self {
@@ -91,7 +100,10 @@ impl ArchiveVersion {
     /// encodings this crate's reader understands ([`Self::supports_adaptive_numeric`]), and 0.7 is
     /// 0.6 plus a per-field `/log.dict` layout it also reads, 0.8 adds adaptive string columns,
     /// 0.9 marks dictionary entries holding text whole, 0.10 adds mixed integer columns and 0.11
-    /// decimal float columns. A differing major, or a minor outside {5, ..., 11}, is still refused,
+    /// decimal float columns. Version 0.12 records timestamp tick units and quantization policies;
+    /// 0.13 adds delta restart anchors, 0.14 adds chunk-local delta widths, and 0.15 adds
+    /// exact multiplication and byte-plane decimal floats.
+    /// A differing major, or a minor outside {5, ..., 15}, is still refused,
     /// because that is where unknown layout changes land, and reading one as if it were 0.5 would
     /// misparse rather than fail.
     #[must_use]
@@ -103,7 +115,11 @@ impl ArchiveVersion {
                 || self.minor == Self::ADAPTIVE_STRINGS.minor
                 || self.minor == Self::VERBATIM_TEXT.minor
                 || self.minor == Self::MIXED_INTEGERS.minor
-                || self.minor == Self::DECIMAL_FLOATS.minor)
+                || self.minor == Self::DECIMAL_FLOATS.minor
+                || self.minor == Self::TIMESTAMP_PRECISION.minor
+                || self.minor == Self::DELTA_RESTARTS.minor
+                || self.minor == Self::LOCAL_DELTA_WIDTHS.minor
+                || self.minor == Self::MULTIPLY_DECIMAL_FLOATS.minor)
     }
 
     /// Whether a separate-column integer stream in an archive at this version may carry an adaptive
@@ -477,7 +493,11 @@ mod tests {
         assert!(ArchiveVersion::VERBATIM_TEXT.supports_adaptive_strings());
         assert!(ArchiveVersion::MIXED_INTEGERS.is_readable());
         assert!(ArchiveVersion::DECIMAL_FLOATS.is_readable());
-        assert!(!ArchiveVersion::new(0, 12, 0).is_readable());
+        assert!(ArchiveVersion::TIMESTAMP_PRECISION.is_readable());
+        assert!(ArchiveVersion::DELTA_RESTARTS.is_readable());
+        assert!(ArchiveVersion::LOCAL_DELTA_WIDTHS.is_readable());
+        assert!(ArchiveVersion::MULTIPLY_DECIMAL_FLOATS.is_readable());
+        assert!(!ArchiveVersion::new(0, 16, 0).is_readable());
         assert!(!ArchiveVersion::new(1, 5, 0).is_readable());
     }
 

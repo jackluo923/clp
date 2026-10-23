@@ -193,20 +193,18 @@ struct CompressArgs {
     /// tables still use per-column frames. Archives written with this set need a supporting reader.
     #[arg(long, default_value_t = 1024_u64 * 1024)]
     separate_columns_min_size: u64,
-    /// Disable adaptive per-column numeric encoding (enabled by default). Adaptive encoding stores
-    /// each integer or float column with the smallest of a set of lightweight codecs chosen by
-    /// post-zstd size, and stamps archive version 0.6.0. Disabling it restores byte-identical 0.5.0
-    /// output that the C++ reference reads.
+    /// Disable optional adaptive numeric encoding (enabled by default). Required encodings for
+    /// mixed-integer or declared timestamp schemas remain enabled. Candidate selection compares
+    /// final compressed sizes and is controlled by --encoding-effort.
     #[arg(long, default_value_t = false)]
     no_adaptive_numeric_columns: bool,
-    /// Allow float columns to be stored as decimal mantissas and a scale when that reproduces
-    /// every value and is smallest (off by default; needs adaptive numeric columns). Float32
-    /// signals and few-digit readings shrink about 18% beyond the default, but reading such a
-    /// column fills two buffers of 8 bytes per row, which a fresh process must fault in: each
-    /// search adds about 14 ms per million rows, and a long-running reader such as DuckDB pays it
-    /// on its first query only. Such a column stamps archive version 0.11.0, which earlier readers
-    /// refuse.
-    #[arg(long, default_value_t = false)]
+    /// Work spent selecting lossless integer and float encodings, independently of -l.
+    /// Balanced keeps established integer codecs and screens exact multiplication-based decimals.
+    /// Fast skips extra delta/decimal trials; exhaustive also tries less likely representations.
+    #[arg(long, value_enum, default_value_t = clp_s::EncodingEffort::Balanced)]
+    encoding_effort: clp_s::EncodingEffort,
+    /// Legacy alias for --encoding-effort exhaustive (affects integers and floats).
+    #[arg(long, hide = true, conflicts_with = "encoding_effort", default_value_t = false)]
     decimal_float_columns: bool,
     /// Omit the optional numeric summaries (count/sum/min/max) and timestamp chunk index from new
     /// archives.
@@ -245,9 +243,18 @@ struct CompressArgs {
     /// template; 0 turns this rule off.
     #[arg(long, default_value_t = clp_s::writer::VerbatimText::DEFAULT.min_strings())]
     verbatim_text_min_strings: u16,
-    /// Path of the authoritative timestamp field.
+    /// Repeatable absolute timestamp field: PATH[:precision=auto|ms|100us][:rounding=nearest].
+    /// Leave device-relative clocks as ordinary numeric fields.
+    /// The first configured field present in an archive supplies time-only search bounds.
+    /// Escape literal colons in PATH as \u003a.
     #[arg(long)]
-    timestamp_key: Option<String>,
+    timestamp_key: Vec<String>,
+    /// Default precision: ns/us/ms/s or positive multiples such as 100us; numeric inputs count these ticks and text dates are quantized. Use auto to infer each input and store the finest precision without rounding.
+    #[arg(long, default_value = "ns")]
+    timestamp_precision: clp_s::timestamp_precision::TimestampPrecisionSetting,
+    /// Quantization: truncate floors to a unit boundary; nearest rounds ties away from the Unix epoch.
+    #[arg(long, value_enum, default_value = "truncate")]
+    timestamp_rounding: clp_s::timestamp_precision::TimestampRounding,
     /// Read additional input paths from this file.
     #[arg(long, short = 'f')]
     files_from: Option<PathBuf>,
@@ -688,7 +695,10 @@ fn run(cli: Cli) -> CliResult<()> {
 
 fn run_compress(arguments: &CompressArgs) -> CliResult<()> {
     let timestamp_resolvers =
-        CompressionTimestampResolvers::parse(arguments.timestamp_key.as_deref())?;
+        CompressionTimestampResolvers::parse(&arguments.timestamp_key,
+            clp_s::timestamp_precision::TimestampStorage { precision: arguments.timestamp_precision.storage_default(),
+                rounding: arguments.timestamp_rounding },
+            arguments.timestamp_precision == clp_s::timestamp_precision::TimestampPrecisionSetting::Auto)?;
     let template_keys = arguments.template_keys.as_deref()
         .map(clp_s::writer::TemplateKeys::parse_csv).transpose()?.unwrap_or_default();
     let archive_creator_id = Uuid::new_v4().to_string();
@@ -707,6 +717,8 @@ fn run_compress(arguments: &CompressArgs) -> CliResult<()> {
     );
     let stats = CompressionArchiveStats::new(arguments.output.print_archive_stats, published_ids);
     let writer_options = WriterOptions::new(arguments.compression_level)
+        .with_timestamp_precision(arguments.timestamp_precision.storage_default())
+        .with_timestamp_rounding(arguments.timestamp_rounding)
         .with_numeric_summaries(!arguments.no_numeric_summaries)
         .with_dictionary_compression_level(arguments.dictionary_compression_level)
         .with_dictionary_long_distance_matching(!arguments.no_dictionary_long_distance_matching)
@@ -716,7 +728,11 @@ fn run_compress(arguments: &CompressArgs) -> CliResult<()> {
         .with_minimum_packed_stream_size(arguments.min_table_size)
         .with_separate_columns_min_size(arguments.separate_columns_min_size)
         .with_adaptive_numeric_columns(!arguments.no_adaptive_numeric_columns)
-        .with_decimal_float_columns(arguments.decimal_float_columns)
+        .with_encoding_effort(if arguments.decimal_float_columns {
+            clp_s::EncodingEffort::Exhaustive
+        } else {
+            arguments.encoding_effort
+        })
         .with_adaptive_string_columns(!arguments.no_adaptive_string_columns)
         .with_binary_uuids(!arguments.no_binary_uuids)
         .with_grouped_array_tables(!arguments.no_grouped_array_tables)
@@ -784,20 +800,30 @@ struct CompressionTimestampResolvers {
 }
 
 impl CompressionTimestampResolvers {
-    fn parse(descriptor: Option<&str>) -> CliResult<Self> {
-        let Some(descriptor) = descriptor.filter(|value| !value.is_empty()) else {
-            return Ok(Self::default());
+    fn parse(specs: &[String], defaults: clp_s::timestamp_precision::TimestampStorage, auto_precision: bool) -> CliResult<Self> {
+        use clp_s::timestamp_precision::TimestampFieldSpec;
+        if specs.len() >= 0x0fff_ffff { return Err("too many timestamp fields".into()); }
+        let mut kv_fields = Vec::new();
+        let mut json_fields = Vec::new();
+        for (priority, raw) in specs.iter().enumerate() {
+            let spec = TimestampFieldSpec::parse_with_auto_default(raw, defaults, auto_precision)?;
+            if kv_fields.iter().any(|p: &KvIrTimestampResolver| p.namespace() == spec.path.namespace()
+                && p.path().components() == spec.path.path().components()) {
+                return Err(format!("duplicate timestamp field `{}`", spec.path.path().descriptor()).into());
+            }
+            if spec.path.namespace() == Some(KvIrNamespace::UserGenerated) {
+                json_fields.push(JsonTimestampResolver::parse(spec.path.path().descriptor())?
+                    .with_field_options(spec.storage, priority).with_auto_precision(spec.auto_precision));
+            }
+            kv_fields.push(spec.path.with_field_options(spec.storage, priority).with_auto_precision(spec.auto_precision));
+        }
+        let json = if json_fields.is_empty() { None } else {
+            let first = json_fields.remove(0); Some(first.with_additional(json_fields))
         };
-        let kv_ir = KvIrTimestampResolver::parse(descriptor)?;
-        let json = if Some(KvIrNamespace::UserGenerated) == kv_ir.namespace() {
-            Some(JsonTimestampResolver::parse(descriptor)?)
-        } else {
-            None
+        let kv_ir = if kv_fields.is_empty() { None } else {
+            let first = kv_fields.remove(0); Some(first.with_additional(kv_fields))
         };
-        Ok(Self {
-            json,
-            kv_ir: Some(kv_ir),
-        })
+        Ok(Self { json, kv_ir })
     }
 }
 

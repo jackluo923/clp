@@ -8,7 +8,7 @@ use tz::timezone::{LocalTimeType, TransitionRule};
 
 struct Candidate {
     zones: Vec<TimeZoneRef<'static>>,
-    patterns: [OnceLock<String>; 18],
+    patterns: [OnceLock<String>; 42],
 }
 
 impl Default for Candidate {
@@ -110,19 +110,7 @@ impl Resolved {
         fraction: Option<(u8, &str, FractionPrecision)>,
     ) -> Result<&'static str, JsonTimestampError> {
         let base = iso_date_time_pattern(separator, fraction, false)?;
-        let fraction_index = match fraction {
-            None => 0,
-            Some((punctuation, _, precision)) => {
-                let precision_index = match precision {
-                    FractionPrecision::Milliseconds => 0,
-                    FractionPrecision::Microseconds => 1,
-                    FractionPrecision::Nanoseconds => 2,
-                    FractionPrecision::Variable => 3,
-                };
-                1 + usize::from(punctuation == b',') * 4 + precision_index
-            }
-        };
-        let index = usize::from(separator == b' ') * 9 + fraction_index;
+        let index = usize::from(separator == b' ') * 21 + super::fraction_format_index(fraction);
         // Finite database-derived slots; repeated events allocate nothing. The pattern
         // stores its resolved offset so extraction never depends on future tzdb updates.
         Ok(self.candidate.patterns[index].get_or_init(|| {

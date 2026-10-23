@@ -826,6 +826,40 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
             })
     }
 
+    /// Chunk ranges required by every guarded time-window predicate.
+    pub fn table_row_ranges(&self, schema_id: i32, rows: usize) -> Option<Vec<(usize, usize)>> {
+        let chunks = self.timestamp_chunks.as_ref()?;
+        let schema = self.catalog.schema_map().get(schema_id)?;
+        let mut result: Option<Vec<(usize, usize)>> = None;
+        for &(node, low, high) in &self.timestamp_windows {
+            if !schema_contains_node(schema, node) { continue; }
+            let Some(ranges) = chunks.row_ranges(schema_id, node, rows, low, high) else { continue; };
+            result = Some(match result {
+                None => ranges,
+                Some(previous) => {
+                    let mut intersection = Vec::new();
+                    let (mut a, mut b) = (0, 0);
+                    while a < previous.len() && b < ranges.len() {
+                        let start = previous[a].0.max(ranges[b].0);
+                        let end = previous[a].1.min(ranges[b].1);
+                        if start < end { intersection.push((start, end)); }
+                        if previous[a].1 < ranges[b].1 { a += 1; } else { b += 1; }
+                    }
+                    intersection
+                }
+            });
+        }
+        result
+    }
+
+    /// Pass the metadata decision to the table reader before any delta values are decoded.
+    pub fn stream_row_selections(&self, stream_id: u64) -> std::collections::HashMap<i32, Vec<(usize, usize)>> {
+        self.catalog.table_metadata().schema_tables().iter()
+            .filter(|table| table.stream_id() == stream_id)
+            .filter_map(|table| Some((table.schema_id(), self.table_row_ranges(table.schema_id(),
+                usize::try_from(table.message_count()).ok()?)?))).collect()
+    }
+
     /// Matches one lazily decoded schema table in physical row order.
     ///
     /// The supplied table must originate from the catalog used to compile this query. Returned
@@ -929,12 +963,7 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
         self.validate_table(decoded)?;
         let table_index = TableIndex::new(decoded, self.catalog, self.options.limits())?;
         let mut evaluator = Evaluator::new(self, decoded, table_index);
-        let rows = decoded.table().message_count();
-        evaluator.chunk_span = match self.table_row_span(decoded.schema().id(), rows) {
-            crate::timestamp_chunks::RowSpan::All => None,
-            crate::timestamp_chunks::RowSpan::Empty => Some((0, 0)),
-            crate::timestamp_chunks::RowSpan::Rows(start, end) => Some((start, end)),
-        };
+        evaluator.chunk_ranges = self.table_row_ranges(decoded.schema().id(), decoded.table().message_count());
         evaluator.evaluate()
     }
 
@@ -3157,9 +3186,9 @@ struct Evaluator<'compiled, 'query, 'archive, 'table> {
     /// Schema-level refusals still are: every leaf is still evaluated, over an empty row range.
     row_span: Option<(usize, usize)>,
     /// Rows the query's time window can reach, from the timestamp chunk index. Every other row is
-    /// a non-match: column scans skip them, and the final bitmap is cleared outside this span,
+    /// a non-match: column scans skip them, and the final bitmap is cleared outside these ranges,
     /// which also keeps a `NOT` from turning an unread row into a match.
-    chunk_span: Option<(usize, usize)>,
+    chunk_ranges: Option<Vec<(usize, usize)>>,
 }
 
 impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive, 'table> {
@@ -3178,7 +3207,7 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
             array_scratch: ArrayScratch::default(),
             range_work: Vec::new(),
             row_span: None,
-            chunk_span: None,
+            chunk_ranges: None,
         }
     }
 
@@ -3209,15 +3238,6 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
             // and still report what they refuse to evaluate.
             self.row_span = Some(true_span(&bitmap).unwrap_or((0, 0)));
             self.states[node_index] = Some(bitmap);
-        }
-        if let Some((start, end)) = self.chunk_span {
-            self.row_span = Some(match self.row_span {
-                Some((a, b)) => {
-                    let start = start.max(a);
-                    (start, end.min(b).max(start))
-                }
-                None => (start, end),
-            });
         }
         for (index, node) in self.compiled.nodes.iter().copied().enumerate() {
             if self.states[index].is_some() {
@@ -3267,16 +3287,30 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
                 self.release_bitmap(timestamp_bitmap.len());
             }
         }
-        if let Some((start, end)) = self.chunk_span {
-            let rows = bitmap.len();
-            bitmap[..start.min(rows)].fill(Tri::False as u8);
-            bitmap[end.min(rows)..].fill(Tri::False as u8);
+        if self.chunk_ranges.is_some() {
+            let mut previous = 0;
+            for index in 0..self.candidate_range_count() {
+                let (start, end) = self.candidate_range(index, bitmap.len());
+                bitmap[previous..start.max(previous)].fill(Tri::False as u8);
+                previous = end.max(previous);
+            }
+            bitmap[previous..].fill(Tri::False as u8);
         }
         let match_count = normalize_matches(&mut bitmap);
         Ok(MatchBitmap {
             bytes: bitmap,
             match_count,
         })
+    }
+
+    fn candidate_range_count(&self) -> usize {
+        self.chunk_ranges.as_ref().map_or(1, |ranges| ranges.len().max(1))
+    }
+    fn candidate_range(&self, index: usize, rows: usize) -> (usize, usize) {
+        let (a, b) = self.row_span.unwrap_or((0, rows));
+        let (c, d) = self.chunk_ranges.as_ref().map_or((0, rows), |ranges| ranges.get(index).copied().unwrap_or((0, 0)));
+        let start = a.max(c).min(rows);
+        (start, b.min(d).min(rows).max(start))
     }
 
     fn evaluate_authoritative_timestamp_range(
@@ -3304,13 +3338,13 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
                     .table()
                     .column(column_index)
                     .ok_or(SearchError::SizeOverflow)?;
-                scan_authoritative_column(
-                    column.data(),
-                    begin_nanoseconds,
-                    end_nanoseconds,
-                    &mut bitmap,
-                    self.compiled.query.root(),
-                )?;
+                for index in 0..self.candidate_range_count() {
+                    let (start, end) = self.candidate_range(index, row_count);
+                    scan_authoritative_column(
+                        column.data(), begin_nanoseconds, end_nanoseconds,
+                        &mut bitmap[start..end], start, self.compiled.query.root(),
+                    )?;
+                }
             }
         }
         Ok(bitmap)
@@ -3589,14 +3623,21 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
             }
             return Ok(());
         }
-        // Rows outside the guarded range-index run cannot match, so they are neither read nor
-        // written and keep this leaf's default.
-        let rows = bitmap.len();
-        let (skip, bitmap) = match self.row_span {
-            Some((start, end)) if start < rows => (start, &mut bitmap[start..end.min(rows)]),
-            Some(_) => (0, &mut bitmap[..0]),
-            None => (0, bitmap),
-        };
+        for index in 0..self.candidate_range_count() {
+            let (start, end) = self.candidate_range(index, bitmap.len());
+            self.scan_column_range(filter, node_id, column, start, &mut bitmap[start..end])?;
+        }
+        Ok(())
+    }
+
+    fn scan_column_range(
+        &mut self,
+        filter: EvaluationFilter<'_, '_>,
+        node_id: u32,
+        column: ColumnData<'table, 'archive>,
+        skip: usize,
+        bitmap: &mut [u8],
+    ) -> Result<(), SearchError> {
         match column {
             ColumnData::MixedInteger(column) => {
                 or_mixed_integer_matches(bitmap, column.iter().skip(skip), filter.predicate);
@@ -3675,15 +3716,20 @@ impl<'compiled, 'query, 'archive, 'table> Evaluator<'compiled, 'query, 'archive,
                 });
             }
             ColumnData::Timestamp(column) => {
-                let Some(timestamp_nanoseconds) = filter.value.timestamp_nanoseconds else {
+                let operand = filter.value.timestamp_nanoseconds.or_else(|| match numeric_literal(filter.predicate.value()) {
+                    Some(NumericLiteral::Integer(value)) => Some(value),
+                    _ => None,
+                });
+                let Some(operand) = operand else {
+                    // Preserve the existing exact float/unsigned comparison contract.
                     or_matches(bitmap, column.epochs().values().skip(skip), |value| {
                         numeric_value_matches_i64(value, filter.predicate)
                     });
                     return Ok(());
                 };
-                or_matches(bitmap, column.epochs().values().skip(skip), |value| {
-                    compare(value, timestamp_nanoseconds, filter.predicate.operator())
-                });
+                if let Some((lo, hi)) = timestamp_tick_interval(operand, column.epochs().scale(), filter.predicate.operator()) {
+                    or_matches(bitmap, column.epochs().ticks().skip(skip), |value| lo <= value && value <= hi);
+                }
             }
         }
         Ok(())
@@ -4269,30 +4315,34 @@ fn scan_authoritative_column(
     begin_nanoseconds: Option<i64>,
     end_nanoseconds: Option<i64>,
     bitmap: &mut [u8],
+    skip: usize,
     expression: NodeId,
 ) -> Result<(), SearchError> {
     match column {
         ColumnData::Timestamp(column) => {
-            or_matches(bitmap, column.epochs().values(), |value| {
-                timestamp_in_range(value, begin_nanoseconds, end_nanoseconds)
-            });
+            let scale = column.epochs().scale();
+            let lo = timestamp_tick_interval(begin_nanoseconds.unwrap_or(i64::MIN), scale, ComparisonOperator::GreaterOrEqual);
+            let hi = timestamp_tick_interval(end_nanoseconds.unwrap_or(i64::MAX), scale, ComparisonOperator::LessOrEqual);
+            if let (Some((lo, _)), Some((_, hi))) = (lo, hi) {
+                or_matches(bitmap, column.epochs().ticks().skip(skip), |value| lo <= value && value <= hi);
+            }
         }
         ColumnData::MixedInteger(column) => {
-            or_matches(bitmap, column.iter(), |value| value.as_i64().is_some_and(|value|
+            or_matches(bitmap, column.iter().skip(skip), |value| value.as_i64().is_some_and(|value|
                 timestamp_in_range(value, begin_nanoseconds, end_nanoseconds)));
         }
         ColumnData::Integer(column) => {
-            or_matches(bitmap, column.iter(), |value| {
+            or_matches(bitmap, column.iter().skip(skip), |value| {
                 timestamp_in_range(value, begin_nanoseconds, end_nanoseconds)
             });
         }
         ColumnData::DeltaInteger(column) => {
-            or_matches(bitmap, column.values(), |value| {
+            or_matches(bitmap, column.values().skip(skip), |value| {
                 timestamp_in_range(value, begin_nanoseconds, end_nanoseconds)
             });
         }
         ColumnData::Float(column) => {
-            scan_authoritative_float(column.iter(), begin_nanoseconds, end_nanoseconds, bitmap);
+            scan_authoritative_float(column.iter().skip(skip), begin_nanoseconds, end_nanoseconds, bitmap);
         }
         ColumnData::DeprecatedDateString(_) => {
             return Err(SearchError::Unsupported {
@@ -4480,6 +4530,28 @@ enum NumericLiteral {
     Integer(i64),
     Unsigned(u64),
     Float(f64),
+}
+
+/// Convert one nanosecond predicate to a closed native-tick interval once.
+/// Euclidean division handles negative instants; i128 protects strict bounds
+/// at i64::MIN/MAX. Equality between ticks has an empty match set.
+fn timestamp_tick_interval(operand: i64, scale: i64, operator: ComparisonOperator) -> Option<(i64, i64)> {
+    let operand = i128::from(operand);
+    let scale = i128::from(scale);
+    let floor = operand.div_euclid(scale);
+    let exact = operand.rem_euclid(scale) == 0;
+    let ceil = floor + i128::from(!exact);
+    let min = i128::from(i64::MIN);
+    let max = i128::from(i64::MAX);
+    let (lo, hi) = match operator {
+        ComparisonOperator::Equal => if exact { (floor, floor) } else { return None; },
+        ComparisonOperator::Less => (min, ceil - 1),
+        ComparisonOperator::LessOrEqual => (min, floor),
+        ComparisonOperator::Greater => (floor + 1, max),
+        ComparisonOperator::GreaterOrEqual => (ceil, max),
+    };
+    let (lo, hi) = (lo.max(min), hi.min(max));
+    (lo <= hi).then_some((lo as i64, hi as i64))
 }
 
 const fn numeric_literal(literal: &Literal) -> Option<NumericLiteral> {
@@ -4918,6 +4990,35 @@ fn add_limited(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_timestamp_intervals_match_epoch_comparisons() {
+        use super::{ComparisonOperator, compare, timestamp_tick_interval};
+        let operators = [ComparisonOperator::Equal, ComparisonOperator::Less,
+            ComparisonOperator::LessOrEqual, ComparisonOperator::Greater, ComparisonOperator::GreaterOrEqual];
+        for scale in [1_i64, 10, 1_000, 100_000, 1_000_000, 1_000_000_000, i64::MAX] {
+            let limit = i64::MAX / scale;
+            let ticks = [-limit, -limit + 1, -2, -1, 0, 1, 2, limit - 1, limit];
+            let mut operands = vec![i64::MIN, i64::MIN + 1, i64::MAX - 1, i64::MAX, -1, 0, 1];
+            for tick in ticks {
+                if let Some(epoch) = tick.checked_mul(scale) {
+                    operands.push(epoch);
+                    operands.extend(epoch.checked_sub(1));
+                    operands.extend(epoch.checked_add(1));
+                }
+            }
+            for operand in operands {
+                for op in operators {
+                    let interval = timestamp_tick_interval(operand, scale, op);
+                    for tick in ticks {
+                        let Some(epoch) = tick.checked_mul(scale) else { continue; };
+                        assert_eq!(interval.is_some_and(|(lo, hi)| lo <= tick && tick <= hi),
+                            compare(epoch, operand, op), "tick={tick}, scale={scale}, operand={operand}, op={op:?}");
+                    }
+                }
+            }
+        }
+    }
+
     use std::io::Cursor;
 
     use super::*;

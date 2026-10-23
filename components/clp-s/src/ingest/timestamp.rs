@@ -15,6 +15,7 @@ use super::classify_json_number;
 use super::number::ValidatedJsonNumberSyntax;
 use super::number::classify_validated_json_number_text;
 use crate::writer::TimestampRef;
+use crate::timestamp_precision::{TimestampPrecision, TimestampStorage};
 
 const NANOSECONDS_PER_SECOND: i64 = 1_000_000_000;
 const NANOSECONDS_PER_MILLISECOND: i64 = 1_000_000;
@@ -306,6 +307,8 @@ pub enum JsonTimestampError {
     },
     /// A parser-supplied exact token was unexpectedly not UTF-8.
     InvalidUtf8,
+    /// Fractional numeric epochs currently have source patterns only for seconds.
+    FractionalInputUnit,
     /// The token is valid JSON but outside the currently supported authoritative timestamp
     /// patterns.
     UnsupportedLexeme {
@@ -326,6 +329,7 @@ impl Display for JsonTimestampError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Number { source } => write!(formatter, "invalid timestamp number: {source}"),
+            Self::FractionalInputUnit => formatter.write_str("fractional numeric timestamps require precision=s or precision=auto; otherwise supply integer ticks or a quoted epoch-seconds string"),
             Self::InvalidUtf8 => formatter.write_str("timestamp token is not UTF-8"),
             Self::UnsupportedLexeme { kind } => {
                 write!(
@@ -360,20 +364,58 @@ impl Error for JsonTimestampError {
 ///
 /// Recognition covers the C++ numeric defaults (integer epoch values with inferred precision and
 /// fractional epoch seconds) plus quoted canonical `YYYY-MM-DD[T ]HH:MM:SS` date-times, optional
-/// `.`/`,` fractions, and optional literal `Z`. Fractions resolve to `\3`, `\6`, `\9`, or `\T`
-/// exactly as C++. Other valid JSON strings/numbers at the configured path fail explicitly; they
+/// `.`/`,` fractions, and optional literal `Z`. Fractions retain their original digit count, including trailing zeroes. Other valid JSON strings/numbers at the configured path fail explicitly; they
 /// are never silently stored with a different type. Values of all other JSON kinds retain their
 /// ordinary behavior.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JsonTimestampResolver {
     path: JsonTimestampPath,
+    input_unit: Option<TimestampPrecision>,
+    auto_precision: bool,
+    integer_patterns: Option<[String; 2]>,
+    storage: Option<TimestampStorage>,
+    priority: usize,
+    additional: Vec<Self>,
 }
 
 impl JsonTimestampResolver {
+    /// Configure interpretation and storage for this field.
+    pub fn with_field_options(mut self, storage: TimestampStorage, priority: usize) -> Self {
+        self.auto_precision = false;
+        self.input_unit = Some(storage.precision);
+        self.integer_patterns = Some([
+            format!(r"\K{{{}}}", storage.precision.nanoseconds_per_tick()),
+            format!(r#""\K{{{}}}""#, storage.precision.nanoseconds_per_tick()),
+        ]);
+        self.storage = Some(storage); self.priority = priority; self
+    }
+    /// Infer each value independently; the writer resolves the finest precision per field.
+    pub fn with_auto_precision(mut self, enabled: bool) -> Self {
+        self.auto_precision = enabled;
+        if enabled { self.input_unit = None; self.integer_patterns = None; }
+        self
+    }
+    pub(super) fn resolved_pattern<'a>(&'a self, pattern: &'a str) -> &'a str {
+        match pattern {
+            r"\K" => &self.integer_patterns.as_ref().expect("configured tick unit")[0],
+            r#""\K""# => &self.integer_patterns.as_ref().expect("configured tick unit")[1],
+            _ => pattern,
+        }
+    }
+    /// Add separately configured timestamp paths without changing the primary path.
+    pub fn with_additional(mut self, additional: Vec<Self>) -> Self { self.additional = additional; self }
+    pub(super) fn resolvers(&self) -> impl Iterator<Item=&Self> { std::iter::once(self).chain(self.additional.iter()) }
+    pub(super) fn is_multiple(&self) -> bool { !self.additional.is_empty() }
+    fn configured<'a>(&self, value: TimestampRef<'a>) -> TimestampRef<'a> {
+        let value = value.with_priority(self.priority);
+        if self.auto_precision { value.with_auto_precision() }
+        else { self.storage.map_or(value, |storage| value.with_storage(storage)) }
+    }
+
     /// Creates a resolver for an already-compiled path.
     #[must_use]
     pub const fn new(path: JsonTimestampPath) -> Self {
-        Self { path }
+        Self { path, input_unit: None, auto_precision: false, integer_patterns: None, storage: None, priority: usize::MAX, additional: Vec::new() }
     }
 
     /// Compiles a resolver from one dotted JSON field descriptor.
@@ -436,12 +478,12 @@ impl JsonTimestampResolver {
         classified: ClassifiedJsonNumber<'a>,
     ) -> Result<(TimestampRef<'a>, bool), JsonTimestampError> {
         let (epoch, pattern) = match classified {
-            ClassifiedJsonNumber::Integer(value) => resolve_integer(value, false)?,
+            ClassifiedJsonNumber::Integer(value) => resolve_integer_unit(value, false, self.input_unit)?,
             ClassifiedJsonNumber::Unsigned(_) => return Err(JsonTimestampError::EpochNanosecondsOutOfRange),
-            ClassifiedJsonNumber::Float { .. } => resolve_fractional_epoch(source, false)?,
+            ClassifiedJsonNumber::Float { .. } => { check_fractional_unit(self.input_unit)?; resolve_fractional_epoch(source, false)? },
         };
         Ok((
-            TimestampRef::new(epoch, source, pattern, self.path.descriptor()),
+            self.configured(TimestampRef::new(epoch, source, self.resolved_pattern(pattern), self.path.descriptor())),
             is_exact_canonical_integer(source.as_bytes(), classified),
         ))
     }
@@ -466,7 +508,7 @@ impl JsonTimestampResolver {
                 kind: JsonTimestampScalarKind::String,
             })?;
         let resolved = match inner.parse::<i64>() {
-            Ok(integer) => resolve_integer(integer, true),
+            Ok(integer) => resolve_integer_unit(integer, true, self.input_unit),
             Err(_) if inner.as_bytes().contains(&b'.') && looks_numeric(inner) => {
                 resolve_fractional_epoch(inner, true)
             }
@@ -478,12 +520,12 @@ impl JsonTimestampResolver {
             },
             other => other,
         })?;
-        Ok(TimestampRef::new(
+        Ok(self.configured(TimestampRef::new(
             epoch,
             lexeme,
-            pattern,
+            self.resolved_pattern(pattern),
             self.path.descriptor(),
-        ))
+        )))
     }
 }
 
@@ -507,6 +549,12 @@ fn is_exact_canonical_integer(source: &[u8], classified: ClassifiedJsonNumber<'_
 pub struct KvIrTimestampResolver {
     path: JsonTimestampPath,
     namespace: Option<KvIrNamespace>,
+    input_unit: Option<TimestampPrecision>,
+    auto_precision: bool,
+    integer_patterns: Option<[String; 2]>,
+    storage: Option<TimestampStorage>,
+    priority: usize,
+    additional: Vec<Self>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -516,6 +564,53 @@ pub(super) struct KvIrResolvedTimestamp {
 }
 
 impl KvIrTimestampResolver {
+    pub fn with_field_options(mut self, storage: TimestampStorage, priority: usize) -> Self {
+        self.auto_precision = false;
+        self.input_unit = Some(storage.precision);
+        self.integer_patterns = Some([
+            format!(r"\K{{{}}}", storage.precision.nanoseconds_per_tick()),
+            format!(r#""\K{{{}}}""#, storage.precision.nanoseconds_per_tick()),
+        ]);
+        self.storage = Some(storage); self.priority = priority; self
+    }
+    /// Infer each value independently; the writer resolves the finest precision per field.
+    pub fn with_auto_precision(mut self, enabled: bool) -> Self {
+        self.auto_precision = enabled;
+        if enabled { self.input_unit = None; self.integer_patterns = None; }
+        self
+    }
+    pub(super) fn resolved_pattern<'a>(&'a self, pattern: &'a str) -> &'a str {
+        match pattern {
+            r"\K" => &self.integer_patterns.as_ref().expect("configured tick unit")[0],
+            r#""\K""# => &self.integer_patterns.as_ref().expect("configured tick unit")[1],
+            _ => pattern,
+        }
+    }
+    pub fn with_additional(mut self, additional: Vec<Self>) -> Self { self.additional = additional; self }
+    pub(super) fn resolvers(&self) -> impl Iterator<Item=&Self> { std::iter::once(self).chain(self.additional.iter()) }
+    pub(super) fn resolver_at(&self, index: usize) -> &Self { if index == 0 { self } else { &self.additional[index - 1] } }
+    pub(super) fn configure_value<'a>(&self, value: TimestampRef<'a>) -> TimestampRef<'a> {
+        let value = value.with_priority(self.priority);
+        if self.auto_precision { value.with_auto_precision() }
+        else { self.storage.map_or(value, |storage| value.with_storage(storage)) }
+    }
+    pub(super) fn integer(&self, value: i64) -> Result<KvIrResolvedTimestamp, JsonTimestampError> {
+        let (epoch_nanoseconds, pattern) = resolve_integer_unit(value, false, self.input_unit)?;
+        Ok(KvIrResolvedTimestamp { epoch_nanoseconds, pattern })
+    }
+    pub(super) fn float(&self, value: &str) -> Result<KvIrResolvedTimestamp, JsonTimestampError> {
+        check_fractional_unit(self.input_unit)?;
+        Self::resolve_fixed_nine_float(value)
+    }
+    pub(super) fn string(&self, value: &[u8]) -> Result<KvIrResolvedTimestamp, JsonTimestampError> {
+        let text = str::from_utf8(value).map_err(|_| JsonTimestampError::InvalidUtf8)?;
+        if let Ok(integer) = text.parse::<i64>() {
+            let (epoch_nanoseconds, pattern) = resolve_integer_unit(integer, true, self.input_unit)?;
+            return Ok(KvIrResolvedTimestamp { epoch_nanoseconds, pattern });
+        }
+        Self::resolve_string(value)
+    }
+
     /// Compiles a namespace-aware KV-IR timestamp descriptor with conservative limits.
     ///
     /// # Errors
@@ -547,6 +642,7 @@ impl KvIrTimestampResolver {
         Ok(Self {
             path: JsonTimestampPath::parse_components(descriptor, start, limits)?,
             namespace,
+            input_unit: None, auto_precision: false, integer_patterns: None, storage: None, priority: usize::MAX, additional: Vec::new(),
         })
     }
 
@@ -562,14 +658,6 @@ impl KvIrTimestampResolver {
     #[must_use]
     pub const fn namespace(&self) -> Option<KvIrNamespace> {
         self.namespace
-    }
-
-    pub(super) fn resolve_integer(value: i64) -> Result<KvIrResolvedTimestamp, JsonTimestampError> {
-        let (epoch, pattern) = resolve_integer(value, false)?;
-        Ok(KvIrResolvedTimestamp {
-            epoch_nanoseconds: epoch,
-            pattern,
-        })
     }
 
     pub(super) fn resolve_fixed_nine_float(
@@ -784,6 +872,23 @@ fn parse_hex_quad(
     Ok(value)
 }
 
+fn check_fractional_unit(unit: Option<TimestampPrecision>) -> Result<(), JsonTimestampError> {
+    if unit.is_some_and(|u| u != TimestampPrecision::Seconds) { Err(JsonTimestampError::FractionalInputUnit) } else { Ok(()) }
+}
+
+fn resolve_integer_unit(value: i64, quoted: bool, unit: Option<TimestampPrecision>) -> Result<(i64, &'static str), JsonTimestampError> {
+    let Some(unit) = unit else { return resolve_integer(value, quoted) };
+    let epoch = value.checked_mul(unit.nanoseconds_per_tick()).ok_or(JsonTimestampError::EpochNanosecondsOutOfRange)?;
+    let (plain, string) = match unit {
+        TimestampPrecision::Nanoseconds => (r"\N", r#""\N""#),
+        TimestampPrecision::Microseconds => (r"\C", r#""\C""#),
+        TimestampPrecision::Milliseconds => (r"\L", r#""\L""#),
+        TimestampPrecision::Seconds => (r"\E", r#""\E""#),
+        _ => (r"\K", r#""\K""#),
+    };
+    Ok((epoch, if quoted { string } else { plain }))
+}
+
 fn resolve_integer(value: i64, quoted: bool) -> Result<(i64, &'static str), JsonTimestampError> {
     // C++ negates negative inputs while estimating precision and multiplies without checked
     // arithmetic. `i64::MIN` and overflowing scaled epochs therefore have no defined portable
@@ -883,7 +988,7 @@ enum FractionPrecision {
     Milliseconds,
     Microseconds,
     Nanoseconds,
-    Variable,
+    Fixed(u8),
 }
 
 fn fraction_precision(fraction: &str) -> Result<FractionPrecision, JsonTimestampError> {
@@ -891,10 +996,7 @@ fn fraction_precision(fraction: &str) -> Result<FractionPrecision, JsonTimestamp
         3 => Ok(FractionPrecision::Milliseconds),
         6 => Ok(FractionPrecision::Microseconds),
         9 => Ok(FractionPrecision::Nanoseconds),
-        _ if fraction.ends_with('0') => Err(JsonTimestampError::UnsupportedLexeme {
-            kind: JsonTimestampScalarKind::Number,
-        }),
-        _ => Ok(FractionPrecision::Variable),
+        _ => Ok(FractionPrecision::Fixed(fraction.len() as u8)),
     }
 }
 
@@ -903,11 +1005,22 @@ const fn numeric_fraction_pattern(precision: FractionPrecision, quoted: bool) ->
         (FractionPrecision::Milliseconds, false) => r"\E.\3",
         (FractionPrecision::Microseconds, false) => r"\E.\6",
         (FractionPrecision::Nanoseconds, false) => r"\E.\9",
-        (FractionPrecision::Variable, false) => r"\E.\T",
         (FractionPrecision::Milliseconds, true) => r#""\E.\3""#,
         (FractionPrecision::Microseconds, true) => r#""\E.\6""#,
         (FractionPrecision::Nanoseconds, true) => r#""\E.\9""#,
-        (FractionPrecision::Variable, true) => r#""\E.\T""#,
+        (FractionPrecision::Fixed(1), false) => r"\E.\1",
+        (FractionPrecision::Fixed(1), true) => r#""\E.\1""#,
+        (FractionPrecision::Fixed(2), false) => r"\E.\2",
+        (FractionPrecision::Fixed(2), true) => r#""\E.\2""#,
+        (FractionPrecision::Fixed(4), false) => r"\E.\4",
+        (FractionPrecision::Fixed(4), true) => r#""\E.\4""#,
+        (FractionPrecision::Fixed(5), false) => r"\E.\5",
+        (FractionPrecision::Fixed(5), true) => r#""\E.\5""#,
+        (FractionPrecision::Fixed(7), false) => r"\E.\7",
+        (FractionPrecision::Fixed(7), true) => r#""\E.\7""#,
+        (FractionPrecision::Fixed(8), false) => r"\E.\8",
+        (FractionPrecision::Fixed(8), true) => r#""\E.\8""#,
+        (FractionPrecision::Fixed(_), _) => unreachable!(),
     }
 }
 
@@ -1073,12 +1186,29 @@ impl<'a> IsoOffset<'a> {
 // Resolved patterns must outlive borrowed record events. Intern only the finite
 // ISO format domain, allocating slots lazily by format and signed hour. Repeated
 // timestamps with the same offset allocate nothing; no input dates are retained.
-// 2 separators x 9 fraction formats x 3 offset spellings, then 48 signed hours
+// 2 separators x 21 fraction formats x 3 offset spellings, then 48 signed hours
 // and 60 minutes. Keeping the sign also preserves the spelling of negative zero.
 type OffsetMinutePatterns = [OnceLock<String>; 60];
 type OffsetHourPatterns = [OnceLock<Box<OffsetMinutePatterns>>; 48];
-static ISO_OFFSET_PATTERNS: [OnceLock<Box<OffsetHourPatterns>>; 54] =
-    [const { OnceLock::new() }; 54];
+static ISO_OFFSET_PATTERNS: [OnceLock<Box<OffsetHourPatterns>>; 126] =
+    [const { OnceLock::new() }; 126];
+
+fn fraction_format_index(fraction: Option<(u8, &str, FractionPrecision)>) -> usize {
+    match fraction {
+        None => 0,
+        Some((punctuation, _, precision)) => {
+            let index = match precision {
+                FractionPrecision::Milliseconds => 0,
+                FractionPrecision::Microseconds => 1,
+                FractionPrecision::Nanoseconds => 2,
+                FractionPrecision::Fixed(digits) => match digits {
+                    1 => 4, 2 => 5, 4 => 6, 5 => 7, 7 => 8, 8 => 9, _ => unreachable!(),
+                },
+            };
+            1 + usize::from(punctuation == b',') * 10 + index
+        }
+    }
+}
 
 fn iso_offset_pattern(
     separator: u8,
@@ -1086,19 +1216,7 @@ fn iso_offset_pattern(
     offset: IsoOffset<'_>,
 ) -> Result<&'static str, JsonTimestampError> {
     let base = iso_date_time_pattern(separator, fraction, false)?;
-    let fraction_index = match fraction {
-        None => 0,
-        Some((punctuation, _, precision)) => {
-            let precision_index = match precision {
-                FractionPrecision::Milliseconds => 0,
-                FractionPrecision::Microseconds => 1,
-                FractionPrecision::Nanoseconds => 2,
-                FractionPrecision::Variable => 3,
-            };
-            1 + usize::from(punctuation == b',') * 4 + precision_index
-        }
-    };
-    let format_index = offset.style * 18 + usize::from(separator == b' ') * 9 + fraction_index;
+    let format_index = offset.style * 42 + usize::from(separator == b' ') * 21 + fraction_format_index(fraction);
     let hours = ISO_OFFSET_PATTERNS[format_index]
         .get_or_init(|| Box::new(std::array::from_fn(|_| OnceLock::new())));
     let minutes = hours[offset.hours + usize::from(offset.negative) * 24]
@@ -1178,36 +1296,76 @@ fn iso_date_time_pattern(
         (b'T', Some((b'.', FractionPrecision::Milliseconds)), false) => r#""\Y-\m-\dT\H:\M:\S.\3""#,
         (b'T', Some((b'.', FractionPrecision::Microseconds)), false) => r#""\Y-\m-\dT\H:\M:\S.\6""#,
         (b'T', Some((b'.', FractionPrecision::Nanoseconds)), false) => r#""\Y-\m-\dT\H:\M:\S.\9""#,
-        (b'T', Some((b'.', FractionPrecision::Variable)), false) => r#""\Y-\m-\dT\H:\M:\S.\T""#,
         (b'T', Some((b',', FractionPrecision::Milliseconds)), false) => r#""\Y-\m-\dT\H:\M:\S,\3""#,
         (b'T', Some((b',', FractionPrecision::Microseconds)), false) => r#""\Y-\m-\dT\H:\M:\S,\6""#,
         (b'T', Some((b',', FractionPrecision::Nanoseconds)), false) => r#""\Y-\m-\dT\H:\M:\S,\9""#,
-        (b'T', Some((b',', FractionPrecision::Variable)), false) => r#""\Y-\m-\dT\H:\M:\S,\T""#,
         (b' ', Some((b'.', FractionPrecision::Milliseconds)), false) => r#""\Y-\m-\d \H:\M:\S.\3""#,
         (b' ', Some((b'.', FractionPrecision::Microseconds)), false) => r#""\Y-\m-\d \H:\M:\S.\6""#,
         (b' ', Some((b'.', FractionPrecision::Nanoseconds)), false) => r#""\Y-\m-\d \H:\M:\S.\9""#,
-        (b' ', Some((b'.', FractionPrecision::Variable)), false) => r#""\Y-\m-\d \H:\M:\S.\T""#,
         (b' ', Some((b',', FractionPrecision::Milliseconds)), false) => r#""\Y-\m-\d \H:\M:\S,\3""#,
         (b' ', Some((b',', FractionPrecision::Microseconds)), false) => r#""\Y-\m-\d \H:\M:\S,\6""#,
         (b' ', Some((b',', FractionPrecision::Nanoseconds)), false) => r#""\Y-\m-\d \H:\M:\S,\9""#,
-        (b' ', Some((b',', FractionPrecision::Variable)), false) => r#""\Y-\m-\d \H:\M:\S,\T""#,
         // A literal trailing Z does not change the epoch; it remains part of the exact pattern.
         (b'T', Some((b'.', FractionPrecision::Milliseconds)), true) => r#""\Y-\m-\dT\H:\M:\S.\3Z""#,
         (b'T', Some((b'.', FractionPrecision::Microseconds)), true) => r#""\Y-\m-\dT\H:\M:\S.\6Z""#,
         (b'T', Some((b'.', FractionPrecision::Nanoseconds)), true) => r#""\Y-\m-\dT\H:\M:\S.\9Z""#,
-        (b'T', Some((b'.', FractionPrecision::Variable)), true) => r#""\Y-\m-\dT\H:\M:\S.\TZ""#,
         (b'T', Some((b',', FractionPrecision::Milliseconds)), true) => r#""\Y-\m-\dT\H:\M:\S,\3Z""#,
         (b'T', Some((b',', FractionPrecision::Microseconds)), true) => r#""\Y-\m-\dT\H:\M:\S,\6Z""#,
         (b'T', Some((b',', FractionPrecision::Nanoseconds)), true) => r#""\Y-\m-\dT\H:\M:\S,\9Z""#,
-        (b'T', Some((b',', FractionPrecision::Variable)), true) => r#""\Y-\m-\dT\H:\M:\S,\TZ""#,
         (b' ', Some((b'.', FractionPrecision::Milliseconds)), true) => r#""\Y-\m-\d \H:\M:\S.\3Z""#,
         (b' ', Some((b'.', FractionPrecision::Microseconds)), true) => r#""\Y-\m-\d \H:\M:\S.\6Z""#,
         (b' ', Some((b'.', FractionPrecision::Nanoseconds)), true) => r#""\Y-\m-\d \H:\M:\S.\9Z""#,
-        (b' ', Some((b'.', FractionPrecision::Variable)), true) => r#""\Y-\m-\d \H:\M:\S.\TZ""#,
         (b' ', Some((b',', FractionPrecision::Milliseconds)), true) => r#""\Y-\m-\d \H:\M:\S,\3Z""#,
         (b' ', Some((b',', FractionPrecision::Microseconds)), true) => r#""\Y-\m-\d \H:\M:\S,\6Z""#,
         (b' ', Some((b',', FractionPrecision::Nanoseconds)), true) => r#""\Y-\m-\d \H:\M:\S,\9Z""#,
-        (b' ', Some((b',', FractionPrecision::Variable)), true) => r#""\Y-\m-\d \H:\M:\S,\TZ""#,
+        (b'T', Some((b'.', FractionPrecision::Fixed(1))), false) => r#""\Y-\m-\dT\H:\M:\S.\1""#,
+        (b'T', Some((b'.', FractionPrecision::Fixed(2))), false) => r#""\Y-\m-\dT\H:\M:\S.\2""#,
+        (b'T', Some((b'.', FractionPrecision::Fixed(4))), false) => r#""\Y-\m-\dT\H:\M:\S.\4""#,
+        (b'T', Some((b'.', FractionPrecision::Fixed(5))), false) => r#""\Y-\m-\dT\H:\M:\S.\5""#,
+        (b'T', Some((b'.', FractionPrecision::Fixed(7))), false) => r#""\Y-\m-\dT\H:\M:\S.\7""#,
+        (b'T', Some((b'.', FractionPrecision::Fixed(8))), false) => r#""\Y-\m-\dT\H:\M:\S.\8""#,
+        (b'T', Some((b'.', FractionPrecision::Fixed(1))), true) => r#""\Y-\m-\dT\H:\M:\S.\1Z""#,
+        (b'T', Some((b'.', FractionPrecision::Fixed(2))), true) => r#""\Y-\m-\dT\H:\M:\S.\2Z""#,
+        (b'T', Some((b'.', FractionPrecision::Fixed(4))), true) => r#""\Y-\m-\dT\H:\M:\S.\4Z""#,
+        (b'T', Some((b'.', FractionPrecision::Fixed(5))), true) => r#""\Y-\m-\dT\H:\M:\S.\5Z""#,
+        (b'T', Some((b'.', FractionPrecision::Fixed(7))), true) => r#""\Y-\m-\dT\H:\M:\S.\7Z""#,
+        (b'T', Some((b'.', FractionPrecision::Fixed(8))), true) => r#""\Y-\m-\dT\H:\M:\S.\8Z""#,
+        (b'T', Some((b',', FractionPrecision::Fixed(1))), false) => r#""\Y-\m-\dT\H:\M:\S,\1""#,
+        (b'T', Some((b',', FractionPrecision::Fixed(2))), false) => r#""\Y-\m-\dT\H:\M:\S,\2""#,
+        (b'T', Some((b',', FractionPrecision::Fixed(4))), false) => r#""\Y-\m-\dT\H:\M:\S,\4""#,
+        (b'T', Some((b',', FractionPrecision::Fixed(5))), false) => r#""\Y-\m-\dT\H:\M:\S,\5""#,
+        (b'T', Some((b',', FractionPrecision::Fixed(7))), false) => r#""\Y-\m-\dT\H:\M:\S,\7""#,
+        (b'T', Some((b',', FractionPrecision::Fixed(8))), false) => r#""\Y-\m-\dT\H:\M:\S,\8""#,
+        (b'T', Some((b',', FractionPrecision::Fixed(1))), true) => r#""\Y-\m-\dT\H:\M:\S,\1Z""#,
+        (b'T', Some((b',', FractionPrecision::Fixed(2))), true) => r#""\Y-\m-\dT\H:\M:\S,\2Z""#,
+        (b'T', Some((b',', FractionPrecision::Fixed(4))), true) => r#""\Y-\m-\dT\H:\M:\S,\4Z""#,
+        (b'T', Some((b',', FractionPrecision::Fixed(5))), true) => r#""\Y-\m-\dT\H:\M:\S,\5Z""#,
+        (b'T', Some((b',', FractionPrecision::Fixed(7))), true) => r#""\Y-\m-\dT\H:\M:\S,\7Z""#,
+        (b'T', Some((b',', FractionPrecision::Fixed(8))), true) => r#""\Y-\m-\dT\H:\M:\S,\8Z""#,
+        (b' ', Some((b'.', FractionPrecision::Fixed(1))), false) => r#""\Y-\m-\d \H:\M:\S.\1""#,
+        (b' ', Some((b'.', FractionPrecision::Fixed(2))), false) => r#""\Y-\m-\d \H:\M:\S.\2""#,
+        (b' ', Some((b'.', FractionPrecision::Fixed(4))), false) => r#""\Y-\m-\d \H:\M:\S.\4""#,
+        (b' ', Some((b'.', FractionPrecision::Fixed(5))), false) => r#""\Y-\m-\d \H:\M:\S.\5""#,
+        (b' ', Some((b'.', FractionPrecision::Fixed(7))), false) => r#""\Y-\m-\d \H:\M:\S.\7""#,
+        (b' ', Some((b'.', FractionPrecision::Fixed(8))), false) => r#""\Y-\m-\d \H:\M:\S.\8""#,
+        (b' ', Some((b'.', FractionPrecision::Fixed(1))), true) => r#""\Y-\m-\d \H:\M:\S.\1Z""#,
+        (b' ', Some((b'.', FractionPrecision::Fixed(2))), true) => r#""\Y-\m-\d \H:\M:\S.\2Z""#,
+        (b' ', Some((b'.', FractionPrecision::Fixed(4))), true) => r#""\Y-\m-\d \H:\M:\S.\4Z""#,
+        (b' ', Some((b'.', FractionPrecision::Fixed(5))), true) => r#""\Y-\m-\d \H:\M:\S.\5Z""#,
+        (b' ', Some((b'.', FractionPrecision::Fixed(7))), true) => r#""\Y-\m-\d \H:\M:\S.\7Z""#,
+        (b' ', Some((b'.', FractionPrecision::Fixed(8))), true) => r#""\Y-\m-\d \H:\M:\S.\8Z""#,
+        (b' ', Some((b',', FractionPrecision::Fixed(1))), false) => r#""\Y-\m-\d \H:\M:\S,\1""#,
+        (b' ', Some((b',', FractionPrecision::Fixed(2))), false) => r#""\Y-\m-\d \H:\M:\S,\2""#,
+        (b' ', Some((b',', FractionPrecision::Fixed(4))), false) => r#""\Y-\m-\d \H:\M:\S,\4""#,
+        (b' ', Some((b',', FractionPrecision::Fixed(5))), false) => r#""\Y-\m-\d \H:\M:\S,\5""#,
+        (b' ', Some((b',', FractionPrecision::Fixed(7))), false) => r#""\Y-\m-\d \H:\M:\S,\7""#,
+        (b' ', Some((b',', FractionPrecision::Fixed(8))), false) => r#""\Y-\m-\d \H:\M:\S,\8""#,
+        (b' ', Some((b',', FractionPrecision::Fixed(1))), true) => r#""\Y-\m-\d \H:\M:\S,\1Z""#,
+        (b' ', Some((b',', FractionPrecision::Fixed(2))), true) => r#""\Y-\m-\d \H:\M:\S,\2Z""#,
+        (b' ', Some((b',', FractionPrecision::Fixed(4))), true) => r#""\Y-\m-\d \H:\M:\S,\4Z""#,
+        (b' ', Some((b',', FractionPrecision::Fixed(5))), true) => r#""\Y-\m-\d \H:\M:\S,\5Z""#,
+        (b' ', Some((b',', FractionPrecision::Fixed(7))), true) => r#""\Y-\m-\d \H:\M:\S,\7Z""#,
+        (b' ', Some((b',', FractionPrecision::Fixed(8))), true) => r#""\Y-\m-\d \H:\M:\S,\8Z""#,
         _ => {
             return Err(JsonTimestampError::UnsupportedLexeme {
                 kind: JsonTimestampScalarKind::String,
@@ -1252,13 +1410,10 @@ mod tests {
             .resolve_number(b"1762445893.00100201")
             .expect("variable fraction");
         assert_eq!(1_762_445_893_001_002_010, fraction.epoch_nanoseconds());
-        assert_eq!(r"\E.\T", fraction.pattern());
-        assert!(matches!(
-            resolver.resolve_number(b"1762445893.10"),
-            Err(JsonTimestampError::UnsupportedLexeme {
-                kind: JsonTimestampScalarKind::Number,
-            })
-        ));
+        assert_eq!(r"\E.\8", fraction.pattern());
+        let fixed = resolver.resolve_number(b"1762445893.10").unwrap();
+        assert_eq!(fixed.pattern(), r"\E.\2");
+        assert_eq!(fixed.epoch_nanoseconds(), 1_762_445_893_100_000_000);
     }
 
     #[test]

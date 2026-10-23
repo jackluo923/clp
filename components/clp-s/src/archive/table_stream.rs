@@ -8,7 +8,7 @@ use std::ops::Range;
 use super::column::ColumnError;
 use super::column::ColumnLimits;
 use super::column::SchemaTable;
-use super::column::decode_schema_table;
+use super::column::decode_schema_table_with_rows;
 use super::packed_stream::ColumnSlot;
 use super::dictionary::ArrayDictionary;
 use super::dictionary::LogTypeDictionary;
@@ -84,6 +84,7 @@ pub struct SchemaTableStream<'stream, 'archive> {
     array_dictionary: &'archive ArrayDictionary,
     timestamp_dictionary: &'archive TimestampDictionary,
     limits: ColumnLimits,
+    row_selections: std::collections::HashMap<i32, Vec<(usize, usize)>>,
 }
 
 impl<'stream, 'archive> SchemaTableStream<'stream, 'archive> {
@@ -185,7 +186,15 @@ impl<'stream, 'archive> SchemaTableStream<'stream, 'archive> {
             array_dictionary,
             timestamp_dictionary,
             limits,
+            row_selections: Default::default(),
         })
+    }
+
+    /// Restrict timestamp validation to query-selected chunks. Callers must only access
+    /// rows in these ranges; ordinary decoding without this method validates all rows.
+    pub fn with_row_selections(mut self, selections: std::collections::HashMap<i32, Vec<(usize, usize)>>) -> Self {
+        self.row_selections = selections;
+        self
     }
 
     /// Returns the packed-stream ID represented by this iterator.
@@ -251,7 +260,7 @@ impl<'stream, 'archive> SchemaTableStream<'stream, 'archive> {
                 table_index,
                 schema_id,
             })?;
-        let decoded = decode_schema_table(
+        let decoded = decode_schema_table_with_rows(
             table_bytes,
             self.column_layout,
             schema,
@@ -262,6 +271,7 @@ impl<'stream, 'archive> SchemaTableStream<'stream, 'archive> {
             self.array_dictionary,
             self.timestamp_dictionary,
             self.limits,
+            self.row_selections.get(&schema_id).map(Vec::as_slice),
         )
         .map_err(|source| TableStreamError::Column {
             table_index,

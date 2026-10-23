@@ -281,6 +281,10 @@ impl<'a> I64Column<'a> {
     pub const fn is_empty(self) -> bool { self.len() == 0 }
     #[must_use]
     pub fn get(self, index: usize) -> Option<i64> { self.data.get(index).map(|v| v as i64) }
+    /// Reads a selected row, reusing a previous value from this column for sequential delta access.
+    pub fn get_with_previous(self, previous: Option<(usize, i64)>, row: usize) -> Option<i64> {
+        self.data.get_with_previous(previous.map(|(r, v)| (r, v as u64)), row).map(|v| v as i64)
+    }
     pub fn iter(self) -> impl ExactSizeIterator<Item=i64> + DoubleEndedIterator + FusedIterator + 'a {
         self.data.iter().map(|v| v as i64)
     }
@@ -406,26 +410,43 @@ impl<'a> F64Column<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeltaI64Column<'a> {
     deltas: I64Column<'a>,
+    scale: i64,
+    restart_rows: usize,
 }
 
-/// A forward iterator that reconstructs a delta column in one linear pass.
+/// A forward iterator that can seek to a persisted chunk anchor.
 #[derive(Clone, Debug)]
 pub struct DeltaI64Values<'a> {
-    deltas: std::slice::Iter<'a, [u8; U64_SIZE]>,
+    deltas: &'a [[u8; U64_SIZE]],
+    row: usize,
     current: i64,
+    scale: i64,
+    restart_rows: usize,
 }
 
 impl Iterator for DeltaI64Values<'_> {
     type Item = i64;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let delta = i64::from_le_bytes(*self.deltas.next()?);
-        self.current = self.current.wrapping_add(delta);
-        Some(self.current)
+    fn next(&mut self) -> Option<i64> {
+        let delta = i64::from_le_bytes(*self.deltas.get(self.row)?);
+        self.current = if self.restart_rows != 0 && self.row % self.restart_rows == 0 {
+            delta
+        } else { self.current.wrapping_add(delta) };
+        self.row += 1;
+        Some(self.current * self.scale)
     }
-
+    fn nth(&mut self, n: usize) -> Option<i64> {
+        let target = self.row.saturating_add(n);
+        if target >= self.deltas.len() { self.row = self.deltas.len(); return None; }
+        if self.restart_rows != 0 {
+            let anchor = target / self.restart_rows * self.restart_rows;
+            if anchor > self.row { self.row = anchor; self.current = 0; }
+        }
+        while self.row < target { self.next()?; }
+        self.next()
+    }
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.deltas.size_hint()
+        let left = self.deltas.len() - self.row;
+        (left, Some(left))
     }
 }
 
@@ -457,12 +478,27 @@ impl<'a> DeltaI64Column<'a> {
     #[must_use]
     pub fn values(self) -> DeltaI64Values<'a> {
         DeltaI64Values {
-            deltas: self.deltas.data.bytes.as_chunks::<U64_SIZE>().0.iter(),
+            deltas: self.deltas.data.bytes.as_chunks::<U64_SIZE>().0,
+            row: 0,
+            restart_rows: self.restart_rows,
             current: 0,
+            scale: self.scale,
         }
     }
 
-    /// Reconstructs one value. Repeated random access is linear in the requested index.
+    /// Nanoseconds per stored tick for timestamps, or one for ordinary integers.
+    #[must_use]
+    pub const fn scale(self) -> i64 {
+        self.scale
+    }
+
+    /// Reconstructs native ticks without converting each row to nanoseconds.
+    #[must_use]
+    pub fn ticks(self) -> DeltaI64Values<'a> {
+        DeltaI64Values { scale: 1, ..self.values() }
+    }
+
+    /// Reconstructs one value, starting at its chunk anchor when available.
     #[must_use]
     pub fn get(self, index: usize) -> Option<i64> {
         self.values().nth(index)
@@ -761,7 +797,7 @@ impl<'table, 'archive> DictionaryIdColumn<'table, 'archive> {
     /// without searching its runs for every row.
     #[must_use]
     pub const fn cursor(self) -> DictionaryValueCursor<'table, 'archive> {
-        DictionaryValueCursor { column: self, run: 0 }
+        DictionaryValueCursor { column: self, run: 0, last: None }
     }
 }
 
@@ -770,12 +806,16 @@ impl<'table, 'archive> DictionaryIdColumn<'table, 'archive> {
 pub struct DictionaryValueCursor<'table, 'archive> {
     column: DictionaryIdColumn<'table, 'archive>,
     run: usize,
+    last: Option<(usize, u64)>,
 }
 
 impl<'archive> DictionaryValueCursor<'_, 'archive> {
     /// Returns one exact variable-dictionary byte string.
     pub fn value(&mut self, index: usize) -> Option<&'archive [u8]> {
-        let id = self.column.ids.data.get_forward(&mut self.run, index)?;
+        let data = self.column.ids.data;
+        let id = if data.is_block_delta() { data.get_with_previous(self.last, index)? }
+            else { data.get_forward(&mut self.run, index)? };
+        self.last = Some((index, id));
         self.column.dictionary.entry(id).map(VariableDictionaryEntry::value)
     }
 }
@@ -1105,6 +1145,17 @@ impl<'table, 'archive> TimestampColumn<'table, 'archive> {
         self.epochs.values().zip(self.pattern_ids.iter())
     }
 
+    /// Decode only selected rows, jumping across excluded delta chunks.
+    pub(crate) fn selected_values(self, bitmap: &'table [u8]) -> impl Iterator<Item = (usize, i64, u64)> + 'table {
+        let mut epochs = self.epochs.values();
+        let mut next = 0;
+        bitmap.iter().enumerate().filter(|(_, matched)| **matched != 0).map(move |(row, _)| {
+            let epoch = epochs.nth(row - next).expect("validated selected timestamp row");
+            next = row + 1;
+            (row, epoch, self.pattern_ids.get(row).expect("validated pattern row"))
+        })
+    }
+
     /// Returns one reconstructed timestamp and pattern.
     #[must_use]
     pub fn get(self, index: usize) -> Option<TimestampValue<'archive>> {
@@ -1141,6 +1192,24 @@ pub fn decode_schema_table<'table, 'archive>(
     array_dictionary: &'archive ArrayDictionary,
     timestamp_dictionary: &'archive TimestampDictionary,
     limits: ColumnLimits,
+) -> Result<SchemaTable<'table, 'archive>, ColumnError> {
+    decode_schema_table_with_rows(table_bytes, column_layout, schema, schema_tree, message_count,
+        variable_dictionary, logtype_dictionary, array_dictionary, timestamp_dictionary, limits, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_schema_table_with_rows<'table, 'archive>(
+    table_bytes: &'table [u8],
+    column_layout: Option<&'table [ColumnSlot]>,
+    schema: &SchemaDefinition,
+    schema_tree: &SchemaTree,
+    message_count: u64,
+    variable_dictionary: &'archive VariableDictionary,
+    logtype_dictionary: &'archive LogTypeDictionary,
+    array_dictionary: &'archive ArrayDictionary,
+    timestamp_dictionary: &'archive TimestampDictionary,
+    limits: ColumnLimits,
+    selected_rows: Option<&[(usize, usize)]>,
 ) -> Result<SchemaTable<'table, 'archive>, ColumnError> {
     let logical_bytes = match column_layout {
         Some(layout) => layout.iter().try_fold(0usize, |sum, slot| {
@@ -1274,6 +1343,7 @@ pub fn decode_schema_table<'table, 'archive>(
             timestamp_dictionary,
             limits,
             &mut total_encoded_variables,
+            selected_rows,
         )?;
         columns.push(Column {
             schema_entry_index,
@@ -1313,6 +1383,7 @@ fn decode_column<'table, 'archive>(
     timestamp_dictionary: &'archive TimestampDictionary,
     limits: ColumnLimits,
     total_encoded_variables: &mut u64,
+    selected_rows: Option<&[(usize, usize)]>,
 ) -> Result<ColumnData<'table, 'archive>, ColumnError> {
     match node_type {
         NodeType::MixedInteger => {
@@ -1400,6 +1471,7 @@ fn decode_column<'table, 'archive>(
             context,
             message_count,
             timestamp_dictionary,
+            selected_rows,
         )?)),
         NodeType::Object | NodeType::Null | NodeType::StructuredArray | NodeType::Metadata => {
             unreachable!("structural nodes are filtered before column decoding")
@@ -1461,7 +1533,7 @@ fn take_delta_column<'a>(
 ) -> Result<DeltaI64Column<'a>, ColumnError> {
     let deltas = take_i64_column(cursor, context, count)?;
     validate_deltas(deltas, context)?;
-    Ok(DeltaI64Column { deltas })
+    Ok(DeltaI64Column { deltas, scale: 1, restart_rows: 0 })
 }
 
 fn take_float_column<'a>(
@@ -1666,18 +1738,34 @@ fn take_timestamp_column<'table, 'archive>(
     context: ColumnContext,
     message_count: usize,
     dictionary: &'archive TimestampDictionary,
+    selected_rows: Option<&[(usize, usize)]>,
 ) -> Result<TimestampColumn<'table, 'archive>, ColumnError> {
-    let epochs = take_delta_column(cursor, context, message_count)?;
+    let deltas = take_i64_column(cursor, context, message_count)?;
+    let scale = dictionary.storage_precision(context.node_id).nanoseconds_per_tick();
+    let restart_rows = dictionary.restart_rows(context.node_id);
+    let epochs = DeltaI64Column { deltas, scale, restart_rows };
     let pattern_ids = take_u64_column(cursor, context, message_count)?;
+    let all = [(0, message_count)];
+    // Legacy continuous deltas still require the preceding chain. New columns need only
+    // the anchors and deltas in selected chunks; decompressed bytes stay encoded.
+    let ranges = if restart_rows == 0 { &all[..] } else { selected_rows.unwrap_or(&all) };
     let mut validated = None;
-    for (message_index, id) in pattern_ids.iter().enumerate() {
-        validate_timestamp_pattern(dictionary, context, message_index, id, &mut validated)?;
+    for &(start, end) in ranges {
+        let end = end.min(message_count);
+        let start = if restart_rows == 0 { 0 } else { start / restart_rows * restart_rows }.min(end);
+        let mut previous = 0i64;
+        for (index, delta) in deltas.iter().enumerate().take(end).skip(start) {
+            let ticks = if restart_rows != 0 && index % restart_rows == 0 { delta }
+                else { previous.checked_add(delta).ok_or_else(|| corrupt(context, Some(index),
+                    ColumnCorruption::DeltaOverflow { previous, delta }))? };
+            ticks.checked_mul(scale).ok_or_else(|| corrupt(context, Some(index),
+                ColumnCorruption::TimestampScaleOverflow { ticks, scale }))?;
+            previous = ticks;
+            let id = pattern_ids.get(index).expect("validated timestamp column span");
+            validate_timestamp_pattern(dictionary, context, index, id, &mut validated)?;
+        }
     }
-    Ok(TimestampColumn {
-        epochs,
-        pattern_ids,
-        dictionary,
-    })
+    Ok(TimestampColumn { epochs, pattern_ids, dictionary })
 }
 
 /// Checks that `id` names a pattern in `dictionary`. Consecutive rows nearly always share a
@@ -1995,6 +2083,8 @@ impl Error for EncodedFloatErrorReason {}
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum ColumnCorruption {
+    /// A stored tick count cannot be normalized to the supported i64 nanosecond domain.
+    TimestampScaleOverflow { ticks: i64, scale: i64 },
     /// A compact numeric layout or its values are invalid.
     InvalidAdaptiveNumeric,
     /// A raw or formatted binary64 value is NaN or infinite.
@@ -2094,6 +2184,8 @@ pub enum ColumnCorruption {
 impl Display for ColumnCorruption {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::TimestampScaleOverflow { ticks, scale } => write!(formatter,
+                "timestamp ticks {ticks} at scale {scale} overflow nanoseconds"),
             Self::InvalidAdaptiveNumeric => formatter.write_str("invalid compact numeric column"),
             Self::NonFiniteFloat => formatter.write_str("binary64 value is not finite"),
             Self::InvalidBoolean { actual } => write!(formatter, "Boolean byte is {actual}"),
@@ -2632,6 +2724,39 @@ mod tests {
         let mut prepared = Vec::new();
         crate::encoded_numeric::prepare(&wire, rows, false, &mut prepared).expect("prepare runs");
         (prepared, rows)
+    }
+
+    #[test]
+    fn timestamp_restart_validation_and_seeks_skip_excluded_chunks() {
+        let rows = crate::delta_blocks::ROWS * 3;
+        let block = crate::delta_blocks::ROWS;
+        // A range for node zero, encoding 4, millisecond ticks, one numeric-ms pattern.
+        let mut payload = Vec::new();
+        for value in [1u64, 2] { push_u64(&mut payload, value); } payload.extend(b"ts");
+        push_u64(&mut payload, 1); payload.extend(0i32.to_le_bytes());
+        for value in [4u64, 1_000_000, 0, 0, 1_000_000, 1, 0, 2] { push_u64(&mut payload, value); }
+        payload.extend(br"\L");
+        let dictionary = TimestampDictionary::decode(payload, TimestampDictionaryLimits::default()).unwrap();
+        let mut raw = Vec::with_capacity(rows * 16);
+        for row in 0..rows { push_i64(&mut raw, if row % block == 0 { 100 } else { 1 }); }
+        raw.resize(rows * 16, 0);
+        // This anchor would overflow epoch normalization, but the query excludes its entire block.
+        raw[block * 8..block * 8 + 8].copy_from_slice(&i64::MAX.to_le_bytes());
+        let context = ColumnContext { column_index: 0, node_id: 0 };
+        let ranges = [(0, block), (block * 2, rows)];
+        let read = |selected| take_timestamp_column(&mut TableCursor::new(&raw), context, rows, &dictionary, selected);
+        let selected = read(Some(&ranges)).unwrap();
+        assert_eq!(selected.epochs().get(block * 2 + 7), Some(107_000_000));
+        let mut values = selected.epochs().values();
+        assert_eq!(values.next(), Some(100_000_000));
+        assert_eq!(values.nth(block * 2 - 1), Some(100_000_000));
+        assert_eq!(values.next(), Some(101_000_000));
+        assert!(read(None).is_err(), "full decompression validates every row");
+        let corrupt_range = [(block, block * 2)];
+        assert!(read(Some(&corrupt_range)).is_err(), "a selected corrupt chunk must fail");
+        assert!(read(Some(&[])).is_ok());
+        let mut bitmap = vec![0; rows]; bitmap[block * 2 + 1] = 1;
+        assert_eq!(selected.selected_values(&bitmap).collect::<Vec<_>>(), [(block * 2 + 1, 101_000_000, 0)]);
     }
 
     #[test]

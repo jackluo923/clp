@@ -471,6 +471,7 @@ struct DictionaryCompression {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WriterOptions {
     compression_level: i32,
+    encoding_effort: crate::EncodingEffort,
     dictionary_compression: DictionaryCompression,
     limits: WriterLimits,
     minimum_packed_stream_size: u64,
@@ -480,6 +481,8 @@ pub struct WriterOptions {
     separate_columns_min_size: u64,
     adaptive: AdaptiveColumns,
     numeric_summaries: bool,
+    timestamp_precision: crate::timestamp_precision::TimestampPrecision,
+    timestamp_rounding: crate::timestamp_precision::TimestampRounding,
 }
 
 /// When the strings of a CLP-string field are stored whole; see
@@ -551,7 +554,6 @@ impl AdaptiveColumns {
     const VERBATIM_TEXT: u8 = 1 << 4;
     const DICTIONARY_LONG_DISTANCE_MATCHING: u8 = 1 << 5;
     const FIELD_DICTIONARIES: u8 = 1 << 6;
-    const DECIMAL_FLOATS: u8 = 1 << 7;
 
     const fn has(self, flag: u8) -> bool {
         0 != self.0 & flag
@@ -567,6 +569,23 @@ impl AdaptiveColumns {
 }
 
 impl WriterOptions {
+    /// Physical timestamp storage unit; coarser units deliberately discard finer precision.
+    #[must_use]
+    pub const fn with_timestamp_precision(mut self, unit: crate::timestamp_precision::TimestampPrecision) -> Self {
+        self.timestamp_precision = unit;
+        self
+    }
+    /// Quantization policy (default: floor to the selected unit boundary).
+    #[must_use]
+    pub const fn with_timestamp_rounding(mut self, rounding: crate::timestamp_precision::TimestampRounding) -> Self {
+        self.timestamp_rounding = rounding;
+        self
+    }
+    /// Physical timestamp unit, independent of the source representation.
+    pub const fn timestamp_precision(self) -> crate::timestamp_precision::TimestampPrecision { self.timestamp_precision }
+    /// Recorded quantization policy.
+    pub const fn timestamp_rounding(self) -> crate::timestamp_precision::TimestampRounding { self.timestamp_rounding }
+
     /// Store versioned numeric summaries in archive metadata (enabled by default).
     #[must_use]
     pub const fn with_numeric_summaries(mut self, enabled: bool) -> Self {
@@ -586,6 +605,7 @@ impl WriterOptions {
     pub const fn new(compression_level: i32) -> Self {
         Self {
             compression_level,
+            encoding_effort: crate::EncodingEffort::Balanced,
             dictionary_compression: DictionaryCompression {
                 level: Self::DEFAULT_DICTIONARY_COMPRESSION_LEVEL,
                 verbatim_text: VerbatimText::DEFAULT,
@@ -598,6 +618,8 @@ impl WriterOptions {
             emit_log_order_column: true,
             separate_columns_min_size: 0,
             numeric_summaries: true,
+            timestamp_precision: crate::timestamp_precision::TimestampPrecision::Nanoseconds,
+            timestamp_rounding: crate::timestamp_precision::TimestampRounding::Truncate,
             // Adaptive column encodings are disabled in the library default. The
             // compression CLI enables them; numeric summaries are enabled in both.
             adaptive: AdaptiveColumns(
@@ -631,15 +653,14 @@ impl WriterOptions {
 
     /// Enables or disables adaptive per-column numeric encoding.
     ///
-    /// When enabled (the default), every schema table that holds an integer or float column is
+    /// When enabled (the compression CLI default), every schema table that holds an integer or float column is
     /// written one zstd frame per column (as with `separate_columns_min_size`), and each numeric
     /// column is stored with the smallest of a small menu of lightweight codecs — integers via
     /// frame-of-reference / delta / dictionary / run-length / constant / plain, floats via
-    /// byte-stream-split / dictionary / run-length / constant / plain — chosen by post-zstd size.
-    /// Such an archive is stamped version 0.6.0 so 0.5.x readers refuse it rather than misread the
-    /// variable-width columns.
+    /// byte-stream-split / dictionary / run-length / constant / plain / exact decimal — chosen by
+    /// post-zstd size within the configured encoding effort. New adaptive archives use version 0.15.
     ///
-    /// Disabling it restores byte-identical 0.5.0 output (the format the C++ reference reads).
+    /// Required adaptive encoding for mixed-integer and native timestamp schemas remains enabled.
     #[must_use]
     pub const fn with_adaptive_numeric_columns(mut self, enabled: bool) -> Self {
         self.adaptive = self.adaptive.with(AdaptiveColumns::NUMERIC, enabled);
@@ -652,28 +673,33 @@ impl WriterOptions {
         self.adaptive.has(AdaptiveColumns::NUMERIC)
     }
 
-    /// Enables or disables storing float columns as decimals, which takes effect only with adaptive
-    /// numeric columns.
-    ///
-    /// When enabled (off by default), a float column whose every value is `m / 10^k` for integers
-    /// `m` and one scale `k` of at most 15, rounded to a double, or to a float when every value is
-    /// a widened float, may be stored as its scale and its mantissas in an integer scheme, if that
-    /// is smallest. Values are reproduced bit for bit. Archives shrink, but reading such a column
-    /// decompresses its mantissas into, and decodes them out of, buffers of 8 bytes per row, where
-    /// a dictionary-encoded float column is a fraction of that and filters test each distinct
-    /// value once. Faulting in those buffers dominates: about 14 ms per million rows in a fresh
-    /// process, and almost nothing once a long-running reader's stream buffer pool retains them.
-    /// An archive with such a column is stamped version 0.11.0, which earlier readers refuse.
+    /// Set the shared integer/float candidate budget, independently of the Zstd level.
+    /// Balanced is the default. Fast trades candidate coverage for less selection work;
+    /// Exhaustive also tries sparse runs and broader exact decimal reconstructions.
     #[must_use]
-    pub const fn with_decimal_float_columns(mut self, enabled: bool) -> Self {
-        self.adaptive = self.adaptive.with(AdaptiveColumns::DECIMAL_FLOATS, enabled);
+    pub const fn with_encoding_effort(mut self, effort: crate::EncodingEffort) -> Self {
+        self.encoding_effort = effort;
         self
     }
 
-    /// Returns whether float columns may be stored as decimals.
+    /// Shared integer/float candidate-selection effort.
+    #[must_use]
+    pub const fn encoding_effort(self) -> crate::EncodingEffort {
+        self.encoding_effort
+    }
+
+    /// Legacy convenience alias: true selects Exhaustive, false selects Balanced.
+    /// Use [`Self::with_encoding_effort`] for the common integer and float policy.
+    #[must_use]
+    pub const fn with_decimal_float_columns(mut self, enabled: bool) -> Self {
+        self.encoding_effort = if enabled { crate::EncodingEffort::Exhaustive } else { crate::EncodingEffort::Balanced };
+        self
+    }
+
+    /// Whether broad legacy decimal trials are enabled (Exhaustive effort).
     #[must_use]
     pub const fn decimal_float_columns(self) -> bool {
-        self.adaptive.has(AdaptiveColumns::DECIMAL_FLOATS)
+        matches!(self.encoding_effort, crate::EncodingEffort::Exhaustive)
     }
 
     /// Enables or disables adaptive encoding of string columns, which takes effect only with
@@ -1018,7 +1044,8 @@ impl<W> OpenArchive<W> {
         Self {
             output,
             options,
-            records: PrimitiveArchive::with_verbatim_text(options.verbatim_text(), keys),
+            records: PrimitiveArchive::with_verbatim_text(options.verbatim_text(), keys)
+                .with_timestamp_storage(options.timestamp_precision(), options.timestamp_rounding()),
         }
     }
 
@@ -1158,7 +1185,7 @@ impl<W: Write + Seek> OpenArchive<W> {
             });
         }
 
-        let encoded = encode_records(&self.records, self.options)?;
+        let encoded = encode_records(self.records, self.options)?;
         self.output
             .seek(SeekFrom::Start(0))
             .map_err(WriterError::Io)?;
@@ -1191,15 +1218,16 @@ impl<W: Write + Seek> OpenArchive<W> {
 }
 
 fn encode_records(
-    records: &PrimitiveArchive,
+    mut records: PrimitiveArchive,
     options: WriterOptions,
 ) -> Result<EncodedEmptyArchive, WriterError> {
     if 0 == records.record_count() {
         EncodedEmptyArchive::new(options)
     } else {
+        records.finalize_auto_timestamps();
         let mixed = records.has_mixed_integers();
-        let options = if mixed { options.with_adaptive_numeric_columns(true).with_adaptive_string_columns(true) } else { options };
-        let (sections, timestamp_dictionary, decimal_floats) = records.encode_sections(options)?;
+        let timestamps = records.has_timestamps();
+        let options = if mixed || timestamps { options.with_adaptive_numeric_columns(true).with_adaptive_string_columns(true) } else { options };
         // Validation hook: emit legacy archives for same-build fallback comparisons.
         let disabled = std::env::var("CLP_DISABLE_NUMERIC_SUMMARIES").is_ok_and(|v| !v.is_empty() && v != "0");
         let summaries = if disabled || !options.numeric_summaries { None } else { Some(records.numeric_summaries()?) };
@@ -1208,9 +1236,13 @@ fn encode_records(
         // Like the numeric summaries, the chunk index is optional Rust metadata; disabling those
         // (for byte parity with the C++ writer) omits it too.
         let chunks = if chunks_disabled || !options.numeric_summaries { None } else { records.timestamp_chunks()? };
+        // Summaries and pruning indexes above use quantized values, independent of storage hints.
+        let (sections, timestamp_dictionary, decimal_floats) = records.encode_sections(options)?;
         let mut encoded = EncodedEmptyArchive::from_sections_with_summaries(options, sections, &timestamp_dictionary,
             summaries.as_deref(), chunks.as_deref(), records.template_index()?.as_deref())?;
-        let version = if decimal_floats {
+        let version = if timestamps || options.adaptive_numeric_columns() || options.adaptive_string_columns() {
+            Some(crate::archive::ArchiveVersion::MULTIPLY_DECIMAL_FLOATS)
+        } else if decimal_floats {
             Some(crate::archive::ArchiveVersion::DECIMAL_FLOATS)
         } else {
             mixed.then_some(crate::archive::ArchiveVersion::MIXED_INTEGERS)
@@ -1323,7 +1355,9 @@ impl EncodedEmptyArchive {
 
         // The archive version describes column encodings. Numeric summaries live
         // in their own versioned metadata packet.
-        let version = if options.verbatim_text().is_some() {
+        let version = if options.adaptive_numeric_columns() || options.adaptive_string_columns() {
+            crate::archive::ArchiveVersion::MULTIPLY_DECIMAL_FLOATS
+        } else if options.verbatim_text().is_some() {
             crate::archive::ArchiveVersion::VERBATIM_TEXT
         } else if options.adaptive_string_columns() {
             crate::archive::ArchiveVersion::ADAPTIVE_STRINGS
@@ -2197,8 +2231,8 @@ mod tests {
             let (version, decoded) = adaptive_column_values(bytes);
             assert_eq!(
                 version,
-                crate::archive::ArchiveVersion::VERBATIM_TEXT,
-                "an adaptive archive, with per-field log-type dictionaries, adaptive string columns and text stored whole by default, is stamped 0.9.0"
+                crate::archive::ArchiveVersion::MULTIPLY_DECIMAL_FLOATS,
+                "an adaptive archive, with per-field log-type dictionaries, adaptive string columns and text stored whole by default, is stamped 0.15.0"
             );
             assert_eq!(decoded, values, "the column round-trips through the adaptive pipeline");
         }
@@ -2306,8 +2340,8 @@ mod tests {
             let (version, bits) = adaptive_float_column_bits(adaptive_float_archive(&values));
             assert_eq!(
                 version,
-                crate::archive::ArchiveVersion::VERBATIM_TEXT,
-                "an adaptive archive, with per-field log-type dictionaries, adaptive string columns and text stored whole by default, is stamped 0.9.0"
+                crate::archive::ArchiveVersion::MULTIPLY_DECIMAL_FLOATS,
+                "an adaptive archive, with per-field log-type dictionaries, adaptive string columns and text stored whole by default, is stamped 0.15.0"
             );
             assert_eq!(bits, expected, "float column round-trips bit-exact");
         }
@@ -2323,12 +2357,12 @@ mod tests {
             let expected: Vec<u64> = values.iter().map(|v| v.to_bits()).collect();
             let decimal = adaptive_float_archive_with(values, WriterOptions::default().with_decimal_float_columns(true));
             let (version, bits) = adaptive_float_column_bits(decimal.clone());
-            assert_eq!(crate::archive::ArchiveVersion::DECIMAL_FLOATS, version);
+            assert_eq!(crate::archive::ArchiveVersion::MULTIPLY_DECIMAL_FLOATS, version);
             assert_eq!(expected, bits);
             let plain = adaptive_float_archive(values);
             assert!(decimal.len() < plain.len(), "{} >= {}", decimal.len(), plain.len());
             let (version, bits) = adaptive_float_column_bits(plain);
-            assert_eq!(crate::archive::ArchiveVersion::VERBATIM_TEXT, version);
+            assert_eq!(crate::archive::ArchiveVersion::MULTIPLY_DECIMAL_FLOATS, version);
             assert_eq!(expected, bits);
         }
     }
@@ -2496,11 +2530,17 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_writer_is_byte_identical_to_the_pinned_cpp_oracle() {
+    fn timestamp_writer_preserves_pinned_cpp_oracle_values_with_explicit_precision() {
         const CPP_ORACLE: &[u8] = include_bytes!("../tests/fixtures/sfa-v0.5.0-timestamps-cpp.bin");
         let source_size = u64::try_from(TIMESTAMP_SOURCE.len()).expect("source size fits u64");
         let rust = timestamp_archive(WriterOptions::default().with_numeric_summaries(false).with_uncompressed_size(source_size));
-        assert_eq!(CPP_ORACLE, rust);
+        let extract = |bytes: &[u8]| {
+            let mut reader = SingleFileArchiveReader::open(Cursor::new(bytes)).unwrap();
+            let mut output = Vec::new();
+            crate::extract_jsonl(&mut reader, &mut output, crate::ExtractionOptions::default()).unwrap();
+            output
+        };
+        assert_eq!(extract(CPP_ORACLE), extract(&rust));
     }
 
     #[test]
@@ -2629,6 +2669,7 @@ mod tests {
                 PackedStreamLimits::default(),
             )
             .expect("read timestamp table stream");
+        let stream = catalog.materialize_adaptive_numerics(0, stream, ColumnLimits::default()).unwrap();
         let decoded = catalog
             .schema_tables(0, &stream, ColumnLimits::default())
             .expect("open timestamp table stream")

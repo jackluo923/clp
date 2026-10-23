@@ -22,7 +22,6 @@ use crate::archive::BooleanColumn;
 use crate::archive::ClpStringColumn;
 use crate::archive::ColumnData;
 use crate::archive::DeltaI64Values;
-use crate::archive::DictionaryIdColumn;
 use crate::archive::EncodedVariableError;
 use crate::archive::F64Column;
 use crate::archive::FormattedFloatColumn;
@@ -531,14 +530,14 @@ impl RecordWriter<'_, '_, '_, '_> {
 #[derive(Clone, Debug)]
 enum ColumnCursor<'table, 'archive> {
     Unused,
-    Integer(I64Column<'table>),
-    MixedInteger(crate::integer::MixedIntegerColumn<'table>),
+    Integer(I64Column<'table>, Option<(usize, i64)>),
+    MixedInteger(crate::integer::MixedIntegerColumn<'table>, Option<(usize, crate::integer::IntegerValue)>),
     DeltaInteger(DeltaI64Values<'table>),
     Float(F64Column<'table>),
     FormattedFloat(FormattedFloatColumn<'table>),
-    DictionaryFloat(DictionaryIdColumn<'table, 'archive>),
+    DictionaryFloat(crate::archive::DictionaryValueCursor<'table, 'archive>),
     Boolean(BooleanColumn<'table>),
-    VarString(DictionaryIdColumn<'table, 'archive>),
+    VarString(crate::archive::DictionaryValueCursor<'table, 'archive>),
     ClpString(ClpStringColumn<'table, 'archive>),
     /// A CLP string written as its logtype template.
     /// A CLP string written as a template; `true` parses a string stored whole.
@@ -684,15 +683,15 @@ fn append_dynamic_value(
     output: &mut BoundedRecordOutput<'_>,
 ) -> Result<(), RecordError> {
     match cursor {
-        ColumnCursor::MixedInteger(column) => {
-            let value = column.get(row_index).ok_or_else(|| missing(step, row_index))?;
+        ColumnCursor::MixedInteger(column, previous) => {
+            let value = column.get_with_previous(*previous, row_index).ok_or_else(|| missing(step, row_index))?;
+            *previous = Some((row_index, value));
             let mut buffer = itoa::Buffer::new();
             output.append(buffer.format(value.exact()).as_bytes())
         }
-        ColumnCursor::Integer(column) => {
-            let value = column
-                .get(row_index)
-                .ok_or_else(|| missing(step, row_index))?;
+        ColumnCursor::Integer(column, previous) => {
+            let value = column.get_with_previous(*previous, row_index).ok_or_else(|| missing(step, row_index))?;
+            *previous = Some((row_index, value));
             append_integer(value, step, scratch, output)
         }
         ColumnCursor::DeltaInteger(values) => {
@@ -1092,14 +1091,14 @@ fn bind_column<'table, 'archive>(
         });
     }
     match data {
-        ColumnData::MixedInteger(column) => Ok(ColumnCursor::MixedInteger(column)),
-        ColumnData::Integer(column) => Ok(ColumnCursor::Integer(column)),
+        ColumnData::MixedInteger(column) => Ok(ColumnCursor::MixedInteger(column, None)),
+        ColumnData::Integer(column) => Ok(ColumnCursor::Integer(column, None)),
         ColumnData::DeltaInteger(column) => Ok(ColumnCursor::DeltaInteger(column.values())),
         ColumnData::Float(column) => Ok(ColumnCursor::Float(column)),
         ColumnData::FormattedFloat(column) => Ok(ColumnCursor::FormattedFloat(column)),
-        ColumnData::DictionaryFloat(column) => Ok(ColumnCursor::DictionaryFloat(column)),
+        ColumnData::DictionaryFloat(column) => Ok(ColumnCursor::DictionaryFloat(column.cursor())),
         ColumnData::Boolean(column) => Ok(ColumnCursor::Boolean(column)),
-        ColumnData::VarString(column) => Ok(ColumnCursor::VarString(column)),
+        ColumnData::VarString(column) => Ok(ColumnCursor::VarString(column.cursor())),
         ColumnData::ClpString(column) => Ok(ColumnCursor::ClpString(column)),
         ColumnData::UnstructuredArray(column) => Ok(ColumnCursor::UnstructuredArray(column)),
         ColumnData::Timestamp(column) => Ok(timestamp_cursor(column)),

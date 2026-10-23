@@ -7,6 +7,7 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 
 use smallvec::SmallVec;
+use crate::timestamp_precision::{TimestampStorage, TimestampPrecision};
 
 use super::WriterError;
 use super::WriterLimits;
@@ -21,8 +22,9 @@ const NANOSECONDS_PER_MILLISECOND: i64 = 1_000_000;
 
 /// One exact timestamp value borrowed for a record append.
 ///
-/// `lexeme` is the exact JSON value that extraction must reproduce. String timestamps therefore
-/// include their surrounding quotes and JSON escapes, while numeric timestamps do not. `pattern`
+/// `lexeme` is the exact input JSON value validated before any deliberate quantization.
+/// Extraction reproduces it at default precision; a coarser policy renders the quantized value.
+/// String timestamps include their surrounding quotes and JSON escapes, while numeric timestamps do not. `pattern`
 /// is the resolved current-format C++ timestamp pattern, with the same quoting convention.
 /// `range_key` is the authoritative timestamp descriptor stored in archive metadata (for example,
 /// `ts` or `event.timestamp`). JSON parsing and timestamp-pattern discovery remain adapter work.
@@ -32,6 +34,9 @@ pub struct TimestampRef<'a> {
     lexeme: &'a str,
     pattern: &'a str,
     range_key: &'a str,
+    // One packed word avoids inflating every borrowed scalar with a full storage struct.
+    config: u64,
+    priority: usize,
 }
 
 impl<'a> TimestampRef<'a> {
@@ -48,7 +53,53 @@ impl<'a> TimestampRef<'a> {
             lexeme,
             pattern,
             range_key,
+            config: 0,
+            priority: usize::MAX,
         }
+    }
+
+    /// Override this field's storage policy. Every value of the field must use the same policy.
+    pub const fn with_storage(mut self, storage: TimestampStorage) -> Self {
+        // Bit 0 is rounding; the remaining 63 bits are the positive tick duration.
+        // Zero means use the writer defaults. Priority is independent of storage policy.
+        self.config = ((storage.precision.nanoseconds_per_tick() as u64) << 1)
+            | storage.rounding as u64;
+        self
+    }
+    /// Auto values are buffered losslessly in ns, then written at the field's finest input precision.
+    pub(crate) const fn with_auto_precision(mut self) -> Self {
+        self.config = 1; // Zero tick duration cannot be an explicit storage configuration.
+        self
+    }
+    pub(crate) const fn is_auto(self) -> bool { self.config == 1 }
+
+    fn inferred_precision(self) -> TimestampPrecision {
+        if let Some(scale) = crate::timestamp::integer_pattern_scale(self.pattern.trim_matches('"')) {
+            return TimestampPrecision::from_nanoseconds_per_tick(scale as u64).expect("valid input unit");
+        }
+        let fraction = self.lexeme.bytes().position(|b| b == b'.' || b == b',')
+            .map_or(0, |i| self.lexeme[i + 1..].bytes().take_while(u8::is_ascii_digit).count());
+        match fraction {
+            0 => TimestampPrecision::Seconds,
+            1..=3 => TimestampPrecision::Milliseconds,
+            4..=6 => TimestampPrecision::Microseconds,
+            _ => TimestampPrecision::Nanoseconds,
+        }
+    }
+    pub(crate) const fn with_priority(mut self, priority: usize) -> Self {
+        self.priority = priority;
+        self
+    }
+    const fn priority(self) -> usize { self.priority }
+    pub const fn storage(self) -> Option<TimestampStorage> {
+        use crate::timestamp_precision::{TimestampPrecision, TimestampRounding};
+        if self.is_auto() {
+            return Some(TimestampStorage { precision: TimestampPrecision::Nanoseconds, rounding: TimestampRounding::Truncate });
+        }
+        let Some(precision) = TimestampPrecision::from_nanoseconds_per_tick(self.config >> 1) else { return None; };
+        Some(TimestampStorage { precision,
+            rounding: if self.config & 1 == 0 { TimestampRounding::Truncate } else { TimestampRounding::Nearest },
+        })
     }
 
     /// Returns the signed epoch-nanosecond value stored in the column.
@@ -101,6 +152,10 @@ impl<'a> PrevalidatedTimestampRef<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum TimestampError {
+    /// Quantized value cannot be represented in the normalized i64 nanosecond domain.
+    QuantizationOverflow,
+    /// A field changed storage policy within the archive.
+    ConflictingStorage,
     /// The authoritative timestamp descriptor is empty.
     EmptyRangeKey,
     /// A later value for one timestamp node supplied a different authoritative descriptor.
@@ -132,6 +187,8 @@ pub enum TimestampError {
 impl Display for TimestampError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ConflictingStorage => formatter.write_str("timestamp field has conflicting storage policies"),
+            Self::QuantizationOverflow => formatter.write_str("quantized timestamp exceeds the signed 64-bit nanosecond range"),
             Self::EmptyRangeKey => formatter.write_str("timestamp range descriptor is empty"),
             Self::ConflictingRangeKey { node_id } => write!(
                 formatter,
@@ -161,7 +218,7 @@ impl Error for TimestampError {
         match self {
             Self::InvalidPattern { source } => Some(source),
             Self::Format { source } => Some(source),
-            Self::EmptyRangeKey
+            Self::ConflictingStorage | Self::QuantizationOverflow | Self::EmptyRangeKey
             | Self::ConflictingRangeKey { .. }
             | Self::LexemeMismatch { .. } => None,
         }
@@ -174,10 +231,14 @@ struct TimestampRange {
     key: String,
     start_milliseconds: i64,
     end_milliseconds: i64,
+    storage: TimestampStorage,
+    auto_precision: bool,
+    priority: usize,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct TimestampDictionaryBuilder {
+    pub(super) defaults: TimestampStorage,
     ranges: Vec<TimestampRange>,
     range_indexes: HashMap<u32, usize>,
     patterns: Vec<TimestampPattern>,
@@ -187,19 +248,22 @@ pub(super) struct TimestampDictionaryBuilder {
 
 impl TimestampDictionaryBuilder {
     pub(super) fn archive_bounds(&self) -> (i64, i64) {
-        self.ranges.first().map_or((0, 0), |range| {
+        self.ranges.iter().min_by_key(|r| r.priority).map_or((0, 0), |range| {
             (range.start_milliseconds, range.end_milliseconds)
         })
     }
 
-    pub(super) fn integer_scale(&self, id: u64) -> Option<i64> {
-        Some(match self.patterns.get(usize::try_from(id).ok()?)?.raw() {
-            r"\E" => 1_000_000_000,
-            r"\L" => 1_000_000,
-            r"\C" => 1_000,
-            r"\N" => 1,
-            _ => return None,
+    pub(super) fn storage_for_node(&self, node: u32) -> TimestampStorage {
+        self.range_indexes.get(&node).map_or(self.defaults, |&i| self.ranges[i].storage)
+    }
+    pub(super) fn auto_scale_for_node(&self, node: u32) -> Option<i64> {
+        self.range_indexes.get(&node).and_then(|&i| {
+            let range = &self.ranges[i];
+            range.auto_precision.then_some(range.storage.precision.nanoseconds_per_tick())
         })
+    }
+    pub(super) fn integer_scale(&self, id: u64) -> Option<i64> {
+        crate::timestamp::integer_pattern_scale(self.patterns.get(usize::try_from(id).ok()?)?.raw())
     }
 
     fn find_pattern(&self, raw: &str) -> Option<usize> {
@@ -220,10 +284,11 @@ impl TimestampDictionaryBuilder {
         for (hash, bucket) in reservations.new_pattern_buckets {
             self.pattern_buckets.insert(hash, bucket);
         }
-        for (range_index, bounds) in plan.range_updates {
+        for (range_index, bounds, precision) in plan.range_updates {
             let range = &mut self.ranges[range_index];
             range.start_milliseconds = bounds.start;
             range.end_milliseconds = bounds.end;
+            range.storage.precision = precision;
         }
         for range in plan.new_ranges {
             let index = self.ranges.len();
@@ -252,13 +317,18 @@ impl TimestampDictionaryBuilder {
                 requested: capacity,
             })?;
         append_u64(&mut encoded, usize_u64(self.ranges.len())?);
-        for range in &self.ranges {
+        let mut ranges: Vec<_> = self.ranges.iter().collect();
+        ranges.sort_by_key(|r| r.priority);
+        for range in ranges {
             append_u64(&mut encoded, usize_u64(range.key.len())?);
             encoded.extend_from_slice(range.key.as_bytes());
             append_u64(&mut encoded, 1);
             let node_id = i32::try_from(range.node_id).map_err(|_| WriterError::SizeOverflow)?;
             encoded.extend_from_slice(&node_id.to_le_bytes());
-            append_u64(&mut encoded, 1);
+            // Encoding 4 adds restart anchors at the shared timestamp chunk boundaries.
+            append_u64(&mut encoded, 4);
+            append_u64(&mut encoded, range.storage.precision.nanoseconds_per_tick() as u64);
+            append_u64(&mut encoded, range.storage.rounding as u64);
             encoded.extend_from_slice(&range.start_milliseconds.to_le_bytes());
             encoded.extend_from_slice(&range.end_milliseconds.to_le_bytes());
         }
@@ -283,7 +353,7 @@ impl TimestampDictionaryBuilder {
         let mut size = size_of::<u64>();
         for range in &self.ranges {
             size = size
-                .checked_add(5 * size_of::<u64>() + size_of::<i32>())
+                .checked_add(7 * size_of::<u64>() + size_of::<i32>())
                 .and_then(|value| value.checked_add(range.key.len()))
                 .ok_or(WriterError::SizeOverflow)?;
         }
@@ -327,7 +397,7 @@ impl MillisecondBounds {
 pub(super) struct TimestampPlan {
     new_ranges: Vec<TimestampRange>,
     new_range_indexes: HashMap<u32, usize>,
-    range_updates: SmallVec<[(usize, MillisecondBounds); 1]>,
+    range_updates: SmallVec<[(usize, MillisecondBounds, TimestampPrecision); 1]>,
     new_patterns: Vec<TimestampPattern>,
     new_pattern_buckets: HashMap<u64, Vec<usize>>,
     added_key_bytes: u64,
@@ -355,7 +425,14 @@ impl TimestampPlan {
         limits: WriterLimits,
         scratch: &mut String,
     ) -> Result<u64, AppendError> {
-        self.validate_range(base, node_id, value, limits)?;
+        // Validate the original source pattern/lexeme, but index the quantized value.
+        let storage = value.storage().unwrap_or(base.defaults);
+        let ticks = storage.precision.quantize(value.epoch_nanoseconds(), storage.rounding)
+            .ok_or(AppendError::Timestamp { node_id, reason: TimestampError::QuantizationOverflow })?;
+        let quantized = TimestampRef::new(ticks * storage.precision.nanoseconds_per_tick(),
+            value.lexeme(), value.pattern(), value.range_key()).with_storage(storage).with_priority(value.priority());
+        let quantized = if value.is_auto() { quantized.with_auto_precision() } else { quantized };
+        self.validate_range(base, node_id, quantized, limits)?;
         let pattern_id = if let Some(index) = base.find_pattern(value.pattern()) {
             validate_untrusted_lexeme(
                 &base.patterns[index],
@@ -503,17 +580,26 @@ impl TimestampPlan {
             usize_u64_append(value.lexeme().len())?,
             limits.max_timestamp_lexeme_bytes(),
         )?;
+        let mut storage = value.storage().unwrap_or(base.defaults);
+        if value.is_auto() { storage.precision = value.inferred_precision(); }
         let bounds = millisecond_bounds(value.epoch_nanoseconds());
         if let Some(range_index) = base.range_indexes.get(&node_id).copied() {
+            if base.ranges[range_index].auto_precision != value.is_auto()
+                || (!value.is_auto() && base.ranges[range_index].storage != storage) {
+                return Err(AppendError::Timestamp { node_id, reason: TimestampError::ConflictingStorage });
+            }
             if base.ranges[range_index].key != value.range_key() {
                 return Err(conflicting_range_key(node_id));
             }
-            if let Some((_, current)) = self
+            if let Some((_, current, precision)) = self
                 .range_updates
                 .iter_mut()
-                .find(|(index, _)| *index == range_index)
+                .find(|(index, _, _)| *index == range_index)
             {
                 *current = current.include(bounds);
+                if storage.precision.nanoseconds_per_tick() < precision.nanoseconds_per_tick() {
+                    *precision = storage.precision;
+                }
                 return Ok(());
             }
             self.range_updates
@@ -524,11 +610,17 @@ impl TimestampPlan {
                 end: base.ranges[range_index].end_milliseconds,
             };
             self.range_updates
-                .push((range_index, current.include(bounds)));
+                .push((range_index, current.include(bounds),
+                    if storage.precision.nanoseconds_per_tick() < base.ranges[range_index].storage.precision.nanoseconds_per_tick() {
+                        storage.precision
+                    } else { base.ranges[range_index].storage.precision }));
             return Ok(());
         }
         if let Some(range_index) = self.new_range_indexes.get(&node_id).copied() {
             let range = &mut self.new_ranges[range_index];
+            if range.auto_precision != value.is_auto() || (!value.is_auto() && range.storage != storage) {
+                return Err(AppendError::Timestamp { node_id, reason: TimestampError::ConflictingStorage });
+            }
             if range.key != value.range_key() {
                 return Err(conflicting_range_key(node_id));
             }
@@ -539,6 +631,9 @@ impl TimestampPlan {
             .include(bounds);
             range.start_milliseconds = combined.start;
             range.end_milliseconds = combined.end;
+            if storage.precision.nanoseconds_per_tick() < range.storage.precision.nanoseconds_per_tick() {
+                range.storage.precision = storage.precision;
+            }
             return Ok(());
         }
 
@@ -568,6 +663,9 @@ impl TimestampPlan {
             .map_err(|_| allocation(AppendResource::TimestampRanges, 1))?;
         let index = self.new_ranges.len();
         self.new_ranges.push(TimestampRange {
+            storage,
+            auto_precision: value.is_auto(),
+            priority: value.priority(),
             node_id,
             key,
             start_milliseconds: bounds.start,
@@ -762,17 +860,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn packed_field_configuration_preserves_precision_rounding_and_priority() {
+        use crate::timestamp_precision::{TimestampPrecision, TimestampRounding};
+        let base = TimestampRef::new(0, "0", r"\N", "ts");
+        assert_eq!(base.storage(), None);
+        for precision in [TimestampPrecision::Nanoseconds, TimestampPrecision::Microseconds,
+            TimestampPrecision::Milliseconds, TimestampPrecision::Seconds,
+            "100us".parse().unwrap(), TimestampPrecision::from_nanoseconds_per_tick(i64::MAX as u64).unwrap()] {
+            let storage = TimestampStorage { precision, rounding: TimestampRounding::Nearest };
+            let value = base.with_storage(storage).with_priority(123456);
+            assert_eq!(value.storage(), Some(storage));
+            assert_eq!(value.priority(), 123456);
+            assert_eq!(base.with_priority(123456).with_storage(storage), value);
+        }
+    }
+
+    #[test]
     fn archive_bounds_use_the_first_range_and_default_to_zero() {
         let mut dictionary = TimestampDictionaryBuilder::default();
         assert_eq!((0, 0), dictionary.archive_bounds());
         dictionary.ranges.extend([
             TimestampRange {
+                storage: TimestampStorage::default(),
+                auto_precision: false,
+                priority: usize::MAX,
                 node_id: 9,
                 key: "first".to_owned(),
                 start_milliseconds: -1_001,
                 end_milliseconds: -1_000,
             },
             TimestampRange {
+                storage: TimestampStorage::default(),
+                auto_precision: false,
+                priority: usize::MAX,
                 node_id: 2,
                 key: "second".to_owned(),
                 start_milliseconds: 2_000,
@@ -796,12 +916,18 @@ mod tests {
         let mut dictionary = TimestampDictionaryBuilder::default();
         dictionary.ranges.extend([
             TimestampRange {
+                storage: TimestampStorage::default(),
+                auto_precision: false,
+                priority: usize::MAX,
                 node_id: 1,
                 key: "first".to_owned(),
                 start_milliseconds: 0,
                 end_milliseconds: 0,
             },
             TimestampRange {
+                storage: TimestampStorage::default(),
+                auto_precision: false,
+                priority: usize::MAX,
                 node_id: 2,
                 key: "second".to_owned(),
                 start_milliseconds: 10,

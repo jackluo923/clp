@@ -47,14 +47,7 @@ const EXPECTED_KV_IR_JSONL: &[u8] = concat!(
     "\"ok\":true,\"ratio\":1.25}\n"
 )
 .as_bytes();
-const EXPECTED_KV_TIMESTAMP_JSONL: &[u8] = concat!(
-    "{\"ts\":1700000000123,\"kind\":\"int\"}\n",
-    "{\"ts\":1700000000.124999046,\"kind\":\"float\"}\n",
-    "{\"ts\":\"1700000000125\",\"kind\":\"plain\"}\n",
-    "{\"ts\":\"2023-11-14 22:13:20.126\",\"kind\":\"encoded\"}\n",
-    "{\"kind\":\"missing\"}\n",
-)
-.as_bytes();
+
 
 fn assert_same_archive_records(expected: &[u8], actual: &[u8]) {
     fn records(bytes: &[u8]) -> Vec<String> {
@@ -1026,7 +1019,7 @@ fn nested_timestamp_key_drives_search_bounds_and_invalid_values_fail_explicitly(
         "c".as_ref(),
         "--single-file-archive".as_ref(),
         "--timestamp-key".as_ref(),
-        "outer.ts".as_ref(),
+        "outer.ts:precision=ms".as_ref(),
         archives_path.as_os_str(),
         input_path.as_os_str(),
     ]);
@@ -1071,7 +1064,7 @@ fn nested_timestamp_key_drives_search_bounds_and_invalid_values_fail_explicitly(
     let invalid = clp_s(&[
         "c".as_ref(),
         "--timestamp-key".as_ref(),
-        "outer.ts".as_ref(),
+        "outer.ts:precision=ms".as_ref(),
         invalid_archives_path.as_os_str(),
         invalid_input_path.as_os_str(),
     ]);
@@ -1380,7 +1373,7 @@ fn kv_ir_representation_options_ignore_json_only_switches_and_accept_timestamps(
         "c".as_ref(),
         "--single-file-archive".as_ref(),
         "--timestamp-key".as_ref(),
-        "@seq".as_ref(),
+        "@seq:precision=s".as_ref(),
         timestamp_archives_path.as_os_str(),
         kv_input_path.as_os_str(),
     ]);
@@ -1394,8 +1387,19 @@ fn kv_ir_representation_options_ignore_json_only_switches_and_accept_timestamps(
     assert_timestamp_range(&only_entry(&timestamp_archives_path), "@seq", 7_000, 7_000);
 }
 
+fn seconds_timestamp_fixture(fixture: &str) -> Vec<u8> {
+    let mut input = decode_hex(fixture);
+    let original = 1_700_000_000_123_i64.to_be_bytes();
+    let offset = input.windows(8).position(|w| w == original).expect("integer timestamp");
+    input[offset..offset + 8].copy_from_slice(&1_700_000_000_i64.to_be_bytes());
+    let original = b"1700000000125";
+    let offset = input.windows(original.len()).position(|w| w == original).expect("quoted timestamp");
+    input[offset..offset + original.len()].copy_from_slice(b"1700000000.12");
+    input
+}
+
 #[test]
-fn both_kv_ir_widths_promote_timestamp_scalars_with_cpp_semantics() {
+fn both_kv_ir_widths_promote_timestamp_scalars_with_declared_seconds() {
     for (label, fixture, expected_size) in [
         ("four", FOUR_BYTE_KV_TIMESTAMP_HEX, 377_u64),
         ("eight", EIGHT_BYTE_KV_TIMESTAMP_HEX, 389_u64),
@@ -1403,7 +1407,7 @@ fn both_kv_ir_widths_promote_timestamp_scalars_with_cpp_semantics() {
         let temporary = TestDirectory::new(&format!("kv-timestamp-{label}"));
         let input_path = temporary.path().join("input.bin");
         let archives_path = temporary.path().join("archives");
-        let input = decode_hex(fixture);
+        let input = seconds_timestamp_fixture(fixture);
         assert_eq!(expected_size, u64::try_from(input.len()).unwrap());
         fs::write(&input_path, &input).expect("write KV timestamp fixture");
 
@@ -1413,7 +1417,7 @@ fn both_kv_ir_widths_promote_timestamp_scalars_with_cpp_semantics() {
             "--single-file-archive".as_ref(),
             "--print-archive-stats".as_ref(),
             "--timestamp-key".as_ref(),
-            "ts".as_ref(),
+            "ts:precision=s".as_ref(),
             archives_path.as_os_str(),
             input_path.as_os_str(),
         ]);
@@ -1427,8 +1431,8 @@ fn both_kv_ir_widths_promote_timestamp_scalars_with_cpp_semantics() {
         let archive_path = only_entry(&archives_path);
         let stats: serde_json::Value =
             serde_json::from_slice(&result.stdout).expect("timestamp stats are valid JSON");
-        assert_eq!(Some(1_700_000_000_123), stats["begin_timestamp"].as_i64());
-        assert_eq!(Some(1_700_000_000_126), stats["end_timestamp"].as_i64());
+        assert_eq!(Some(1_700_000_000_000), stats["begin_timestamp"].as_i64());
+        assert_eq!(Some(1_700_000_000_000), stats["end_timestamp"].as_i64());
         assert_eq!(Some(false), stats["is_split"].as_bool());
         assert_eq!(Some(expected_size), stats["uncompressed_size"].as_u64());
         assert_eq!(Some(0), stats["range_index"].as_array().map(Vec::len));
@@ -1442,18 +1446,22 @@ fn both_kv_ir_widths_promote_timestamp_scalars_with_cpp_semantics() {
                 .ok(),
             stats["size"].as_u64(),
         );
-        assert_timestamp_range(&archive_path, "ts", 1_700_000_000_123, 1_700_000_000_126);
+        assert_timestamp_range(&archive_path, "ts", 1_700_000_000_000, 1_700_000_000_000);
         let extracted =
             extract_original(&archive_path, &temporary.path().join("timestamp-extracted"));
         assert_eq!(
-            semantic_json_records(EXPECTED_KV_TIMESTAMP_JSONL),
+            { let expected = vec![serde_json::json!({"ts":1700000000_i64,"kind":"int"}),
+                serde_json::json!({"ts":1700000000.0,"kind":"float"}),
+                serde_json::json!({"ts":"1700000000.00","kind":"plain"}),
+                serde_json::json!({"ts":"2023-11-14 22:13:20.000","kind":"encoded"}),
+                serde_json::json!({"kind":"missing"})]; semantic_json_records(expected.iter().map(|r| r.to_string() + "\n").collect::<String>().as_bytes()) },
             semantic_json_records(&extracted)
         );
     }
 }
 
 #[test]
-fn zero_target_reports_archive_local_negative_sub_millisecond_timestamp_bounds() {
+fn zero_target_reports_archive_local_quantized_negative_timestamp_bounds() {
     let temporary = TestDirectory::new("kv-timestamp-split");
     let input_path = temporary.path().join("input.bin");
     let archives_path = temporary.path().join("archives");
@@ -1469,7 +1477,7 @@ fn zero_target_reports_archive_local_negative_sub_millisecond_timestamp_bounds()
         "0".as_ref(),
         "--print-archive-stats".as_ref(),
         "--timestamp-key".as_ref(),
-        "ts".as_ref(),
+        "ts:precision=s".as_ref(),
         archives_path.as_os_str(),
         input_path.as_os_str(),
     ]);
@@ -1489,8 +1497,8 @@ fn zero_target_reports_archive_local_negative_sub_millisecond_timestamp_bounds()
     for (index, (actual, expected)) in stats
         .iter()
         .zip([
-            (-1_001, -1_000, true, 239_u64),
-            (2_000, 2_001, true, 11),
+            (-2_000, -2_000, true, 239_u64),
+            (2_000, 2_000, true, 11),
             (0, 0, false, 1),
         ])
         .enumerate()
@@ -1518,7 +1526,7 @@ fn zero_target_reports_archive_local_negative_sub_millisecond_timestamp_bounds()
         fs::read_dir(&archives_path).expect("read archives").count()
     );
     assert_eq!(
-        b"{\"ts\":-1.000000001}\n",
+        b"{\"ts\":-2.000000000}\n",
         extract_original(
             &archives_path.join(stats[0]["id"].as_str().expect("first archive ID")),
             &temporary.path().join("first-extracted"),
@@ -1526,7 +1534,7 @@ fn zero_target_reports_archive_local_negative_sub_millisecond_timestamp_bounds()
         .as_slice(),
     );
     assert_eq!(
-        b"{\"ts\":2.000000001}\n",
+        b"{\"ts\":2.000000000}\n",
         extract_original(
             &archives_path.join(stats[1]["id"].as_str().expect("second archive ID")),
             &temporary.path().join("second-extracted"),
@@ -1540,8 +1548,8 @@ fn malformed_kv_timestamp_fails_after_only_complete_records() {
     let temporary = TestDirectory::new("invalid-kv-timestamp");
     let input_path = temporary.path().join("input.bin");
     let archives_path = temporary.path().join("archives");
-    let mut input = decode_hex(FOUR_BYTE_KV_TIMESTAMP_HEX);
-    let original = b"1700000000125";
+    let mut input = seconds_timestamp_fixture(FOUR_BYTE_KV_TIMESTAMP_HEX);
+    let original = b"1700000000.12";
     let replacement = b"not-a-time___";
     let offset = input
         .windows(original.len())
@@ -1555,7 +1563,7 @@ fn malformed_kv_timestamp_fails_after_only_complete_records() {
         "--single-file-archive".as_ref(),
         "--print-archive-stats".as_ref(),
         "--timestamp-key".as_ref(),
-        "ts".as_ref(),
+        "ts:precision=s".as_ref(),
         archives_path.as_os_str(),
         input_path.as_os_str(),
     ]);
@@ -1565,15 +1573,15 @@ fn malformed_kv_timestamp_fails_after_only_complete_records() {
     assert!(diagnostic.contains("user-generated node"));
     let stats: serde_json::Value =
         serde_json::from_slice(&result.stdout).expect("committed-prefix stats are valid JSON");
-    assert_eq!(Some(1_700_000_000_123), stats["begin_timestamp"].as_i64());
-    assert_eq!(Some(1_700_000_000_125), stats["end_timestamp"].as_i64());
+    assert_eq!(Some(1_700_000_000_000), stats["begin_timestamp"].as_i64());
+    assert_eq!(Some(1_700_000_000_000), stats["end_timestamp"].as_i64());
     assert_eq!(Some(282), stats["uncompressed_size"].as_u64());
     assert_eq!(Some(0), stats["range_index"][0]["s"].as_u64());
     assert_eq!(Some(2), stats["range_index"][0]["e"].as_u64());
     assert_eq!(
         concat!(
-            "{\"kind\":\"int\",\"ts\":1700000000123}\n",
-            "{\"kind\":\"float\",\"ts\":1700000000.124999046}\n",
+            "{\"kind\":\"int\",\"ts\":1700000000}\n",
+            "{\"kind\":\"float\",\"ts\":1700000000.000000000}\n",
         )
         .as_bytes(),
         extract_original(
@@ -1608,7 +1616,7 @@ fn auto_namespace_timestamp_is_a_json_noop_in_either_mixed_input_order() {
             "--disable-log-order".as_ref(),
             "--single-file-archive".as_ref(),
             "--timestamp-key".as_ref(),
-            "@seq".as_ref(),
+            "@seq:precision=s".as_ref(),
             archives_path.as_os_str(),
             ordered_inputs[0],
             ordered_inputs[1],
@@ -1950,7 +1958,7 @@ fn adaptive_string_columns_read_back_exactly_and_answer_searches_the_same() {
     }
     let version = |archive: &Path| fs::read(archive).expect("read archive")[4..8].to_vec();
     // Mixed JSON integers require archive version 0.10.
-    assert_eq!(vec![0, 0, 10, 0], version(&adaptive));
+    assert_eq!(vec![0, 0, 15, 0], version(&adaptive));
 }
 
 #[test]
@@ -2512,16 +2520,16 @@ fn field_logtype_dictionaries_read_back_exactly_and_answer_searches_the_same() {
     // of the other selected compression options.
     // The header's version is bytes 4 to 8.
     let version = |archive: &Path| fs::read(archive).expect("read archive")[4..8].to_vec();
-    assert_eq!(vec![0, 0, 10, 0], version(&fields));
+    assert_eq!(vec![0, 0, 15, 0], version(&fields));
     assert_eq!(
-        vec![0, 0, 10, 0],
+        vec![0, 0, 15, 0],
         version(&compress(
             "plain-strings",
             &["--no-adaptive-string-columns"]
         ))
     );
     assert_eq!(
-        vec![0, 0, 10, 0],
+        vec![0, 0, 15, 0],
         version(&compress("no-adaptive", &["--no-adaptive-numeric-columns"]))
     );
 }
@@ -2821,4 +2829,357 @@ fn frame_of_reference_filters_match_plain_archives_and_preserve_complete_records
         };
         assert_eq!(search(&plain), search(&adaptive), "{query}");
     }
+}
+
+#[test]
+fn string_timestamp_units_work_for_both_layouts_and_kql_windows() {
+    // String formats supply their own time; the declared unit quantizes them.
+    for single_file in [false, true] {
+        for (rounding, numeric, text, end_ms) in [
+            ("truncate", "1679456094.576000000", "2023-03-21T23:34:54.576000000-04:00", "1679456094576"),
+            ("nearest", "1679456094.577000000", "2023-03-21T23:34:54.577000000-04:00", "1679456094577"),
+        ] {
+            let temporary = TestDirectory::new("timestamp-storage");
+            let input = temporary.path().join("input.json");
+            let archives = temporary.path().join("archives");
+            fs::write(&input, concat!(
+                "{\"ts\":\"1679456094.576789012\",\"id\":1}\n",
+                "{\"ts\":\"2023-03-21T23:34:54.576789012-04:00\",\"id\":2}\n"
+            )).unwrap();
+            let mut args = vec!["c".as_ref(), "--timestamp-key".as_ref(), "ts".as_ref(),
+                "--timestamp-precision".as_ref(), "ms".as_ref(),
+                "--timestamp-rounding".as_ref(), rounding.as_ref()];
+            if single_file { args.push("--single-file-archive".as_ref()); }
+            args.extend([archives.as_os_str(), input.as_os_str()]);
+            let result = clp_s(&args);
+            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+            let archive = only_entry(&archives);
+            let expected = vec![serde_json::json!({"ts":numeric,"id":1}), serde_json::json!({"ts":text,"id":2})];
+            let extracted = extract_original(&archive, &temporary.path().join("extracted"));
+            assert_eq!(semantic_json_records(&extracted), expected);
+            let result = clp_s(&["s".as_ref(), archive.as_os_str(), "*".as_ref(),
+                "--tge".as_ref(), end_ms.as_ref(), "--tle".as_ref(), end_ms.as_ref()]);
+            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+            assert_eq!(semantic_json_records(&result.stdout), expected);
+        }
+    }
+}
+
+#[test]
+fn per_field_timestamp_units_precision_and_primary_order() {
+    use clp_s::timestamp_precision::TimestampPrecision;
+    for single_file in [true, false] {
+        let temporary = TestDirectory::new("field-timestamp-options");
+        let input = temporary.path().join("input.json");
+        let archives = temporary.path().join("archives");
+        // Different precisions, overlapping nested names and an escaped colon. Primary field
+        // appears last in JSON to verify declaration order, not encounter order, chooses bounds.
+        let source = concat!(
+            "{\"id\":1,\"received\":1050123456,\"a\":{\"ts\":1051},\"b\":{\"ts\":1051},\"literal:key\":1050,\"event_time\":1050}\n",
+            "{\"id\":2,\"received\":1150123456,\"a\":{\"ts\":1151},\"b\":{\"ts\":1151},\"literal:key\":1150,\"event_time\":1150}\n",
+        );
+        fs::write(&input, source).unwrap();
+        let mut args = vec!["c".as_ref(),
+            "--timestamp-key".as_ref(), "event_time:precision=ms".as_ref(),
+            "--timestamp-key".as_ref(), "received:precision=us".as_ref(),
+            "--timestamp-key".as_ref(), "a.ts:precision=s:rounding=nearest".as_ref(),
+            "--timestamp-key".as_ref(), r"literal\u003akey:precision=ms".as_ref()];
+        if single_file { args.push("--single-file-archive".as_ref()); }
+        args.extend([archives.as_os_str(), input.as_os_str()]);
+        let result = clp_s(&args);
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        let archive = only_entry(&archives);
+        let expected = vec![
+            serde_json::json!({"id":1,"received":1050123456_i64,"a":{"ts":1051},"b":{"ts":1051},"literal:key":1050,"event_time":1050}),
+            serde_json::json!({"id":2,"received":1150123456_i64,"a":{"ts":1151},"b":{"ts":1151},"literal:key":1150,"event_time":1150})];
+        let extracted = extract_original(&archive, &temporary.path().join("extracted"));
+        let mut expected_sorted = expected.clone(); expected_sorted.sort_by_key(serde_json::Value::to_string);
+        assert_eq!(semantic_json_records(&extracted), expected_sorted);
+        let result = clp_s(&["s".as_ref(), archive.as_os_str(), "*".as_ref(), "--tge".as_ref(), "1050".as_ref(), "--tle".as_ref(), "1050".as_ref()]);
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        assert_eq!(semantic_json_records(&result.stdout), vec![expected[0].clone()]);
+        if single_file {
+            let mut reader = SingleFileArchiveReader::open(File::open(&archive).unwrap()).unwrap();
+            let metadata = reader.read_metadata(MetadataLimits::default()).unwrap();
+            let ranges = metadata.timestamp_dictionary().ranges();
+            assert_eq!(ranges[0].key(), "event_time");
+            assert_eq!(ranges[0].storage_precision(), TimestampPrecision::Milliseconds);
+            assert_eq!(ranges[1].storage_precision(), TimestampPrecision::Microseconds);
+            assert_eq!(ranges[2].storage_precision(), TimestampPrecision::Seconds);
+        }
+    }
+}
+
+#[test]
+fn duplicate_timestamp_paths_and_invalid_field_options_fail_before_output_creation() {
+    for fields in [vec!["ts:precision=ms", "ts:precision=ns"],
+        vec![r"a\.b:precision=ms", r"a\u002eb:precision=ns"],
+        vec!["ts:precision=ms:increment=100ms"], vec!["ts:precison=ms"]] {
+        let temporary = TestDirectory::new("invalid-timestamp-options");
+        let output = temporary.path().join("archives");
+        let input = temporary.path().join("input.json");
+        fs::write(&input, "{\"ts\":1050}\n").unwrap();
+        let mut args = vec!["c".as_ref()];
+        for field in &fields { args.extend([OsStr::new("--timestamp-key"), OsStr::new(field)]); }
+        args.extend([output.as_os_str(), input.as_os_str()]);
+        let result = clp_s(&args);
+        assert!(!result.status.success());
+        assert!(!output.exists());
+    }
+}
+
+#[test]
+fn field_options_survive_archive_rotation_and_zeroed_fractional_seconds() {
+    let temp = TestDirectory::new("timestamp-fields-rotation");
+    let input = temp.path().join("input.json");
+    let output = temp.path().join("archives");
+    fs::write(&input, "{\"relative\":1051,\"seconds\":1.25}\n{\"relative\":1151,\"seconds\":2.25}\n").unwrap();
+    let result = clp_s(&["c".as_ref(), "--single-file-archive".as_ref(),
+        "--target-encoded-size".as_ref(), "1".as_ref(),
+        "--timestamp-key".as_ref(), "seconds:precision=s".as_ref(),
+        "--timestamp-key".as_ref(), "relative:precision=ms:rounding=nearest".as_ref(),
+        output.as_os_str(), input.as_os_str()]);
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    let mut seconds = Vec::new();
+    for entry in fs::read_dir(&output).unwrap() {
+        let path = entry.unwrap().path();
+        let mut reader = SingleFileArchiveReader::open(File::open(&path).unwrap()).unwrap();
+        let metadata = reader.read_metadata(MetadataLimits::default()).unwrap();
+        // A source ending exactly at the rotation threshold can publish an empty final archive.
+        if metadata.timestamp_dictionary().ranges().is_empty() {
+            let result = clp_s(&["s".as_ref(), path.as_os_str(), "*".as_ref()]);
+            assert!(result.status.success());
+            assert!(result.stdout.is_empty());
+            continue;
+        }
+        assert_eq!(metadata.timestamp_dictionary().ranges()[0].key(), "seconds");
+        let result = clp_s(&["s".as_ref(), path.as_os_str(), "*".as_ref()]);
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        let rows = semantic_json_records(&result.stdout);
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0]["relative"].as_i64(), Some(1051 | 1151)));
+        seconds.push(rows[0]["seconds"].as_f64().unwrap() as i64);
+    }
+    seconds.sort();
+    assert_eq!(seconds, [1, 2]);
+}
+
+#[test]
+fn removed_timestamp_storage_factor_flag_is_rejected_before_output_creation() {
+    let temporary = TestDirectory::new("removed-timestamp-factor");
+    let output = temporary.path().join("archives");
+    let input = temporary.path().join("input.json");
+    fs::write(&input, "{\"ts\":1050}\n").unwrap();
+    let result = clp_s(&["c".as_ref(), "--timestamp-storage-factor".as_ref(),
+        "100".as_ref(), output.as_os_str(), input.as_os_str()]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("--timestamp-storage-factor"));
+    assert!(!output.exists());
+}
+
+#[test]
+fn native_tick_durations_roundtrip_in_both_archive_layouts() {
+    for single_file in [false, true] {
+        for (duration, scale) in [("us", 1_000), ("1us", 1_000), ("10us", 10_000),
+            ("100us", 100_000), ("250us", 250_000), ("ms", 1_000_000), ("1ms", 1_000_000),
+            ("10ms", 10_000_000), ("100ms", 100_000_000), ("s", 1_000_000_000),
+            ("1s", 1_000_000_000), ("10s", 10_000_000_000)] {
+            let temp = TestDirectory::new("native-ticks");
+            let input = temp.path().join("input.json");
+            let output = temp.path().join("archives");
+            let source_ns = 123_456_i64;
+            fs::write(&input, format!("{{\"ts\":{source_ns}}}\n")).unwrap();
+            let field = format!("ts:precision={duration}");
+            let mut args = vec!["c".as_ref(), "--timestamp-key".as_ref(), OsStr::new(&field)];
+            if single_file { args.push("--single-file-archive".as_ref()); }
+            args.extend([output.as_os_str(), input.as_os_str()]);
+            let result = clp_s(&args);
+            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+            let archive = only_entry(&output);
+            let expected = source_ns;
+            let extracted = extract_original(&archive, &temp.path().join("extracted"));
+            assert_eq!(semantic_json_records(&extracted), vec![serde_json::json!({"ts":expected})]);
+            if single_file {
+                let mut reader = SingleFileArchiveReader::open(File::open(&archive).unwrap()).unwrap();
+                let metadata = reader.read_metadata(MetadataLimits::default()).unwrap();
+                assert_eq!(metadata.timestamp_dictionary().ranges()[0].storage_precision().nanoseconds_per_tick(), scale);
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_native_tick_durations_fail_before_creating_archives() {
+    for duration in ["0us", "-10ms", "1.5ms", "10", "10ps", "9223372036854775808ns"] {
+        let temp = TestDirectory::new("bad-native-ticks");
+        let input = temp.path().join("input.json");
+        fs::write(&input, "{\"ts\":1050}\n").unwrap();
+        for global in [false, true] {
+            let output = temp.path().join(if global { "global" } else { "field" });
+            let field = format!("ts:precision={duration}");
+            let args = if global {
+                vec![OsStr::new("c"), OsStr::new("--timestamp-key"), OsStr::new("ts"),
+                    OsStr::new("--timestamp-precision"), OsStr::new(duration), output.as_os_str(), input.as_os_str()]
+            } else {
+                vec![OsStr::new("c"), OsStr::new("--timestamp-key"), OsStr::new(&field), output.as_os_str(), input.as_os_str()]
+            };
+            let result = clp_s(&args);
+            assert!(!result.status.success(), "{duration}");
+            assert!(!output.exists());
+        }
+    }
+}
+
+#[test]
+fn default_unit_is_nanoseconds_and_old_options_are_rejected() {
+    let temp = TestDirectory::new("unified-timestamp-default");
+    let input = temp.path().join("input.json");
+    fs::write(&input, "{\"ts\":12345}\n").unwrap();
+    let output = temp.path().join("archives");
+    let result = clp_s(&["c".as_ref(), "--single-file-archive".as_ref(),
+        "--timestamp-key".as_ref(), "ts".as_ref(), output.as_os_str(), input.as_os_str()]);
+    assert!(result.status.success());
+    let path = only_entry(&output);
+    assert_timestamp_range(&path, "ts", 0, 1);
+    for field in ["ts:input-unit=ms", "ts:unit=ms"] {
+        let failed = temp.path().join("failed");
+        let result = clp_s(&["c".as_ref(), "--timestamp-key".as_ref(), field.as_ref(),
+            failed.as_os_str(), input.as_os_str()]);
+        assert!(!result.status.success());
+        assert!(!failed.exists());
+    }
+    let failed = temp.path().join("failed");
+    let result = clp_s(&["c".as_ref(), "--timestamp-unit".as_ref(), "ms".as_ref(),
+        failed.as_os_str(), input.as_os_str()]);
+    assert!(!result.status.success());
+    assert!(!failed.exists());
+}
+
+#[test]
+fn auto_timestamp_precision_preserves_mixed_inputs_and_resolves_native_ticks() {
+    let cases = [
+        (vec!["1700000000", "1700000000123", "\"1700000000456\""], 1_000_000),
+        (vec!["1700000000", "1700000000123456", "1700000000123", "\"1700000000456789\""], 1_000),
+        (vec!["1700000000", "1700000000123", "1700000000123456789"], 1),
+        (vec!["-1700000000", "-1700000000123"], 1_000_000),
+        (vec!["\"2023-11-14T22:13:20Z\"", "\"2023-11-14T22:13:20.10Z\""], 1_000_000),
+        (vec!["\"2023-11-14T22:13:20.12340-04:00\"", "\"2023-11-14 22:13:20.1200 EDT\""], 1_000),
+        (vec!["1700000000.10", "\"1700000000.12345670\""], 1),
+    ];
+    for (values, scale) in cases {
+        for single_file in [false, true] {
+            for global in [false, true] {
+                let tmp = TestDirectory::new("auto-precision");
+                let input = tmp.path().join("input.ndjson");
+                let output = tmp.path().join("archives");
+                // Deliberately change encoded schema while promoting precision, then reuse it.
+                let source = values.iter().enumerate().map(|(i, value)| format!(
+                    "{{\"ts\":{value},\"id\":{i},\"explicit\":12345{} }}\n",
+                    if i % 2 == 0 { ",\"extra\":true" } else { "" },
+                )).collect::<String>();
+                fs::write(&input, &source).unwrap();
+                let mut args = vec!["c".as_ref(), "--timestamp-key".as_ref(),
+                    if global { "ts".as_ref() } else { "ts:precision=auto".as_ref() },
+                    "--timestamp-key".as_ref(), "explicit:precision=100us".as_ref()];
+                if global { args.extend([OsStr::new("--timestamp-precision"), OsStr::new("auto")]); }
+                if single_file { args.push("--single-file-archive".as_ref()); }
+                args.extend([output.as_os_str(), input.as_os_str()]);
+                let result = clp_s(&args);
+                assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+                let archive = only_entry(&output);
+                let extracted = extract_original(&archive, &tmp.path().join("extracted"));
+                assert_eq!(semantic_json_records(&extracted), semantic_json_records(source.as_bytes()));
+                if single_file {
+                    use clp_s::archive::{ArchiveCatalogLimits, ColumnData, ColumnLimits, PackedStreamLimits};
+                    let mut reader = SingleFileArchiveReader::open(File::open(&archive).unwrap()).unwrap();
+                    let catalog = reader.read_catalog(ArchiveCatalogLimits::default()).unwrap();
+                    let ranges = catalog.metadata().timestamp_dictionary().ranges();
+                    let range = ranges.iter().find(|r| r.key() == "ts").unwrap();
+                    assert_eq!(range.storage_precision().nanoseconds_per_tick(), scale);
+                    let mut rows = 0;
+                    for stream_id in 0..catalog.table_metadata().packed_streams().len() {
+                        let stream = reader.read_packed_stream(catalog.metadata(), catalog.table_metadata(), stream_id, PackedStreamLimits::default()).unwrap();
+                        let stream = catalog.materialize_adaptive_numerics(stream_id as u64, stream, ColumnLimits::default()).unwrap();
+                        for table in catalog.schema_tables(stream_id as u64, &stream, ColumnLimits::default()).unwrap() {
+                            for column in table.unwrap().table().columns() {
+                                if let ColumnData::Timestamp(ts) = column.data() {
+                                    for (tick, ns) in ts.epochs().ticks().zip(ts.epochs().values()) {
+                                        assert_eq!(tick.checked_mul(ts.epochs().scale()), Some(ns));
+                                        rows += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    assert_eq!(rows, values.len() * 2);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn auto_precision_survives_archive_rotation_and_kv_ir_input() {
+    for fixture in [FOUR_BYTE_KV_TIMESTAMP_HEX, EIGHT_BYTE_KV_TIMESTAMP_HEX] {
+        let tmp = TestDirectory::new("auto-kv");
+        let input = tmp.path().join("input.clp");
+        fs::write(&input, decode_hex(fixture)).unwrap();
+        // Untagged decode is the independent source-value reference.
+        let mut reference = Vec::new();
+        for (label, options) in [
+            ("plain", vec![]),
+            ("auto", vec!["--timestamp-key", "ts:precision=auto"]),
+            ("rotated", vec!["--timestamp-key", "ts", "--timestamp-precision", "auto", "--target-encoded-size", "0"]),
+        ] {
+            let archives = tmp.path().join(label);
+            let mut args = vec![OsStr::new("c"), OsStr::new("--single-file-archive")];
+            args.extend(options.iter().map(OsStr::new));
+            args.extend([archives.as_os_str(), input.as_os_str()]);
+            let result = clp_s(&args);
+            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+            let extracted = extract_original(&archives, &tmp.path().join(format!("{label}-extracted")));
+            let mut rows = semantic_json_records(&extracted);
+            // serde_json's default decimal parser can round a long epoch fraction by one
+            // ULP; compare this binary64 source with Rust's correctly rounded float parser.
+            for line in std::str::from_utf8(&extracted).unwrap().lines() {
+                if line.contains("\"float\"") {
+                    let lexeme = line.split("\"ts\":").nth(1).unwrap().split([',', '}']).next().unwrap();
+                    let parsed = serde_json::json!(lexeme.parse::<f64>().unwrap());
+                    rows.iter_mut().find(|row| row["kind"] == "float").unwrap()["ts"] = parsed;
+                }
+            }
+            if label == "plain" { reference = rows; }
+            else { assert_eq!(rows, reference); }
+            if label == "rotated" {
+                let mut scales = std::collections::BTreeSet::new();
+                for entry in fs::read_dir(&archives).unwrap() {
+                    let mut reader = SingleFileArchiveReader::open(File::open(entry.unwrap().path()).unwrap()).unwrap();
+                    let metadata = reader.read_metadata(MetadataLimits::default()).unwrap();
+                    for range in metadata.timestamp_dictionary().ranges() {
+                        scales.insert(range.storage_precision().nanoseconds_per_tick());
+                    }
+                }
+                assert!(scales.len() > 1, "each archive must resolve its own scale: {scales:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn explicit_precision_quantizes_every_fraction_width_without_losing_format() {
+    let tmp = TestDirectory::new("fixed-fraction-rounding");
+    let input = tmp.path().join("input.ndjson");
+    let output = tmp.path().join("archives");
+    let source = (1..=9).map(|width| format!(
+        "{{\"ts\":\"2023-11-14T22:13:20.{}Z\",\"id\":{width}}}\n", "1".repeat(width),
+    )).collect::<String>();
+    let expected = (1..=9).map(|width| format!(
+        "{{\"ts\":\"2023-11-14T22:13:20.{}Z\",\"id\":{width}}}\n", "0".repeat(width),
+    )).collect::<String>();
+    fs::write(&input, source).unwrap();
+    let result = clp_s(&["c".as_ref(), "--single-file-archive".as_ref(), "--timestamp-key".as_ref(),
+        "ts:precision=s".as_ref(), output.as_os_str(), input.as_os_str()]);
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    let extracted = extract_original(&output, &tmp.path().join("extracted"));
+    assert_eq!(semantic_json_records(&extracted), semantic_json_records(expected.as_bytes()));
 }

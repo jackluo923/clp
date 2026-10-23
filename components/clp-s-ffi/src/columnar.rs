@@ -861,9 +861,13 @@ impl ProjectedScanner {
 
     fn project_next_table_columns(&mut self, constants: bool) -> Result<Option<usize>, ScanError> {
         let stream = self.stream.as_ref().expect("stream is loaded");
+        let selections = self.parsed.compile_for_archive_reusing(
+            &self.catalog, self.options.search(), &mut self.dictionary_matches,
+        ).map_err(|e| ScanError::Archive(e.to_string()))?
+            .stream_row_selections(self.stream_index as u64);
         let mut tables = self.catalog.schema_tables(
             self.stream_index as u64, stream, self.options.columns(),
-        ).map_err(|e| ScanError::Archive(e.to_string()))?;
+        ).map_err(|e| ScanError::Archive(e.to_string()))?.with_row_selections(selections);
         if !tables.seek_to_table(self.table_cursor) {
             return Ok(None);
         }
@@ -939,14 +943,21 @@ impl ProjectedScanner {
                             _ => unreachable!(),
                         }
                     } else {
-                        for row in bitmap.matching_rows() {
-                            let bits = match data {
-                                Some(ColumnData::MixedInteger(values)) => values.get(row).map(|v| v.bits()),
-                                Some(ColumnData::Integer(values)) => values.get(row).map(|v| v as u64),
-                                Some(ColumnData::Float(values)) => values.get(row).map(f64::to_bits),
-                                _ => unreachable!(),
-                            }.ok_or_else(|| ScanError::Projection("selected row outside compact column".into()))?;
-                            buffer.numeric.push(bits);
+                        fn append_selected(values: impl Iterator<Item = u64>, bitmap: &MatchBitmap, output: &mut Vec<u64>) -> Result<(), ScanError> {
+                            let mut values = values;
+                            let mut next = 0;
+                            for row in bitmap.matching_rows() {
+                                let bits = values.nth(row - next).ok_or_else(|| ScanError::Projection("selected row outside compact column".into()))?;
+                                next = row + 1;
+                                output.push(bits);
+                            }
+                            Ok(())
+                        }
+                        match data {
+                            Some(ColumnData::MixedInteger(values)) => append_selected(values.iter().map(|v| v.bits()), &bitmap, &mut buffer.numeric)?,
+                            Some(ColumnData::Integer(values)) => append_selected(values.iter().map(|v| v as u64), &bitmap, &mut buffer.numeric)?,
+                            Some(ColumnData::Float(values)) => append_selected(values.iter().map(f64::to_bits), &bitmap, &mut buffer.numeric)?,
+                            _ => unreachable!(),
                         }
                     }
                     ColumnView { kind, reserved: 0, data: buffer.numeric.as_ptr().cast() }
@@ -961,8 +972,10 @@ impl ProjectedScanner {
                         // render once, even when the selected rows are sparse.
                         let mut cache: [Option<(i64, Cell)>; 64] = [None; 64];
                         let mut constant_cell: Option<Cell> = None;
+                        let mut previous_variable = None;
                         for (output_row, row) in bitmap.matching_rows().enumerate() {
-                            let value = variables.get(row).ok_or_else(|| ScanError::Projection("invalid CLP variable row".into()))?;
+                            let value = variables.get_with_previous(previous_variable, row).ok_or_else(|| ScanError::Projection("invalid CLP variable row".into()))?;
+                            previous_variable = Some((row, value));
                             let slot = ((value as u64).wrapping_mul(0x9e3779b97f4a7c15) >> 58) as usize;
                             let cell = match cache[slot] {
                                 Some((key, cell)) if key == value => cell,
@@ -1322,6 +1335,7 @@ impl ProjectedScanner {
             .map_err(|source| {
                 ScanError::Archive(format!("failed to open stream {stream_id}: {source}"))
             })?
+            .with_row_selections(compiled.stream_row_selections(stream_id))
             .next()
             .transpose()
             .map_err(|source| ScanError::Archive(format!("failed to decode table: {source}")))?
@@ -1433,6 +1447,7 @@ impl ProjectedScanner {
             .map_err(|source| {
                 ScanError::Archive(format!("failed to open stream {stream_id}: {source}"))
             })?;
+        tables = tables.with_row_selections(compiled.stream_row_selections(stream_id));
         // Resume where the last batch stopped without decoding the tables in between.
         if !tables.seek_to_table(self.table_cursor) {
             return Ok(false);
@@ -1517,15 +1532,22 @@ impl ProjectedScanner {
 }
 
 /// Monotonically selected rows share one delta prefix, avoiding quadratic random access.
+enum ForwardValueIter<'a> {
+    Delta(DeltaI64Values<'a>),
+    Integer(clp_s::archive::I64Column<'a>, Option<(usize, i64)>),
+    Mixed(clp_s::integer::MixedIntegerColumn<'a>, Option<(usize, clp_s::integer::IntegerValue)>),
+}
 struct ForwardDelta<'a> {
-    values: DeltaI64Values<'a>,
+    values: ForwardValueIter<'a>,
     next_row: usize,
 }
 impl<'a> ForwardDelta<'a> {
     fn from_column(data: ColumnData<'a, '_>) -> Option<Self> {
         let values = match data {
-            ColumnData::Timestamp(v) => v.epochs().values(),
-            ColumnData::DeltaInteger(v) => v.values(),
+            ColumnData::Timestamp(v) => ForwardValueIter::Delta(v.epochs().values()),
+            ColumnData::DeltaInteger(v) => ForwardValueIter::Delta(v.values()),
+            ColumnData::Integer(v) => ForwardValueIter::Integer(v, None),
+            ColumnData::MixedInteger(v) => ForwardValueIter::Mixed(v, None),
             _ => return None,
         };
         Some(Self {
@@ -1535,7 +1557,19 @@ impl<'a> ForwardDelta<'a> {
     }
     fn get(&mut self, row: usize) -> Option<i64> {
         let skip = row.checked_sub(self.next_row)?;
-        let value = self.values.nth(skip)?;
+        let value = match &mut self.values {
+            ForwardValueIter::Delta(values) => values.nth(skip)?,
+            ForwardValueIter::Integer(column, previous) => {
+                let value = column.get_with_previous(*previous, row)?;
+                *previous = Some((row, value));
+                value
+            }
+            ForwardValueIter::Mixed(column, previous) => {
+                let value = column.get_with_previous(*previous, row)?;
+                *previous = Some((row, value));
+                value.bits() as i64
+            }
+        };
         self.next_row = row + 1;
         Some(value)
     }
@@ -1567,19 +1601,19 @@ fn project_row(
         };
         let cell = match column.data() {
             ColumnData::MixedInteger(values) => {
-                values.get(row).map_or_else(Cell::absent, |value| {
+                deltas[field].as_mut().and_then(|values| values.get(row)).map_or_else(Cell::absent, |bits| {
                     Cell::scalar(
-                        if value.is_large() {
+                        if values.is_large_at(row) {
                             kind::UNSIGNED
                         } else {
                             kind::INTEGER
                         },
-                        value.bits() as i64,
+                        bits,
                         0.0,
                     )
                 })
             }
-            ColumnData::Integer(values) => values.get(row).map_or_else(Cell::absent, |value| {
+            ColumnData::Integer(_) => deltas[field].as_mut().and_then(|values| values.get(row)).map_or_else(Cell::absent, |value| {
                 Cell::scalar(kind::INTEGER, value, 0.0)
             }),
             ColumnData::DeltaInteger(_) => deltas[field]

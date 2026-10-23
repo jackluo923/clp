@@ -575,6 +575,7 @@ fn prefilter_by_columns<A: ArchiveReader + ?Sized>(
     let decoded = catalog
         .schema_tables(stream_id, &stream, options.columns)
         .map_err(|source| ArchiveSearchError::TableStream { stream_id, source })?
+        .with_row_selections(compiled.stream_row_selections(stream_id))
         .next()
         .transpose()
         .map_err(|source| ArchiveSearchError::TableStream { stream_id, source })?;
@@ -697,7 +698,8 @@ fn scan_streams<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
         position.stats.add_stream(stream.len())?;
         let decoded_tables = catalog
             .schema_tables(stream_id, &stream, options.columns)
-            .map_err(|source| ArchiveSearchError::TableStream { stream_id, source })?;
+            .map_err(|source| ArchiveSearchError::TableStream { stream_id, source })?
+            .with_row_selections(compiled.stream_row_selections(stream_id));
         for decoded in decoded_tables {
             let decoded =
                 decoded.map_err(|source| ArchiveSearchError::TableStream { stream_id, source })?;

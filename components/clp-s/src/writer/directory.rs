@@ -83,7 +83,8 @@ impl OpenDirectoryArchive {
     pub fn new_with_template_keys(options: WriterOptions, keys: super::TemplateKeys) -> Self {
         Self {
             options,
-            records: PrimitiveArchive::with_verbatim_text(options.verbatim_text(), keys),
+            records: PrimitiveArchive::with_verbatim_text(options.verbatim_text(), keys)
+                .with_timestamp_storage(options.timestamp_precision(), options.timestamp_rounding()),
         }
     }
 
@@ -220,7 +221,7 @@ impl OpenDirectoryArchive {
     ///
     /// Returns an encoding, limit, allocation, or checked-size error. No external sink is touched.
     pub fn finish(self) -> Result<EncodedDirectoryArchive, WriterError> {
-        EncodedDirectoryArchive::from_encoded(encode_records(&self.records, self.options)?)
+        EncodedDirectoryArchive::from_encoded(encode_records(self.records, self.options)?)
     }
 
     /// Encodes the complete archive before driving a caller-owned transactional sink.

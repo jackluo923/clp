@@ -794,6 +794,7 @@ struct JsonRecordEvents<'record> {
     options: JsonArchiveOptions,
     timestamp_resolver: Option<&'record JsonTimestampResolver>,
     unmatched_object_depth: Option<usize>,
+    timestamp_object_path: Vec<&'record [u8]>,
     structured_arena: &'record Bump,
     structured_values: u64,
 }
@@ -899,6 +900,7 @@ impl<'record> JsonRecordEvents<'record> {
             options,
             timestamp_resolver,
             unmatched_object_depth: None,
+            timestamp_object_path: Vec::new(),
             structured_arena,
             structured_values: 0,
         }
@@ -1335,6 +1337,14 @@ impl<'record> JsonRecordEvents<'record> {
 
     fn matching_timestamp_resolver(&self) -> Option<&'record JsonTimestampResolver> {
         let resolver = self.timestamp_resolver?;
+        if resolver.is_multiple() {
+            let key = self.pending_key?;
+            return resolver.resolvers().find(|r| {
+                let components = r.path().components();
+                components.len() == self.object_depth && components.last().is_some_and(|v| v.as_bytes() == key)
+                    && components[..components.len()-1].iter().zip(&self.timestamp_object_path).all(|(a,b)| a.as_bytes() == *b)
+            });
+        }
         if self.unmatched_object_depth.is_some()
             || resolver.path().components().len() != self.object_depth
         {
@@ -1347,10 +1357,11 @@ impl<'record> JsonRecordEvents<'record> {
             .then_some(resolver)
     }
 
-    fn enter_object_path(&mut self, key: &[u8], new_depth: usize) {
+    fn enter_object_path(&mut self, key: &'record [u8], new_depth: usize) {
         let Some(resolver) = self.timestamp_resolver else {
             return;
         };
+        if resolver.is_multiple() { self.timestamp_object_path.push(key); return; }
         if self.unmatched_object_depth.is_some() {
             return;
         }
@@ -1363,6 +1374,9 @@ impl<'record> JsonRecordEvents<'record> {
     }
 
     fn exit_object_path(&mut self) {
+        if self.timestamp_resolver.is_some_and(JsonTimestampResolver::is_multiple) {
+            self.timestamp_object_path.pop(); return;
+        }
         if self.unmatched_object_depth == Some(self.object_depth) {
             self.unmatched_object_depth = None;
         }

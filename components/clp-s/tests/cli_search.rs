@@ -1817,7 +1817,7 @@ fn timestamp_key_windows_outside_the_archive_range_skip_it_unread() {
         "--single-file-archive".as_ref(),
         "--disable-log-order".as_ref(),
         "--timestamp-key".as_ref(),
-        "ts".as_ref(),
+        "ts:precision=ms".as_ref(),
         archives.as_os_str(),
         input.as_os_str(),
     ]);
@@ -1884,7 +1884,7 @@ fn timestamp_chunks_skip_rows_and_tables_outside_the_window_without_changing_res
     let compress = |name: &str, env: &[(&str, &str)], extra: &[&str]| {
         let archives = directory.path().join(name);
         let mut command = Command::new(env!("CARGO_BIN_EXE_clp-s"));
-        command.args(["c", "--single-file-archive", "--disable-log-order", "--timestamp-key", "ts"]);
+        command.args(["c", "--single-file-archive", "--disable-log-order", "--timestamp-key", "ts:precision=ms"]);
         command.args(extra).arg(&archives).arg(&input);
         for (key, value) in env {
             command.env(key, value);

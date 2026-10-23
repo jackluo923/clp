@@ -10,6 +10,7 @@ const BLOCK: usize = 64;
 pub(crate) enum Descriptors<'a> {
     Numeric(NumericColumn<'a>),
     Delta(Delta<'a>),
+    BlockDelta { column: NumericColumn<'a>, view: crate::delta_blocks::View<'a>, checkpoints: &'a OnceLock<Vec<u64>> },
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Delta<'a> {
@@ -21,6 +22,11 @@ pub(crate) struct Delta<'a> {
     checkpoints: &'a OnceLock<Vec<u64>>,
 }
 impl<'a> Descriptors<'a> {
+    pub(crate) fn blocked(bytes: &'a [u8], rows: usize, checkpoints: &'a OnceLock<Vec<u64>>) -> Result<Self, Error> {
+        let column = NumericColumn::encoded(bytes, rows, crate::encoded_numeric::NumericEncoding::BlockDelta)?;
+        let view = crate::delta_blocks::View::new(bytes, rows)?;
+        Ok(Self::BlockDelta { column, view, checkpoints })
+    }
     pub(crate) fn delta(
         bytes: &'a [u8],
         rows: usize,
@@ -43,7 +49,7 @@ impl<'a> Descriptors<'a> {
     }
     pub(crate) fn len(self) -> usize {
         match self {
-            Self::Numeric(n) => n.len(),
+            Self::Numeric(n) | Self::BlockDelta { column: n, .. } => n.len(),
             Self::Delta(d) => d.rows,
         }
     }
@@ -52,7 +58,7 @@ impl<'a> Descriptors<'a> {
     }
     pub(crate) fn linear(self) -> Option<(u64, u64)> {
         let (first, step) = match self {
-            Self::Numeric(n) => (n.constant()?, 0),
+            Self::Numeric(n) | Self::BlockDelta { column: n, .. } => n.linear()?,
             Self::Delta(d) if d.width == 0 => (d.first, d.minimum),
             _ => return None,
         };
@@ -62,6 +68,15 @@ impl<'a> Descriptors<'a> {
     pub(crate) fn get(self, row: usize) -> Option<u64> {
         match self {
             Self::Numeric(n) => n.get(row),
+            Self::BlockDelta { column, view, checkpoints } => {
+                if row >= column.len() { return None; }
+                if view.is_constant_stride() { return view.get(row); }
+                // Random-access clients retain the old bounded lookup cost. Streaming filters
+                // and forward cursors do not build this optional in-memory checkpoint cache.
+                let checkpoints = checkpoints.get_or_init(|| column.iter().step_by(BLOCK).collect());
+                let start = row / BLOCK * BLOCK;
+                view.from_previous(Some((start, checkpoints[row / BLOCK])), row)
+            }
             Self::Delta(d) => {
                 if row >= d.rows {
                     return None;
@@ -79,7 +94,7 @@ impl<'a> Descriptors<'a> {
     }
     pub(crate) fn iter(self) -> DescriptorIter<'a> {
         match self {
-            Self::Numeric(n) => DescriptorIter::Numeric(n.iter()),
+            Self::Numeric(n) | Self::BlockDelta { column: n, .. } => DescriptorIter::Numeric(n.iter()),
             Self::Delta(d) => DescriptorIter::Delta(d.iter(d.checkpoints.get().is_none())),
         }
     }
@@ -123,6 +138,8 @@ impl DescriptorCursor<'_> {
             (Descriptors::Delta(d), Some((last, value))) if row >= last && row - last < BLOCK => {
                 d.advance(value, last, row)
             }
+            (Descriptors::BlockDelta { view, .. }, previous) => view.from_previous(previous, row)?,
+            (Descriptors::Numeric(n), previous) => n.get_with_previous(previous, row)?,
             _ => self.column.get(row)?,
         };
         self.last = Some((row, value));
@@ -139,6 +156,12 @@ impl Iterator for DescriptorIter<'_> {
         match self {
             Self::Numeric(n) => n.next(),
             Self::Delta(d) => d.next(),
+        }
+    }
+    fn nth(&mut self, n: usize) -> Option<u64> {
+        match self {
+            Self::Numeric(values) => values.nth(n),
+            Self::Delta(values) => values.nth(n),
         }
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -235,6 +258,23 @@ impl<'a> Bits<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn persisted_blocks_seek_without_building_random_access_checkpoints() {
+        let rows = crate::delta_blocks::ROWS + 127;
+        let values: Vec<_> = (0..rows).map(|r| r as i64 * 7 + (r % 3) as i64).collect();
+        let wire = crate::adaptive_int::candidates(&values).find(|c| c[0] == crate::delta_blocks::SCHEME).unwrap();
+        let checkpoints = OnceLock::new();
+        let column = Descriptors::blocked(&wire[1..], rows, &checkpoints).unwrap();
+        let start = crate::delta_blocks::ROWS;
+        assert_eq!(column.iter().nth(start), Some(values[start] as u64));
+        let mut cursor = column.cursor();
+        for row in (start..rows).step_by(3) { assert_eq!(cursor.get(row), Some(values[row] as u64)); }
+        assert!(checkpoints.get().is_none(), "forward reads must not decode preceding blocks");
+        for row in [17, start - 1, start + 1, rows - 1, 0] { assert_eq!(column.get(row), Some(values[row] as u64)); }
+        assert_eq!(checkpoints.get().unwrap().len(), rows.div_ceil(BLOCK));
+        assert_eq!(column.get(rows), None);
+    }
+
     #[test]
     fn packed_delta_iteration_and_random_access_match_reference() {
         for width in 0..=64 {

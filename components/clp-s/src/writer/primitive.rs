@@ -774,6 +774,15 @@ fn template_node_selected<'a>(
 }
 
 impl PrimitiveArchive {
+    pub(super) fn with_timestamp_storage(mut self, precision: crate::timestamp_precision::TimestampPrecision,
+        rounding: crate::timestamp_precision::TimestampRounding) -> Self {
+        self.timestamp_dictionary.defaults = crate::timestamp_precision::TimestampStorage { precision, rounding };
+        self
+    }
+    pub(super) fn has_timestamps(&self) -> bool {
+        self.tables.tables.iter().any(|t| t.columns.iter().any(|c| c.node_type == NodeType::Timestamp))
+    }
+
     /// An empty archive that stores CLP strings whole as `rules` says, or never for `None`.
     pub(super) fn with_verbatim_text(rules: Option<crate::writer::VerbatimText>, template_keys: super::TemplateKeys) -> Self {
         let mut archive = Self::default();
@@ -1089,6 +1098,28 @@ impl PrimitiveArchive {
         Ok(fields)
     }
 
+    /// Resolve auto fields once, before summaries and serialization. Explicit fields already
+    /// contain native ticks. Rebuild deltas in place so late finer values never lose precision
+    /// and different encoded schemas sharing a field use the same scale.
+    pub(super) fn finalize_auto_timestamps(&mut self) {
+        for table in &mut self.tables.tables {
+            for column in &mut table.columns {
+                let Some(scale) = self.timestamp_dictionary.auto_scale_for_node(column.node_id) else { continue; };
+                if scale == 1 { continue; }
+                let TableColumnData::Timestamp { deltas, current, .. } = &mut column.data else { continue; };
+                let (mut epoch, mut previous) = (0_i64, 0_i64);
+                for delta in deltas.chunks_exact_mut(8) {
+                    epoch = epoch.wrapping_add(i64::from_le_bytes(delta.as_ref().try_into().unwrap()));
+                    debug_assert_eq!(epoch % scale, 0);
+                    let tick = epoch / scale;
+                    delta.copy_from_slice(&tick.wrapping_sub(previous).to_le_bytes());
+                    previous = tick;
+                }
+                *current = previous;
+            }
+        }
+    }
+
     /// The timestamp chunk index of every table's timestamp columns, or `None` when no table has
     /// one. See [`crate::timestamp_chunks`].
     pub(super) fn timestamp_chunks(&self) -> Result<Option<Vec<u8>>, WriterError> {
@@ -1099,9 +1130,10 @@ impl PrimitiveArchive {
                 let TableColumnData::Timestamp { deltas, .. } = &column.data else {
                     continue;
                 };
+                let tick_ns = self.timestamp_dictionary.storage_for_node(column.node_id).precision.nanoseconds_per_tick();
                 let epochs = deltas.chunks_exact(8).scan(0_i64, |epoch, delta| {
                     *epoch = epoch.wrapping_add(i64::from_le_bytes(delta.try_into().unwrap()));
-                    Some(*epoch)
+                    Some(*epoch * tick_ns)
                 });
                 columns.push(ChunkColumn {
                     schema: table.schema_id,
@@ -1163,6 +1195,7 @@ impl PrimitiveArchive {
                         deltas, pattern_ids, ..
                     } => {
                         let mut epoch = 0_i64;
+                        let tick_ns = i128::from(self.timestamp_dictionary.storage_for_node(column.node_id).precision.nanoseconds_per_tick());
                         let mut complete = true;
                         for (delta, pattern) in deltas.chunks_exact(8).zip(pattern_ids.chunks_exact(8)) {
                             epoch = epoch.wrapping_add(i64::from_le_bytes(delta.try_into().unwrap()));
@@ -1173,7 +1206,7 @@ impl PrimitiveArchive {
                             };
                             // Summarize the original JSON integer, not rounded range bounds.
                             summary
-                                .add_integer(i128::from(epoch / scale))
+                                .add_integer(i128::from(epoch) * tick_ns / i128::from(scale))
                                 .ok_or(WriterError::SizeOverflow)?;
                         }
                         if !complete {
@@ -3790,9 +3823,12 @@ fn encode_timestamp_value(
     limits: WriterLimits,
     scratch: &mut String,
 ) -> Result<EncodedValue, AppendError> {
+    let storage = value.storage().unwrap_or(dictionaries.timestamp_base.defaults);
+    let ticks = storage.precision.quantize(value.epoch_nanoseconds(), storage.rounding)
+        .ok_or(AppendError::Timestamp { node_id, reason: super::timestamp::TimestampError::QuantizationOverflow })?;
     Ok(EncodedValue::Timestamp {
-        value: value.epoch_nanoseconds(),
-        delta: value.epoch_nanoseconds(),
+        value: ticks,
+        delta: ticks,
         pattern_id: dictionaries.resolve_timestamp(
             node_id,
             value,
@@ -4267,7 +4303,18 @@ impl TableColumn {
                 pattern_ids,
                 ..
             } => {
-                output.write_all(deltas).map_err(WriterError::Io)?;
+                // Retain the existing Zstd frame and byte width, but restart each indexed chunk.
+                let mut current = 0i64;
+                let mut block = Vec::with_capacity(deltas.len().min(crate::delta_blocks::ROWS * 8));
+                for chunk in deltas.chunks(crate::delta_blocks::ROWS * 8) {
+                    block.clear();
+                    block.extend_from_slice(chunk);
+                    for (index, bytes) in chunk.as_chunks::<8>().0.iter().enumerate() {
+                        current = current.wrapping_add(i64::from_le_bytes(*bytes));
+                        if index == 0 { block[..8].copy_from_slice(&current.to_le_bytes()); }
+                    }
+                    output.write_all(&block).map_err(WriterError::Io)?;
+                }
                 output.write_all(pattern_ids).map_err(WriterError::Io)
             }
             TableColumnData::FormattedFloat {
@@ -5293,6 +5340,7 @@ fn encode_plain_column(
 /// and appends its zstd frame to `out`. The reader inverts it via [`adaptive_int::decode`].
 fn encode_adaptive_integer_column(
     column: &TableColumn,
+    options: WriterOptions,
     compressor: &mut zstd::bulk::Compressor<'_>,
     raw_frames: bool,
     out: &mut Vec<u8>,
@@ -5309,7 +5357,7 @@ fn encode_adaptive_integer_column(
         .map(|chunk| i64::from_le_bytes(chunk.try_into().expect("8-byte chunk")))
         .collect();
     write_best_candidate(
-        adaptive_int::candidates(&values),
+        adaptive_int::candidates_with_effort(&values, options.encoding_effort()),
         compressor,
         raw_frames,
         out,
@@ -5345,6 +5393,7 @@ fn best_candidate(
 fn encode_adaptive_clp_string_column(
     column: &TableColumn,
     rows: u64,
+    options: WriterOptions,
     compressor: &mut zstd::bulk::Compressor<'_>,
     remap: Option<&LogTypeRemap>,
     out: &mut Vec<u8>,
@@ -5375,11 +5424,11 @@ fn encode_adaptive_clp_string_column(
             .map(|chunk| i64::from_le_bytes(*chunk))
             .collect()
     };
-    let descriptors = best_candidate(adaptive_int::candidates(&values(descriptors)), compressor)?;
+    let descriptors = best_candidate(adaptive_int::candidates_with_effort(&values(descriptors), options.encoding_effort()), compressor)?;
     let variables = if variables.is_empty() {
         Vec::new()
     } else {
-        best_candidate(adaptive_int::candidates(&values(variables)), compressor)?
+        best_candidate(adaptive_int::candidates_with_effort(&values(variables), options.encoding_effort()), compressor)?
     };
     let mut payload = Vec::new();
     payload
@@ -5419,7 +5468,7 @@ fn encode_adaptive_float_column(
         .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("8-byte chunk")))
         .collect();
     let (uncompressed, scheme) = write_best_scheme(
-        adaptive_float::candidates(&bits, options.decimal_float_columns()),
+        adaptive_float::candidates_with_effort(&bits, options.encoding_effort()),
         compressor,
         raw_frames,
         out,
@@ -5497,11 +5546,11 @@ fn encode_grouped_tables(
                         .expect("writer produced valid mixed integers");
                     for value in decoded.iter() { combined.append(value); }
                 }
-                (GroupedFrameEncoding::MixedInteger, best_candidate(combined.candidates(), compressor)?)
+                (GroupedFrameEncoding::MixedInteger, best_candidate(combined.candidates_with_effort(options.encoding_effort()), compressor)?)
             }
             NodeType::Integer | NodeType::VarString | NodeType::DictionaryFloat => (
                 GroupedFrameEncoding::Integer,
-                best_candidate(adaptive_int::candidates(&values(&plain)), compressor)?,
+                best_candidate(adaptive_int::candidates_with_effort(&values(&plain), options.encoding_effort()), compressor)?,
             ),
             NodeType::Float => {
                 let bits: Vec<u64> = plain
@@ -5511,7 +5560,7 @@ fn encode_grouped_tables(
                     .map(|chunk| u64::from_le_bytes(*chunk))
                     .collect();
                 let payload = best_candidate(
-                    adaptive_float::candidates(&bits, options.decimal_float_columns()),
+                    adaptive_float::candidates_with_effort(&bits, options.encoding_effort()),
                     compressor,
                 )?;
                 packed.decimal_floats |= adaptive_float::is_decimal(&payload);
@@ -5519,7 +5568,7 @@ fn encode_grouped_tables(
             }
             NodeType::ClpString => (
                 GroupedFrameEncoding::ClpString,
-                grouped_clp_string_payload(&plain, columns, compressor)?,
+                grouped_clp_string_payload(&plain, columns, options.encoding_effort(), compressor)?,
             ),
             _ => (GroupedFrameEncoding::Plain, plain),
         };
@@ -5548,6 +5597,7 @@ fn encode_grouped_tables(
 fn grouped_clp_string_payload(
     plain: &[u8],
     columns: &[(&TableColumn, u64)],
+    effort: crate::EncodingEffort,
     compressor: &mut zstd::bulk::Compressor<'_>,
 ) -> Result<Vec<u8>, WriterError> {
     let mut descriptors = Vec::new();
@@ -5586,11 +5636,11 @@ fn grouped_clp_string_payload(
             .map(|chunk| i64::from_le_bytes(*chunk))
             .collect()
     };
-    let descriptors = best_candidate(adaptive_int::candidates(&values(&descriptors)), compressor)?;
+    let descriptors = best_candidate(adaptive_int::candidates_with_effort(&values(&descriptors), effort), compressor)?;
     let variables = if variables.is_empty() {
         Vec::new()
     } else {
-        best_candidate(adaptive_int::candidates(&values(&variables)), compressor)?
+        best_candidate(adaptive_int::candidates_with_effort(&values(&variables), effort), compressor)?
     };
     let mut payload = Vec::with_capacity(
         (counts.len() + 2) * size_of::<u64>() + descriptors.len() + variables.len(),
@@ -5636,20 +5686,21 @@ fn encode_separate_table(
         let uncompressed = match (options.adaptive_numeric_columns(), column.node_type) {
             (_, NodeType::MixedInteger) => {
                 let TableColumnData::MixedInteger(buffer) = &column.data else { unreachable!() };
-                write_best_candidate(buffer.candidates(), compressor, strings, &mut packed.compressed)?
+                write_best_candidate(buffer.candidates_with_effort(options.encoding_effort()), compressor, strings, &mut packed.compressed)?
             }
             (true, NodeType::Integer) => {
-                encode_adaptive_integer_column(column, compressor, strings, &mut packed.compressed)?
+                encode_adaptive_integer_column(column, options, compressor, strings, &mut packed.compressed)?
             }
             (true, NodeType::Float) => {
                 encode_adaptive_float_column(column, options, compressor, strings, packed)?
             }
             (true, NodeType::VarString | NodeType::DictionaryFloat) if strings => {
-                encode_adaptive_integer_column(column, compressor, true, &mut packed.compressed)?
+                encode_adaptive_integer_column(column, options, compressor, true, &mut packed.compressed)?
             }
             (true, NodeType::ClpString) if strings => encode_adaptive_clp_string_column(
                 column,
                 table.message_count,
+                options,
                 compressor,
                 remap,
                 &mut packed.compressed,
@@ -5986,8 +6037,9 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn borrowed_record_planning_values_remain_compact() {
-        assert_eq!(64, size_of::<BorrowedScalarValue<'_>>());
-        assert_eq!(72, size_of::<BorrowedPlannedValue<'_>>());
+        // Tick duration/rounding and declaration priority use two added words.
+        assert_eq!(80, size_of::<BorrowedScalarValue<'_>>());
+        assert_eq!(88, size_of::<BorrowedPlannedValue<'_>>());
     }
 
     #[derive(Clone)]

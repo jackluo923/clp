@@ -8,6 +8,8 @@
 mod adaptive_float;
 mod adaptive_int;
 mod encoded_numeric;
+pub mod encoding_effort;
+pub use encoding_effort::EncodingEffort;
 pub mod integer;
 pub mod archive;
 mod byte_scan;
@@ -23,6 +25,7 @@ mod ordered_merge;
 mod record;
 pub mod search;
 pub mod timestamp;
+pub mod timestamp_precision;
 pub mod timestamp_catalog;
 pub mod writer;
 
@@ -70,3 +73,5 @@ pub use record::RecordWriter;
 pub mod numeric_summary;
 pub mod timestamp_chunks;
 pub mod template_index;
+
+mod delta_blocks;

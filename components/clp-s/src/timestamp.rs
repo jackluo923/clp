@@ -294,6 +294,9 @@ impl TimestampPattern {
             Token::Nanoseconds => {
                 append_fraction(fractional_nanoseconds(timestamp, date_time)?, 9, buffer)
             }
+            Token::FixedFraction(digits) => {
+                append_fraction(fractional_nanoseconds(timestamp, date_time)?, usize::from(*digits), buffer)
+            }
             Token::VariableFraction => {
                 append_variable_fraction(fractional_nanoseconds(timestamp, date_time)?, buffer)
             }
@@ -301,6 +304,7 @@ impl TimestampPattern {
             Token::EpochMilliseconds => append_i64(timestamp / 1_000_000, buffer),
             Token::EpochMicroseconds => append_i64(timestamp / 1_000, buffer),
             Token::EpochNanoseconds => append_i64(timestamp, buffer),
+            Token::EpochTicks(scale) => append_i64(timestamp / scale, buffer),
         }
     }
 }
@@ -327,10 +331,12 @@ enum Token {
     Microseconds,
     Nanoseconds,
     VariableFraction,
+    FixedFraction(u8),
     EpochSeconds,
     EpochMilliseconds,
     EpochMicroseconds,
     EpochNanoseconds,
+    EpochTicks(i64),
     Timezone(Range<usize>),
     EscapedBackslash,
 }
@@ -475,7 +481,15 @@ impl<'a> PatternCompiler<'a> {
                 .ok_or(TimestampPatternError::PatternSizeOverflow);
         }
         match directive {
-            b'B' => self.compile_names(directive_index, 12, true),
+            b'K' => {
+                let (content, next) = extract_bracket_content(self.raw, directive_index + 1, self.content_end)?;
+                let scale = self.raw[content].parse::<i64>().ok().filter(|v| *v > 0)
+                    .ok_or(TimestampPatternError::InvalidEscapeSequence { index: directive_index, directive })?;
+                self.tokens.push(Token::EpochTicks(scale));
+                self.apply_class(DirectiveClass::Numeric);
+                Ok(next)
+            }
+            b'B'  => self.compile_names(directive_index, 12, true),
             b'A' => self.compile_names(directive_index, 7, false),
             b'z' => self.compile_timezone(directive_index),
             b'Z' | b'?' | b'P' | b'O' | b's' => {
@@ -588,6 +602,7 @@ const fn simple_directive(directive: u8) -> Option<(Token, DirectiveClass)> {
         b'M' => (Token::Minute, date),
         b'S' => (Token::Second, date),
         b'J' => (Token::LeapSecond, date),
+        b'1' | b'2' | b'4' | b'5' | b'7' | b'8' => (Token::FixedFraction(directive - b'0'), neutral),
         b'3' => (Token::Milliseconds, neutral),
         b'6' => (Token::Microseconds, neutral),
         b'9' => (Token::Nanoseconds, neutral),
@@ -782,12 +797,14 @@ fn calculate_max_formatted_size(
             | Token::Second
             | Token::LeapSecond
             | Token::EscapedBackslash => 2,
+            Token::FixedFraction(digits) => usize::from(*digits),
             Token::Microseconds => 6,
             Token::Nanoseconds | Token::VariableFraction => 9,
             Token::EpochSeconds
             | Token::EpochMilliseconds
             | Token::EpochMicroseconds
-            | Token::EpochNanoseconds => 20,
+            | Token::EpochNanoseconds
+            | Token::EpochTicks(_) => 20,
         };
         size = size
             .checked_add(token_size)
@@ -964,9 +981,7 @@ fn append_fraction(
     buffer: &mut String,
 ) -> Result<(), TimestampFormatError> {
     let divisor = match digits {
-        3 => 1_000_000,
-        6 => 1_000,
-        9 => 1,
+        1..=9 => 10_u32.pow((9 - digits) as u32),
         _ => return Err(TimestampFormatError::InvalidCompiledPattern),
     };
     append_positive_padded(i64::from(nanoseconds / divisor), digits, '0', buffer)
@@ -977,7 +992,9 @@ fn append_variable_fraction(
     buffer: &mut String,
 ) -> Result<(), TimestampFormatError> {
     if 0 == nanoseconds {
-        return Err(TimestampFormatError::ZeroVariableFraction);
+        // Deliberate storage quantization can remove a formerly nonzero fraction.
+        buffer.push('0');
+        return Ok(());
     }
     let mut digits = [b'0'; 9];
     let mut value = nanoseconds;
@@ -1229,6 +1246,18 @@ impl Display for TimestampFormatError {
 }
 
 impl Error for TimestampFormatError {}
+
+/// Nanoseconds per tick for a complete unquoted integer timestamp pattern.
+/// String, calendar, fractional, and composite patterns are not certified.
+pub fn integer_pattern_scale(raw: &str) -> Option<i64> {
+    match raw {
+        r"\E" => Some(1_000_000_000),
+        r"\L" => Some(1_000_000),
+        r"\C" => Some(1_000),
+        r"\N" => Some(1),
+        _ => raw.strip_prefix(r"\K{")?.strip_suffix('}')?.parse::<i64>().ok().filter(|v| *v > 0),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1695,11 +1724,9 @@ mod tests {
             TimestampPattern::compile(r"before\Tafter", TimestampPatternLimits::default())
                 .expect("variable fraction pattern compiles");
         let mut buffer = String::from("retained");
-        assert!(matches!(
-            variable.append_epoch_nanoseconds(1_000_000_000, &mut buffer),
-            Err(TimestampFormatError::ZeroVariableFraction)
-        ));
-        assert_eq!("retained", buffer);
+        variable.append_epoch_nanoseconds(1_000_000_000, &mut buffer).unwrap();
+        assert_eq!("retainedbefore0after", buffer);
+        buffer.truncate("retained".len());
 
         let two_digit_year =
             TimestampPattern::compile(r"before\y", TimestampPatternLimits::default())
@@ -1722,5 +1749,23 @@ mod tests {
             .expect("quoted empty pattern compiles");
         assert!(quoted_empty.is_quoted());
         assert_eq!(r#""""#, quoted_empty.format_epoch_nanoseconds(123).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod native_tick_pattern_tests {
+    use super::*;
+    #[test]
+    fn custom_ticks_format_and_certify_exactly() {
+        let pattern = TimestampPattern::compile(r"\K{100000}", TimestampPatternLimits::default()).unwrap();
+        for (ns, ticks) in [(1_234_500_000, "12345"), (-1_234_500_000, "-12345"), (0, "0")] {
+            assert_eq!(pattern.format_epoch_nanoseconds(ns).unwrap(), ticks);
+        }
+        assert_eq!(integer_pattern_scale(r"\K{100000}"), Some(100_000));
+        for raw in [r"\K{0}", r"\K{-1}", r"\K{9223372036854775808}"] {
+            assert!(TimestampPattern::compile(raw, TimestampPatternLimits::default()).is_err());
+            assert_eq!(integer_pattern_scale(raw), None);
+        }
+        assert_eq!(integer_pattern_scale(r#""\K{100000}""#), None);
     }
 }

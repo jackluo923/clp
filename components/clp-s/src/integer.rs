@@ -87,13 +87,17 @@ impl IntegerBuffer {
     pub(crate) fn wire_len(&self) -> usize {
         1 + self.bits.len() + self.bitmap.len()
     }
+    #[cfg(test)]
     pub(crate) fn candidates(&self) -> Vec<Vec<u8>> {
+        self.candidates_with_effort(crate::EncodingEffort::Balanced)
+    }
+    pub(crate) fn candidates_with_effort(&self, effort: crate::EncodingEffort) -> Vec<Vec<u8>> {
         let values: Vec<i64> = self
             .bits
             .chunks_exact(8)
             .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
             .collect();
-        adaptive_int::candidates(&values)
+        adaptive_int::candidates_with_effort(&values, effort)
             .into_iter()
             .map(|payload| {
                 let mut raw = Vec::with_capacity(1 + payload.len() + self.bitmap.len());
@@ -193,6 +197,10 @@ impl<'a> MixedIntegerColumn<'a> {
     pub fn is_empty(self) -> bool {
         self.data.len() == 0
     }
+    /// Whether this row's bit pattern represents an unsigned value above i64::MAX.
+    pub fn is_large_at(self, row: usize) -> bool {
+        row < self.len() && !self.bitmap.is_empty() && self.bitmap[row / 8] & (1 << (row % 8)) != 0
+    }
     fn value(self, row: usize, bits: u64) -> IntegerValue {
         if !self.bitmap.is_empty() && self.bitmap[row / 8] & (1 << (row % 8)) != 0 {
             IntegerValue::Unsigned(bits)
@@ -202,6 +210,10 @@ impl<'a> MixedIntegerColumn<'a> {
     }
     pub fn get(self, row: usize) -> Option<IntegerValue> {
         self.data.get(row).map(|bits| self.value(row, bits))
+    }
+    /// Reuses a prior row from this column when walking restartable deltas.
+    pub fn get_with_previous(self, previous: Option<(usize, IntegerValue)>, row: usize) -> Option<IntegerValue> {
+        self.data.get_with_previous(previous.map(|(r, v)| (r, v.bits())), row).map(|bits| self.value(row, bits))
     }
     pub fn iter(self) -> impl ExactSizeIterator<Item = IntegerValue> + DoubleEndedIterator + 'a {
         self.data

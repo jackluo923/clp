@@ -1170,11 +1170,9 @@ fn count_by_time(
     let bitmap = matches.bitmap().as_bytes();
     match column.data() {
         ColumnData::Timestamp(values) => {
-            for (row, ((value, _), matched)) in values.encoded_values().zip(bitmap).enumerate() {
-                if 0 != *matched {
-                    let milliseconds = value / NANOSECONDS_PER_MILLISECOND;
-                    add_timestamp(counts, milliseconds, bucket_size, limits, row)?;
-                }
+            for (row, value, _) in values.selected_values(bitmap) {
+                let milliseconds = value / NANOSECONDS_PER_MILLISECOND;
+                add_timestamp(counts, milliseconds, bucket_size, limits, row)?;
             }
         }
         ColumnData::DeprecatedDateString(values) => {
@@ -1345,12 +1343,7 @@ fn scan_extreme(
                 }
             }
             ColumnData::Timestamp(values) => {
-                for (row, ((epoch, pattern_id), matched)) in
-                    values.encoded_values().zip(bitmap).enumerate()
-                {
-                    if 0 == *matched {
-                        continue;
-                    }
+                for (row, epoch, pattern_id) in values.selected_values(bitmap) {
                     timestamp_scratch.clear();
                     matches
                         .catalog()
@@ -1651,10 +1644,7 @@ fn scan_unique_timestamp(
     values: &mut UniqueValues,
     scratch: &mut StringScratch<'_>,
 ) -> Result<(), AggregationError> {
-    for (row, ((epoch, pattern_id), matched)) in column.encoded_values().zip(bitmap).enumerate() {
-        if 0 == *matched {
-            continue;
-        }
+    for (row, epoch, pattern_id) in column.selected_values(bitmap) {
         scratch.timestamp.clear();
         patterns
             .append_epoch_nanoseconds(pattern_id, epoch, scratch.timestamp)

@@ -199,6 +199,7 @@ fn source_unit_extrema_certify_negative_and_subunit_epochs() {
         (r"\L", 1_000_000),
         (r"\C", 1_000),
         (r"\N", 1),
+        (r"\K{100000}", 100_000),
     ] {
         let mut writer = OpenArchive::new(Cursor::new(Vec::new()), WriterOptions::default());
         for (i, epoch) in epochs.iter().enumerate() {
