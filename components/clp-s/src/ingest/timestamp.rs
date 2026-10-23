@@ -499,6 +499,16 @@ impl JsonTimestampResolver {
         &'a self,
         value: JsonString<'a>,
     ) -> Result<TimestampRef<'a>, JsonTimestampError> {
+        self.resolve_validated_string(value).map(|(timestamp, _)| timestamp)
+    }
+
+    /// Common ISO text is validated field by field and its pattern retains every separator,
+    /// fraction digit and UTC offset. Reuse that proof instead of formatting each value again.
+    /// Numeric strings and named zones retain the writer's general round-trip validation.
+    pub(super) fn resolve_validated_string<'a>(
+        &'a self,
+        value: JsonString<'a>,
+    ) -> Result<(TimestampRef<'a>, bool), JsonTimestampError> {
         let lexeme =
             str::from_utf8(value.raw_json()).map_err(|_| JsonTimestampError::InvalidUtf8)?;
         let inner = lexeme
@@ -507,25 +517,32 @@ impl JsonTimestampResolver {
             .ok_or(JsonTimestampError::UnsupportedLexeme {
                 kind: JsonTimestampScalarKind::String,
             })?;
-        let resolved = match inner.parse::<i64>() {
+        let iso = inner.len() >= 19 && inner.as_bytes()[4] == b'-';
+        let resolved = if iso {
+            resolve_iso_date_time(inner)
+        } else { match inner.parse::<i64>() {
             Ok(integer) => resolve_integer_unit(integer, true, self.input_unit),
             Err(_) if inner.as_bytes().contains(&b'.') && looks_numeric(inner) => {
                 resolve_fractional_epoch(inner, true)
             }
             Err(_) => resolve_iso_date_time(inner),
-        };
+        }};
         let (epoch, pattern) = resolved.map_err(|error| match error {
             JsonTimestampError::UnsupportedLexeme { .. } => JsonTimestampError::UnsupportedLexeme {
                 kind: JsonTimestampScalarKind::String,
             },
             other => other,
         })?;
-        Ok(self.configured(TimestampRef::new(
+        // The calendar parser validates the complete raw token, including date ranges and
+        // fractional precision. A named zone starts with a space after the seconds field;
+        // the optional space at position 10 is an ordinary calendar separator.
+        let prevalidated = iso && !inner.as_bytes()[19..].contains(&b' ');
+        Ok((self.configured(TimestampRef::new(
             epoch,
             lexeme,
             self.resolved_pattern(pattern),
             self.path.descriptor(),
-        )))
+        )), prevalidated))
     }
 }
 
@@ -1494,6 +1511,40 @@ mod tests {
                 pattern.format_epoch_nanoseconds(expected).unwrap(),
                 "{source}"
             );
+        }
+    }
+
+    #[test]
+    fn prevalidated_iso_text_reconstructs_every_accepted_spelling() {
+        use crate::timestamp::{TimestampPattern, TimestampPatternLimits};
+        let resolver = JsonTimestampResolver::parse("ts").unwrap();
+        for date in ["1678-01-01", "1969-12-31", "2000-02-29", "2024-03-01", "2261-12-31"] {
+            for separator in ['T', ' '] {
+                for digits in 0..=9 {
+                    for punctuation in ['.', ','] {
+                        let fraction = if digits == 0 { String::new() } else {
+                            format!("{punctuation}{}", &"120000009"[..digits])
+                        };
+                        for zone in ["", "Z", "+00", "-00", "+0530", "-00:45", "+23:59", "-04:00"] {
+                            let source = format!("{date}{separator}12:34:56{fraction}{zone}");
+                            let raw = format!("\"{source}\"");
+                            let (timestamp, trusted) = resolver.resolve_validated_string(JsonString::new(raw.as_bytes(), &source)).unwrap();
+                            assert!(trusted);
+                            let pattern = TimestampPattern::compile(timestamp.pattern(), TimestampPatternLimits::default()).unwrap();
+                            assert_eq!(raw, pattern.format_epoch_nanoseconds(timestamp.epoch_nanoseconds()).unwrap());
+                        }
+                    }
+                }
+            }
+        }
+        for source in ["1700000000000", "-0", "2023-07-01 00:00:00 EDT"] {
+            let raw = format!("\"{source}\"");
+            assert!(!resolver.resolve_validated_string(JsonString::new(raw.as_bytes(), source)).unwrap().1);
+        }
+        for source in ["2023-02-29T00:00:00Z", "2024-01-01T24:00:00Z", "2024-01-01T00:00:60Z",
+            "2024-01-01T00:00:00.1234567890Z", "2024-01-01T00:00:00Zjunk", "2024-01-01T00:00:00+24:00"] {
+            let raw = format!("\"{source}\"");
+            assert!(resolver.resolve_validated_string(JsonString::new(raw.as_bytes(), source)).is_err(), "{source}");
         }
     }
 

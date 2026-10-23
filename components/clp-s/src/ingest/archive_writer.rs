@@ -1323,13 +1323,17 @@ impl<'record> JsonRecordEvents<'record> {
             .then(|| self.matching_timestamp_resolver())
             .flatten()
         {
-            let timestamp = resolver.resolve_string(value).map_err(|source| {
+            let (timestamp, prevalidated) = resolver.resolve_validated_string(value).map_err(|source| {
                 JsonRecordEventError::Timestamp {
                     json_event_index: event_index,
                     source,
                 }
             })?;
-            Ok(ValueRef::Timestamp(timestamp))
+            Ok(if prevalidated {
+                ValueRef::PrevalidatedTimestamp(PrevalidatedTimestampRef::new(timestamp))
+            } else {
+                ValueRef::Timestamp(timestamp)
+            })
         } else {
             Ok(ValueRef::String(value.decoded_bytes()))
         }
