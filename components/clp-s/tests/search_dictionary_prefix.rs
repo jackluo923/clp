@@ -40,6 +40,10 @@ impl TrackingReader {
 }
 
 impl ArchiveReader for TrackingReader {
+    fn supports_random_access(&self) -> bool {
+        self.inner.supports_random_access()
+    }
+
     fn read_catalog(
         &mut self,
         limits: ArchiveCatalogLimits,
@@ -247,6 +251,53 @@ fn search(
         .filter(|row| !row.is_empty())
         .map(|row| serde_json::from_slice(row).unwrap())
         .collect()
+}
+
+#[test]
+fn numeric_preflight_skips_variable_reads_but_never_invents_dictionary_misses() {
+    for separate in [false, true] {
+        let bytes = fixture(separate, false);
+        for (query, expected_rows, expected_reads) in [
+            ("id > 100 AND value:later", 0, 0),
+            ("id > 100 OR value:later", 1, 1),
+            ("value:later", 1, 1),
+            ("value:absent", 0, 1),
+            ("NOT value:later", 33, 1),
+            ("NOT (id > 100) AND value:later", 1, 1),
+        ] {
+            let mut reader = TrackingReader::new(bytes.clone());
+            assert_eq!(search(&mut reader, query, Some(&["id"])).len(), expected_rows, "{query}");
+            assert_eq!(reader.full_reads, expected_reads, "{query}, separate={separate}");
+        }
+    }
+}
+
+#[test]
+fn template_preflight_needs_no_variable_dictionary_for_a_proven_miss() {
+    for separate in [false, true] {
+        let mut writer = OpenArchive::new(Cursor::new(Vec::new()), options(separate));
+        writer.append_record(RecordRef::new(&[
+            FieldRef::new(b"id", ValueRef::I64(1)),
+            FieldRef::new(b"value", ValueRef::String(b"early")),
+            FieldRef::new(b"message", ValueRef::String(b"started worker 17")),
+            FieldRef::new(b"float", ValueRef::RetainedFloat(
+                RetainedFloatRef::new(123456789.123456789, b"1.23456789123456789e8"))),
+        ])).unwrap();
+        append_tail(&mut writer, 0, 4096);
+        let bytes = writer.finish().unwrap().into_inner().into_inner();
+        for (query, expected_rows, expected_reads) in [
+            ("message:missing* AND value:early", 0, 0),
+            ("message:started* AND value:early", 1, 1),
+            ("message:*17 AND value:early", 1, 1),
+            ("NOT message:missing* AND value:early", 1, 1),
+            ("message:missing* OR value:early", 1, 1),
+            ("float > 100", 1, 1),
+        ] {
+            let mut reader = TrackingReader::new(bytes.clone());
+            assert_eq!(search(&mut reader, query, Some(&["id"])).len(), expected_rows, "{query}");
+            assert_eq!(reader.full_reads, expected_reads, "{query}, separate={separate}");
+        }
+    }
 }
 
 #[test]

@@ -399,6 +399,24 @@ pub fn search_archive<A: ArchiveReader + ?Sized, S: ArchiveMatchSink + ?Sized>(
         output: output_nodes.as_deref(),
     };
     let filter_dictionaries = filter.dictionaries(catalog.schema_tree());
+    if filter_dictionaries.variable && reader.supports_random_access() {
+        // Small log dictionaries and numeric/schema summaries can prove an archive empty
+        // before its often much larger variable dictionary is touched. Do not interpret an
+        // unloaded variable dictionary as evidence that a predicate value is absent.
+        let mut early = filter_dictionaries.clone();
+        early.variable = false;
+        early.array = false;
+        load_dictionaries(reader, &mut catalog, &options.catalog, &early, &mut loaded)?;
+        let compiled = query.compile_for_archive(&catalog, options.search)
+            .map_err(ArchiveSearchError::Compile)?;
+        if !compiled.reaches_match_sink().map_err(ArchiveSearchError::Compile)? {
+            return Ok(ArchiveSearchStats::default());
+        }
+        if !compiled.may_match_before_variables() {
+            sink.begin_archive().map_err(ArchiveSearchError::BeginSink)?;
+            return Ok(ArchiveSearchStats::default());
+        }
+    }
     load_dictionaries(
         reader,
         &mut catalog,

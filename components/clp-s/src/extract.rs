@@ -490,6 +490,12 @@ pub trait JsonlRecordSink {
 /// at runtime without duplicating the extraction pipeline. Implementations retain ownership of
 /// their underlying seekable sources and load `/0` one packed stream at a time.
 pub trait ArchiveReader {
+    /// Whether sections can be revisited in arbitrary order. Forward-only and custom readers
+    /// default to their established access order; seekable file/directory readers opt in.
+    fn supports_random_access(&self) -> bool {
+        false
+    }
+
     /// Loads and cross-validates all non-table archive state.
     ///
     /// # Errors
@@ -607,6 +613,10 @@ pub trait ArchiveReader {
 }
 
 impl<R: Read + Seek> ArchiveReader for SingleFileArchiveReader<R> {
+    fn supports_random_access(&self) -> bool {
+        Self::supports_random_access(self)
+    }
+
     fn read_catalog(
         &mut self,
         limits: ArchiveCatalogLimits,
@@ -682,6 +692,10 @@ impl<R: Read + Seek> ArchiveReader for SingleFileArchiveReader<R> {
 }
 
 impl<S: DirectoryArchiveSource> ArchiveReader for DirectoryArchiveReader<S> {
+    fn supports_random_access(&self) -> bool {
+        true
+    }
+
     fn read_catalog(
         &mut self,
         limits: ArchiveCatalogLimits,

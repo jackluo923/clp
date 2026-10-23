@@ -1867,6 +1867,12 @@ fn take_timestamp_column<'table, 'archive>(
     let restart_rows = dictionary.restart_rows(context.node_id);
     let epochs = DeltaI64Column { deltas, scale, restart_rows };
     let pattern_ids = take_u64_column(cursor, context, message_count)?;
+    // Timestamp frames contain fixed-width deltas and pattern IDs. Walk their validated byte
+    // spans directly rather than using a generic numeric accessor and indexed pattern lookup
+    // per row. Retain every overflow and pattern check, including unselected rows in a
+    // legacy continuous delta chain.
+    let delta_values = deltas.canonical_bytes().expect("plain timestamp deltas").as_chunks::<8>().0;
+    let patterns = pattern_ids.encoded_bytes().as_chunks::<8>().0;
     let all = [(0, message_count)];
     // Legacy continuous deltas still require the preceding chain. New columns need only
     // the anchors and deltas in selected chunks; decompressed bytes stay encoded.
@@ -1876,14 +1882,16 @@ fn take_timestamp_column<'table, 'archive>(
         let end = end.min(message_count);
         let start = if restart_rows == 0 { 0 } else { start / restart_rows * restart_rows }.min(end);
         let mut previous = 0i64;
-        for (index, delta) in deltas.iter().enumerate().take(end).skip(start) {
+        for (relative, (delta, id)) in delta_values[start..end].iter().zip(&patterns[start..end]).enumerate() {
+            let index = start + relative;
+            let delta = i64::from_le_bytes(*delta);
             let ticks = if restart_rows != 0 && index % restart_rows == 0 { delta }
                 else { previous.checked_add(delta).ok_or_else(|| corrupt(context, Some(index),
                     ColumnCorruption::DeltaOverflow { previous, delta }))? };
             ticks.checked_mul(scale).ok_or_else(|| corrupt(context, Some(index),
                 ColumnCorruption::TimestampScaleOverflow { ticks, scale }))?;
             previous = ticks;
-            let id = pattern_ids.get(index).expect("validated timestamp column span");
+            let id = u64::from_le_bytes(*id);
             validate_timestamp_pattern(dictionary, context, index, id, &mut validated)?;
         }
     }

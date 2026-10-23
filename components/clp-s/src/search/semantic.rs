@@ -739,7 +739,7 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
         }) {
             compiled.numeric_pruning = super::numeric_pruning::NumericPruning::new(catalog);
         }
-        compiled.archive_may_match = compiled.compute_archive_may_match();
+        compiled.archive_may_match = compiled.compute_archive_may_match(true);
         compiled.timestamp_windows = compiled.compute_timestamp_windows();
         if !compiled.timestamp_windows.is_empty() {
             compiled.timestamp_chunks = catalog
@@ -1565,7 +1565,14 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
         self.archive_may_match
     }
 
-    fn compute_archive_may_match(&self) -> bool {
+    /// Conservative archive rejection before loading the variable dictionary. Required log
+    /// dictionaries must already be loaded. An absent variable value is unknown in this pass;
+    /// log templates may reject a pattern only when no substitution could make it match.
+    pub(crate) fn may_match_before_variables(&self) -> bool {
+        self.compute_archive_may_match(false)
+    }
+
+    fn compute_archive_may_match(&self, with_variables: bool) -> bool {
         if let Some(CompiledNode::Not(operand)) = self.nodes.get(self.query.root().index()).copied() {
             if let Some(CompiledNode::Predicate(index)) = self.nodes.get(operand.index()).copied() {
                 if let Some(compiled) = self.predicates.get(index) {
@@ -1587,7 +1594,7 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
         }
         for node in &self.nodes {
             let value = match *node {
-                CompiledNode::Predicate(index) => self.predicate_may_match_archive(index),
+                CompiledNode::Predicate(index) => self.predicate_may_match_archive(index, with_variables),
                 CompiledNode::Boolean { operator, left, right } => {
                     let left = possible.get(left.index()).copied().unwrap_or(true);
                     let right = possible.get(right.index()).copied().unwrap_or(true);
@@ -1603,7 +1610,7 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
         possible.get(self.query.root().index()).copied().unwrap_or(true)
     }
 
-    fn predicate_may_match_archive(&self, predicate_index: usize) -> bool {
+    fn predicate_may_match_archive(&self, predicate_index: usize, with_variables: bool) -> bool {
         let Some(compiled) = self.predicates.get(predicate_index) else {
             return true;
         };
@@ -1643,10 +1650,16 @@ impl<'query, 'archive> CompiledQuery<'query, 'archive> {
                     .and_then(|pattern| super::clp_pattern::ClpPattern::new(
                         pattern, self.options.ignore_case(), 0,
                     ));
+                let empty = crate::archive::VariableDictionary::empty();
+                let variables = if with_variables { self.catalog.variable_dictionary() } else { &empty };
                 if anchored.is_some_and(|plan| !plan.with_cache(&self.pattern_cache)
-                    .dictionary_may_match(dictionary, self.catalog.variable_dictionary())) {
+                    .dictionary_may_match(dictionary, variables)) {
                     return false;
                 }
+            }
+            if !with_variables && matches!(node.node_type(), NodeType::VarString | NodeType::DictionaryFloat) {
+                return !opposite_string_class(node.node_type(), predicate)
+                    && node_compatible(node.node_type(), predicate);
             }
             node_may_match_without_table(node.node_type(), predicate, &compiled.value)
         })

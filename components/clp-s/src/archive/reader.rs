@@ -65,6 +65,7 @@ pub struct SingleFileArchiveReader<R> {
     source: R,
     layout: SingleFileArchiveLayout,
     variable_dictionary_prefix: Option<VariableDictionaryPrefix>,
+    random_access: bool,
 }
 
 impl<R: Read + Seek> SingleFileArchiveReader<R> {
@@ -79,7 +80,9 @@ impl<R: Read + Seek> SingleFileArchiveReader<R> {
         let archive_size = source.seek(SeekFrom::End(0)).map_err(OpenError::Io)?;
         source.seek(SeekFrom::Start(0)).map_err(OpenError::Io)?;
 
-        Self::open_streaming(source, Some(archive_size))
+        let mut reader = Self::open_streaming(source, Some(archive_size))?;
+        reader.random_access = true;
+        Ok(reader)
     }
 
     /// Opens an SFA source whose fixed header begins at logical byte zero without seeking to its
@@ -116,7 +119,14 @@ impl<R: Read + Seek> SingleFileArchiveReader<R> {
         let layout =
             SingleFileArchiveLayout::new(header, archive_size).map_err(OpenError::Layout)?;
 
-        Ok(Self { source, layout, variable_dictionary_prefix: None })
+        Ok(Self { source, layout, variable_dictionary_prefix: None, random_access: false })
+    }
+
+    /// Whether this reader was opened through the seekable entry point. Streaming sources
+    /// conservatively retain physical access order even if their adapter implements `Seek`.
+    #[must_use]
+    pub const fn supports_random_access(&self) -> bool {
+        self.random_access
     }
 
     /// Returns the validated outer archive layout.
