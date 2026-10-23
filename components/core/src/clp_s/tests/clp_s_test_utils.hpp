@@ -32,7 +32,8 @@
         bool structurize_arrays,
         std::optional<std::filesystem::path> parsing_spec_path = std::nullopt,
         bool adaptive_numeric_columns = false,
-        size_t separate_columns_min_size = 0
+        size_t separate_columns_min_size = 0,
+        bool adaptive_dictionary_columns = false
 ) -> std::vector<clp_s::ArchiveStats>;
 
 [[nodiscard]] auto get_heuristic_parsing_spec_path() -> std::filesystem::path;

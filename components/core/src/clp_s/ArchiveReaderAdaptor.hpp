@@ -80,8 +80,8 @@ public:
      * the `checkin_reader_for_section` method.
      * @param section
      * @return A ReaderInterface opened and pointing to the requested section.
-     * @throw OperationFailed if a reader is already checked out, or checking out this section would
-     *        force a backwards seek.
+     * @throw OperationFailed if a reader is already checked out, or a forward-only input would
+     * require a backwards seek. Local files and in-memory buffers support arbitrary section order.
      */
     std::unique_ptr<clp::ReaderInterface> checkout_reader_for_section(std::string_view section);
 
@@ -120,6 +120,11 @@ public:
      * @return Whether this archive is a single-file archive.
      */
     [[nodiscard]] auto is_single_file_archive() const -> bool { return m_single_file_archive; }
+
+    /** Whether skipped sections must be loaded before advancing a forward-only input. */
+    [[nodiscard]] auto requires_ordered_section_reads() const -> bool {
+        return m_single_file_archive && !m_allow_backward_seek;
+    }
 
     /**
      * @return true if the archive info packet set the experimental bool.
@@ -189,7 +194,7 @@ private:
      * @param section
      * @return A ReaderInterface opened and pointing to the requested section.
      * @throw OperationFailed if the requested section does not exist in ArchiveFileInfo, if
-     *        checking out the section would force a backward seek, or on any I/O error.
+     *        a forward-only input would require a backward seek, or on any I/O error.
      */
     std::unique_ptr<clp::ReaderInterface> checkout_reader_for_sfa_section(std::string_view section);
 
@@ -212,6 +217,7 @@ private:
     Path m_archive_path{};
     NetworkAuthOption m_network_auth{};
     bool m_single_file_archive{false};
+    bool m_allow_backward_seek{false};
     ArchiveFileInfoPacket m_archive_file_info{};
     ArchiveHeader m_archive_header{};
     ArchiveInfoPacket m_archive_info{};

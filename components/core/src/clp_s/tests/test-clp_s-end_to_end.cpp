@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <optional>
 #include <set>
 #include <string>
@@ -340,6 +341,7 @@ TEST_CASE("clp-s-compress-extract-valid-formatted-floats", "[clp-s][end-to-end]"
 TEST_CASE("clp-s-compress-extract-invalid-formatted-floats", "[clp-s][end-to-end]") {
     auto structurize_arrays = GENERATE(true, false);
     auto single_file_archive = GENERATE(true, false);
+    auto const dictionary = GENERATE(false, true);
 
     TestOutputCleaner const test_cleanup{
             {std::string{cTestEndToEndArchiveDirectory},
@@ -355,10 +357,16 @@ TEST_CASE("clp-s-compress-extract-invalid-formatted-floats", "[clp-s][end-to-end
                     std::nullopt,
                     true,
                     single_file_archive,
-                    structurize_arrays
+                    structurize_arrays,
+                    std::nullopt,
+                    false,
+                    dictionary ? 1 : 0,
+                    dictionary
             )
     );
-    validate_archive_header();
+    if (false == dictionary) {
+        validate_archive_header();
+    }
 
     auto const expected_matching_types{
             structurize_arrays ? std::set<clp_s::NodeType>{clp_s::NodeType::DictionaryFloat}
@@ -444,7 +452,9 @@ TEST_CASE("clp-s-compress-extract-timestamps", "[clp-s][end-to-end]") {
 TEST_CASE("clp-s-separate-column-roundtrip", "[clp-s][SeparateColumns]") {
     auto const single_file_archive = GENERATE(false, true);
     auto const adaptive = GENERATE(false, true);
+    auto const dictionary = GENERATE(false, true);
     auto const arrays = GENERATE(false, true);
+    auto const threshold = GENERATE(size_t{1}, std::numeric_limits<size_t>::max());
     TestOutputCleaner const cleanup{
             {std::string{cTestEndToEndArchiveDirectory},
              std::string{cTestEndToEndOutputDirectory},
@@ -459,7 +469,8 @@ TEST_CASE("clp-s-separate-column-roundtrip", "[clp-s][SeparateColumns]") {
             arrays,
             std::nullopt,
             adaptive,
-            1
+            threshold,
+            dictionary
     );
     compare(extract(false));
     for (auto const& entry : std::filesystem::directory_iterator(cTestEndToEndArchiveDirectory)) {
@@ -474,7 +485,7 @@ TEST_CASE("clp-s-separate-column-roundtrip", "[clp-s][SeparateColumns]") {
         archive.read_dictionaries_and_metadata();
         archive.open_packed_streams();
         for (auto const id : archive.get_schema_ids()) {
-            REQUIRE(archive.has_separate_columns(id));
+            REQUIRE(archive.has_separate_columns(id) == (threshold == 1));
             auto const rows{
                     archive.read_schema_table(id, false, false, std::unordered_set<int32_t>{})
                             .get_num_messages()

@@ -11,13 +11,16 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <clp_s/AdaptiveColumn.hpp>
+#include <clp_s/ArchiveReaderAdaptor.hpp>
 #include <clp_s/ColumnReader.hpp>
 #include <clp_s/NumericColumnView.hpp>
+#include <clp_s/SchemaReader.hpp>
 #include <clp_s/search/ast/ColumnDescriptor.hpp>
 #include <clp_s/search/ast/FilterExpr.hpp>
 #include <clp_s/search/ast/Integral.hpp>
 #include <clp_s/search/ast/StringLiteral.hpp>
 #include <clp_s/search/ColumnScan.hpp>
+#include <clp_s/search/DictionaryIdSet.hpp>
 
 namespace {
 using Bytes = std::vector<char>;
@@ -443,4 +446,204 @@ TEST_CASE(
     floats.load(float_buffer, 1);
     REQUIRE(floats.encoded_values() == nullptr);
     REQUIRE(std::get<double>(floats.extract_value(0)) == 1.25);
+}
+
+TEST_CASE(
+        "Compact dictionary columns preserve string and float predicates",
+        "[DictionaryColumns]"
+) {
+    using namespace clp_s;
+    using namespace clp_s::search;
+    using namespace clp_s::search::ast;
+    ArchiveReaderAdaptor adaptor{{InputSource::Filesystem, "."}, {}};
+
+    class Dictionary : public VariableDictionaryReader {
+    public:
+        explicit Dictionary(ArchiveReaderAdaptor& adaptor) : VariableDictionaryReader{adaptor} {
+            for (auto const* value : {"-0.0", "0.000", "1.2500", "-3.125", "1e100"}) {
+                m_entries.emplace_back(value, m_entries.size());
+            }
+        }
+    };
+
+    auto values{std::make_shared<Dictionary>(adaptor)};
+    for (uint64_t count : {0U, 1U}) {
+        SchemaReader table;
+        table.reset(nullptr, nullptr, 0, {}, count, false, nullptr, nullptr);
+        table.append_column(new VariableStringColumnReader{0, values});
+        auto buffer{std::make_shared<char[]>(1)};
+        std::vector<size_t> sizes{0};
+        if (count == 0) {
+            REQUIRE_NOTHROW(table.load(buffer, 0, 0, sizes, true, {}, true));
+        } else {
+            REQUIRE_THROWS(table.load(buffer, 0, 0, sizes, true, {}, true));
+        }
+    }
+    constexpr size_t rows{257};
+    std::vector<Bytes> payloads;
+    Bytes constant{5};
+    append(constant, uint64_t{2});
+    payloads.push_back(constant);
+    std::vector<uint64_t> ids(rows);
+    for (size_t i{0}; i < rows; ++i) {
+        ids[i] = i % 5;
+    }
+    Bytes frame{1};
+    append(frame, uint64_t{0});
+    frame.push_back(3);
+    packed(frame, ids, 3);
+    payloads.push_back(frame);
+    payloads.push_back(dictionary(std::vector<uint64_t>{0, 1, 2, 3, 4}, ids, 3, Type::Integer));
+    Bytes runs{4};
+    append(runs, uint32_t{3});
+    for (auto const [id, length] :
+         std::vector<std::pair<uint64_t, uint32_t>>{{0, 128}, {3, 100}, {4, 29}})
+    {
+        append(runs, id);
+        append(runs, length);
+    }
+    payloads.push_back(runs);
+    for (auto const& encoded : payloads) {
+        CAPTURE(static_cast<int>(encoded[0]));
+        auto raw{adaptive_column::decode(encoded, Type::Integer, rows)};
+        auto view{NumericColumnView::try_load(encoded, Type::Integer, rows)};
+        REQUIRE(view.has_value());
+        REQUIRE_NOTHROW(view->validate_unsigned_range(5));
+        REQUIRE_THROWS(view->validate_unsigned_range(0));
+        VariableStringColumnReader compact{0, values}, plain{0, values}, repeated{0, values};
+        DictionaryFloatColumnReader compact_float{0, values}, plain_float{0, values};
+        compact.load_encoded(*view);
+        compact_float.load_encoded(*view);
+        BufferViewReader input{raw.data(), raw.size()}, float_input{raw.data(), raw.size()};
+        plain.load(input, rows);
+        plain_float.load(float_input, rows);
+        Bytes other;
+        for (size_t row{0}; row < rows; ++row) {
+            append(other, static_cast<uint64_t>((row + 1) % 5));
+        }
+        BufferViewReader repeat_input{other.data(), other.size()};
+        repeated.load(repeat_input, rows);
+        DictionaryIdSet matches{std::unordered_set<int64_t>{0, 2, 4}};
+        for (auto operation : {FilterOperation::EQ, FilterOperation::NEQ}) {
+            for (bool inverted : {false, true}) {
+                auto column{ColumnDescriptor::create_from_escaped_tokens({"value"}, "")};
+                column->set_column_id(0);
+                column->set_matching_type(LiteralType::VarStringT);
+                auto operand{StringLiteral::create("*")};
+                auto expression{FilterExpr::create(column, operation, operand, inverted)};
+                for (bool multiple : {false, true}) {
+                    ColumnScan::VarStringReaderMap actual{{0, {&compact}}}, expected{{0, {&plain}}};
+                    if (multiple) {
+                        actual[0].insert(actual[0].begin(), &repeated);
+                        expected[0].insert(expected[0].begin(), &repeated);
+                    }
+                    ColumnScan::VarMatchMap sets{{expression.get(), &matches}};
+                    auto scan{ColumnScan::try_create(
+                            expression,
+                            {},
+                            {},
+                            actual,
+                            {},
+                            nullptr,
+                            {},
+                            sets,
+                            rows
+                    )};
+                    auto reference{ColumnScan::try_create(
+                            expression,
+                            {},
+                            {},
+                            expected,
+                            {},
+                            nullptr,
+                            {},
+                            sets,
+                            rows
+                    )};
+                    REQUIRE(scan.has_value());
+                    REQUIRE(reference.has_value());
+                    for (size_t row{0}; row < rows; ++row) {
+                        REQUIRE(scan->filter(row) == reference->filter(row));
+                    }
+                }
+            }
+        }
+        auto check_float = [&](std::shared_ptr<Literal> operand, FilterOperation operation) {
+            for (bool inverted : {false, true}) {
+                auto column{ColumnDescriptor::create_from_escaped_tokens({"value"}, "")};
+                column->set_column_id(0);
+                column->set_matching_type(LiteralType::FloatT);
+                auto expression{FilterExpr::create(column, operation, operand, inverted)};
+                ColumnScan::BasicReaderMap actual{{0, {&compact_float}}},
+                        expected{{0, {&plain_float}}};
+                auto scan{
+                        ColumnScan::
+                                try_create(expression, actual, {}, {}, {}, nullptr, {}, {}, rows)
+                };
+                auto reference{
+                        ColumnScan::
+                                try_create(expression, expected, {}, {}, {}, nullptr, {}, {}, rows)
+                };
+                REQUIRE(scan.has_value());
+                REQUIRE(reference.has_value());
+                for (size_t row{0}; row < rows; ++row) {
+                    REQUIRE(scan->filter(row) == reference->filter(row));
+                }
+            }
+        };
+        for (auto operation :
+             {FilterOperation::EQ,
+              FilterOperation::NEQ,
+              FilterOperation::LT,
+              FilterOperation::LTE,
+              FilterOperation::GT,
+              FilterOperation::GTE})
+        {
+            check_float(Integral::create_from_int(0), operation);
+        }
+        for (auto operation : {FilterOperation::EQ, FilterOperation::NEQ}) {
+            for (auto const* pattern : {"*25*", "-*", "*0*", "*999*"}) {
+                check_float(StringLiteral::create(pattern), operation);
+            }
+        }
+        for (size_t row{rows}; row > 0; --row) {
+            REQUIRE(compact.extract_value(row - 1) == plain.extract_value(row - 1));
+            REQUIRE(
+                    std::bit_cast<uint64_t>(std::get<double>(compact_float.extract_value(row - 1)))
+                    == std::bit_cast<uint64_t>(std::get<double>(plain_float.extract_value(row - 1)))
+            );
+            std::string rendered;
+            compact_float.extract_string_value_into_buffer(row - 1, rendered);
+            REQUIRE(rendered == std::get<std::string>(plain.extract_value(row - 1)));
+        }
+        BufferViewReader reuse{raw.data(), raw.size()};
+        compact.load(reuse, rows);
+        REQUIRE(compact.encoded_values() == nullptr);
+        REQUIRE(compact.extract_value(0) == plain.extract_value(0));
+    }
+    // References are checked before an encoded predicate can turn an invalid ID into a match.
+    for (uint64_t bad_id : {uint64_t{5}, uint64_t{INT64_MAX}, UINT64_MAX}) {
+        Bytes invalid{5};
+        append(invalid, bad_id);
+        VariableStringColumnReader reader{0, values};
+        reader.load_encoded(*NumericColumnView::try_load(invalid, Type::Integer, rows));
+        REQUIRE_THROWS(reader.encoded_values());
+        REQUIRE_THROWS(reader.get_variable_id(0));
+        // Tagged plain and decoded delta IDs must pass the same reference check.
+        Bytes raw;
+        append(raw, bad_id);
+        BufferViewReader input{raw.data(), raw.size()};
+        reader.load(input, 1);
+        reader.require_valid_ids();
+        REQUIRE_THROWS(reader.encoded_values());
+        REQUIRE_THROWS(reader.get_variable_id(0));
+    }
+    // A negative FOR base can wrap to valid unsigned values; validate the actual references.
+    Bytes wrap{1};
+    append(wrap, uint64_t(-1));
+    wrap.push_back(2);
+    packed(wrap, std::vector<uint64_t>{1, 2, 3}, 2);
+    auto wrapped{NumericColumnView::try_load(wrap, Type::Integer, 3)};
+    REQUIRE_NOTHROW(wrapped->validate_unsigned_range(3));
+    REQUIRE_THROWS(wrapped->validate_unsigned_range(2));
 }

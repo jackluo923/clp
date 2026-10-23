@@ -43,10 +43,12 @@ void SchemaWriter::store(ZstdCompressor& compressor) {
     }
 }
 
-auto SchemaWriter::has_numeric_columns(SchemaTree const& tree) const -> bool {
+auto SchemaWriter::has_adaptive_columns(SchemaTree const& tree, bool dictionary) const -> bool {
     return std::ranges::any_of(m_column_node_ids, [&](auto id) {
         auto const type{tree.get_node(id).get_type()};
-        return type == NodeType::Integer || type == NodeType::Float;
+        return type == NodeType::Integer || type == NodeType::Float
+               || (dictionary
+                   && (type == NodeType::VarString || type == NodeType::DictionaryFloat));
     });
 }
 
@@ -55,7 +57,8 @@ auto SchemaWriter::store_separate(
         ZSTD_CCtx& context,
         int level,
         SchemaTree const& tree,
-        bool adaptive
+        bool adaptive,
+        bool adaptive_dictionary
 ) -> std::vector<ColumnFrame> {
     std::vector<ColumnFrame> frames;
     std::vector<char> raw;
@@ -68,11 +71,14 @@ auto SchemaWriter::store_separate(
             frames.push_back({0, 0});
             continue;
         }
-        if (adaptive && (type == NodeType::Integer || type == NodeType::Float)) {
+        if ((adaptive && (type == NodeType::Integer || type == NodeType::Float))
+            || (adaptive_dictionary
+                && (type == NodeType::VarString || type == NodeType::DictionaryFloat)))
+        {
             auto frame{adaptive_column::encode(
                     raw,
-                    type == NodeType::Integer ? adaptive_column::Type::Integer
-                                              : adaptive_column::Type::Float,
+                    type == NodeType::Float ? adaptive_column::Type::Float
+                                            : adaptive_column::Type::Integer,
                     context,
                     level
             )};

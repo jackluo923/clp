@@ -180,18 +180,25 @@ void ResultsCacheOutputHandler::write(
 
 CountReducerOutputHandler::CountReducerOutputHandler(int reducer_socket_fd)
         : search::OutputHandler(false, false),
-          m_reducer_socket_fd(reducer_socket_fd),
-          m_pipeline(reducer::PipelineInputMode::InterStage) {
-    m_pipeline.add_pipeline_stage(std::make_shared<reducer::CountOperator>());
-}
+          m_reducer_socket_fd(reducer_socket_fd) {}
 
 auto CountReducerOutputHandler::write(string_view message) -> void {
-    m_pipeline.push_record(reducer::EmptyRecord{});
+    m_aggregator.add_record(message, 0);
 }
 
 auto CountReducerOutputHandler::finish() -> ErrorCode {
+    std::map<reducer::GroupTags, int64_t> counts;
+    if (m_aggregator.get_count() != 0) {
+        counts.emplace(reducer::GroupTags{}, m_aggregator.get_count());
+    }
     if (false
-        == reducer::send_pipeline_results(m_reducer_socket_fd, std::move(m_pipeline.finish())))
+        == reducer::send_pipeline_results(
+                m_reducer_socket_fd,
+                std::make_unique<reducer::Int64MapRecordGroupIterator>(
+                        counts,
+                        reducer::CountOperator::cRecordElementKey
+                )
+        ))
     {
         return ErrorCode::ErrorCodeFailureNetwork;
     }

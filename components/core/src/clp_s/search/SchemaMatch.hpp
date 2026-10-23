@@ -42,6 +42,14 @@ public:
     std::shared_ptr<ast::Expression> run(std::shared_ptr<ast::Expression>& expr) override;
 
     /**
+     * Loads dictionaries needed by the resolved queries and, when requested, all matched columns
+     * for record or metadata output.
+     * Must run after `run` and before opening the packed streams. Unresolved field wildcards
+     * conservatively retain all dictionary dependencies of their matched schemas.
+     */
+    auto prepare_dictionaries(bool needs_all_columns) -> void;
+
+    /**
      * @param schema
      * @return The query for a given schema
      */
@@ -224,6 +232,9 @@ private:
      * @param needs Bitmask of `DictionaryNeed` flags to OR the schema's needs into.
      */
     auto collect_dictionary_needs(SchemaView const& schema, uint8_t& needs) -> void;
+
+    /** Adds the dictionaries needed to read the given physical column. */
+    auto collect_column_dictionary_needs(SchemaNode::id_t column_id, uint8_t& needs) -> void;
 
     /**
      * Reads the dictionaries flagged in `needs`.

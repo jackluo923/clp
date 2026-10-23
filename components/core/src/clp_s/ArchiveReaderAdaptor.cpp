@@ -16,6 +16,7 @@
 #include <spdlog/spdlog.h>
 
 #include "../clp/BoundedReader.hpp"
+#include "../clp/BufferReader.hpp"
 #include "../clp/ErrorCode.hpp"
 #include "../clp/FileReader.hpp"
 #include "archive_constants.hpp"
@@ -32,6 +33,7 @@ ArchiveReaderAdaptor::ArchiveReaderAdaptor(
 )
         : m_archive_path{archive_path},
           m_network_auth{network_auth},
+          m_allow_backward_seek{InputSource::Filesystem == archive_path.source},
           m_timestamp_dictionary{std::make_shared<TimestampDictionaryReader>()} {
     if (InputSource::Filesystem != archive_path.source
         || std::filesystem::is_regular_file(archive_path.path))
@@ -44,6 +46,10 @@ ArchiveReaderAdaptor::ArchiveReaderAdaptor(
         std::shared_ptr<clp::ReaderInterface> single_file_archive_reader
 )
         : m_single_file_archive{true},
+          m_allow_backward_seek{
+                  nullptr != dynamic_cast<clp::FileReader*>(single_file_archive_reader.get())
+                  || nullptr != dynamic_cast<clp::BufferReader*>(single_file_archive_reader.get())
+          },
           m_timestamp_dictionary{std::make_shared<TimestampDictionaryReader>()},
           m_reader{std::move(single_file_archive_reader)} {
     if (nullptr == m_reader) {
@@ -223,7 +229,7 @@ ErrorCode ArchiveReaderAdaptor::try_read_header(clp::ReaderInterface& reader) {
     }
 
     auto const [major, minor, patch]{decompose_archive_version(m_archive_header.version)};
-    if (major != 0 || minor > 6) {
+    if (major != 0 || minor > 6 || (minor == 6 && patch > 1)) {
         return ErrorCodeUnsupported;
     }
 
@@ -305,12 +311,14 @@ std::unique_ptr<clp::ReaderInterface> ArchiveReaderAdaptor::checkout_reader_for_
         throw OperationFailed(ErrorCodeNotReady, __FILENAME__, __LINE__);
     }
 
-    m_current_reader_holder.emplace(section);
+    std::unique_ptr<clp::ReaderInterface> reader;
     if (m_single_file_archive) {
-        return checkout_reader_for_sfa_section(section);
+        reader = checkout_reader_for_sfa_section(section);
     } else {
-        return std::make_unique<clp::FileReader>(m_archive_path.path + std::string{section});
+        reader = std::make_unique<clp::FileReader>(m_archive_path.path + std::string{section});
     }
+    m_current_reader_holder.emplace(section);
+    return reader;
 }
 
 std::unique_ptr<clp::ReaderInterface> ArchiveReaderAdaptor::checkout_reader_for_sfa_section(
@@ -330,9 +338,6 @@ std::unique_ptr<clp::ReaderInterface> ArchiveReaderAdaptor::checkout_reader_for_
         throw OperationFailed(ErrorCodeFailure, __FILENAME__, __LINE__);
     }
 
-    size_t file_offset = m_files_section_offset + it->o;
-    ++it;
-
     auto const next_file_offset_result{
             ReaderUtils::try_uint64_to_size_t(m_archive_header.compressed_size)
     };
@@ -340,12 +345,26 @@ std::unique_ptr<clp::ReaderInterface> ArchiveReaderAdaptor::checkout_reader_for_
         throw OperationFailed(ErrorCodeOutOfBounds, __FILENAME__, __LINE__);
     }
     size_t next_file_offset{next_file_offset_result.value()};
+    if (m_files_section_offset > next_file_offset
+        || it->o > next_file_offset - m_files_section_offset)
+    {
+        throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);
+    }
+    size_t const file_offset{m_files_section_offset + it->o};
+    ++it;
 
     if (m_archive_file_info.files.end() != it) {
+        if (it->o > next_file_offset - m_files_section_offset) {
+            throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);
+        }
         next_file_offset = m_files_section_offset + it->o;
     }
 
-    if (curr_pos > file_offset) {
+    if (next_file_offset < file_offset) {
+        throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);
+    }
+
+    if (curr_pos > file_offset && requires_ordered_section_reads()) {
         SPDLOG_ERROR(
                 "Single-file archive sections must be read in on-disk order; cannot read '{}' at "
                 "offset {} when the reader is already at offset {}.",

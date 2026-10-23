@@ -683,6 +683,10 @@ set(SOURCE_FILES_unitTest
         tests/test-ClppShapeQueryMatcher.cpp
         tests/test-AdaptiveColumn.cpp
         tests/test-NumericColumnView.cpp
+        tests/test-SelectiveDictionaryReads.cpp
+        tests/test-MetadataCounts.cpp
+        src/clp_s/aggregators.cpp
+        src/clp_s/OutputHandlerImpl.cpp
         tests/test-ColumnValueFilter.cpp
         tests/test-EncodedVariableInterpreter.cpp
         tests/test-encoding_methods.cpp
@@ -737,6 +741,11 @@ if(CLP_ENABLE_TESTS)
     add_executable(unitTest
             ${SOURCE_FILES_unitTest}
             ${SOURCE_FILES_reducer_unitTest}
+            )
+    set_source_files_properties(
+            tests/test-MetadataCounts.cpp
+            PROPERTIES
+            COMPILE_DEFINITIONS "CLP_BUILD_CLPP_DECOMPOSITION=$<BOOL:${CLP_BUILD_CLPP_DECOMPOSITION}>"
             )
     target_include_directories(unitTest
             PRIVATE

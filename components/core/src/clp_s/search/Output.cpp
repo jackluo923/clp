@@ -83,25 +83,52 @@ bool Output::filter() {
     }
 
     {
+        PROFILE_SCOPE("search_read_dictionaries");
+        m_match->prepare_dictionaries(
+                m_should_marshal_records || m_output_handler->should_output_metadata()
+        );
+    }
+    {
         PROFILE_SCOPE("query_runner_global_init");
         m_query_runner.global_init();
     }
-    m_archive_reader->open_packed_streams();
 
     std::string message;
     auto const archive_id = m_archive_reader->get_archive_id();
     bool scanned_any_ert{false};
     for (int32_t schema_id : matched_schemas) {
+        EvaluatedValue schema_result;
         {
             PROFILE_SCOPE("query_runner_schema_init");
-            if (EvaluatedValue::False == m_query_runner.schema_init(schema_id)) {
+            schema_result = m_query_runner.schema_init(schema_id);
+            if (EvaluatedValue::False == schema_result) {
                 continue;
             }
         }
+        auto const num_records{m_archive_reader->get_num_messages_for_schema(schema_id)};
+        if (EvaluatedValue::True == schema_result && !m_should_marshal_records
+            && !m_output_handler->should_output_metadata()
+            && m_output_handler->try_write_count(num_records))
+        {
+            m_result_metrics.num_archive_records_matching_query += num_records;
+            m_result_metrics.num_records_counted_from_metadata += num_records;
+            ++m_result_metrics.num_schemas_counted_from_metadata;
+            if (num_records != 0) {
+                ++m_result_metrics.num_schemas_with_matches;
+            }
+            if (ErrorCode::ErrorCodeSuccess != m_output_handler->flush()) {
+                SPDLOG_ERROR("Failed to flush metadata count output");
+                return false;
+            }
+            continue;
+        }
+        // Keep the data section unopened when all ERTs can be rejected or counted from metadata.
+        if (!scanned_any_ert) {
+            m_archive_reader->open_packed_streams();
+        }
         scanned_any_ert = true;
         ++m_result_metrics.num_schemas_scanned;
-        m_result_metrics.num_messages_evaluated
-                += m_archive_reader->get_num_messages_for_schema(schema_id);
+        m_result_metrics.num_messages_evaluated += num_records;
 
         PROFILE_SCOPE("schema_scan");
         auto& reader = [&]() -> SchemaReader& {
@@ -154,8 +181,10 @@ bool Output::filter() {
             return false;
         }
     }
-    m_termination_stage
-            = scanned_any_ert ? cTerminationStageErtScan : cTerminationStageDictionarySearch;
+    m_termination_stage = scanned_any_ert ? cTerminationStageErtScan
+                          : m_result_metrics.num_schemas_counted_from_metadata != 0
+                                  ? cTerminationStageMetadataCount
+                                  : cTerminationStageDictionarySearch;
     auto ecode = m_output_handler->finish();
     if (ErrorCode::ErrorCodeSuccess != ecode) {
         SPDLOG_ERROR(

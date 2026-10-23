@@ -13,6 +13,7 @@ import argparse
 import json
 import random
 import statistics
+import string
 import subprocess
 import time
 from pathlib import Path
@@ -49,6 +50,23 @@ def extract(
     return records, elapsed
 
 
+def dictionary_id_fixture(path: Path, rows: int) -> None:
+    """Writes repeated string IDs and decimal lexemes that require dictionary storage."""
+    random_source = random.Random(20261024)
+    names = [f"category{chr(97 + i // 26)}{chr(97 + i % 26)}" for i in range(256)]
+    with path.open("w") as output:
+        for i in range(rows):
+            values = {
+                "fixed": "unchanging",
+                "category": names[random_source.randrange(len(names))],
+                "clustered": names[(i // 1024) % len(names)],
+                "state": ["idle", "busy"][i // 1024 % 2],
+            }
+            decimal = ["1.25000000000000001", "-3.12500000000000001"][i // 1024 % 2]
+            output.write(json.dumps(values, separators=(",", ":"))[:-1])
+            output.write(f',"decimal":{decimal}}}\n')
+
+
 def main() -> None:  # noqa: C901, PLR0912, PLR0915
     """Creates archives, verifies equivalence, and writes benchmark measurements."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -64,6 +82,16 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--clpp-input", type=Path)
     parser.add_argument("--parsing-spec", type=Path)
+    parser.add_argument(
+        "--dictionary-heavy",
+        action="store_true",
+        help="Also compare queries on up to 50,000 records with a large unrelated text dictionary.",
+    )
+    parser.add_argument(
+        "--dictionary-columns",
+        action="store_true",
+        help="Compare adaptive dictionary-ID storage and add a repeated-value fixture.",
+    )
     args = parser.parse_args()
     if args.rows <= 0 or args.repeats <= 0:
         parser.error("rows and repeats must be positive")
@@ -95,6 +123,8 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             [],
             ["--no-retain-float-format"],
             [
+                "seq: *",
+                "seq: * AND state: *",
                 "seq: 999",
                 "seq > 95000",
                 "seq < 10 AND state: busy",
@@ -115,6 +145,59 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             ],
         )
     ]
+    if args.dictionary_columns:
+        dictionary_source = args.output / "dictionary-ids.jsonl"
+        dictionary_id_fixture(dictionary_source, args.rows)
+        workloads.append(
+            (
+                "dictionary-ids",
+                dictionary_source,
+                [],
+                [],
+                [
+                    "fixed: unchanging",
+                    "fixed: *changing",
+                    "category: categorya*",
+                    "clustered: categorya*",
+                    "state: busy",
+                    "NOT state: busy",
+                    "decimal > 0",
+                    "decimal: *25*",
+                    "state: busy AND decimal < 0",
+                    "*: *busy*",
+                ],
+            )
+        )
+    if args.dictionary_heavy:
+        text_source = args.output / "dictionary-heavy.jsonl"
+        text_random = random.Random(20261023)
+        with text_source.open("w") as output:
+            for i in range(min(args.rows, 50000)):
+                marker = "needle" if i % 1000 == 0 else "ordinary"
+                prose = "".join(text_random.choices(string.ascii_lowercase, k=1024))
+                row = {
+                    "seq": i,
+                    "state": ["idle", "busy", "failed"][i % 3],
+                    "detail": f"Diagnostic text {marker} {prose}",
+                }
+                output.write(json.dumps(row, separators=(",", ":")) + "\n")
+        workloads.append(
+            (
+                "dictionary",
+                text_source,
+                [],
+                [],
+                [
+                    "seq: 999",
+                    "state: b*",
+                    "detail: *",
+                    "detail: *needle*",
+                    "*: *needle*",
+                    "NOT state: busy",
+                    "state: busy AND seq < 10",
+                ],
+            )
+        )
     if args.clpp_input:
         workloads.append(
             (
@@ -123,6 +206,8 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 ["--experimental"],
                 ["--parsing-specification", args.parsing_spec],
                 [
+                    "message: *",
+                    "message: *PacketResponder*",
                     "message: *blk_1073746491_5667*",
                     "message: *5667*",
                     "message: *Exception*",
@@ -138,6 +223,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         "rows": args.rows,
         "repeats": args.repeats,
         "baseline_adaptive": args.baseline_adaptive,
+        "dictionary_columns": args.dictionary_columns,
         "workloads": {},
     }
     for name, input_file, prefix, compress_options, queries in workloads:
@@ -157,6 +243,14 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 ["--adaptive-numeric-columns", "--separate-columns-min-size", "1048576"],
             ),
         ]
+        if args.dictionary_columns:
+            configurations.append(
+                (
+                    "adaptive-dictionary",
+                    args.candidate,
+                    ["--adaptive-dictionary-columns", "--separate-columns-min-size", "1048576"],
+                )
+            )
         expected_records = None
         archives = {}
         measurements = {}
@@ -233,6 +327,20 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 check=False,
             )
             assert rejected.returncode != 0, "baseline unexpectedly accepted adaptive archive"
+        if args.dictionary_columns:
+            rejected = subprocess.run(
+                [
+                    str(args.baseline),
+                    *prefix,
+                    "s",
+                    str(archives["adaptive-dictionary"]),
+                    queries[0],
+                    "--count",
+                ],
+                capture_output=True,
+                check=False,
+            )
+            assert rejected.returncode != 0, "baseline unexpectedly accepted dictionary-ID archive"
         results["workloads"][name] = measurements
         (args.output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
         print(json.dumps({"workload": name, "results": measurements}), flush=True)

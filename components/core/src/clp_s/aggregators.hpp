@@ -3,6 +3,7 @@
 
 #include <concepts>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -74,8 +75,18 @@ public:
             [[maybe_unused]] std::string_view message,
             [[maybe_unused]] epochtime_t timestamp_millisecs
     ) -> void {
-        m_count += 1;
+        add_count(1);
     }
+
+    /** Adds a proven count, rejecting values that cannot be represented in the result. */
+    auto add_count(uint64_t count) -> void {
+        if (count > static_cast<uint64_t>(std::numeric_limits<int64_t>::max() - m_count)) {
+            throw std::overflow_error{"Record count exceeds INT64_MAX"};
+        }
+        m_count += static_cast<int64_t>(count);
+    }
+
+    [[nodiscard]] auto get_count() const -> int64_t { return m_count; }
 
     [[nodiscard]] auto get_results() const -> std::vector<AggregationResult>;
 

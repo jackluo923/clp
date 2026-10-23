@@ -171,7 +171,8 @@ void SchemaReader::load(
         size_t uncompressed_size,
         std::span<size_t const> column_sizes,
         bool adaptive,
-        std::span<uint8_t const> selection
+        std::span<uint8_t const> selection,
+        bool adaptive_dictionary
 ) {
     m_stream_buffer = stream_buffer;
     BufferViewReader buffer_reader{m_stream_buffer.get() + offset, uncompressed_size};
@@ -204,6 +205,41 @@ void SchemaReader::load(
             continue;
         }
         auto const type{reader->get_type()};
+        if (adaptive_dictionary
+            && (type == NodeType::VarString || type == NodeType::DictionaryFloat))
+        {
+            auto* ids{static_cast<DictionaryIdColumnReader*>(reader)};
+            if (size == 0) {
+                // The writer omits empty frames. Loading still rejects any nonzero row count.
+                BufferViewReader empty{data, 0};
+                ids->load(empty, m_num_messages);
+                continue;
+            }
+            if (auto view{NumericColumnView::try_load(
+                        {data, size},
+                        adaptive_column::Type::Integer,
+                        m_num_messages
+                )})
+            {
+                ids->load_encoded(std::move(*view));
+            } else if (data[0] == 0) {
+                BufferViewReader plain{data + 1, size - 1};
+                ids->load(plain, m_num_messages);
+                if (plain.get_remaining_size() != 0) {
+                    throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);
+                }
+            } else {
+                m_decoded_columns[i] = adaptive_column::decode(
+                        {data, size},
+                        adaptive_column::Type::Integer,
+                        m_num_messages
+                );
+                BufferViewReader decoded{m_decoded_columns[i].data(), m_decoded_columns[i].size()};
+                ids->load(decoded, m_num_messages);
+            }
+            ids->require_valid_ids();
+            continue;
+        }
         if (adaptive && (type == NodeType::Integer || type == NodeType::Float) && size != 0) {
             if (data[0] == 0) {
                 // The tagged plain codec already contains ordinary values; borrow them directly.

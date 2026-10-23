@@ -21,6 +21,7 @@ constexpr std::string_view cTerminationStageTimeRangeMatchingAfterColumnResoluti
 constexpr std::string_view cTerminationStageSchemaMatching{"schema_matching"};
 constexpr std::string_view cTerminationStageErtScan{"ert_scan"};
 constexpr std::string_view cTerminationStageDictionarySearch{"dictionary_search"};
+constexpr std::string_view cTerminationStageMetadataCount{"metadata_count"};
 
 /**
  * Counts of how the columns referenced by a query's predicates use wildcards.
@@ -88,6 +89,8 @@ struct SearchResultMetrics {
     uint64_t num_column_scan_filters{};
     uint64_t num_matched_schemas{};
     uint64_t num_messages_evaluated{};
+    uint64_t num_records_counted_from_metadata{};
+    uint64_t num_schemas_counted_from_metadata{};
     uint64_t num_query_runner_filters{};
     uint64_t num_schemas_scanned{};
     uint64_t num_schemas_with_matches{};

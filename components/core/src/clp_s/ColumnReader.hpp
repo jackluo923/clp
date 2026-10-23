@@ -213,19 +213,52 @@ private:
     UnalignedMemSpan<float_format_t> m_formats;
 };
 
-class DictionaryFloatColumnReader : public BaseColumnReader {
+/** Shared storage for ordinary or adaptively encoded variable-dictionary IDs. */
+class DictionaryIdColumnReader : public BaseColumnReader {
+public:
+    DictionaryIdColumnReader(int32_t id, std::shared_ptr<VariableDictionaryReader> dictionary)
+            : BaseColumnReader{id},
+              m_var_dict{std::move(dictionary)} {}
+
+    auto load(BufferViewReader& reader, uint64_t num_messages) -> void override;
+
+    auto load_encoded(NumericColumnView view) -> void {
+        m_variables = {};
+        m_encoded_values = std::move(view);
+        require_valid_ids();
+    }
+
+    // A count may load a column without needing its dictionary. Validate references on first use,
+    // after query preparation has loaded the dictionary, rather than forcing unrelated I/O here.
+    auto require_valid_ids() -> void { m_validate_ids = true; }
+
+    auto get_variable_id(uint64_t row) -> uint64_t;
+
+    auto encoded_values() -> NumericColumnView const* {
+        validate_ids();
+        return m_encoded_values ? &*m_encoded_values : nullptr;
+    }
+
+protected:
+    std::shared_ptr<VariableDictionaryReader> m_var_dict;
+
+private:
+    auto validate_ids() -> void;
+    UnalignedMemSpan<uint64_t> m_variables;
+    std::optional<NumericColumnView> m_encoded_values;
+    bool m_validate_ids{false};
+};
+
+class DictionaryFloatColumnReader : public DictionaryIdColumnReader {
 public:
     // Constructor
     explicit DictionaryFloatColumnReader(
             int32_t id,
             std::shared_ptr<VariableDictionaryReader> var_dict
     )
-            : BaseColumnReader(id),
-              m_var_dict{std::move(var_dict)} {}
+            : DictionaryIdColumnReader{id, std::move(var_dict)} {}
 
     // Methods inherited from BaseColumnReader
-    auto load(BufferViewReader& reader, uint64_t num_messages) -> void override;
-
     auto get_type() -> NodeType override { return NodeType::DictionaryFloat; }
 
     auto extract_value(uint64_t cur_message)
@@ -234,9 +267,8 @@ public:
     auto extract_string_value_into_buffer(uint64_t cur_message, std::string& buffer)
             -> void override;
 
-private:
-    std::shared_ptr<VariableDictionaryReader> m_var_dict;
-    UnalignedMemSpan<variable_dictionary_id_t> m_var_dict_ids;
+    /** Uses the same numeric conversion as ordinary per-row evaluation. */
+    auto value_for_id(uint64_t id) const -> double { return std::stod(m_var_dict->get_value(id)); }
 };
 
 class BooleanColumnReader : public BaseColumnReader {
@@ -319,16 +351,13 @@ private:
     bool m_is_array;
 };
 
-class VariableStringColumnReader : public BaseColumnReader {
+class VariableStringColumnReader : public DictionaryIdColumnReader {
 public:
     // Constructor
     VariableStringColumnReader(int32_t id, std::shared_ptr<VariableDictionaryReader> var_dict)
-            : BaseColumnReader(id),
-              m_var_dict(std::move(var_dict)) {}
+            : DictionaryIdColumnReader{id, std::move(var_dict)} {}
 
     // Methods inherited from BaseColumnReader
-    auto load(BufferViewReader& reader, uint64_t num_messages) -> void override;
-
     auto get_type() -> NodeType override { return NodeType::VarString; }
 
     auto extract_value(uint64_t cur_message)
@@ -345,18 +374,6 @@ public:
             std::string& buffer,
             SimdJsonStringEscaper& escaper
     ) -> void override;
-
-    /**
-     * Gets the encoded id of the variable
-     * @param cur_message
-     * @return The encoded logtype id
-     */
-    auto get_variable_id(uint64_t cur_message) -> uint64_t;
-
-private:
-    std::shared_ptr<VariableDictionaryReader> m_var_dict;
-
-    UnalignedMemSpan<uint64_t> m_variables;
 };
 
 class DeprecatedDateStringColumnReader : public BaseColumnReader {

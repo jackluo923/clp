@@ -51,7 +51,8 @@ public:
             -> ystdlib::error_handling::Result<void>;
 
     /** Reads and validates per-column frame extents immediately after stream metadata. */
-    auto read_separate_metadata(ZstdDecompressor& decompressor) -> void;
+    auto read_separate_metadata(ZstdDecompressor& decompressor, bool dictionary_extension = false)
+            -> void;
 
     auto get_column_sizes(size_t stream_id) const -> std::span<size_t const> {
         auto const it{m_column_sizes.find(stream_id)};

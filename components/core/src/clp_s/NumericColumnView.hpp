@@ -36,6 +36,9 @@ public:
     /** Conservative bounds for integer frame-of-reference values, when the range cannot wrap. */
     [[nodiscard]] auto integer_bounds() const -> std::optional<std::pair<int64_t, int64_t>>;
 
+    /** Validates unsigned references against an exclusive bound without expanding row values. */
+    auto validate_unsigned_range(uint64_t upper_bound) const -> void;
+
     /**
      * ORs matching rows into a bitmap of zero/one bytes. Existing matches from other occurrences of
      * the field remain set. The predicate receives the original integer/double bits, and is

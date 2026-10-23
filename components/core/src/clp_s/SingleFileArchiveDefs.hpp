@@ -52,6 +52,12 @@ constexpr uint32_t cArchiveVersion{
 // 0.6 matches the Rust separate-column numeric scheme headers. Packed tables retain 0.5 bytes.
 constexpr uint32_t cAdaptiveNumericVersion{make_archive_version(0, 6, 0)};
 
+// Dictionary-ID codecs use an explicitly versioned separate-column metadata extension. The
+// sentinel is larger than any valid stream count, so readers of 0.6.0 reject the new layout.
+constexpr uint32_t cAdaptiveDictionaryVersion{make_archive_version(0, 6, 1)};
+constexpr uint64_t cSeparateColumnExtensionMarker{UINT64_MAX};
+constexpr uint64_t cSeparateColumnExtensionVersion{1};
+
 // Format version markers for backwards compatibility.
 constexpr uint32_t cDeprecatedDateStringFormatVersionMarker{make_archive_version(0, 5, 0)};
 

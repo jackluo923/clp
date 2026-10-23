@@ -1202,7 +1202,7 @@ EvaluatedValue QueryRunner::constant_propagate(std::shared_ptr<Expression> const
             return expr->is_inverted() ? EvaluatedValue::True : EvaluatedValue::False;
         }
     } else if (std::dynamic_pointer_cast<AndExpr>(expr)) {
-        bool any_unknown = true;
+        bool any_unknown = false;
         std::vector<OpList::iterator> to_delete;
         for (auto it = expr->op_begin(); it != expr->op_end(); it++) {
             auto subExpr = std::static_pointer_cast<Expression>(*it);
@@ -1232,7 +1232,6 @@ EvaluatedValue QueryRunner::constant_propagate(std::shared_ptr<Expression> const
             // value must be True
             return expr->is_inverted() ? EvaluatedValue::False : EvaluatedValue::True;
         }
-        return EvaluatedValue::Unknown;
     } else if (auto filter = std::dynamic_pointer_cast<FilterExpr>(expr)) {
         if ((filter->get_operation() == FilterOperation::EXISTS
              || filter->get_operation() == FilterOperation::NEXISTS)
@@ -1379,13 +1378,20 @@ EvaluatedValue QueryRunner::constant_propagate(std::shared_ptr<Expression> const
 
 auto QueryRunner::evaluate_with_column_value_filter(FilterExpr* filter) -> EvaluatedValue {
     auto const op{filter->get_operation()};
-    if (FilterOperation::EQ != op && FilterOperation::NEQ != op) {
+    bool const is_range{
+            FilterOperation::LT == op || FilterOperation::LTE == op || FilterOperation::GT == op
+            || FilterOperation::GTE == op
+    };
+    if (FilterOperation::EQ != op && FilterOperation::NEQ != op && false == is_range) {
         return EvaluatedValue::Unknown;
     }
     auto const& column{filter->get_column()};
     if (column->is_pure_wildcard() || column->is_unresolved_descriptor()
         || column->has_unresolved_tokens())
     {
+        return EvaluatedValue::Unknown;
+    }
+    if (is_range && LiteralType::IntegerT != column->get_literal_type()) {
         return EvaluatedValue::Unknown;
     }
     auto const* value_filter{
@@ -1395,8 +1401,26 @@ auto QueryRunner::evaluate_with_column_value_filter(FilterExpr* filter) -> Evalu
         return EvaluatedValue::Unknown;
     }
 
-    bool may_match{true};
     auto const& operand{filter->get_operand()};
+    if (is_range) {
+        auto const bounds{value_filter->key_bounds()};
+        int64_t value{};
+        if (false == bounds.has_value() || false == operand->as_int(value, op)) {
+            return EvaluatedValue::Unknown;
+        }
+        // Range comparisons are monotone: equal results at both endpoints prove the result for
+        // every stored value. Use the row evaluator's operand conversion and comparisons, without
+        // adding or subtracting one at the signed integer limits.
+        bool const min_matches{evaluate_int_filter_core(op, bounds->first, value)};
+        bool const max_matches{evaluate_int_filter_core(op, bounds->second, value)};
+        if (min_matches != max_matches) {
+            return EvaluatedValue::Unknown;
+        }
+        return (min_matches != filter->is_inverted()) ? EvaluatedValue::True
+                                                      : EvaluatedValue::False;
+    }
+
+    bool may_match{true};
     switch (column->get_literal_type()) {
         case LiteralType::IntegerT: {
             int64_t value{};

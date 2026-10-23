@@ -24,7 +24,7 @@
 #include <clp_s/CommandLineArguments.hpp>
 #include <clp_s/ErrorCode.hpp>
 
-#include "../reducer/Pipeline.hpp"
+#include "../reducer/GroupTags.hpp"
 #include "../reducer/RecordGroupIterator.hpp"
 #include "Defs.hpp"
 #include "FileWriter.hpp"
@@ -233,6 +233,11 @@ public:
     auto write(std::string_view message) -> void override;
 
     // Methods overriding OutputHandler
+    auto try_write_count(uint64_t count) -> bool override {
+        m_aggregator.add_count(count);
+        return true;
+    }
+
     /**
      * Flushes the count.
      * @return ErrorCodeSuccess on success
@@ -243,7 +248,7 @@ public:
 private:
     // Data members
     int m_reducer_socket_fd;
-    reducer::Pipeline m_pipeline;
+    CountAggregator m_aggregator;
 };
 
 /**
@@ -316,6 +321,14 @@ public:
     auto write(std::string_view message) -> void override { m_aggregator.add_record(message, 0); }
 
     // Methods overriding OutputHandler
+    auto try_write_count(uint64_t count) -> bool override {
+        if constexpr (std::is_same_v<AggT, CountAggregator>) {
+            m_aggregator.add_count(count);
+            return true;
+        }
+        return false;
+    }
+
     /**
      * Drains the aggregation's results into the sink.
      * @return ErrorCodeSuccess on success

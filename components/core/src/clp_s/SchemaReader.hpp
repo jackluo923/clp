@@ -236,6 +236,8 @@ public:
      * @param adaptive Whether separate numeric columns carry adaptive codec headers.
      * @param selection One flag per physical column, or empty to load all columns. Omitted
      * columns must not be accessed until loaded by another call.
+     * @param adaptive_dictionary Whether separate dictionary-ID columns carry integer codec
+     * headers.
      */
     void load(
             std::shared_ptr<char[]> stream_buffer,
@@ -243,7 +245,8 @@ public:
             size_t uncompressed_size,
             std::span<size_t const> column_sizes = {},
             bool adaptive = false,
-            std::span<uint8_t const> selection = {}
+            std::span<uint8_t const> selection = {},
+            bool adaptive_dictionary = false
     );
 
     /** Selects every physical occurrence of the requested field IDs. */

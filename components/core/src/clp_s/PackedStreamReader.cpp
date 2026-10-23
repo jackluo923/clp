@@ -64,15 +64,32 @@ auto PackedStreamReader::read_metadata(ZstdDecompressor& decompressor)
     return ystdlib::error_handling::success();
 }
 
-auto PackedStreamReader::read_separate_metadata(ZstdDecompressor& decompressor) -> void {
-    auto read_size = [&]() -> size_t {
+auto PackedStreamReader::read_separate_metadata(
+        ZstdDecompressor& decompressor,
+        bool dictionary_extension
+) -> void {
+    auto read_uint64 = [&]() -> uint64_t {
         uint64_t value{};
         auto const rc{decompressor.try_read_numeric_value(value)};
-        if (rc != ErrorCodeSuccess || value > std::numeric_limits<size_t>::max()) {
+        if (rc != ErrorCodeSuccess) {
+            throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);
+        }
+        return value;
+    };
+    auto read_size = [&]() -> size_t {
+        auto const value{read_uint64()};
+        if (value > std::numeric_limits<size_t>::max()) {
             throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);
         }
         return static_cast<size_t>(value);
     };
+    if (dictionary_extension) {
+        if (read_uint64() != cSeparateColumnExtensionMarker
+            || read_uint64() != cSeparateColumnExtensionVersion)
+        {
+            throw OperationFailed(ErrorCodeUnsupported, __FILENAME__, __LINE__);
+        }
+    }
     auto const count{read_size()};
     if (count > m_stream_metadata.size()) {
         throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);

@@ -84,6 +84,12 @@ constexpr std::string_view cAttrNumClppShapesDecomposedByEngine{
 constexpr std::string_view cAttrNumColumnScanFilters{"clp.query.num_column_scan_filters"};
 constexpr std::string_view cAttrNumMatchedSchemas{"clp.query.num_matched_schemas"};
 constexpr std::string_view cAttrNumMessagesEvaluated{"clp.query.num_messages_evaluated"};
+constexpr std::string_view cAttrNumRecordsCountedFromMetadata{
+        "clp.query.num_records_counted_from_metadata"
+};
+constexpr std::string_view cAttrNumSchemasCountedFromMetadata{
+        "clp.query.num_schemas_counted_from_metadata"
+};
 constexpr std::string_view cAttrNumQueryRunnerFilters{"clp.query.num_query_runner_filters"};
 constexpr std::string_view cAttrNumSchemasScanned{"clp.query.num_schemas_scanned"};
 constexpr std::string_view cAttrNumSchemasWithMatches{"clp.query.num_schemas_with_matches"};
@@ -376,6 +382,14 @@ public:
         m_span->SetAttribute(
                 to_nostd_string_view(cAttrNumMessagesEvaluated),
                 to_int64_attribute(metrics.num_messages_evaluated)
+        );
+        m_span->SetAttribute(
+                to_nostd_string_view(cAttrNumRecordsCountedFromMetadata),
+                to_int64_attribute(metrics.num_records_counted_from_metadata)
+        );
+        m_span->SetAttribute(
+                to_nostd_string_view(cAttrNumSchemasCountedFromMetadata),
+                to_int64_attribute(metrics.num_schemas_counted_from_metadata)
         );
         m_span->SetAttribute(
                 to_nostd_string_view(cAttrNumQueryRunnerFilters),

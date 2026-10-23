@@ -272,6 +272,7 @@ JsonParser::JsonParser(JsonParserOption const& option)
     m_archive_options.min_table_size = option.min_table_size;
     m_archive_options.separate_columns_min_size = option.separate_columns_min_size;
     m_archive_options.adaptive_numeric_columns = option.adaptive_numeric_columns;
+    m_archive_options.adaptive_dictionary_columns = option.adaptive_dictionary_columns;
     m_archive_options.id = m_generator();
     m_archive_options.authoritative_timestamp = m_timestamp_column;
     m_archive_options.authoritative_timestamp_namespace = m_timestamp_namespace;

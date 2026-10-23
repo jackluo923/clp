@@ -2,13 +2,17 @@
 
 ## Scope
 
-This port brings separate column frames, adaptive numeric compression, selective column reads, scans of encoded numeric values, and adaptive dictionary-ID lookup to the C++ implementation. It builds on the [CLP+ wildcard optimizations](design-clpp-wildcard-search-implementation.md): encoded record table (ERT) summaries still reject entire ERTs first, and count queries can then avoid reading unrelated columns in surviving ERTs.
+This port reduces how much data C++ CLP+ stores, reads, and evaluates. It builds on the [CLP+ wildcard optimizations](design-clpp-wildcard-search-implementation.md): search loads the dictionaries needed to prepare a query, rejects encoded record tables (ERTs) that cannot match, counts an ERT directly when metadata proves every row matches, and reads the required columns from the remaining ERTs. Adaptive encodings reduce column sizes and let eligible predicates run without expanding every value.
 
-The source is [`jackluo923/separate-columns` at `f4b3ef36`](https://github.com/jackluo923/clp/tree/f4b3ef36). The implementation uses the Rust 0.6 numeric layouts while retaining the C++ query evaluator, parsing integration, and reconstruction behavior.
+The source is [`jackluo923/separate-columns` through `ff72ff6b`](https://github.com/jackluo923/clp/tree/ff72ff6b). The implementation reuses the Rust numeric payload layouts and adapts its ERT range proofs to existing C++ integer summaries, while retaining the C++ query evaluator, parsing integration, and reconstruction behavior. Dictionary-ID codecs use a separately versioned C++ archive extension; this does not add support for current Rust archives.
 
 | Optimization | Rust commits | C++ treatment |
 |---|---|---|
 | Separate column frames and selective reads | `fbe2f9ce`, `3ce1b648` | Ported for count queries with resolved field dependencies; ordinary output and metadata-producing queries read all columns |
+| Count proven matches from ERT metadata | `0d2b46ef` | Ported through the C++ evaluator's proof of the complete query; only count handlers accept a bulk count |
+| Prove range predicates from ERT summaries and remove covered column dependencies | `54abc872`, `cc292f7a` | Adapted to existing CLP+ integer summaries; timestamp summaries and numeric aggregate pushdown remain separate work |
+| Encode and scan dictionary-ID columns | `12828b82`, `a4c6b36c` | Ported for variable strings and dictionary-backed floats; legacy CLP-string descriptor buffers retain their layout |
+| Load only the dictionaries a query needs | `2a6168a7`, `3ce1b648` | Ported for count queries on local directory archives, local single-file archives, and memory buffers; forward-only inputs retain ordered loading |
 | Choose numeric encodings by compressed size | `15a57e03` | Ported for integer and double columns |
 | Construct candidates one at a time | `51bbd4e5` | Ported; reuse a Zstd context and candidate buffers rather than retaining all encodings |
 | Value-sorted float dictionaries with byte-wide codes | `267fc8d3` | Ported as an additional lossless candidate |
@@ -16,6 +20,7 @@ The source is [`jackluo923/separate-columns` at `f4b3ef36`](https://github.com/j
 | Scan numeric columns in their encoded representation | `422a9f15`, `db272333`, `0933623e` | Ported for constants, frame-of-reference integers, dictionaries, and runs; includes packed dictionary scans and integer range checks |
 | Reuse decompression buffers and resolve numeric operands before scanning | `a246881c`, `a0094f65` | The C++ reader and `ColumnScan` already provide these mechanisms |
 | Skip archives outside timestamp bounds | `ae71fdf6` | Already handled by `EvaluateTimestampIndex` |
+| Fuse legacy string-token scanning | `ff72ff6b` | Further porting work; this parser is separate from CLP+'s log-surgeon parsing path |
 | Decimal floats, per-field dictionaries, compact CLP descriptors, binary UUIDs, and timestamp chunk indexes | Other changes on the Rust branch | Further porting work; these formats and execution paths are not introduced here |
 
 ## Writing smaller numeric columns
@@ -31,7 +36,38 @@ For each eligible column, `AdaptiveColumn` compresses the applicable candidates 
 
 Dictionary candidates stop tracking distinct values after 65,536 entries. Float dictionaries also try sorting values and using whole-byte codes, which can make slowly changing sequences easier for Zstd to compress. Float encoding preserves every bit, including signed zero and NaN payloads. Decimal conversion is not used.
 
-The codec operates on `Integer` and `Float` columns. Existing `FormattedFloat`, `DictionaryFloat`, timestamp, and CLP-string representations retain their bytes. In particular, the CLI's default float-format retention remains unchanged; `--no-retain-float-format` permits ordinary `Float` columns but retains the existing CLI rendering behavior of that mode.
+The numeric option operates on `Integer` and `Float` columns. The dictionary option extends the integer codecs to `VarString` and `DictionaryFloat` ID columns, as described below. `FormattedFloat`, timestamp, and legacy CLP-string payloads retain their bytes. The CLI's default float-format retention remains unchanged; `--no-retain-float-format` permits ordinary `Float` columns but retains the existing CLI rendering behavior of that mode.
+
+## Counting an ERT without reading its records
+
+An ERT's metadata includes its record count. When the query evaluator proves that every record in the ERT matches the complete query, a count query can add that number directly. For example, `message: *` can count records in ERTs containing that field. A wildcard can also qualify when the fixed text in an ERT's string shape (template) guarantees a match, regardless of its variable values.
+
+`QueryRunner::schema_init` simplifies the expression for each ERT to true, false, or unknown. `Output` skips false ERTs, adds the record count for true ERTs, and scans unknown ERTs. The proof must cover the entire expression, including AND, OR, NOT, and any time bounds. A match in a string shape alone is insufficient when another predicate still depends on record values. Existence checks inside unstructured arrays also require evaluation of those arrays.
+
+Only output handlers that explicitly support bulk counting can take this path. Ordinary record output, output metadata, and time-bucketed counts retain record evaluation. Both local count aggregation and reducer count output accept bulk counts while preserving their result format and checking for overflow.
+
+The reader opens the record-data section only when an ERT requires scanning. If every ERT is rejected or counted from metadata, that section remains unopened. Query preparation may still read dictionaries needed to establish the result. This optimization applies to existing packed archives as well as separate-column archives and requires no storage option or format change. Telemetry reports the ERTs and records counted from metadata, and uses the `metadata_count` termination stage when no ERT was scanned.
+
+## Proving integer ranges before reading columns
+
+CLP+ already stores the smallest and largest integer values for each field in an ERT's `ColumnValueFilter`. Equality and numeric-prefix wildcard queries use these summaries to reject impossible matches. Range predicates now use the same bounds to determine whether every value, no value, or only some values could match, before loading the column.
+
+For an ERT whose `seq` values range from 100 through 199:
+
+| Predicate | Proof | Effect on a count query |
+|---|---|---|
+| `seq < 100` | No value matches | Skip the ERT |
+| `seq >= 100 AND seq < 200` | Every value matches the complete query | Add the ERT's record count from metadata |
+| `seq >= 100 AND sensor > 1950` | The `seq` predicate is always true | Evaluate only `sensor > 1950`; separate-column archives also leave the `seq` frame unread |
+| `seq >= 150` | The range crosses the boundary | Read and evaluate `seq` |
+
+`QueryRunner` evaluates `<`, `<=`, `>`, and `>=` at both endpoints. If both results agree, the predicate has that result throughout the range; otherwise it remains unresolved. The proof uses the same operand conversion and comparison functions as row evaluation, including rounding fractional operands for integer comparisons. It compares endpoints directly without incrementing or decrementing signed integer limits.
+
+The result feeds the existing AND, OR, and NOT simplification before column selection. A true predicate can disappear from an AND, and a false predicate can disappear from an OR. Counting still requires proof of the complete expression. Different ERTs can therefore be rejected, counted from metadata, or scanned within one query without counting a record twice. Record reconstruction still reads the columns needed to produce the output.
+
+This adaptation requires an existing integer summary. Missing or empty summaries, unresolved field paths, and fields inside unstructured arrays retain their evaluation path. A summary for a repeated integer field covers all its physical occurrences; endpoint agreement remains sufficient to prove the result. Dictionary-ID bounds describe IDs rather than string ordering and are never used for string range proofs. Timestamp and floating-point columns have no applicable summary in this implementation. Ordinary CLP-S archives without CLP+ summaries also retain their current range scans.
+
+The writer and archive bytes are unchanged. Packed ERTs can be skipped or counted in full; skipping an individual column frame requires separate-column storage. The Rust changes also use timestamp summaries and aggregate metadata, which this integer adaptation does not introduce.
 
 ## Reading fewer columns
 
@@ -42,6 +78,16 @@ After schema resolution and constant propagation, `QueryRunner` gathers the fiel
 Field wildcards with unresolved dependencies retain the complete read path. Queries that reconstruct strings or return timestamp/order metadata also read all columns.
 
 The reader validates frame extents, column counts, codec tags, dictionary indices, run totals, and integer reconstruction bounds. Separate streams must contain exactly one ERT at offset zero. Rereading the current separate stream can load columns omitted by an earlier selection.
+
+## Reading only needed dictionaries
+
+Reading fewer column frames does not help if search first decompresses a large dictionary for an unrelated field. For example, counting `seq: 999` needs the integer `seq` column, even when the same ERT has a text column backed by a large string shape dictionary.
+
+After resolving fields and matching ERTs, `SchemaMatch::prepare_dictionaries` derives dictionary dependencies from each ERT's query. An integer or ordinary double predicate needs no string dictionary. Variable strings and dictionary-backed floats need the variable dictionary. A CLP-string predicate needs both variable and logtype dictionaries; an unstructured-array predicate needs the variable and array dictionaries. Resolved field-existence predicates need no dictionary values, but existence checks inside unstructured arrays still need the array's dictionaries. Queries that reconstruct records or return metadata prepare dictionaries for all columns in the matched ERTs, and unresolved field wildcards conservatively retain those dependencies too.
+
+Local single-file archives and memory buffers can seek back to a dictionary requested during later query preparation, so advancing to metadata no longer forces every preceding dictionary to load. Directory archives already allow independent section access. Forward-only inputs, including network streams and readers whose seek capabilities are unknown, retain the existing ordered loading path. All required dictionaries are prepared before the reader opens the ERT data section.
+
+This optimization changes neither the writer nor the archive format and applies to existing packed archives as well as separate-column archives. A needed dictionary is still loaded in full: per-field dictionaries and selective reads within a dictionary remain separate porting work.
 
 ## Searching numeric columns without expanding them
 
@@ -70,6 +116,16 @@ Variable-string wildcard matching resolves to a set of matching dictionary IDs. 
 
 All representations implement exact membership. The scan still applies the existing equality, inequality, and expression-inversion behavior.
 
+## Compact dictionary-ID columns
+
+A `VarString` column stores an ID into the variable dictionary for each row. CLP+ uses these columns for extracted string variables. A `DictionaryFloat` column also stores IDs, but its dictionary entries preserve decimal text that cannot be represented by the ordinary formatted-float encoding. Compressing these IDs therefore benefits both string predicates and some numeric predicates without changing the stored text.
+
+With `--adaptive-dictionary-columns`, separate frames for these two column types use the integer codec candidates: plain IDs, a constant ID, frame-of-reference offsets, first differences, a local dictionary of IDs, or runs. The writer chooses by compressed size after Zstd, just as it does for numeric columns. A local dictionary here maps compact row codes to IDs in the archive's variable dictionary; it does not replace that archive dictionary.
+
+The reader retains constants, frame-of-reference offsets, local dictionaries, and runs in compact form. String predicates test those IDs against the existing matching-ID set. Float predicates resolve an ID to its decimal value using the existing conversion: once for a constant, once per local dictionary entry, or once per run. Numeric wildcards reuse the same result, avoiding repeated conversion and matching. Plain IDs remain directly readable, and delta IDs expand before scanning.
+
+The reader validates encoded structure and verifies that referenced IDs exist before using the column. Reference validation is delayed until first use so loading an unrelated column does not force its dictionary to be read. Extraction still obtains the original dictionary text, including the original decimal spelling. Legacy `ClpString` descriptor and variable buffers are not encoded by this option; the Rust shortcuts for those buffers need a separate port.
+
 ## Options and compatibility
 
 The new storage paths are opt-in:
@@ -77,27 +133,30 @@ The new storage paths are opt-in:
 ```sh
 clp-s --experimental c \
     --parsing-specification parsing.spec.cached.txt \
-    --adaptive-numeric-columns \
+    --adaptive-dictionary-columns \
     --separate-columns-min-size 1048576 \
     archives input.jsonl
 ```
 
-`--separate-columns-min-size N` separates ERTs of at least `N` uncompressed bytes. With a nonzero threshold, smaller ERTs remain packed even when adaptive encoding is enabled. With only `--adaptive-numeric-columns`, every ERT containing an eligible numeric column is separated. Without either option, the writer retains the existing packed layout.
+`--separate-columns-min-size N` separates ERTs of at least `N` uncompressed bytes. With a nonzero threshold, smaller ERTs remain packed even when adaptive encoding is enabled. With a zero threshold, `--adaptive-numeric-columns` separates ERTs containing eligible numeric columns; `--adaptive-dictionary-columns` also includes ERTs containing variable-string or dictionary-float columns and enables adaptive numeric encoding. Without any of these options, the writer retains the existing packed layout.
 
 | Configuration | Version and behavior |
 |---|---|
 | Existing options only | Archive 0.5.1; existing packed columns |
 | Separate frames only | Archive 0.5.1's reserved separate-column metadata section; numeric values remain plain |
 | Adaptive numeric encoding | Archive 0.6.0; numeric columns in separate frames carry a scheme tag; packed ERTs retain their existing bytes |
+| Adaptive dictionary-ID encoding | Archive 0.6.1; also tags eligible dictionary-ID columns in separate frames; packed ERTs retain their existing bytes |
 
-The new reader accepts legacy archives. Older C++ readers reject the nonempty separate-column metadata section; they cannot read archives that use the new column layout. The new reader rejects unsupported newer minor versions rather than interpreting their bytes as this format. Versions 0.7 and later from the Rust branch require additional readers and are not supported by this port.
+The new reader accepts existing C++ 0.5.1 and 0.6.0 archives. Readers predating separate columns reject their nonempty metadata section. Readers supporting 0.6.0 also reject the 0.6.1 dictionary extension: its separate-column metadata begins with a `UINT64_MAX` marker and extension version `1`, before the usual stream count. The marker cannot be a valid stream count, so readers that ignore the header's patch version still reject the archive. The extension is emitted whenever the dictionary option is enabled, even if every ERT remains packed.
+
+The new reader rejects unknown extension versions and archive versions newer than 0.6.1. Rust 0.7 and later require additional readers and are not supported by this port.
 
 ## Validation and measurement
 
 Build and test inside the project's `clp-core-dependencies-x86-manylinux_2_28:dev` image with the C++ dependencies mounted. Configure `CLP_BUILD_CLPP_DECOMPOSITION=ON` and `CLP_BUILD_TESTING=ON`, then build `clp-s` and `unitTest`.
 
 ```sh
-unitTest '[AdaptiveColumn],[NumericColumnView],[DictionaryIdSet],[SeparateColumns]'
+unitTest '[AdaptiveColumn],[NumericColumnView],[DictionaryIdSet],[DictionaryColumns],[SeparateColumns],[SelectiveDictionaries],[MetadataCounts],[IntegerRangeProofs],[ColumnValueFilter]'
 
 python3 components/core/tools/benchmarks/clpp-column-port.py \
     --baseline /path/to/baseline/clp-s \
@@ -109,7 +168,7 @@ python3 components/core/tools/benchmarks/clpp-column-port.py \
 
 The benchmark harness generates a deterministic numeric fixture, compares baseline, unchanged storage, separate-frame storage, and adaptive storage, and checks ordered extraction and query counts. It also verifies that the new binary reads baseline archives. Query timings include process startup and use a warmup followed by three interleaved runs per configuration. Ingest timings are medians of three runs; extraction is checked once per configuration. Measurements use warm caches on a shared host, so small timing differences should not be treated as stable gains.
 
-Unit coverage includes every numeric wire scheme, signed integer limits, floating-point bit patterns, truncated payloads, invalid frame metadata, exact dictionary membership, and archive round trips with both archive containers and array layouts. Codec mutation checks also run under AddressSanitizer and UndefinedBehaviorSanitizer.
+Unit coverage includes every numeric wire scheme, signed integer limits, floating-point bit patterns, truncated payloads, invalid frame metadata, exact dictionary membership, and archive round trips with both archive containers and array layouts. Selective-read tests verify that count queries leave damaged unused dictionaries unread while reconstruction rejects them, and cover forward-only inputs, memory buffers, reader reuse, and logical expressions. Metadata-count tests cover logical expressions, time bounds, array members, output requirements, and damaged record data that must remain unread for proven counts. Integer-range tests cover endpoint inclusivity, fractional operands, signed limits, repeated fields, missing fields, mixed types, and queries combining metadata counts with scans. They also damage one integer frame to verify that a proven predicate leaves it unread while another column is scanned. Dictionary-column tests compare compact scans against decoded scans and verify reference validation, reader reuse, and exact float-text extraction. Numeric codec mutation checks also run under AddressSanitizer and UndefinedBehaviorSanitizer.
 
 ### Compression results
 
@@ -140,7 +199,7 @@ The numeric equality and string wildcard queries benefit from skipping unrelated
 
 ### Effect of scanning encoded numeric values
 
-This comparison isolates the reader change: both configurations use adaptive storage with a 1 MiB ERT threshold, and the baseline is `3aa39f93`. The numeric fixture contains 1,000,000 records. Reproduce it with the benchmark harness by adding `--baseline-adaptive --rows 1000000`.
+This comparison isolates the encoded scan change in `5139a614`: both configurations use adaptive storage with a 1 MiB ERT threshold, and the baseline is `3aa39f93`. The numeric fixture contains 1,000,000 records. Reproduce it with the benchmark harness by adding `--baseline-adaptive --rows 1000000`.
 
 | Query | Matching records | Expand before scanning | Scan encoded values | Speedup |
 |---|---:|---:|---:|---:|
@@ -155,3 +214,89 @@ This comparison isolates the reader change: both configurations use adaptive sto
 Constants avoid materialization and repeated comparisons; dictionaries avoid comparing the same value for every row. Numeric wildcards also save repeated decimal conversion and pattern matching. Even a query such as `*: busy`, which retains all columns, can avoid expanding unrelated numeric columns. Delta-encoded sequences still use the ordinary decoder, so `seq: 999` receives no direct scan benefit.
 
 The writer and archive layout are unchanged. Ordered extraction and query counts agree with the baseline. Six interleaved extraction measurements on identical archives give medians of 806 ms versus 798 ms for the numeric fixture and 335 ms versus 337 ms for the Hive sample; these small differences do not establish an extraction speedup.
+
+### Effect of selective dictionary reads
+
+The baseline is `5139a614`, including encoded numeric scans. Both readers use the same adaptive archives with a 1 MiB ERT threshold. The text-heavy fixture contains 50,000 records with `seq`, a three-value `state`, and unique text in `detail`; its large logtype dictionary makes the cost of unrelated text visible. The numeric fixture contains 100,000 records, and the Hive sample contains 274,581 records.
+
+Generate these workloads with the benchmark harness using `--baseline-adaptive --dictionary-heavy --repeats 7`. The comparison below uses a warmup followed by seven interleaved runs of both binaries on identical baseline archives. Peak resident memory is measured for each CLI process with Linux `wait4`; the reported values are medians.
+
+| Workload | Query | Matching records | Baseline | Selective dictionaries | Speedup |
+|---|---|---:|---:|---:|---:|
+| Text-heavy | `seq: 999` | 1 | 61.1 ms | 8.3 ms | 7.39× |
+| Text-heavy | `state: b*` | 16,667 | 62.9 ms | 8.8 ms | 7.15× |
+| Text-heavy | `detail: *` | 50,000 | 61.6 ms | 8.1 ms | 7.57× |
+| Text-heavy | `detail: *needle*` | 50 | 142.8 ms | 143.2 ms | 1.00× |
+| Numeric | `x > 50.05` | 24,891 | 12.5 ms | 9.3 ms | 1.34× |
+| Hive | `message.blockID.blockNum: 1073746491` | 2 | 78.5 ms | 13.2 ms | 5.93× |
+| Hive | `message: *blk_1073746491_5667*` | 3 | 86.9 ms | 70.2 ms | 1.24× |
+| Hive | `message: *zzzz*` | 0 | 59.6 ms | 28.4 ms | 2.10× |
+
+The narrow text-fixture queries skip `detail`'s dictionary entirely, while `detail: *needle*` still needs it and receives no measurable benefit. The Hive BlockID query resolves directly to an integer column, avoiding string dictionaries and unrelated parsing and shape-index sections. Peak resident memory drops from 73.9 MiB to 18.0 MiB for the text-fixture integer lookup, and from 105.1 MiB to 20.3 MiB for the Hive BlockID lookup.
+
+Query counts and ordered extraction agree across the readers. Extraction medians are 88 ms versus 90 ms for the numeric fixture, 177 ms versus 178 ms for the text-heavy fixture, and 327 ms versus 292 ms for Hive. Archive bytes and compression behavior are unchanged; this optimization affects what the reader loads.
+
+### Effect of metadata-only counts
+
+This comparison isolates bulk counting from the preceding selective-dictionary reader. Both binaries read identical archives, with a warmup followed by seven interleaved runs. The adaptive numeric fixture contains 1,000,000 records, the packed numeric fixture contains 100,000 records, and Hive contains 274,581 records.
+
+| Workload | Query | Matching records | Per-row count | Metadata count | Speedup |
+|---|---|---:|---:|---:|---:|
+| Numeric, adaptive | `seq: *` | 1,000,000 | 14.0 ms | 7.3 ms | 1.93× |
+| Numeric, adaptive | `seq: * AND state: *` | 1,000,000 | 10.7 ms | 7.5 ms | 1.43× |
+| Numeric, packed | `seq: *` | 100,000 | 20.2 ms | 8.3 ms | 2.45× |
+| Hive | `message: *` | 274,581 | 28.0 ms | 11.7 ms | 2.39× |
+| Hive | `message: *PacketResponder*` | 758 | 31.8 ms | 29.7 ms | 1.07× |
+| Hive | `message: *Exception*` | 4,927 | 65.7 ms | 66.0 ms | 0.99× |
+
+The adaptive existence query already avoids decompressing unnecessary columns; bulk counting removes its row loop. Packed ERTs also avoid decompression, reducing peak resident memory from 26.6 MiB to 17.8 MiB for `seq: *`. Broad field existence benefits more than the tested Hive wildcards, whose preparation and remaining evaluation still dominate. A numeric equality control, `seq: 999`, takes 23.2 ms before and 22.8 ms after on the million-row archive, providing no evidence of a scan improvement from this change.
+
+### Effect of compact dictionary-ID columns
+
+The baseline includes metadata counts, selective dictionary reads, and encoded numeric scans. The candidate additionally enables `--adaptive-dictionary-columns`; both writers use a 1 MiB ERT threshold. The numeric and repeated-value fixtures contain 200,000 records each. The repeated-value fixture mixes a constant string, 256 randomly selected categories, strings repeated in blocks of 1,024 rows, and two dictionary-backed decimal spellings. Hive contains 274,581 records.
+
+Reproduce the comparison with `clpp-column-port.py --baseline-adaptive --dictionary-columns --rows 200000`, supplying the baseline, candidate, output directory, and Hive input/specification as above. Compression and query timings use three runs per configuration.
+
+| Workload | Numeric codecs only | With dictionary-ID codecs | Size reduction | Baseline ingest | Candidate ingest |
+|---|---:|---:|---:|---:|---:|
+| Repeated values | 225,707 bytes | 203,866 bytes | 9.7% | 126 ms | 136 ms |
+| Numeric fixture | 1,870,847 bytes | 1,849,430 bytes | 1.1% | 295 ms | 294 ms |
+| Hive sample | 4,624,247 bytes | 4,521,292 bytes | 2.2% | 2.19 s | 2.18 s |
+
+| Workload | Query | Matching records | Plain dictionary IDs | Compact dictionary IDs | Speedup |
+|---|---|---:|---:|---:|---:|
+| Repeated values | `category: categorya*` | 20,089 | 11.0 ms | 8.5 ms | 1.29× |
+| Repeated values | `state: busy` | 99,648 | 8.9 ms | 7.7 ms | 1.16× |
+| Repeated values | `decimal > 0` | 100,352 | 19.6 ms | 7.2 ms | 2.73× |
+| Repeated values | `decimal: *25*` | 200,000 | 28.1 ms | 8.5 ms | 3.30× |
+| Repeated values | `state: busy AND decimal < 0` | 99,648 | 21.0 ms | 8.2 ms | 2.58× |
+| Hive | `message: *a*b*` | 117,705 | 142.8 ms | 143.8 ms | 0.99× |
+
+Repeated decimal IDs benefit most because compact scans avoid parsing and wildcard-matching the same decimal text for every row. String-ID scans save less work because ordinary membership checks are already cheap. The numeric fixture and Hive do not show a consistent search speedup from this option, although their archives shrink. Ordered extraction and query counts agree across configurations, and the older reader rejects every tested archive using the dictionary-ID extension. The repeated-value fixture's approximately 8% ingestion increase illustrates the extra codec-selection work; these results do not justify enabling the option by default.
+
+### Effect of integer range proofs
+
+The baseline includes compact dictionary-ID columns, metadata counts, and selective reads. Both readers use identical CLP+ archives. The numeric fixture contains 1,000,000 records with sequential `seq` values and randomly distributed `sensor` values from 0 through 1,999. It is stored once with packed ERTs and once with adaptive separate columns. Hive contains 274,581 records and uses the existing adaptive archive with a 1 MiB ERT threshold.
+
+```sh
+python3 components/core/tools/benchmarks/clpp-integer-ranges.py \
+    --baseline /path/to/reader-before-range-proofs/clp-s \
+    --candidate /path/to/modified/clp-s \
+    --output /path/to/new-results-directory \
+    --hive-archive /path/to/hive-archives
+```
+
+The harness checks every query count and records a warmup followed by seven interleaved runs. Timings include CLI startup and use warm caches; the build and regression tests finish before measurement.
+
+| Workload | Query | Matching records | Baseline | Range proofs | Speedup |
+|---|---|---:|---:|---:|---:|
+| Numeric, packed | `seq >= 0 AND seq < 1000000` | 1,000,000 | 43.3 ms | 9.8 ms | 4.43× |
+| Numeric, packed | `seq < 0` | 0 | 37.9 ms | 9.2 ms | 4.12× |
+| Numeric, adaptive | `seq >= 0 AND seq < 1000000` | 1,000,000 | 28.2 ms | 9.4 ms | 3.00× |
+| Numeric, adaptive | `seq >= 0 AND sensor > 1950` | 24,401 | 30.5 ms | 17.2 ms | 1.77× |
+| Numeric, adaptive | `seq > 999990` | 9 | 24.9 ms | 24.9 ms | 1.00× |
+| Hive | `message.blockID.blockNum >= 0` | 6,028 | 15.5 ms | 11.4 ms | 1.36× |
+| Hive | `message.blockID.blockNum > 2000000000` | 0 | 15.3 ms | 11.0 ms | 1.39× |
+| Hive | `message: *PacketResponder* AND message.blockID.blockNum >= 0` | 758 | 34.4 ms | 32.7 ms | 1.05× |
+
+The fully covered and impossible numeric ranges avoid record data entirely. The mixed predicate still scans `sensor`, but separate-column storage lets it skip `seq` after proving `seq >= 0`. On packed storage, the same mixed predicate improves only from 41.6 ms to 39.7 ms because the shared frame still has to be decompressed. Partial ranges and the `seq: 999` equality control show no meaningful improvement. The Hive compound wildcard saves little because the remaining query preparation still dominates. These gains depend on what an ERT's bounds can prove; compression ratio and archive bytes are unchanged.

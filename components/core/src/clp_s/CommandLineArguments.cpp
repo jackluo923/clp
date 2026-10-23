@@ -378,6 +378,10 @@ CommandLineArguments::parse_arguments(int argc, char const** argv) {
                     po::bool_switch(&m_adaptive_numeric_columns),
                     "Choose lossless numeric encodings (archive 0.6); with a zero size threshold, separate every ERT containing numeric columns."
             )(
+                    "adaptive-dictionary-columns",
+                    po::bool_switch(&m_adaptive_dictionary_columns),
+                    "Compress dictionary IDs for variable strings and dictionary-backed floats; also enables adaptive numeric columns (archive 0.6.1)."
+            )(
                     "target-encoded-size",
                     po::value<size_t>(&m_target_encoded_size)->value_name("TARGET_ENCODED_SIZE")->
                         default_value(m_target_encoded_size),

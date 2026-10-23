@@ -38,6 +38,7 @@ struct JsonParserOption {
     size_t max_document_size{};
     size_t separate_columns_min_size{};
     bool adaptive_numeric_columns{false};
+    bool adaptive_dictionary_columns{false};
     size_t min_table_size{};
     int compression_level{};
     bool print_archive_stats{};

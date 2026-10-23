@@ -6,6 +6,7 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <utility>
 
 #include <ystdlib/error_handling/Result.hpp>
 
@@ -15,8 +16,8 @@
 
 namespace clp_s {
 /**
- * A summary of the distinct values stored in one column of one schema table, used at search time
- * to skip tables that cannot satisfy an equality predicate on the column.
+ * A summary of the distinct values stored in one column of one encoded record table (ERT), used
+ * at search time to reject impossible predicates and prove integer range predicates true or false.
  *
  * Values are identified by a 64-bit key: the value itself for integer columns and the dictionary ID
  * for variable string columns. The filter records the key range and a Bloom filter over the keys,
@@ -67,6 +68,17 @@ public:
     }
 
     [[nodiscard]] auto num_keys() const -> size_t { return m_num_keys; }
+
+    /**
+     * @return The inclusive key bounds, or nullopt if empty or invalid. For variable strings these
+     * are dictionary-ID bounds, not lexicographic bounds.
+     */
+    [[nodiscard]] auto key_bounds() const -> std::optional<std::pair<int64_t, int64_t>> {
+        if (0 == m_num_keys || m_min_key > m_max_key) {
+            return std::nullopt;
+        }
+        return std::pair{m_min_key, m_max_key};
+    }
 
     /**
      * Writes the filter.

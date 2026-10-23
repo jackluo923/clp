@@ -106,6 +106,8 @@ public:
 
     auto get_adaptive_numeric_columns() const -> bool { return m_adaptive_numeric_columns; }
 
+    auto get_adaptive_dictionary_columns() const -> bool { return m_adaptive_dictionary_columns; }
+
     size_t get_target_encoded_size() const { return m_target_encoded_size; }
 
     size_t get_max_document_size() const { return m_max_document_size; }
@@ -267,6 +269,7 @@ private:
     int m_compression_level{3};
     size_t m_separate_columns_min_size{};
     bool m_adaptive_numeric_columns{false};
+    bool m_adaptive_dictionary_columns{false};
     size_t m_target_encoded_size{8ULL * 1024 * 1024 * 1024};  // 8 GiB
     bool m_print_archive_stats{false};
     size_t m_max_document_size{512ULL * 1024 * 1024};  // 512 MiB

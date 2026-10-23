@@ -59,9 +59,10 @@ public:
             ZSTD_CCtx& context,
             int level,
             SchemaTree const& tree,
-            bool adaptive
+            bool adaptive,
+            bool adaptive_dictionary = false
     ) -> std::vector<ColumnFrame>;
-    auto has_numeric_columns(SchemaTree const& tree) const -> bool;
+    auto has_adaptive_columns(SchemaTree const& tree, bool dictionary) const -> bool;
 
     /**
      * Builds a value filter per schema tree node for every column type that supports one. A node

@@ -43,6 +43,7 @@ struct ArchiveWriterOption {
     bool single_file_archive;
     size_t separate_columns_min_size{};
     bool adaptive_numeric_columns{false};
+    bool adaptive_dictionary_columns{false};
     size_t min_table_size;
     std::vector<std::string> authoritative_timestamp;
     std::string authoritative_timestamp_namespace;
@@ -460,6 +461,7 @@ private:
     size_t m_min_table_size{};
     size_t m_separate_columns_min_size{};
     bool m_adaptive_numeric_columns{false};
+    bool m_adaptive_dictionary_columns{false};
 
     std::vector<std::string> m_authoritative_timestamp;
     std::string m_authoritative_timestamp_namespace;

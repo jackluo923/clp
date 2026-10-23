@@ -1,6 +1,7 @@
 #ifndef CLP_S_SEARCH_OUTPUTHANDLER_HPP
 #define CLP_S_SEARCH_OUTPUTHANDLER_HPP
 
+#include <cstdint>
 #include <string_view>
 #include <vector>
 
@@ -41,6 +42,14 @@ public:
      * @param message The message to write.
      */
     virtual void write(std::string_view message) = 0;
+
+    /**
+     * Consumes a proven count without individual records. Only count handlers opt in.
+     * @return true if consumed; false leaves the handler unchanged and requires ordinary output.
+     */
+    [[nodiscard]] virtual auto try_write_count([[maybe_unused]] uint64_t count) -> bool {
+        return false;
+    }
 
     /**
      * Flushes the output handler after each table that gets searched.

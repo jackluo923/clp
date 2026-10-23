@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <fmt/format.h>
+#include <utils/profiling/ScopedProfiler.hpp>
 
 #include <clp_s/archive_constants.hpp>
 #include <clp_s/ArchiveReader.hpp>
@@ -36,7 +37,6 @@
 #include <clp_s/search/ast/StringLiteral.hpp>
 #include <clpp/Defs.hpp>
 #include <clpp/Interpretation.hpp>
-#include <utils/profiling/ScopedProfiler.hpp>
 
 using clp_s::search::ast::AndExpr;
 using clp_s::search::ast::ColumnDescriptor;
@@ -123,16 +123,47 @@ std::shared_ptr<Expression> SchemaMatch::run(std::shared_ptr<Expression>& expr) 
         split_expression_by_schema(expr, m_schema_to_query, m_matched_schema_ids);
     }
 
-    {
-        PROFILE_SCOPE("schema_match_read_dictionaries");
-        uint8_t needs{0};
-        for (auto const schema_id : m_matched_schema_ids) {
-            collect_dictionary_needs((*m_schemas)[schema_id].get_view(), needs);
-        }
-        read_dictionaries(needs);
-    }
-
     return expr;
+}
+
+auto SchemaMatch::prepare_dictionaries(bool needs_all_columns) -> void {
+    uint8_t needs{0};
+    for (auto const schema_id : m_matched_schema_ids) {
+        auto const schema{(*m_schemas)[schema_id].get_view()};
+        if (needs_all_columns) {
+            collect_dictionary_needs(schema, needs);
+            continue;
+        }
+        std::vector<ast::Expression*> pending{m_schema_to_query.at(schema_id).get()};
+        while (!pending.empty()) {
+            auto* expr{pending.back()};
+            pending.pop_back();
+            if (auto* filter{dynamic_cast<ast::FilterExpr*>(expr)}; filter != nullptr) {
+                auto const operation{filter->get_operation()};
+                auto const column{filter->get_column()};
+                if ((operation == ast::FilterOperation::EXISTS
+                     || operation == ast::FilterOperation::NEXISTS)
+                    && !column->has_unresolved_tokens())
+                {
+                    continue;
+                }
+                if (column->get_column_id() < 0 || column->is_pure_wildcard()
+                    || column->is_unresolved_descriptor())
+                {
+                    collect_dictionary_needs(schema, needs);
+                } else {
+                    collect_column_dictionary_needs(column->get_column_id(), needs);
+                }
+            } else {
+                for (auto const& operand : expr->get_op_list()) {
+                    if (auto* child{dynamic_cast<ast::Expression*>(operand.get())}) {
+                        pending.push_back(child);
+                    }
+                }
+            }
+        }
+    }
+    read_dictionaries(needs);
 }
 
 std::shared_ptr<Expression> SchemaMatch::populate_column_mapping(
@@ -746,6 +777,16 @@ void SchemaMatch::split_expression_by_schema(
             auto descriptor = std::static_pointer_cast<FilterExpr>(new_filter)->get_column().get();
             auto old_descriptor_id{filter->get_column()->get_id()};
 
+            if (filter->get_operation() == FilterOperation::NEXISTS
+                && !descriptor->is_pure_wildcard() && !descriptor->has_unresolved_tokens()
+                && !m_descriptor_to_schema.at(old_descriptor_id).contains(schema_id))
+            {
+                // Schema intersection proved the field absent. There is no physical column to
+                // resolve or read; an empty conjunction represents the proven result.
+                queries[schema_id] = AndExpr::create(filter->is_inverted());
+                continue;
+            }
+
             if (false == descriptor->is_pure_wildcard()) {
                 descriptor->set_column_id(
                         get_column_id_for_descriptor(old_descriptor_id, schema_id)
@@ -842,23 +883,28 @@ void SchemaMatch::add_searched_column_to_schema(int32_t schema, int32_t column) 
     m_schema_to_searched_columns[schema].insert(column);
 }
 
+auto SchemaMatch::collect_column_dictionary_needs(SchemaNode::id_t column_id, uint8_t& needs)
+        -> void {
+    switch (m_tree->get_node(column_id).get_type()) {
+        case NodeType::DictionaryFloat:
+        case NodeType::VarString:
+            needs |= cVarDict;
+            break;
+        case NodeType::ClpString:
+            needs |= cVarDict | cLogTypeDict;
+            break;
+        case NodeType::UnstructuredArray:
+            needs |= cVarDict | cArrayDict;
+            break;
+        default:
+            break;
+    }
+}
+
 auto SchemaMatch::collect_dictionary_needs(SchemaView const& schema, uint8_t& needs) -> void {
     schema.visit_entries(
             [&](SchemaNode::id_t column_id) -> bool {
-                switch (m_tree->get_node(column_id).get_type()) {
-                    case NodeType::DictionaryFloat:
-                    case NodeType::VarString:
-                        needs |= cVarDict;
-                        break;
-                    case NodeType::ClpString:
-                        needs |= cVarDict | cLogTypeDict;
-                        break;
-                    case NodeType::UnstructuredArray:
-                        needs |= cVarDict | cArrayDict;
-                        break;
-                    default:
-                        break;
-                }
+                collect_column_dictionary_needs(column_id, needs);
                 return false;
             },
             [&](UnorderedObject const& obj) -> bool {

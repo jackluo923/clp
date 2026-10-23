@@ -14,6 +14,7 @@
 #include <clp_s/AdaptiveColumn.hpp>
 #include <clp_s/PackedStreamReader.hpp>
 #include <clp_s/search/DictionaryIdSet.hpp>
+#include <clp_s/SingleFileArchiveDefs.hpp>
 
 namespace {
 using namespace clp_s::adaptive_column;
@@ -204,7 +205,7 @@ TEST_CASE("Dictionary membership is exact for small dense and sparse sets", "[Di
 }
 
 TEST_CASE("Separate column metadata validates frame extents", "[SeparateColumns]") {
-    auto check_metadata = [](std::vector<uint64_t> const& fields) {
+    auto check_metadata = [](std::vector<uint64_t> const& fields, bool dictionary = false) {
         auto const raw{bytes(fields)};
         Bytes compressed(ZSTD_compressBound(raw.size()));
         auto const size{
@@ -215,11 +216,22 @@ TEST_CASE("Separate column metadata validates frame extents", "[SeparateColumns]
         input.open(compressed.data(), size);
         clp_s::PackedStreamReader reader;
         REQUIRE_FALSE(reader.read_metadata(input).has_error());
-        reader.read_separate_metadata(input);
+        reader.read_separate_metadata(input, dictionary);
     };
     // Two streams, then one separate stream with one column. Its extent ends at stream 1.
     std::vector<uint64_t> valid{2, 0, 8, 20, 8, 1, 0, 1, 8, 20};
     REQUIRE_NOTHROW(check_metadata(valid));
+    auto extended{valid};
+    extended.insert(
+            extended.begin() + 5,
+            {clp_s::cSeparateColumnExtensionMarker, clp_s::cSeparateColumnExtensionVersion}
+    );
+    REQUIRE_NOTHROW(check_metadata(extended, true));
+    REQUIRE_THROWS(check_metadata(extended, false));
+    REQUIRE_THROWS(check_metadata(valid, true));
+    auto unknown{extended};
+    unknown[6] = 2;
+    REQUIRE_THROWS(check_metadata(unknown, true));
     for (auto [index, value] :
          std::vector<std::pair<size_t, uint64_t>>{
                  {5, 3},

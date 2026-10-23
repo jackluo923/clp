@@ -126,20 +126,44 @@ auto BooleanColumnReader::extract_value(uint64_t cur_message)
     return m_values[cur_message];
 }
 
-auto DictionaryFloatColumnReader::load(BufferViewReader& reader, uint64_t num_messages) -> void {
-    m_var_dict_ids = reader.read_unaligned_span_u64<variable_dictionary_id_t>(num_messages);
+auto DictionaryIdColumnReader::load(BufferViewReader& reader, uint64_t num_messages) -> void {
+    m_encoded_values.reset();
+    m_validate_ids = false;
+    m_variables = reader.read_unaligned_span_u64<uint64_t>(num_messages);
+}
+
+auto DictionaryIdColumnReader::validate_ids() -> void {
+    if (!m_validate_ids) {
+        return;
+    }
+    auto const size{m_var_dict->get_entries().size()};
+    if (m_encoded_values) {
+        m_encoded_values->validate_unsigned_range(size);
+    } else {
+        for (size_t i{0}; i < m_variables.size(); ++i) {
+            if (m_variables[i] >= size) {
+                throw OperationFailed(ErrorCodeCorrupt, __FILENAME__, __LINE__);
+            }
+        }
+    }
+    m_validate_ids = false;
+}
+
+auto DictionaryIdColumnReader::get_variable_id(uint64_t row) -> uint64_t {
+    validate_ids();
+    return m_encoded_values ? m_encoded_values->bits_at(row) : m_variables[row];
 }
 
 auto DictionaryFloatColumnReader::extract_value(uint64_t cur_message)
         -> std::variant<int64_t, double, std::string, uint8_t> {
-    return std::stod(m_var_dict->get_value(m_var_dict_ids[cur_message]));
+    return value_for_id(get_variable_id(cur_message));
 }
 
 auto DictionaryFloatColumnReader::extract_string_value_into_buffer(
         uint64_t cur_message,
         std::string& buffer
 ) -> void {
-    buffer.append(m_var_dict->get_value(m_var_dict_ids[cur_message]));
+    buffer.append(m_var_dict->get_value(get_variable_id(cur_message)));
 }
 
 auto ClpStringColumnReader::load(BufferViewReader& reader, uint64_t num_messages) -> void {
@@ -231,27 +255,23 @@ auto ClpStringColumnReader::get_encoded_vars(uint64_t cur_message) -> UnalignedM
     return m_encoded_vars.sub_span(encoded_vars_offset, entry.get_num_variables());
 }
 
-auto VariableStringColumnReader::load(BufferViewReader& reader, uint64_t num_messages) -> void {
-    m_variables = reader.read_unaligned_span_u64<uint64_t>(num_messages);
-}
-
 auto VariableStringColumnReader::extract_value(uint64_t cur_message)
         -> std::variant<int64_t, double, std::string, uint8_t> {
-    return m_var_dict->get_value(m_variables[cur_message]);
+    return m_var_dict->get_value(get_variable_id(cur_message));
 }
 
 auto VariableStringColumnReader::extract_string_value_into_buffer(
         uint64_t cur_message,
         std::string& buffer
 ) -> void {
-    buffer.append(m_var_dict->get_value(m_variables[cur_message]));
+    buffer.append(m_var_dict->get_value(get_variable_id(cur_message)));
 }
 
 auto VariableStringColumnReader::extract_escaped_string_value_into_buffer(
         uint64_t cur_message,
         std::string& buffer
 ) -> void {
-    StringUtils::escape_json_string(buffer, m_var_dict->get_value(m_variables[cur_message]));
+    StringUtils::escape_json_string(buffer, m_var_dict->get_value(get_variable_id(cur_message)));
 }
 
 auto VariableStringColumnReader::extract_escaped_string_value_into_buffer(
@@ -259,11 +279,7 @@ auto VariableStringColumnReader::extract_escaped_string_value_into_buffer(
         std::string& buffer,
         SimdJsonStringEscaper& escaper
 ) -> void {
-    escaper.escape(buffer, m_var_dict->get_value(m_variables[cur_message]));
-}
-
-auto VariableStringColumnReader::get_variable_id(uint64_t cur_message) -> uint64_t {
-    return m_variables[cur_message];
+    escaper.escape(buffer, m_var_dict->get_value(get_variable_id(cur_message)));
 }
 
 auto DeprecatedDateStringColumnReader::load(BufferViewReader& reader, uint64_t num_messages)

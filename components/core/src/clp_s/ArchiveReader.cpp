@@ -161,7 +161,10 @@ auto ArchiveReader::read_metadata() -> ystdlib::error_handling::Result<void> {
 
     YSTDLIB_ERROR_HANDLING_TRYV(m_stream_reader.read_metadata(m_table_metadata_decompressor));
 
-    m_stream_reader.read_separate_metadata(m_table_metadata_decompressor);
+    m_stream_reader.read_separate_metadata(
+            m_table_metadata_decompressor,
+            m_archive_reader_adaptor->get_header().version >= cAdaptiveDictionaryVersion
+    );
 
     uint64_t num_schemas{0};
     if (auto const error{m_table_metadata_decompressor.try_read_numeric_value(num_schemas)};
@@ -239,7 +242,7 @@ void ArchiveReader::read_dictionaries_and_metadata() {
 }
 
 auto ArchiveReader::ensure_section_readable(std::string_view section) -> void {
-    if (false == m_archive_reader_adaptor->is_single_file_archive()) {
+    if (false == m_archive_reader_adaptor->requires_ordered_section_reads()) {
         return;
     }
     for (auto const prior : m_archive_reader_adaptor->get_sections_before(section)) {
@@ -432,7 +435,8 @@ SchemaReader& ArchiveReader::read_schema_table(
             schema_metadata.uncompressed_size(),
             m_stream_reader.get_column_sizes(schema_metadata.stream_id()),
             m_archive_reader_adaptor->get_header().version >= cAdaptiveNumericVersion,
-            selection
+            selection,
+            m_archive_reader_adaptor->get_header().version >= cAdaptiveDictionaryVersion
     );
     return m_schema_reader;
 }
@@ -450,7 +454,9 @@ std::vector<std::shared_ptr<SchemaReader>> ArchiveReader::read_all_tables() {
                 schema_metadata.stream_offset(),
                 schema_metadata.uncompressed_size(),
                 m_stream_reader.get_column_sizes(schema_metadata.stream_id()),
-                m_archive_reader_adaptor->get_header().version >= cAdaptiveNumericVersion
+                m_archive_reader_adaptor->get_header().version >= cAdaptiveNumericVersion,
+                {},
+                m_archive_reader_adaptor->get_header().version >= cAdaptiveDictionaryVersion
         );
         readers.push_back(std::move(schema_reader));
     }
@@ -718,6 +724,7 @@ void ArchiveReader::close() {
     m_clpp.reset();
     m_stream_reader.close();
     m_archive_reader_adaptor.reset();
+    m_read_sections.clear();
 
     m_id_to_schema_metadata.clear();
     m_schema_ids.clear();

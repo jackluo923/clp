@@ -41,7 +41,8 @@ void ArchiveWriter::open(ArchiveWriterOption const& option) {
     m_single_file_archive = option.single_file_archive;
     m_min_table_size = option.min_table_size;
     m_separate_columns_min_size = option.separate_columns_min_size;
-    m_adaptive_numeric_columns = option.adaptive_numeric_columns;
+    m_adaptive_dictionary_columns = option.adaptive_dictionary_columns;
+    m_adaptive_numeric_columns = option.adaptive_numeric_columns || m_adaptive_dictionary_columns;
     m_archives_dir = option.archives_dir;
     m_authoritative_timestamp = option.authoritative_timestamp;
     m_authoritative_timestamp_namespace = option.authoritative_timestamp_namespace;
@@ -319,7 +320,9 @@ void ArchiveWriter::write_archive_files(
 
 void ArchiveWriter::write_archive_header(FileWriter& archive_writer, size_t metadata_section_size) {
     ArchiveHeader header{
-            m_adaptive_numeric_columns ? cAdaptiveNumericVersion : cArchiveVersion,
+            m_adaptive_dictionary_columns ? cAdaptiveDictionaryVersion
+            : m_adaptive_numeric_columns  ? cAdaptiveNumericVersion
+                                          : cArchiveVersion,
             m_uncompressed_size,
             m_compressed_size,
             static_cast<uint32_t>(metadata_section_size),
@@ -529,7 +532,7 @@ std::pair<size_t, size_t> ArchiveWriter::store_tables() {
                 (m_separate_columns_min_size != 0
                  && table.get_total_uncompressed_size() >= m_separate_columns_min_size)
                 || (m_adaptive_numeric_columns && m_separate_columns_min_size == 0
-                    && table.has_numeric_columns(m_schema_tree))
+                    && table.has_adaptive_columns(m_schema_tree, m_adaptive_dictionary_columns))
         };
         if (separate_columns) {
             finish_packed();
@@ -539,7 +542,8 @@ std::pair<size_t, size_t> ArchiveWriter::store_tables() {
                     *context,
                     m_compression_level,
                     m_schema_tree,
-                    m_adaptive_numeric_columns
+                    m_adaptive_numeric_columns,
+                    m_adaptive_dictionary_columns
             )};
             uint64_t size{};
             for (auto const& frame : frames) {
@@ -576,6 +580,10 @@ std::pair<size_t, size_t> ArchiveWriter::store_tables() {
         m_table_metadata_compressor.write_numeric_value(stream.uncompressed_size);
     }
 
+    if (m_adaptive_dictionary_columns) {
+        m_table_metadata_compressor.write_numeric_value(cSeparateColumnExtensionMarker);
+        m_table_metadata_compressor.write_numeric_value(cSeparateColumnExtensionVersion);
+    }
     m_table_metadata_compressor.write_numeric_value(static_cast<uint64_t>(separate.size()));
     for (auto const& [id, frames] : separate) {
         m_table_metadata_compressor.write_numeric_value(id);

@@ -263,6 +263,7 @@ bool compress(CommandLineArguments const& command_line_arguments) {
     option.compression_level = command_line_arguments.get_compression_level();
     option.separate_columns_min_size = command_line_arguments.get_separate_columns_min_size();
     option.adaptive_numeric_columns = command_line_arguments.get_adaptive_numeric_columns();
+    option.adaptive_dictionary_columns = command_line_arguments.get_adaptive_dictionary_columns();
     option.timestamp_key = command_line_arguments.get_timestamp_key();
     option.print_archive_stats = command_line_arguments.print_archive_stats();
     option.retain_float_format = command_line_arguments.get_retain_float_format();

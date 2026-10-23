@@ -82,13 +82,13 @@ TEST_CASE("clp_s_column_value_filter_membership", "[clpp][ColumnValueFilter]") {
     REQUIRE(filter.may_contain_in_range(0, cBase - 1));
     auto const max_key{cBase + 3 * static_cast<int64_t>(cNumKeys - 1)};
     REQUIRE(filter.may_contain_in_range(max_key, std::numeric_limits<int64_t>::max()));
-    REQUIRE(false
-            == filter.may_contain_in_range(max_key + 1, std::numeric_limits<int64_t>::max()));
+    REQUIRE(false == filter.may_contain_in_range(max_key + 1, std::numeric_limits<int64_t>::max()));
 }
 
 TEST_CASE("clp_s_column_value_filter_empty", "[clpp][ColumnValueFilter]") {
     auto const filter{make_filter({})};
     REQUIRE(0 == filter.num_keys());
+    REQUIRE_FALSE(filter.key_bounds().has_value());
     REQUIRE(false == filter.may_contain(0));
     REQUIRE(false
             == filter.may_contain_in_range(
@@ -97,6 +97,7 @@ TEST_CASE("clp_s_column_value_filter_empty", "[clpp][ColumnValueFilter]") {
             ));
     auto const read{round_trip(filter)};
     REQUIRE(0 == read.num_keys());
+    REQUIRE_FALSE(read.key_bounds().has_value());
     REQUIRE(false == read.may_contain(0));
 }
 
@@ -105,6 +106,8 @@ TEST_CASE("clp_s_column_value_filter_round_trip", "[clpp][ColumnValueFilter]") {
     auto const filter{make_filter(keys)};
     auto const read{round_trip(filter)};
     REQUIRE(keys.size() == read.num_keys());
+    REQUIRE(filter.key_bounds() == std::pair<int64_t, int64_t>{-7, 1'073'746'491});
+    REQUIRE(read.key_bounds() == filter.key_bounds());
     for (auto const key : keys) {
         REQUIRE(read.may_contain(key));
     }
@@ -114,6 +117,17 @@ TEST_CASE("clp_s_column_value_filter_round_trip", "[clpp][ColumnValueFilter]") {
     REQUIRE(read.may_contain_in_range(-100, -7));
     REQUIRE(false == read.may_contain_in_range(-100, -8));
     REQUIRE(false == read.may_contain_in_range(1'073'746'492, 2'000'000'000));
+}
+
+TEST_CASE("clp_s_column_value_filter_extreme_bounds", "[clpp][ColumnValueFilter]") {
+    auto const low{std::numeric_limits<int64_t>::min()};
+    auto const high{std::numeric_limits<int64_t>::max()};
+    auto const filter{make_filter({high, 0, low})};
+    REQUIRE(filter.key_bounds() == std::pair{low, high});
+    REQUIRE(round_trip(filter).key_bounds() == filter.key_bounds());
+    auto const constant{make_filter({high})};
+    REQUIRE(constant.key_bounds() == std::pair{high, high});
+    REQUIRE(round_trip(constant).key_bounds() == constant.key_bounds());
 }
 
 TEST_CASE("clp_s_column_value_filter_large_column", "[clpp][ColumnValueFilter]") {

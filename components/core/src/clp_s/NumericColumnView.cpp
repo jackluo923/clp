@@ -62,6 +62,40 @@ auto NumericColumnView::read_word(std::span<char const> bytes, size_t offset) ->
     return read<uint64_t>(bytes, offset);
 }
 
+auto NumericColumnView::validate_unsigned_range(uint64_t upper_bound) const -> void {
+    if (m_rows == 0) {
+        return;
+    }
+    auto validate = [&](uint64_t value) {
+        if (value >= upper_bound) {
+            corrupt();
+        }
+    };
+    switch (m_kind) {
+        case Kind::Constant:
+            validate(m_base);
+            break;
+        case Kind::FrameOfReference: {
+            auto const mask{(static_cast<unsigned __int128>(1) << m_width) - 1};
+            if (m_base < upper_bound && mask < upper_bound - m_base) {
+                break;
+            }
+            for_each_code([&](size_t, uint64_t offset) { validate(m_base + offset); });
+            break;
+        }
+        case Kind::Dictionary:
+            for (size_t i{0}; i < m_values.size(); i += 8) {
+                validate(read_word(m_values, i));
+            }
+            break;
+        case Kind::RunLength:
+            for (size_t i{0}; i < m_values.size(); i += 12) {
+                validate(read_word(m_values, i));
+            }
+            break;
+    }
+}
+
 auto
 NumericColumnView::try_load(std::span<char const> encoded, adaptive_column::Type type, size_t rows)
         -> std::optional<NumericColumnView> {

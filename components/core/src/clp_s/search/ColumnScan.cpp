@@ -273,6 +273,16 @@ template <typename T>
         return bitmap;
     }
     for (auto* reader : readers->second) {
+        if constexpr (std::is_same_v<T, double>) {
+            if (auto* ids{dynamic_cast<DictionaryFloatColumnReader*>(reader)}; ids != nullptr) {
+                if (auto const* encoded{ids->encoded_values()}) {
+                    encoded->or_matches(bitmap, [&](uint64_t id) {
+                        return compare(operation, ids->value_for_id(id), operand);
+                    });
+                    continue;
+                }
+            }
+        }
         if constexpr (sizeof(T) == sizeof(uint64_t)) {
             if (auto const* encoded{encoded_values<T>(reader)}; encoded != nullptr) {
                 if constexpr (std::is_same_v<T, int64_t>) {
@@ -392,6 +402,16 @@ template <typename T>
         return (FilterOperation::EQ == operation) == matched;
     };
     for (auto* reader : readers->second) {
+        if constexpr (std::is_same_v<T, double>) {
+            if (auto* ids{dynamic_cast<DictionaryFloatColumnReader*>(reader)}; ids != nullptr) {
+                if (auto const* encoded{ids->encoded_values()}) {
+                    encoded->or_matches(bitmap, [&](uint64_t id) {
+                        return matches(ids->value_for_id(id));
+                    });
+                    continue;
+                }
+            }
+        }
         if (auto const* encoded{encoded_values<T>(reader)}; encoded != nullptr) {
             encoded->or_matches(bitmap, [&](uint64_t bits) {
                 return matches(std::bit_cast<T>(bits));
@@ -482,6 +502,13 @@ clp_string_matches(ClpStringColumnReader* reader, clp::Query const& query, uint6
         return bitmap;
     }
     for (auto* reader : readers->second) {
+        if (auto const* encoded{reader->encoded_values()}) {
+            encoded->or_matches(bitmap, [&](uint64_t id) {
+                return (FilterOperation::EQ == operation)
+                       == matching_vars.contains(static_cast<int64_t>(id));
+            });
+            continue;
+        }
         for (uint64_t message_index{0}; message_index < num_messages; ++message_index) {
             auto const matched = matching_vars.contains(
                     static_cast<int64_t>(reader->get_variable_id(message_index))
