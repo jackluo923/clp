@@ -690,6 +690,7 @@ pub(super) struct PrimitiveArchive {
     record_plan_scratch: RecordPlanScratch,
     node_path_cache: Vec<u32>,
     record_layout_cache: Option<RecordLayoutCache>,
+    recent_record_layouts: Vec<RecentRecordLayout>,
     last_record_layout_cache_hit: bool,
     record_count: u64,
     resident_bytes: u64,
@@ -935,6 +936,11 @@ impl PrimitiveArchive {
 
     fn commit(&mut self, plan: RecordPlan, reservations: CommitReservations) {
         let cached_layout_matched = plan.cached_layout_matched;
+        if let Some(index) = plan.cached_layout_index {
+            let recent = &mut self.recent_record_layouts[index];
+            std::mem::swap(&mut self.node_path_cache, &mut recent.path);
+            std::mem::swap(self.record_layout_cache.as_mut().expect("active cached layout"), &mut recent.layout);
+        }
         self.tree.commit(plan.nodes, reservations.tree);
         if !self.template_keys.is_empty() {
             for id in self.template_nodes.len()..self.tree.nodes.len() {
@@ -944,7 +950,10 @@ impl PrimitiveArchive {
             }
         }
         if let Some(node_path_cache) = plan.node_path_cache {
-            self.node_path_cache = node_path_cache;
+            let old_path = std::mem::replace(&mut self.node_path_cache, node_path_cache);
+            if let Some(layout) = self.record_layout_cache.take() {
+                self.remember_record_layout(old_path, layout);
+            }
         }
         self.variable_dictionary
             .commit(plan.variable_dictionary, reservations.variable_dictionary);
@@ -964,6 +973,24 @@ impl PrimitiveArchive {
         self.record_count += 1;
         self.resident_bytes = plan.resulting_resident_bytes;
         self.encoded_data_size = plan.resulting_encoded_data_size;
+    }
+
+    fn remember_record_layout(&mut self, path: Vec<u32>, layout: RecordLayoutCache) {
+        // Cache only bounded, ordered layouts. This is optional compression scratch, never
+        // archive metadata; allocation failure simply leaves the ordinary lookup path in use.
+        const MAX_RECENT: usize = 8;
+        const MAX_BYTES_PER_LAYOUT: usize = 8192;
+        if path.capacity().saturating_mul(size_of::<u32>())
+            .saturating_add(layout.sorted_to_traversal.capacity().saturating_mul(size_of::<usize>())) > MAX_BYTES_PER_LAYOUT
+            || layout.entry_count != layout.ordered_entry_count {
+            return;
+        }
+        if self.recent_record_layouts.len() == MAX_RECENT {
+            self.recent_record_layouts.remove(0);
+        }
+        if self.recent_record_layouts.try_reserve(1).is_ok() {
+            self.recent_record_layouts.push(RecentRecordLayout { path, layout });
+        }
     }
 
     /// Encodes `/log.dict` as one dictionary per CLP-string field, each with its own IDs, and
@@ -2098,6 +2125,7 @@ struct RecordPlan {
     timestamp_dictionary: TimestampPlan,
     table: TablePlan,
     cached_layout_matched: bool,
+    cached_layout_index: Option<usize>,
     resulting_resident_bytes: u64,
     resulting_encoded_data_size: u64,
     template_uses: Vec<(u32, u64)>,
@@ -2111,6 +2139,12 @@ struct RecordLayoutCache {
     value_count: usize,
     /// Empty when traversal order already is physical column order.
     sorted_to_traversal: SortedValuePositions,
+}
+
+#[derive(Debug)]
+struct RecentRecordLayout {
+    path: Vec<u32>,
+    layout: RecordLayoutCache,
 }
 
 impl RecordPlan {
@@ -2739,6 +2773,7 @@ struct RecordPlanBuilder<'archive, 'record, 'scratch> {
     pending_fields: PendingFields<'record>,
     node_path_position: usize,
     replacement_node_path: Option<Vec<u32>>,
+    cached_layout_index: Option<usize>,
     added_key_bytes: u64,
 }
 
@@ -2781,6 +2816,7 @@ impl<'archive, 'record, 'scratch> RecordPlanBuilder<'archive, 'record, 'scratch>
             pending_fields: PendingFields::new(),
             node_path_position: 0,
             replacement_node_path: None,
+            cached_layout_index: None,
             added_key_bytes: 0,
         })
     }
@@ -2797,10 +2833,21 @@ impl<'archive, 'record, 'scratch> RecordPlanBuilder<'archive, 'record, 'scratch>
             .checked_add(1)
             .ok_or(AppendError::SizeOverflow)?;
         if self.replacement_node_path.is_none()
-            && let Some(&cached_id) = self.archive.node_path_cache.get(path_position)
+            && let Some(&cached_id) = self.cached_node_path().get(path_position)
             && self.cached_node_matches(cached_id, parent, node_type, key)
         {
             return Ok(cached_id);
+        }
+        if self.replacement_node_path.is_none() {
+            let prefix = &self.cached_node_path()[..path_position];
+            if let Some((index, id)) = self.archive.recent_record_layouts.iter().enumerate().find_map(|(index, recent)| {
+                let &id = recent.path.get(path_position)?;
+                (recent.path.get(..path_position) == Some(prefix)
+                    && self.cached_node_matches(id, parent, node_type, key)).then_some((index, id))
+            }) {
+                self.cached_layout_index = Some(index);
+                return Ok(id);
+            }
         }
         self.start_replacement_node_path(path_position)?;
         let id = self.intern_node(parent, node_type, key)?;
@@ -2893,8 +2940,7 @@ impl<'archive, 'record, 'scratch> RecordPlanBuilder<'archive, 'record, 'scratch>
     fn next_cached_key_matches(&self, parent: Option<u32>, key: &[u8]) -> bool {
         self.replacement_node_path.is_none()
             && self
-                .archive
-                .node_path_cache
+                .cached_node_path()
                 .get(self.node_path_position)
                 .and_then(|id| usize::try_from(*id).ok())
                 .and_then(|index| self.archive.tree.nodes.get(index))
@@ -2917,13 +2963,12 @@ impl<'archive, 'record, 'scratch> RecordPlanBuilder<'archive, 'record, 'scratch>
     }
 
     fn cached_record_layout_matches(&self) -> bool {
-        let Some(cache) = self.archive.record_layout_cache.as_ref() else {
+        let Some(cache) = self.cached_layout() else {
             return false;
         };
         if !self.unordered_entries.is_empty()
             || self.replacement_node_path.is_some()
-            || self.node_path_position != self.archive.node_path_cache.len()
-            || self.archive.tables.last_table_index != Some(cache.table_index)
+            || self.node_path_position != self.cached_node_path().len()
             || self.entries.len() != cache.entry_count
             || self.values.len() != cache.value_count
         {
@@ -2967,20 +3012,27 @@ impl<'archive, 'record, 'scratch> RecordPlanBuilder<'archive, 'record, 'scratch>
         true
     }
 
+    fn cached_node_path(&self) -> &'archive [u32] {
+        self.cached_layout_index.map_or(self.archive.node_path_cache.as_slice(),
+            |index| self.archive.recent_record_layouts[index].path.as_slice())
+    }
+
+    fn cached_layout(&self) -> Option<&'archive RecordLayoutCache> {
+        self.cached_layout_index.map_or(self.archive.record_layout_cache.as_ref(),
+            |index| Some(&self.archive.recent_record_layouts[index].layout))
+    }
+
     fn start_replacement_node_path(&mut self, path_position: usize) -> Result<(), AppendError> {
         if self.replacement_node_path.is_some() {
             return Ok(());
         }
-        let capacity = self
-            .archive
-            .node_path_cache
-            .len()
+        let capacity = self.cached_node_path().len()
             .max(self.node_path_position);
         let mut replacement = Vec::new();
         replacement
             .try_reserve_exact(capacity)
             .map_err(|_| append_allocation(AppendResource::SchemaNodes, capacity))?;
-        replacement.extend_from_slice(&self.archive.node_path_cache[..path_position]);
+        replacement.extend_from_slice(&self.cached_node_path()[..path_position]);
         self.replacement_node_path = Some(replacement);
         Ok(())
     }
@@ -3261,13 +3313,13 @@ impl<'archive, 'record, 'scratch> RecordPlanBuilder<'archive, 'record, 'scratch>
             });
         }
         let cached_layout_matches = self.cached_record_layout_matches();
+        let cached_layout = self.cached_layout();
+        let cached_path = self.cached_node_path();
         let ordered_entry_count = self.entries.len();
         let mut sorted_to_traversal = SortedValuePositions::new();
         let table_index = if cached_layout_matches {
             Some(
-                self.archive
-                    .record_layout_cache
-                    .as_ref()
+                cached_layout
                     .expect("a matching record layout cache exists")
                     .table_index,
             )
@@ -3276,10 +3328,7 @@ impl<'archive, 'record, 'scratch> RecordPlanBuilder<'archive, 'record, 'scratch>
         };
         let value_count = self.values.len();
         let value_order = if cached_layout_matches {
-            &self
-                .archive
-                .record_layout_cache
-                .as_ref()
+            &cached_layout
                 .expect("a matching record layout cache exists")
                 .sorted_to_traversal
         } else {
@@ -3348,7 +3397,7 @@ impl<'archive, 'record, 'scratch> RecordPlanBuilder<'archive, 'record, 'scratch>
         )?;
         validate_resulting_archive_shape(self.archive, self.limits, is_new_schema, value_count)?;
         let node_path_cache = resulting_node_path_cache(
-            self.archive,
+            cached_path,
             self.replacement_node_path,
             self.node_path_position,
         )?;
@@ -3356,7 +3405,7 @@ impl<'archive, 'record, 'scratch> RecordPlanBuilder<'archive, 'record, 'scratch>
             None
         } else {
             if cached_layout_matches {
-                sorted_to_traversal = self.archive.record_layout_cache.as_ref().unwrap().sorted_to_traversal.clone();
+                sorted_to_traversal = cached_layout.unwrap().sorted_to_traversal.clone();
             }
             Some(RecordLayoutCache {
                 table_index: table_index.unwrap_or(self.archive.tables.tables.len()),
@@ -3378,6 +3427,7 @@ impl<'archive, 'record, 'scratch> RecordPlanBuilder<'archive, 'record, 'scratch>
             template_uses: dictionaries.template_uses,
             table,
             cached_layout_matched: cached_layout_matches,
+            cached_layout_index: self.cached_layout_index,
             resulting_resident_bytes: sizes.resident_bytes,
             resulting_encoded_data_size: sizes.encoded_data_size,
         })
@@ -3630,18 +3680,18 @@ fn validate_resulting_archive_shape(
 }
 
 fn resulting_node_path_cache(
-    archive: &PrimitiveArchive,
+    cached_path: &[u32],
     replacement: Option<Vec<u32>>,
     path_position: usize,
 ) -> Result<Option<Vec<u32>>, AppendError> {
-    if replacement.is_some() || path_position == archive.node_path_cache.len() {
+    if replacement.is_some() || path_position == cached_path.len() {
         return Ok(replacement);
     }
     let mut replacement = Vec::new();
     replacement
         .try_reserve_exact(path_position)
         .map_err(|_| append_allocation(AppendResource::SchemaNodes, path_position))?;
-    replacement.extend_from_slice(&archive.node_path_cache[..path_position]);
+    replacement.extend_from_slice(&cached_path[..path_position]);
     Ok(Some(replacement))
 }
 
@@ -6643,6 +6693,48 @@ mod tests {
                     .expect("encode cached proof")
             );
         }
+    }
+
+    #[test]
+    fn recent_layouts_match_uncached_bytes_and_reject_duplicate_keys() {
+        let layouts = [
+            vec![RecordEventRef::value(b"a", ValueRef::I64(1)), RecordEventRef::value(b"b", ValueRef::Bool(true))],
+            vec![RecordEventRef::value(b"a", ValueRef::I64(2)), RecordEventRef::object_start(b"nested"),
+                RecordEventRef::value(b"b", ValueRef::String(b"text")), RecordEventRef::ObjectEnd],
+            vec![RecordEventRef::value(b"b", ValueRef::Bool(false)), RecordEventRef::value(b"a", ValueRef::I64(3))],
+            vec![RecordEventRef::value(b"a", ValueRef::String(b"type change")), RecordEventRef::value(b"b", ValueRef::Bool(true))],
+        ];
+        for ordered in [false, true] {
+            let mut cached = PrimitiveArchive::default();
+            let mut reference = PrimitiveArchive::default();
+            let consumed = Rc::new(Cell::new(0));
+            for row in 0..32 {
+                let events = &layouts[row % layouts.len()];
+                cached.try_append_replayable_events(replayable_events(events, &consumed), WriterLimits::DEFAULT, ordered).unwrap();
+                reference.node_path_cache.clear();
+                reference.record_layout_cache = None;
+                reference.recent_record_layouts.clear();
+                reference.append_events(events.iter().copied(), WriterLimits::DEFAULT, ordered).unwrap();
+                if row >= layouts.len() { assert!(cached.last_record_layout_cache_hit, "row {row}"); }
+            }
+            let options = WriterOptions::default().with_log_order(ordered);
+            let before = cached.encode_sections(options).unwrap();
+            assert_eq!(before, reference.encode_sections(options).unwrap());
+            let duplicate = [RecordEventRef::value(b"a", ValueRef::I64(5)), RecordEventRef::value(b"a", ValueRef::I64(6))];
+            assert!(cached.try_append_replayable_events(replayable_events(&duplicate, &consumed), WriterLimits::DEFAULT, ordered).is_err());
+            assert_eq!(before, cached.encode_sections(options).unwrap());
+            assert!(cached.recent_record_layouts.len() <= 8);
+        }
+    }
+
+    #[test]
+    fn recent_layout_cache_is_bounded_when_schemas_keep_changing() {
+        let mut archive = PrimitiveArchive::default();
+        for row in 0..50 {
+            let key = format!("field{row}");
+            archive.append_events([RecordEventRef::value(key.as_bytes(), ValueRef::I64(row))], WriterLimits::DEFAULT, false).unwrap();
+        }
+        assert_eq!(archive.recent_record_layouts.len(), 8);
     }
 
     #[test]
