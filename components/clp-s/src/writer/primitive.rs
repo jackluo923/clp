@@ -5448,6 +5448,31 @@ fn best_candidate(
     Ok(best.map(|(_, candidate)| candidate).unwrap_or_default())
 }
 
+struct SelectedCandidate {
+    payload: Vec<u8>,
+    compressed: Vec<u8>,
+}
+
+/// Grouped numeric frames store the winning payload directly, so retain its compressed bytes.
+/// Selection deliberately uses compressed size (not raw fallback size), matching `best_candidate`.
+fn best_candidate_with_frame(
+    candidates: impl IntoIterator<Item = Vec<u8>>,
+    compressor: &mut zstd::bulk::Compressor<'_>,
+) -> Result<SelectedCandidate, WriterError> {
+    let mut best: Option<SelectedCandidate> = None;
+    let mut compressed = Vec::new();
+    for payload in candidates {
+        compress_into(&payload, compressor, &mut compressed)?;
+        if best.as_ref().is_none_or(|current| compressed.len() < current.compressed.len()) {
+            let mut old = best.take().unwrap_or(SelectedCandidate { payload: Vec::new(), compressed: Vec::new() });
+            old.payload = payload;
+            std::mem::swap(&mut old.compressed, &mut compressed);
+            best = Some(old);
+        }
+    }
+    Ok(best.expect("numeric candidates always include a fallback"))
+}
+
 /// Encodes one CLP-string column adaptively and appends its zstd frame to `out`.
 ///
 /// The column is two runs of 8-byte values: one descriptor per row (log-type ID and where the row's
@@ -5601,6 +5626,7 @@ fn encode_grouped_tables(
                 .map(|chunk| i64::from_le_bytes(*chunk))
                 .collect()
         };
+        let mut selected_frame = None;
         let (encoding, payload) = match node_type {
             NodeType::MixedInteger => {
                 let mut combined = crate::integer::IntegerBuffer::default();
@@ -5611,12 +5637,16 @@ fn encode_grouped_tables(
                         .expect("writer produced valid mixed integers");
                     for value in decoded.iter() { combined.append(value); }
                 }
-                (GroupedFrameEncoding::MixedInteger, best_candidate(combined.candidates_with_effort(options.encoding_effort()), compressor)?)
+                let selected = best_candidate_with_frame(combined.candidates_with_effort(options.encoding_effort()), compressor)?;
+                selected_frame = Some(selected.compressed);
+                (GroupedFrameEncoding::MixedInteger, selected.payload)
             }
-            NodeType::Integer | NodeType::VarString | NodeType::DictionaryFloat => (
-                GroupedFrameEncoding::Integer,
-                best_candidate(adaptive_int::candidates_with_effort(&values(&plain), options.encoding_effort()), compressor)?,
-            ),
+            NodeType::Integer | NodeType::VarString | NodeType::DictionaryFloat => {
+                let selected = best_candidate_with_frame(
+                    adaptive_int::candidates_with_effort(&values(&plain), options.encoding_effort()), compressor)?;
+                selected_frame = Some(selected.compressed);
+                (GroupedFrameEncoding::Integer, selected.payload)
+            }
             NodeType::Float => {
                 let bits: Vec<u64> = plain
                     .as_chunks::<8>()
@@ -5624,10 +5654,12 @@ fn encode_grouped_tables(
                     .iter()
                     .map(|chunk| u64::from_le_bytes(*chunk))
                     .collect();
-                let payload = best_candidate(
+                let selected = best_candidate_with_frame(
                     adaptive_float::candidates_with_effort(&bits, options.encoding_effort()),
                     compressor,
                 )?;
+                let payload = selected.payload;
+                selected_frame = Some(selected.compressed);
                 packed.decimal_floats |= adaptive_float::is_decimal(&payload);
                 (GroupedFrameEncoding::Float, payload)
             }
@@ -5638,13 +5670,17 @@ fn encode_grouped_tables(
             _ => (GroupedFrameEncoding::Plain, plain),
         };
         let start = packed.compressed.len();
-        packed
-            .compressed
-            .extend_from_slice(&column_frame(&payload, compressor, true)?);
+        let payload_len = len_u64(&payload)?;
+        let frame = match selected_frame {
+            Some(frame) if frame.len() < payload.len() => frame,
+            Some(_) => payload,
+            None => column_frame(&payload, compressor, true)?,
+        };
+        packed.compressed.extend_from_slice(&frame);
         frames.push((
             *node_id,
             encoding,
-            len_u64(&payload)?,
+            payload_len,
             usize_u64(packed.compressed.len() - start)?,
         ));
     }
@@ -6735,6 +6771,25 @@ mod tests {
             archive.append_events([RecordEventRef::value(key.as_bytes(), ValueRef::I64(row))], WriterLimits::DEFAULT, false).unwrap();
         }
         assert_eq!(archive.recent_record_layouts.len(), 8);
+    }
+
+    #[test]
+    fn grouped_winner_reuses_exact_frame_and_preserves_ties() {
+        for level in [1, 3, 9] {
+            let mut compressor = zstd::bulk::Compressor::new(level).unwrap();
+            for values in [vec![], vec![7], vec![7; 1000], (0..10000).map(|i| i / 7).collect()] {
+                for effort in [crate::EncodingEffort::Fast, crate::EncodingEffort::Balanced, crate::EncodingEffort::Exhaustive] {
+                    let candidates = || adaptive_int::candidates_with_effort(&values, effort);
+                    let expected = best_candidate(candidates(), &mut compressor).unwrap();
+                    let expected_frame = compressor.compress(&expected).unwrap();
+                    let selected = best_candidate_with_frame(candidates(), &mut compressor).unwrap();
+                    assert_eq!(selected.payload, expected);
+                    assert_eq!(selected.compressed, expected_frame);
+                }
+            }
+            let selected = best_candidate_with_frame([vec![0], vec![1]], &mut compressor).unwrap();
+            assert_eq!(selected.payload, vec![0], "equal compressed sizes retain first candidate");
+        }
     }
 
     #[test]
