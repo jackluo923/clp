@@ -447,6 +447,12 @@ pub fn candidates_with_effort(values: &[i64], effort: EncodingEffort) -> impl It
     candidates_from_stats_with_effort(values, stats, effort)
 }
 
+/// Own the decoded input without retaining all encoded candidates at once.
+pub(crate) fn owned_candidates_with_effort(values: Vec<i64>, effort: EncodingEffort) -> impl Iterator<Item = Vec<u8>> {
+    let stats = (!values.is_empty()).then(|| scan(&values));
+    (0..7).filter_map(move |scheme| candidate_from_stats(&values, stats.as_ref(), scheme, effort))
+}
+
 fn candidates_from_stats<'a>(values: &'a [i64], stats: Option<&'a Stats>) -> impl Iterator<Item = Vec<u8>> + 'a {
     (0..7).filter_map(move |scheme| candidate_from_stats(values, stats, scheme, EncodingEffort::Balanced))
 }

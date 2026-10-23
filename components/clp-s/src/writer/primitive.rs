@@ -5266,22 +5266,24 @@ fn write_best_scheme(
     let mut best: Option<Vec<u8>> = None;
     let mut best_uncompressed = 0_usize;
     let mut best_scheme = None;
+    let mut compressed = Vec::new();
     for candidate in candidates {
         let uncompressed = candidate.len();
         let scheme = candidate.first().copied();
-        let compressed = compressor.compress(&candidate).map_err(WriterError::Io)?;
-        // We already own this candidate: a raw winner can be moved instead of copied.
-        let frame = if raw_frames && compressed.len() >= uncompressed {
-            candidate
-        } else {
-            compressed
-        };
+        compress_into(&candidate, compressor, &mut compressed)?;
+        let raw = raw_frames && compressed.len() >= uncompressed;
+        let size = if raw { uncompressed } else { compressed.len() };
         let better = match &best {
             None => true,
-            Some(current) => frame.len() < current.len(),
+            Some(current) => size < current.len(),
         };
         if better {
-            best = Some(frame);
+            if raw {
+                best = Some(candidate);
+            } else {
+                // Reuse the previous winner's allocation for the next compression trial.
+                std::mem::swap(best.get_or_insert_with(Vec::new), &mut compressed);
+            }
             best_uncompressed = uncompressed;
             best_scheme = scheme;
         }
@@ -5289,6 +5291,20 @@ fn write_best_scheme(
     let frame = best.expect("candidates is never empty");
     out.extend_from_slice(&frame);
     Ok((usize_u64(best_uncompressed)?, best_scheme))
+}
+
+/// Keep a compression output allocation across candidate trials. Context parameters and input
+/// bytes are identical to `Compressor::compress`; only the destination buffer is recycled.
+fn compress_into(
+    input: &[u8],
+    compressor: &mut zstd::bulk::Compressor<'_>,
+    output: &mut Vec<u8>,
+) -> Result<(), WriterError> {
+    output.clear();
+    let bound = zstd::zstd_safe::compress_bound(input.len());
+    output.try_reserve(bound).map_err(|_| WriterError::AllocationFailed { requested: bound })?;
+    compressor.compress_to_buffer(input, output).map_err(WriterError::Io)?;
+    Ok(())
 }
 
 /// One column's stored frame: its zstd frame, or with `raw_frames` the column itself when zstd
@@ -5371,11 +5387,10 @@ fn best_candidate(
     compressor: &mut zstd::bulk::Compressor<'_>,
 ) -> Result<Vec<u8>, WriterError> {
     let mut best: Option<(usize, Vec<u8>)> = None;
+    let mut compressed = Vec::new();
     for candidate in candidates {
-        let size = compressor
-            .compress(&candidate)
-            .map_err(WriterError::Io)?
-            .len();
+        compress_into(&candidate, compressor, &mut compressed)?;
+        let size = compressed.len();
         if best.as_ref().is_none_or(|(best_size, _)| size < *best_size) {
             best = Some((size, candidate));
         }

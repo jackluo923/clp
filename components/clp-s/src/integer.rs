@@ -89,24 +89,21 @@ impl IntegerBuffer {
     }
     #[cfg(test)]
     pub(crate) fn candidates(&self) -> Vec<Vec<u8>> {
-        self.candidates_with_effort(crate::EncodingEffort::Balanced)
+        self.candidates_with_effort(crate::EncodingEffort::Balanced).collect()
     }
-    pub(crate) fn candidates_with_effort(&self, effort: crate::EncodingEffort) -> Vec<Vec<u8>> {
+    pub(crate) fn candidates_with_effort(&self, effort: crate::EncodingEffort) -> impl Iterator<Item = Vec<u8>> + '_ {
         let values: Vec<i64> = self
             .bits
             .chunks_exact(8)
             .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
             .collect();
-        adaptive_int::candidates_with_effort(&values, effort)
-            .into_iter()
-            .map(|payload| {
-                let mut raw = Vec::with_capacity(1 + payload.len() + self.bitmap.len());
-                raw.push(u8::from(!self.bitmap.is_empty()));
-                raw.extend_from_slice(&payload);
-                raw.extend_from_slice(&self.bitmap);
-                raw
+        adaptive_int::owned_candidates_with_effort(values, effort)
+            .map(|mut payload| {
+                payload.reserve(1 + self.bitmap.len());
+                payload.insert(0, u8::from(!self.bitmap.is_empty()));
+                payload.extend_from_slice(&self.bitmap);
+                payload
             })
-            .collect()
     }
 }
 
@@ -226,6 +223,27 @@ impl<'a> MixedIntegerColumn<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lazy_candidates_preserve_eager_bytes_and_order_at_every_effort() {
+        for count in [0, 1, 9, crate::delta_blocks::ROWS + 3] {
+            let mut buffer = IntegerBuffer::default();
+            let values: Vec<_> = (0..count).map(|row| {
+                if row % 13 == 0 { IntegerValue::Unsigned(u64::MAX - row as u64) }
+                else { IntegerValue::Signed(row as i64 / 7 - 100) }
+            }).collect();
+            for &value in &values { buffer.append(value); }
+            let bits: Vec<_> = values.iter().map(|v| v.bits() as i64).collect();
+            for effort in [crate::EncodingEffort::Fast, crate::EncodingEffort::Balanced, crate::EncodingEffort::Exhaustive] {
+                let expected: Vec<_> = adaptive_int::candidates_with_effort(&bits, effort).map(|payload| {
+                    let mut bytes = vec![u8::from(!buffer.bitmap.is_empty())];
+                    bytes.extend_from_slice(&payload);
+                    bytes.extend_from_slice(&buffer.bitmap);
+                    bytes
+                }).collect();
+                assert_eq!(buffer.candidates_with_effort(effort).collect::<Vec<_>>(), expected);
+            }
+        }
+    }
     #[test]
     fn optional_bitmap_and_all_adaptive_candidates_roundtrip() {
         for count in [1_usize, 7, 8, 9, 65, 257] {
