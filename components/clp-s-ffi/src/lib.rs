@@ -3722,3 +3722,4 @@ mod tests {
 mod numeric_aggregate;
 
 mod timestamp_summary;
+mod schema_discovery;

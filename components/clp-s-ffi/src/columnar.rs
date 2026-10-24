@@ -273,7 +273,7 @@ pub fn archive_field_types(tree: &SchemaTree) -> Vec<ArchiveFieldType> {
 /// A backslash escapes the following character, so a key containing a literal dot survives the
 /// split, and `\uXXXX` names a character by its code, as a search projection's descriptor may;
 /// `_shape` writes a comma this way.
-fn split_descriptor(source: &str) -> Vec<String> {
+pub(crate) fn split_descriptor(source: &str) -> Vec<String> {
     let mut components = Vec::new();
     let mut current = String::new();
     let mut characters = source.chars();

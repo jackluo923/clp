@@ -1089,6 +1089,47 @@ clp_s_status clp_s_v6_numeric_aggregate(
     uint32_t (*cancel)(void *), void *context, clp_s_v5_numeric_summary_result *out,
     clp_s_error_buffer *error);
 
+/** Schema discovery: queryable dot-path inventories for physical schema tables.
+ * Arrays are terminal containers. Callbacks borrow fields only for their duration.
+ * Window bounds are [lower, upper). Numeric windows admit ordinary signed integers;
+ * timestamp windows use epoch nanoseconds for explicitly tagged timestamp fields.
+ * Field names are exact, or SQL LIKE (%/_, case sensitive, no escape clause).
+ * Matching schemas return every queryable field, including null and object nodes.
+ * This is synchronous; inputs/callbacks/context must remain live throughout the call.
+ * Returns errors/cancellation rather than successful partial results.
+ */
+typedef struct clp_s_v8_schema_selector {
+    uint8_t const *path;
+    size_t length;
+    uint32_t pattern;
+} clp_s_v8_schema_selector;
+typedef struct clp_s_v8_schema_options {
+    clp_s_v8_schema_selector const *selectors;
+    size_t selector_count;
+    uint32_t match_all, time_kind; /* time_kind: 0=no window, 1=timestamp, 2=integer */
+    uint8_t const *time_path;
+    size_t time_path_length;
+    uint32_t bounds; /* bit 0=lower supplied, bit 1=upper supplied */
+    int64_t lower, upper;
+    uint64_t max_compressed, max_decompressed; /* zero selects default */
+} clp_s_v8_schema_options;
+typedef struct clp_s_v8_schema_field {
+    uint8_t const *path;
+    size_t path_length;
+    uint8_t const *type;
+    size_t type_length;
+} clp_s_v8_schema_field;
+typedef struct clp_s_v8_schema {
+    clp_s_v8_schema_field const *fields;
+    size_t field_count;
+    uint64_t matching_rows, total_rows;
+    uint32_t scanned;
+} clp_s_v8_schema;
+clp_s_status clp_s_v8_discover_schemas(
+    uint8_t const *path, size_t path_length, clp_s_v8_schema_options const *options,
+    uint32_t (*emit)(void *, clp_s_v8_schema const *), uint32_t (*cancel)(void *),
+    void *context, clp_s_error_buffer *error);
+
 #ifdef __cplusplus
 }
 #endif
