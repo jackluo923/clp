@@ -5,6 +5,8 @@ This document covers only the `clp-s` executable and the library that will repla
 It does not authorize changes to the `clp`, `glt`, or web UI products.
 :::
 
+**Scope on `jackluo923/separate-columns`:** this document records the original C++ 0.5.0 interoperability contract and migration evidence. The current branch deliberately extends that baseline: default archives use newer formats, currently 0.15, and require a matching Rust reader. Per-field native timestamp precision, `auto`, and rounding are described in the [current CLI guide](../user-docs/core-clp-s.md#rust-timestamp-field-options). Statements below about byte-identical C++ output or nanosecond timestamp columns apply to the historical reference configurations, not every current writer mode.
+
 This document defines the compatibility boundary for replacing the C++ implementation of `clp-s`
 with a library-first Rust implementation. It is intentionally stricter than a feature list: it
 separates behavior that downstream systems already rely on from incidental behavior that must be

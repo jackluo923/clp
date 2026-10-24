@@ -3,6 +3,8 @@
 For JSON logs, you can compress, decompress, and search them using the `clp-s` binary described
 below.
 
+This branch documents the Rust CLI on `jackluo923/separate-columns`. Its default archive format and timestamp options extend the original C++ implementation. The [0.5.0 format specification](../dev-docs/design-clp-s-archive-format.md) and [compatibility contract](../dev-docs/design-clp-s-rust-compatibility.md) describe the historical interoperability baseline, not the current default writer. Native timestamp precision is implemented in `14f0ba55`; later ISO parsing work in `2f3bb80d` preserves its semantics. Check `clp-s c --help` and the binary's build provenance before applying these examples to an older distribution.
+
 ## Compression
 
 Usage:
@@ -20,14 +22,12 @@ Usage:
 * `options` allow you to specify how data gets compressed into an archive. For example:
   * `--single-file-archive` specifies that single-file archives should be produced (i.e., each
     archive is a single file in `archives-dir`).
-  * `--timestamp-key <field-path>` specifies which field should be treated as each log event's
-    timestamp.
+  * `--timestamp-key 'field:precision=ms'` declares integer epoch milliseconds. Text dates can use `precision=auto`; custom ticks and rounding are described below. Repeat the option for additional fields. With no precision override, numeric inputs count nanoseconds.
   * `--target-encoded-size <size>` specifies the threshold (in bytes) at which archives are split,
     where `size` is the total size of the dictionaries and encoded messages in an archive.
     * This option acts as a soft limit on memory usage for compression, decompression, and search.
     * This option significantly affects compression ratio.
-  * `--structurize-arrays` specifies that arrays should be fully parsed and array entries should be
-    encoded into dedicated columns.
+  * Arrays are structurized into dedicated columns by default. `--no-structurize-arrays` keeps each array as an unstructured value instead.
   * `--encoding-effort fast|balanced|exhaustive` controls how many adaptive integer and float
     encodings are tried before Zstd. The default is `balanced`, independently of the Zstd
     `--compression-level` setting. All three efforts preserve numeric values exactly.
@@ -53,12 +53,11 @@ For a complete list of options, run `./clp-s c --help`.
 **Treat the field `{"d": {"@timestamp": "..."}}` as each log event's timestamp:**
 
 ```shell
-./clp-s c --timestamp-key 'd.@timestamp' /mnt/data/archives1 /mnt/logs/log1.json
+./clp-s c --timestamp-key 'd.@timestamp:precision=auto' /mnt/data/archives1 /mnt/logs/log1.json
 ```
 
 :::{tip}
-Specifying the timestamp-key will create a range-index for the timestamp column which can increase
-compression ratio and search performance.
+Declaring a timestamp field creates timestamp range metadata; the default numeric-summary configuration also records chunk min/max indexes. These can accelerate time filtering. Compression savings depend on the data and selected precision; keep relative device clocks as ordinary integers.
 :::
 
 **Compress a KV-IR file stored on S3 into a single-file archive:**
@@ -108,7 +107,7 @@ Declare `--timestamp-key` only for **absolute Unix epoch timestamps or text date
 The public option is **`precision=`**. Repeat `--timestamp-key` for multiple fields; it is not a CSV list:
 
 ```bash
-"$CLP" c --single-file-archive \
+./clp-s c --single-file-archive \
   --timestamp-key 'event_time:precision=ms' \
   --timestamp-key 'received_at:precision=100us:rounding=nearest' \
   archives input.ndjson
@@ -139,7 +138,7 @@ Each field stores native integer ticks and precision metadata. Supported timesta
 Paths use dotted syntax: `\.` is a literal dot, `\u003a` a literal colon, and `\@timestamp` the literal JSON key `@timestamp`. An unescaped leading `@` selects KV-IR's auto-generated namespace instead:
 
 ```bash
-"$CLP" c --timestamp-key '\@timestamp:precision=auto' archives elasticsearch.ndjson
+./clp-s c --timestamp-key '\@timestamp:precision=auto' archives elasticsearch.ndjson
 ```
 
 The old compression spellings `unit=` and `--timestamp-unit` are rejected. There is no separate input-unit, increment, or storage-factor option. The DuckDB query wrapper's `--timestamp-unit` remains a separate registration hint. CLI time-only `--tge`/`--tle` bounds remain epoch milliseconds; explicit numeric KQL bounds on indexed timestamp fields use epoch nanoseconds.
@@ -184,16 +183,18 @@ Usage:
 
 ### Examples
 
-**Find all log events within a time range:**
+**Find all log events within a time range on the declared timestamp field:**
 
 ```shell
-./clp-s s /mnt/data/archives1 'ts >= 1649923037 AND ts <= 1649923038'
+./clp-s s --tge 1649923037000 --tle 1649923038000 /mnt/data/archives1 '*'
 ```
 or
 ```shell
 ./clp-s s /mnt/data/archives1 \
-    'ts >= date("2022-04-14T07:57:17") AND ts <= date("2022-04-14T07:57:18")'
+    'ts >= 1649923037000000000 AND ts <= 1649923038000000000'
 ```
+
+CLI `--tge` and `--tle` are inclusive epoch-millisecond bounds on the first configured timestamp field present in the archive. Explicit numeric KQL predicates on a tagged timestamp use epoch nanoseconds, irrespective of native storage ticks. An ordinary integer field instead compares its original values. DuckDB BIGINT mappings also retain source units; native `TIMESTAMP_NS` mappings query instants using SQL timestamp literals.
 
 **Find log events with a given key-value pair:**
 
@@ -218,8 +219,8 @@ compressed data:**
 
 * `clp-s` currently only supports *valid* JSON logs; it does not handle JSON logs with trailing
   commas or other JSON syntax errors.
-* Time zone information is not preserved.
-* The order of log events is not preserved.
+* Supported timestamp strings retain their source format and timezone label/offset. Choosing a coarser precision deliberately changes their fractional value; invalid or ambiguous timestamps fail compression.
+* Default extraction and search do not promise original event order. Use `clp-s x --ordered` when the archive retains its log-order column. Archives created with `--disable-log-order` or `--no-log-order-column` cannot restore global original order.
 * The input directory structure is not preserved and during decompression all files are written to
   the same file.
 * In addition, there are a few limitations, related to querying arrays, described in the search

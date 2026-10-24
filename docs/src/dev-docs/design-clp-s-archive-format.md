@@ -6,6 +6,8 @@ It is a migration prerequisite for the Rust rewrite, not a proposal for an incom
 The C++ executable and committed golden archives remain the interoperability oracle.
 :::
 
+**Scope on `jackluo923/separate-columns`:** the specification below is the historical C++ 0.5.0 layout. The current Rust default writer emits newer formats, currently 0.15, with native timestamp ticks and other extensions. It does not store every timestamp in nanosecond columns. See the [current timestamp field options](../user-docs/core-clp-s.md#rust-timestamp-field-options) and `components/clp-s/src/archive/format.rs` for the supported version lines. The historical wire details and measurements below are unchanged.
+
 This document describes both CLP-S archive containers:
 
 * a directory containing a header and one file per logical section; and
