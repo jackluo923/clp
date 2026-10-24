@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -22,6 +23,7 @@
 #include <clp_s/DictionaryWriter.hpp>
 #include <clp_s/ParsedMessage.hpp>
 #include <clp_s/RangeIndexWriter.hpp>
+#include <clp_s/RecordLayoutCache.hpp>
 #include <clp_s/Schema.hpp>
 #include <clp_s/SchemaMap.hpp>
 #include <clp_s/SchemaTree.hpp>
@@ -180,6 +182,15 @@ public:
      * @param message
      */
     void append_message(int32_t schema_id, Schema const& schema, ParsedMessage& message);
+
+    auto begin_json_record() -> void { m_record_layout_cache.begin_record(); }
+
+    /** Resolves an ERT and its value order, reusing a fully matched JSON record layout. */
+    auto append_json_record(
+            std::span<int32_t const> ordered_nodes,
+            Schema& unordered_schema,
+            ParsedMessage& message
+    ) -> void;
 
     /**
      * Adds a node to the schema tree and attempts to resolve the node against the authoritative
@@ -470,6 +481,7 @@ private:
 
     SchemaMap m_schema_map;
     SchemaTree m_schema_tree;
+    RecordLayoutCache m_record_layout_cache;
 
     std::map<int32_t, std::unique_ptr<SchemaWriter>> m_id_to_schema_writer;
 

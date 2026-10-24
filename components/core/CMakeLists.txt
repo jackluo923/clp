@@ -682,6 +682,7 @@ set(SOURCE_FILES_unitTest
         tests/test-ClppShapeDecomposer.cpp
         tests/test-ClppShapeQueryMatcher.cpp
         tests/test-AdaptiveColumn.cpp
+        tests/test-RecordLayoutCache.cpp
         tests/test-NumericColumnView.cpp
         tests/test-SelectiveDictionaryReads.cpp
         tests/test-OutputColumnReads.cpp

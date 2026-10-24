@@ -20,10 +20,18 @@ void SchemaWriter::append_column(int32_t node_id, std::unique_ptr<BaseColumnWrit
 }
 
 size_t SchemaWriter::append_message(ParsedMessage& message) {
-    int count{};
+    message.sort_content();
+    return append_message(message, {});
+}
+
+auto SchemaWriter::append_message(ParsedMessage& message, std::span<size_t const> value_order)
+        -> size_t {
+    size_t count{};
     size_t total_size{};
-    for (auto& i : message.get_content()) {
-        total_size += m_columns[count]->add_value(i.second);
+    auto& values{message.get_content()};
+    for (size_t i{0}; i < values.size(); ++i) {
+        auto const position{value_order.empty() ? i : value_order[i]};
+        total_size += m_columns[count]->add_value(values[position].second);
         ++count;
     }
 
@@ -55,14 +63,16 @@ auto SchemaWriter::has_adaptive_columns(SchemaTree const& tree, bool dictionary)
 auto SchemaWriter::store_separate(
         FileWriter& file,
         ZSTD_CCtx& context,
+        CompressionBuffers& buffers,
         int level,
         SchemaTree const& tree,
         bool adaptive,
         bool adaptive_dictionary
 ) -> std::vector<ColumnFrame> {
     std::vector<ColumnFrame> frames;
-    std::vector<char> raw;
-    std::vector<char> compressed;
+    auto& raw{buffers.raw};
+    auto& compressed{buffers.compressed};
+    frames.reserve(m_columns.size());
     for (size_t i{0}; i < m_columns.size(); ++i) {
         raw.clear();
         m_columns[i]->store(raw);
@@ -75,12 +85,13 @@ auto SchemaWriter::store_separate(
             || (adaptive_dictionary
                 && (type == NodeType::VarString || type == NodeType::DictionaryFloat)))
         {
-            auto frame{adaptive_column::encode(
+            auto const& frame{adaptive_column::encode(
                     raw,
                     type == NodeType::Float ? adaptive_column::Type::Float
                                             : adaptive_column::Type::Integer,
                     context,
-                    level
+                    level,
+                    buffers.adaptive
             )};
             file.write(frame.compressed.data(), frame.compressed.size());
             frames.push_back({frame.uncompressed_size, frame.compressed.size()});

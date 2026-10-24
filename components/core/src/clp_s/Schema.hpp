@@ -256,6 +256,9 @@ public:
      */
     auto insert_ordered(SchemaNode::id_t mst_node_id) -> void;
 
+    /** Inserts a record's ordered nodes in one batch, preserving any unordered objects. */
+    auto insert_ordered(std::span<SchemaNode::id_t const> node_ids) -> void;
+
     /**
      * Inserts a node into the unordered region of the schema.
      */

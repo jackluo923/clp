@@ -203,6 +203,7 @@ auto ArchiveWriter::close(std::optional<std::string_view> parsing_spec_str, bool
         std::cout << std::flush;
     }
 
+    m_record_layout_cache.clear();
     m_id_to_schema_writer.clear();
     m_schema_tree.clear();
     m_schema_map.clear();
@@ -345,9 +346,46 @@ ArchiveWriter::append_message(int32_t schema_id, Schema const& schema, ParsedMes
     ++m_next_log_event_id;
 }
 
+auto ArchiveWriter::append_json_record(
+        std::span<int32_t const> ordered_nodes,
+        Schema& unordered_schema,
+        ParsedMessage& message
+) -> void {
+    auto const unordered_value_count{message.get_unordered_content().size()};
+    auto const* layout{m_record_layout_cache.find(
+            ordered_nodes,
+            {unordered_schema.data(), unordered_schema.size()},
+            message,
+            unordered_value_count
+    )};
+    m_record_layout_cache.end_record();
+    if (layout != nullptr) {
+        message.set_id(layout->schema_id);
+        m_encoded_message_size += m_id_to_schema_writer.at(layout->schema_id)
+                                          ->append_message(message, layout->value_order);
+        ++m_next_log_event_id;
+        return;
+    }
+    // Keep unordered object delimiters and string shape IDs intact while sorting the ordered
+    // region once. The cache remembers the traversal order before the values are sorted.
+    unordered_schema.insert_ordered(ordered_nodes);
+    auto const schema_id{add_schema(unordered_schema)};
+    m_record_layout_cache.remember(
+            schema_id,
+            ordered_nodes,
+            std::span<int32_t const>{unordered_schema.data(), unordered_schema.size()}.subspan(
+                    unordered_schema.get_num_ordered()
+            ),
+            message,
+            unordered_value_count
+    );
+    message.set_id(schema_id);
+    append_message(schema_id, unordered_schema, message);
+}
+
 SchemaNode::id_t
 ArchiveWriter::add_node(SchemaNode::id_t parent_node_id, NodeType type, std::string_view key) {
-    auto const node_id{m_schema_tree.add_node(parent_node_id, type, key)};
+    auto const node_id{m_record_layout_cache.add_node(m_schema_tree, parent_node_id, type, key)};
     if (NodeType::Object == type && m_matched_timestamp_prefix_node_id == parent_node_id) {
         if (false == m_authoritative_timestamp.empty() && constants::cRootNodeId == parent_node_id)
         {
@@ -510,6 +548,7 @@ std::pair<size_t, size_t> ArchiveWriter::store_tables() {
     std::sort(schemas.begin(), schemas.end(), comp);
 
     std::vector<std::pair<uint64_t, std::vector<SchemaWriter::ColumnFrame>>> separate;
+    SchemaWriter::CompressionBuffers compression_buffers;
     std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)> context{ZSTD_createCCtx(), ZSTD_freeCCtx};
     if (!context) {
         throw std::bad_alloc{};
@@ -540,6 +579,7 @@ std::pair<size_t, size_t> ArchiveWriter::store_tables() {
             auto frames{table.store_separate(
                     m_tables_file_writer,
                     *context,
+                    compression_buffers,
                     m_compression_level,
                     m_schema_tree,
                     m_adaptive_numeric_columns,

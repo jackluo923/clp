@@ -1,9 +1,9 @@
 #ifndef CLP_S_PARSEDMESSAGE_HPP
 #define CLP_S_PARSEDMESSAGE_HPP
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <map>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -29,6 +29,7 @@ public:
                     bool,
                     std::pair<epochtime_t, uint64_t>,
                     std::pair<double, float_format_t>>;
+    using Content = std::vector<std::pair<int32_t, variable_t>>;
 
     // Methods
     auto set_id(int32_t schema_id) -> void { m_schema_id = schema_id; }
@@ -41,11 +42,11 @@ public:
      */
     template <typename T>
     auto add_value(int32_t node_id, T const& value) -> void {
-        m_message.emplace(node_id, value);
+        m_message.emplace_back(node_id, value);
     }
 
     auto add_value(int32_t node_id, std::string_view value) -> void {
-        m_message.emplace(node_id, std::string{value});
+        m_message.emplace_back(node_id, std::string{value});
     }
 
     /**
@@ -55,7 +56,7 @@ public:
      * @param format
      */
     auto add_value(int32_t node_id, double value, float_format_t format) -> void {
-        m_message.emplace(node_id, std::make_pair(value, format));
+        m_message.emplace_back(node_id, std::make_pair(value, format));
     }
 
     /**
@@ -93,9 +94,26 @@ public:
     }
 
     /**
-     * @return The content of the message
+     * Sorts values by node ID, retaining the first value for duplicate IDs as the map-based
+     * implementation did. Cached layouts use the insertion order directly instead.
      */
-    auto get_content() -> std::map<int32_t, variable_t>& { return m_message; }
+    auto sort_content() -> void {
+        auto less = [](auto const& lhs, auto const& rhs) { return lhs.first < rhs.first; };
+        if (false == std::ranges::is_sorted(m_message, less)) {
+            std::stable_sort(m_message.begin(), m_message.end(), less);
+        }
+        auto const duplicates{std::unique(
+                m_message.begin(),
+                m_message.end(),
+                [](auto const& lhs, auto const& rhs) { return lhs.first == rhs.first; }
+        )};
+        m_message.erase(duplicates, m_message.end());
+    }
+
+    /** Values retain insertion order until sort_content is called. */
+    [[nodiscard]] auto get_content() -> Content& { return m_message; }
+
+    [[nodiscard]] auto get_content() const -> Content const& { return m_message; }
 
     /**
      * @return the unordered content of the message
@@ -105,7 +123,7 @@ public:
 private:
     // Variables
     int32_t m_schema_id{-1};
-    std::map<int32_t, variable_t> m_message;
+    Content m_message;
     std::vector<variable_t> m_unordered_message;
 };
 }  // namespace clp_s

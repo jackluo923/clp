@@ -182,6 +182,9 @@ public:
         return m_nodes[id];
     }
 
+    /** Records another occurrence of a node whose identity was checked by a layout cache. */
+    auto record_node_occurrence(SchemaNode::id_t id) -> void { m_nodes.at(id).increase_count(); }
+
     /**
      * Gets the root of the object sub-tree within a namespace.
      * @param subtree_namespace

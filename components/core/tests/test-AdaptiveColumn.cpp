@@ -178,6 +178,42 @@ TEST_CASE("Adaptive columns preserve integer and floating point bits", "[Adaptiv
     REQUIRE(decode(encoded, Type::Float, 6) == raw);
 }
 
+TEST_CASE(
+        "Reused adaptive buffers preserve frames across types, sizes and levels",
+        "[AdaptiveColumn]"
+) {
+    std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)> context{ZSTD_createCCtx(), ZSTD_freeCCtx};
+    REQUIRE(context != nullptr);
+    EncodingBuffers buffers;
+    std::mt19937_64 random{123};
+    for (auto level : {1, 3, 9}) {
+        for (auto count : {4096, 0, 1, 1000, 2, 8192, 7}) {
+            for (auto type : {Type::Float, Type::Integer}) {
+                for (auto constant : {false, true}) {
+                    std::vector<uint64_t> values(count, 42);
+                    if (false == constant) {
+                        std::ranges::generate(values, [&]() { return random(); });
+                    }
+                    auto const raw{bytes(values)};
+                    auto const expected{encode(raw, type, *context, level)};
+                    auto const& actual{encode(raw, type, *context, level, buffers)};
+                    REQUIRE(actual.uncompressed_size == expected.uncompressed_size);
+                    REQUIRE(actual.compressed == expected.compressed);
+                    Bytes encoded(actual.uncompressed_size);
+                    REQUIRE(ZSTD_decompress(
+                                    encoded.data(),
+                                    encoded.size(),
+                                    actual.compressed.data(),
+                                    actual.compressed.size()
+                            )
+                            == encoded.size());
+                    REQUIRE(decode(encoded, type, values.size()) == raw);
+                }
+            }
+        }
+    }
+}
+
 TEST_CASE("Dictionary membership is exact for small dense and sparse sets", "[DictionaryIdSet]") {
     for (size_t count : {0U, 1U, 4U, 5U, 100U, 1000U}) {
         for (int64_t stride : {1, 3, 1'000'000}) {

@@ -312,6 +312,8 @@ set(
         JsonParser.cpp
         JsonParser.hpp
         ParsedMessage.hpp
+        RecordLayoutCache.cpp
+        RecordLayoutCache.hpp
         RangeIndexWriter.cpp
         RangeIndexWriter.hpp
         ReaderUtils.cpp

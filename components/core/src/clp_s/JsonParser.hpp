@@ -278,6 +278,7 @@ private:
 
     Schema m_current_schema;
     ParsedMessage m_current_parsed_message;
+    std::vector<int32_t> m_ordered_schema_nodes;
 
     std::string m_timestamp_key;
     std::vector<std::string> m_timestamp_column;

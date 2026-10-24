@@ -3,9 +3,11 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <utility>
 #include <vector>
 
+#include "AdaptiveColumn.hpp"
 #include "ColumnValueFilter.hpp"
 #include "ColumnWriter.hpp"
 #include "FileWriter.hpp"
@@ -43,6 +45,9 @@ public:
      */
     size_t append_message(ParsedMessage& message);
 
+    /** Appends insertion-order values using a previously validated column permutation. */
+    auto append_message(ParsedMessage& message, std::span<size_t const> value_order) -> size_t;
+
     /**
      * Stores the columns to disk.
      * @param compressor
@@ -54,9 +59,16 @@ public:
         uint64_t compressed_size;
     };
 
+    struct CompressionBuffers {
+        std::vector<char> raw;
+        std::vector<char> compressed;
+        adaptive_column::EncodingBuffers adaptive;
+    };
+
     auto store_separate(
             FileWriter& file,
             ZSTD_CCtx& context,
+            CompressionBuffers& buffers,
             int level,
             SchemaTree const& tree,
             bool adaptive,

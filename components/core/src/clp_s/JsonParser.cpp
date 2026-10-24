@@ -592,7 +592,7 @@ void JsonParser::parse_line(
                 auto objref = object_stack.top();
                 auto it = simdjson::ondemand::object_iterator(objref.begin());
                 if (it == objref.end()) {
-                    m_current_schema.insert_ordered(node_id);
+                    m_ordered_schema_nodes.push_back(node_id);
                     object_stack.pop();
                     break;
                 } else {
@@ -618,7 +618,7 @@ void JsonParser::parse_line(
                             cur_key
                     );
                     m_current_parsed_message.add_value(node_id, value);
-                    m_current_schema.insert_ordered(node_id);
+                    m_ordered_schema_nodes.push_back(node_id);
                 }
                 break;
             }
@@ -702,7 +702,7 @@ void JsonParser::parse_line(
                         m_current_parsed_message.add_value(node_id, double_value);
                     }
                 }
-                m_current_schema.insert_ordered(node_id);
+                m_ordered_schema_nodes.push_back(node_id);
                 break;
             }
             case simdjson::ondemand::json_type::string: {
@@ -721,7 +721,7 @@ void JsonParser::parse_line(
                                     true
                             )
                     );
-                    m_current_schema.insert_ordered(node_id);
+                    m_ordered_schema_nodes.push_back(node_id);
                     break;
                 }
 
@@ -742,13 +742,13 @@ void JsonParser::parse_line(
                                 cur_key
                         );
                         m_current_parsed_message.add_value(node_id, value);
-                        m_current_schema.insert_ordered(node_id);
+                        m_ordered_schema_nodes.push_back(node_id);
                     }
                 } else {
                     node_id = m_archive_writer
                                       ->add_node(node_id_stack.top(), NodeType::VarString, cur_key);
                     m_current_parsed_message.add_value(node_id, value);
-                    m_current_schema.insert_ordered(node_id);
+                    m_ordered_schema_nodes.push_back(node_id);
                 }
                 break;
             }
@@ -757,13 +757,13 @@ void JsonParser::parse_line(
                 node_id = m_archive_writer
                                   ->add_node(node_id_stack.top(), NodeType::Boolean, cur_key);
                 m_current_parsed_message.add_value(node_id, value);
-                m_current_schema.insert_ordered(node_id);
+                m_ordered_schema_nodes.push_back(node_id);
                 break;
             }
             case simdjson::ondemand::json_type::null: {
                 node_id = m_archive_writer
                                   ->add_node(node_id_stack.top(), NodeType::NullValue, cur_key);
-                m_current_schema.insert_ordered(node_id);
+                m_ordered_schema_nodes.push_back(node_id);
                 break;
             }
         }
@@ -968,6 +968,8 @@ auto JsonParser::ingest_json(
 
     while (json_file_iterator.get_json(json_it)) {
         m_current_schema.clear();
+        m_ordered_schema_nodes.clear();
+        m_archive_writer->begin_json_record();
 
         auto ref = *json_it;
         auto is_scalar_result = ref.is_scalar();
@@ -991,7 +993,7 @@ auto JsonParser::ingest_json(
                     log_event_idx_node_id,
                     m_archive_writer->get_next_log_event_id()
             );
-            m_current_schema.insert_ordered(log_event_idx_node_id);
+            m_ordered_schema_nodes.push_back(log_event_idx_node_id);
         }
 
         // Some errors from simdjson are latent until trying to access invalid JSON fields.
@@ -1009,10 +1011,11 @@ auto JsonParser::ingest_json(
             return false;
         }
 
-        int32_t current_schema_id = m_archive_writer->add_schema(m_current_schema);
-        m_current_parsed_message.set_id(current_schema_id);
-        m_archive_writer
-                ->append_message(current_schema_id, m_current_schema, m_current_parsed_message);
+        m_archive_writer->append_json_record(
+                m_ordered_schema_nodes,
+                m_current_schema,
+                m_current_parsed_message
+        );
 
         bytes_consumed_up_to_prev_record = json_file_iterator.get_num_bytes_consumed();
         if (m_archive_writer->get_data_size() >= m_target_encoded_size) {

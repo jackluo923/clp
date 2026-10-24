@@ -6,6 +6,7 @@
 #include <limits>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 
 namespace clp_s::adaptive_column {
 namespace {
@@ -97,13 +98,28 @@ auto unpack(Input& in, size_t count, unsigned width, Emit emit) -> void {
 }  // namespace
 
 auto encode(std::span<char const> values, Type type, ZSTD_CCtx& context, int level) -> Frame {
+    EncodingBuffers buffers;
+    encode(values, type, context, level, buffers);
+    return std::move(buffers.best);
+}
+
+auto encode(
+        std::span<char const> values,
+        Type type,
+        ZSTD_CCtx& context,
+        int level,
+        EncodingBuffers& buffers
+) -> Frame const& {
     if (values.size() % 8 != 0) {
         corrupt();
     }
     size_t const count{values.size() / 8};
-    Frame best;
-    Bytes candidate;
-    Bytes compressed;
+    auto& best{buffers.best};
+    auto& candidate{buffers.candidate};
+    auto& compressed{buffers.compressed};
+    best.compressed.clear();
+    best.uncompressed_size = 0;
+    candidate.clear();
     auto measure = [&]() {
         compressed.resize(ZSTD_compressBound(candidate.size()));
         auto const size{ZSTD_compressCCtx(

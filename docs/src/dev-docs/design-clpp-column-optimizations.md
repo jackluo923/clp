@@ -2,9 +2,11 @@
 
 ## Scope
 
-This port reduces how much data C++ CLP+ stores, reads, and evaluates. It builds on the [CLP+ wildcard optimizations](design-clpp-wildcard-search-implementation.md): search first checks whether integer summaries rule out every candidate encoded record table (ERT), then loads the dictionaries needed to prepare any remaining query. It rejects ERTs that cannot match, counts an ERT directly when metadata proves every row matches, and reads the required columns from the remaining ERTs. Adaptive encodings reduce column sizes and let eligible predicates run without expanding every value.
+This port reduces the work C++ CLP+ performs during ingestion and how much data it stores, reads, and evaluates. Recurring JSON layouts reuse field lookups and column ordering, while compression buffers are reused across columns and ERTs.
 
-The ports draw on [`jackluo923/separate-columns` through `75367842`](https://github.com/jackluo923/clp/tree/75367842). The implementation reuses the Rust numeric payload layouts and adapts its ERT range proofs to existing C++ integer summaries, while retaining the C++ query evaluator, parsing integration, and reconstruction behavior. Dictionary-ID codecs use a separately versioned C++ archive extension; this does not add support for current Rust archives.
+It builds on the [CLP+ wildcard optimizations](design-clpp-wildcard-search-implementation.md): search first checks whether integer summaries rule out every candidate encoded record table (ERT), then loads the dictionaries needed to prepare any remaining query. It rejects ERTs that cannot match, counts an ERT directly when metadata proves every row matches, and reads the required columns from the remaining ERTs. Adaptive encodings reduce column sizes and let eligible predicates run without expanding every value.
+
+The ports draw on [`jackluo923/separate-columns` through `7a038f26`](https://github.com/jackluo923/clp/tree/7a038f26). The implementation reuses the Rust numeric payload layouts and adapts its ERT range proofs to existing C++ integer summaries, while retaining the C++ query evaluator, parsing integration, and reconstruction behavior. Dictionary-ID codecs use a separately versioned C++ archive extension; this does not add support for current Rust archives.
 
 | Optimization | Rust commits | C++ treatment |
 |---|---|---|
@@ -16,7 +18,10 @@ The ports draw on [`jackluo923/separate-columns` through `75367842`](https://git
 | Reject impossible archives before loading predicate dictionaries | `de53a8f2`, `75367842` | Integer proofs run before dictionary preparation; CLP+ string shape rejection already runs during schema matching |
 | Prepare and reuse dictionary string predicates | `de53a8f2` | Exact-literal matching and query caches already exist; prepared case folding removes per-entry string allocations |
 | Choose numeric encodings by compressed size | `15a57e03` | Ported for integer and double columns |
-| Construct candidates one at a time | `51bbd4e5` | Ported; reuse a Zstd context and candidate buffers rather than retaining all encodings |
+| Construct candidates one at a time and reuse compression buffers | `51bbd4e5`, `b08e9781` | Ported; buffers now persist across columns and ERTs during archive writing |
+| Reuse recurring record layouts | `58f38f24` | Adapted to JSON ingestion, including validation of structured arrays and CLP+ string shape IDs |
+| Retain the winning compressed frame | `0dbfe4f3` | Already handled by the C++ separate-column writer |
+| Reuse timestamp validation and parsed JSON integers | `2f3bb80d`, `7a038f26` | C++ already carries typed integers from simdjson and does not perform the extra timestamp formatting pass |
 | Value-sorted float dictionaries with byte-wide codes | `267fc8d3` | Ported as an additional lossless candidate |
 | Choose an exact dictionary-ID membership representation | `14344bfc` | Ported to variable-string column scans |
 | Scan numeric columns in their encoded representation | `422a9f15`, `db272333`, `0933623e` | Ported for constants, frame-of-reference integers, dictionaries, and runs; includes packed dictionary scans and integer range checks |
@@ -24,6 +29,16 @@ The ports draw on [`jackluo923/separate-columns` through `75367842`](https://git
 | Skip archives outside timestamp bounds | `ae71fdf6` | Already handled by `EvaluateTimestampIndex` |
 | Fuse legacy string-token scanning | `ff72ff6b` | Further porting work; this parser is separate from CLP+'s log-surgeon parsing path |
 | Decimal floats, per-field dictionaries, compact CLP descriptors, binary UUIDs, and timestamp chunk indexes | Other changes on the Rust branch | Further porting work; these formats and execution paths are not introduced here |
+
+## Reusing record layouts during ingestion
+
+Records often repeat the same fields and types, even when several record layouts are interleaved. Resolving their schema and ordering their values again adds work without changing the destination ERT. `RecordLayoutCache` remembers up to eight recent layouts and reuses three parts of ingestion:
+
+- **Field lookup:** compare the next field's parent, name, and type with a cached node. A match reuses its ID and still increments its occurrence count. A mismatch can switch to another cached layout with the same preceding nodes, or use the ordinary schema-tree lookup.
+- **ERT selection:** require the complete node traversal, ordered field sequence, unordered schema, and value layout to match before reusing the ERT ID. The unordered schema includes array delimiters and string shape IDs, so identical field names do not imply identical layouts.
+- **Column ordering:** retain values in a reusable vector in traversal order and apply the cached permutation when appending them to columns. This avoids allocating a map node for each ordered value and sorting those values again. A cache miss builds the ordered schema in one batch; values already in column order bypass sorting, while other values are stably sorted with the first occurrence of a duplicate ID retained.
+
+Each cached layout has an 8 KiB budget for its vector allocations; the current node traversal also stops being cached after 8 KiB. Replacement reuses the evicted layout's allocations. Oversized layouts are not retained. After 16 consecutive misses, cache lookup and replacement pause for 64 records, avoiding repeated work when layouts keep changing; probing then resumes so a later stable phase can benefit. Closing an archive clears the cache before node and ERT IDs can be reused. JSON validation, timestamp parsing, and CLP+ string decomposition still run for every record. The cache checks their results and preserves the archive format and payload bytes. KV-IR retains its existing node mapping; its ordered values also use the reusable vector.
 
 ## Writing smaller numeric columns
 
@@ -35,6 +50,8 @@ For each eligible column, `AdaptiveColumn` compresses the applicable candidates 
 |---|---|
 | Integer | Plain, constant, frame-of-reference offsets from the minimum, first differences, dictionary IDs, and run-length encoding |
 | Double | Plain IEEE-754 bits, constant, byte-stream split, dictionary IDs, and run-length encoding |
+
+The writer retains raw-column, candidate, trial-compression, and winning-frame buffers across columns and ERTs while writing an archive. Each encoding starts with empty logical contents but keeps the previous allocation; the selected frame is written directly. Buffer reuse changes allocation costs without changing candidate selection, tie handling, or compressed bytes. Capacity follows the largest columns seen and is released when archive writing finishes.
 
 Dictionary candidates stop tracking distinct values after 65,536 entries. Float dictionaries also try sorting values and using whole-byte codes, which can make slowly changing sequences easier for Zstd to compress. Float encoding preserves every bit, including signed zero and NaN payloads. Decimal conversion is not used.
 
@@ -201,6 +218,8 @@ Unit coverage includes every numeric wire scheme, signed integer limits, floatin
 Output-read tests make unused frames unreadable, check that required frames are read at most once, and verify incremental dictionary reads across interleaved sections. They cover exact float text, repeated array elements, output timestamps and record indices, CLP+ projections, and corrupted dictionary tails. The `clpp-output-reads.py` harness compares exact result bytes and interleaves baseline and candidate searches over the same archives, including low and high dictionary IDs, narrow projections, zero matches, wildcard predicates, full output, and count controls.
 
 Preflight tests make variable dictionaries, array dictionaries, and record data unreadable for queries that summaries prove impossible. They cover multiple ERTs, AND/OR/NOT, integer limits, fractional comparisons, packed and separate storage, missing summaries, output finalization, and forward-only inputs. Dictionary-matching tests compare results with the previous conversion behavior, including a custom C++ locale. Prepared wildcard tests cover every byte value and randomized patterns with escapes and backtracking.
+
+Record-layout tests cover interleaved fields, reordered keys, changed types and parents, complete-schema matching, string shape changes, missing values, duplicate-value handling, bounded cache storage, recovery after cache misses, and archive resets. Compression-buffer tests alternate column types, sizes, and Zstd levels and compare exact frames with independently allocated encodings.
 
 ### Compression results
 
@@ -384,5 +403,31 @@ python3 components/core/tools/benchmarks/clpp-dictionary-preflight.py \
     --baseline /path/to/baseline/clp-s \
     --candidate /path/to/modified/clp-s \
     --output /path/to/new-results-directory \
+    --repeats 7
+```
+
+### Ingestion with recurring record layouts
+
+The comparison uses C++ commit `b8153100` as the baseline, with both binaries built in the project's manylinux image. Each workload has 50,000 records except the wide-record fixture, which has 2,000 records with 513 fields each. Packed and adaptive runs use the same options for both writers; adaptive runs enable dictionary-ID codecs and a one-byte separate-column threshold. The figures are medians of seven interleaved runs after a warmup, include CLI startup, and use warm caches on a shared host. Validation runs outside the timed region.
+
+| Workload | Packed: baseline → modified | Adaptive: baseline → modified |
+|---|---:|---:|
+| One repeated JSON layout | 106.9 ms → 73.9 ms | 118.0 ms → 85.0 ms |
+| Four interleaved JSON layouts | 133.8 ms → 95.5 ms | 133.9 ms → 94.4 ms |
+| 32 rotating layouts, 25 fields | 125.5 ms → 107.1 ms | 127.9 ms → 106.7 ms |
+| 32 rotating layouts, two fields | 34.0 ms → 34.4 ms | 35.7 ms → 35.7 ms |
+| Wide JSON, 513 fields | 94.5 ms → 68.7 ms | 117.1 ms → 90.7 ms |
+| CLP+ strings and structured arrays | 131.7 ms → 128.1 ms | 135.2 ms → 129.4 ms |
+
+Recurring JSON layouts take about 28–31% less ingestion time. Batched schema construction and reusable value vectors also help records whose layouts exceed the cache's count or size limits. Pausing cache probes after repeated misses keeps the narrow rotating-layout control essentially unchanged. The CLP+ fixture shows a smaller gain; its string decomposition still runs for every record. Measurements cover the combined writer changes.
+
+Every non-header archive section matches byte for byte, including schemas, column frames, dictionaries, and indexes. Headers contain per-run range identities and can differ by a few bytes. Both readers reconstruct identical records from both writers' archives and agree on search counts. The harness also forces repeated archive splits and verifies that node and ERT IDs are resolved correctly after each reset.
+
+```sh
+python3 components/core/tools/benchmarks/clpp-record-layouts.py \
+    --baseline /path/to/baseline/clp-s \
+    --candidate /path/to/modified/clp-s \
+    --output /path/to/new-results-directory \
+    --rows 50000 \
     --repeats 7
 ```

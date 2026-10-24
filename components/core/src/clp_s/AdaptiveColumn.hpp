@@ -20,6 +20,22 @@ struct Frame {
     size_t uncompressed_size{};
 };
 
+/** Retains candidate and compression allocations across columns; no encoded data is shared. */
+struct EncodingBuffers {
+    std::vector<char> candidate;
+    std::vector<char> compressed;
+    Frame best;
+};
+
+/** The returned frame belongs to buffers and is valid until the next call using those buffers. */
+auto encode(
+        std::span<char const> values,
+        Type type,
+        ZSTD_CCtx& context,
+        int level,
+        EncodingBuffers& buffers
+) -> Frame const&;
+
 /** Measures candidates one at a time after Zstd compression; ties retain the first candidate. */
 auto encode(std::span<char const> values, Type type, ZSTD_CCtx& context, int level) -> Frame;
 
