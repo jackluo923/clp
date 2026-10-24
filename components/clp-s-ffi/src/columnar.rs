@@ -53,6 +53,26 @@ use clp_s::timestamp_catalog::TimestampPatternCatalog;
 /// matched rows, not by the whole query's.
 const BATCH_ROWS: usize = 8192;
 
+/// A projected descriptor that materializes the source file a row came from, resolved through the
+/// archive's range index rather than a schema column.
+const FILENAME_DESCRIPTOR: &str = "$_filename";
+
+/// One range-index entry as the scan sees it: the log-event range one source file covers.
+struct FilenameRange {
+    start: u64,
+    end: u64,
+    filename: Option<String>,
+}
+
+/// One member's physical span within a schema table, used when the archive carries no per-row
+/// `log_event_idx` column.
+struct FilenameSpan {
+    schema_id: i32,
+    row_start: u64,
+    row_end: u64,
+    filename: Option<String>,
+}
+
 /// Bytes allowed for one reconstructed CLP string.
 const CLP_SCRATCH_LIMIT: usize = 1024 * 1024;
 
@@ -305,6 +325,14 @@ pub struct ProjectedScanner {
     field_nodes: Vec<Vec<u32>>,
     /// How each requested field is written: its value, or its CLP strings as templates.
     field_shapes: Vec<FieldForm>,
+    /// Which requested fields materialize `$_filename` rather than a schema value.
+    filename_fields: Vec<bool>,
+    /// Log-event ranges with the source file each covers, sorted by start.
+    filename_ranges: Vec<FilenameRange>,
+    /// Physical spans with the source file each covers, sorted by `(schema_id, row_start)`.
+    filename_spans: Vec<FilenameSpan>,
+    /// The log-order column's schema node, when the archive carries one.
+    log_order_node: Option<u32>,
     /// Sorted schema nodes the filter reads, or `None` when they cannot be pinned down.
     filter_nodes: Option<Vec<u32>>,
     /// Sorted schema nodes the scan reads, or `None` to read every column.
@@ -655,14 +683,56 @@ impl ProjectedScanner {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let field_shapes: Vec<FieldForm> = parsed_fields.iter().map(|(_, form)| *form).collect();
+        let filename_fields: Vec<bool> = parsed_fields
+            .iter()
+            .map(|(descriptor, _)| *descriptor == FILENAME_DESCRIPTOR)
+            .collect();
         let field_nodes = parsed_fields
             .iter()
-            .map(|(descriptor, _)| {
+            .zip(&filename_fields)
+            .map(|((descriptor, _), filename)| {
+                if *filename {
+                    return Vec::new();
+                }
                 let components = split_descriptor(descriptor);
                 let borrowed: Vec<&str> = components.iter().map(String::as_str).collect();
                 resolve_path(catalog.schema_tree(), &borrowed)
             })
             .collect::<Vec<_>>();
+        let needs_filename = filename_fields.iter().any(|field| *field);
+        let mut filename_ranges = Vec::new();
+        let mut filename_spans = Vec::new();
+        let mut log_order_node = None;
+        if needs_filename {
+            if let Some(index) = catalog.metadata().range_index() {
+                filename_ranges.reserve(index.entries().len());
+                for entry in index.entries() {
+                    let filename = entry
+                        .field("_filename")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned);
+                    filename_ranges.push(FilenameRange {
+                        start: entry.start_index(),
+                        end: entry.end_index(),
+                        filename: filename.clone(),
+                    });
+                    for span in entry.physical_spans() {
+                        filename_spans.push(FilenameSpan {
+                            schema_id: span.schema_id(),
+                            row_start: span.row_start(),
+                            row_end: span.row_end(),
+                            filename: filename.clone(),
+                        });
+                    }
+                }
+            }
+            filename_ranges.sort_unstable_by_key(|range| range.start);
+            filename_spans.sort_unstable_by_key(|span| (span.schema_id, span.row_start));
+            log_order_node = LogOrderLocator::discover(catalog.schema_tree())
+                .ok()
+                .flatten()
+                .map(|locator| locator.node_id());
+        }
         let mut options = *options;
         // A measurement hook: force the eager load so the two paths can be timed
         // in one binary. Not a supported setting.
@@ -674,6 +744,11 @@ impl ProjectedScanner {
         let wanted_nodes = filter_nodes.as_ref().map(|filter| {
             let mut nodes: Vec<u32> = field_nodes.iter().flatten().copied().collect();
             nodes.extend_from_slice(filter);
+            // Filename-only projections have no field nodes, but the row locator still
+            // needs decoding to map a row to its archive member.
+            if let Some(log_order) = log_order_node {
+                nodes.push(log_order);
+            }
             nodes.sort_unstable();
             nodes.dedup();
             nodes
@@ -786,6 +861,10 @@ impl ProjectedScanner {
             field_count: fields.len(),
             field_nodes,
             field_shapes,
+            filename_fields,
+            filename_ranges,
+            filename_spans,
+            log_order_node,
             filter_nodes,
             wanted_nodes,
             numeric_plans: None,
@@ -901,10 +980,40 @@ impl ProjectedScanner {
                 if plan.is_some_and(|p| !p.fields[field]) { return None; }
                 decoded.table().columns().iter().position(|c| nodes.contains(&c.node_id()))
             }).collect();
+            let filenames: Vec<Option<String>> = if self.filename_fields.iter().any(|field| *field) {
+                let log_order_slot = self.log_order_node.and_then(|node| {
+                    decoded.table().columns().iter().position(|column| column.node_id() == node)
+                });
+                let mut log_order_delta = log_order_slot
+                    .and_then(|index| decoded.table().column(index))
+                    .and_then(|column| ForwardDelta::from_column(column.data()));
+                bitmap
+                    .matching_rows()
+                    .map(|row| {
+                        self.filename_for_row(&decoded, log_order_delta.as_mut(), row)
+                            .map(str::to_owned)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             for (field, slot) in columns.iter().enumerate() {
                 let buffer = &mut self.column_buffers[field];
                 buffer.numeric.clear();
                 buffer.cells.clear();
+                if self.filename_fields.get(field).copied().unwrap_or(false) {
+                    for filename in &filenames {
+                        buffer.cells.push(filename.as_deref().map_or_else(Cell::absent, |name| {
+                            push_text(kind::STRING, name.as_bytes(), &mut self.text)
+                        }));
+                    }
+                    self.column_views.push(ColumnView {
+                        kind: kind::UNSUPPORTED,
+                        reserved: 0,
+                        data: buffer.cells.as_ptr().cast(),
+                    });
+                    continue;
+                }
                 let data = slot.and_then(|i| decoded.table().column(i)).map(|c| c.data());
                 let (kind, bytes, constant) = match data {
                     Some(ColumnData::MixedInteger(values)) if !values.has_large_uint64() => (kind::INTEGER, values.canonical_signed_bytes(), values.signed_constant()),
@@ -1045,7 +1154,8 @@ impl ProjectedScanner {
                     for row in bitmap.matching_rows() {
                         project_row(
                             &decoded, &[*slot], &self.field_shapes[field..field + 1], &mut deltas,
-                            self.catalog.timestamp_patterns(), row, &mut buffer.cells, &mut self.text,
+                            self.catalog.timestamp_patterns(), row, None, &[],
+                            &mut buffer.cells, &mut self.text,
                         )?;
                     }
                     ColumnView { kind: kind::UNSUPPORTED, reserved: 0, data: buffer.cells.as_ptr().cast() }
@@ -1355,6 +1465,11 @@ impl ProjectedScanner {
             let mut wanted: Vec<_> = self.field_nodes.iter().zip(&plan.fields)
                 .filter(|(_, needed)| **needed).flat_map(|(nodes, _)| nodes.iter().copied()).collect();
             if !plan.all_rows { wanted.extend_from_slice(self.filter_nodes.as_deref()?); }
+            // The row locator resolves a row to its archive member; a numeric plan
+            // otherwise never asks for it.
+            if let Some(log_order) = self.log_order_node {
+                wanted.push(log_order);
+            }
             wanted.sort_unstable();
             wanted.dedup();
             return self.column_nodes(stream_id)
@@ -1489,7 +1604,14 @@ impl ProjectedScanner {
                 slot.and_then(|i| decoded.table().column(i))
                     .and_then(|c| ForwardDelta::from_column(c.data()))
             }).collect();
+            let log_order_slot = self.log_order_node.and_then(|node| {
+                decoded.table().columns().iter().position(|column| column.node_id() == node)
+            });
+            let mut log_order_delta = log_order_slot
+                .and_then(|index| decoded.table().column(index))
+                .and_then(|column| ForwardDelta::from_column(column.data()));
             for row in bitmap.matching_rows() {
+                let filename = self.filename_for_row(&decoded, log_order_delta.as_mut(), row);
                 project_row(
                     &decoded,
                     &columns,
@@ -1497,6 +1619,8 @@ impl ProjectedScanner {
                     &mut deltas,
                     self.catalog.timestamp_patterns(),
                     row,
+                    filename,
+                    &self.filename_fields,
                     &mut cells,
                     &mut text,
                 )?;
@@ -1514,6 +1638,43 @@ impl ProjectedScanner {
         self.buffered_rows = buffered;
         self.table_cursor = table_cursor;
         Ok(stream_has_more)
+    }
+
+    /// Resolves the source file a row belongs to, or `None` when the archive carries no range
+    /// metadata for it.
+    fn filename_for_row(
+        &self,
+        decoded: &DecodedSchemaTable<'_, '_>,
+        log_order: Option<&mut ForwardDelta<'_>>,
+        row: usize,
+    ) -> Option<&str> {
+        if self.filename_fields.iter().all(|field| !*field) {
+            return None;
+        }
+        if let Some(delta) = log_order
+            && let Some(index) = delta.get(row).and_then(|value| u64::try_from(value).ok())
+        {
+            let position = self.filename_ranges.partition_point(|range| range.start <= index);
+            if position != 0 {
+                let range = &self.filename_ranges[position - 1];
+                if index < range.end {
+                    return range.filename.as_deref();
+                }
+            }
+            return None;
+        }
+        let schema_id = decoded.schema().id();
+        let position = self
+            .filename_spans
+            .partition_point(|span| (span.schema_id, span.row_start) <= (schema_id, row as u64));
+        if position == 0 {
+            return None;
+        }
+        let span = &self.filename_spans[position - 1];
+        if span.schema_id == schema_id && (row as u64) < span.row_end {
+            return span.filename.as_deref();
+        }
+        None
     }
 
     /// Maps each requested field to a column index in this table, when it has one.
@@ -1586,11 +1747,19 @@ fn project_row(
     deltas: &mut [Option<ForwardDelta<'_>>],
     timestamps: &TimestampPatternCatalog,
     row: usize,
+    filename: Option<&str>,
+    filename_fields: &[bool],
     cells: &mut Vec<Cell>,
     text: &mut Vec<u8>,
 ) -> Result<(), ScanError> {
     let table = decoded.table();
     for (field, slot) in columns.iter().enumerate() {
+        if filename_fields.get(field).copied().unwrap_or(false) {
+            cells.push(filename.map_or_else(Cell::absent, |name| {
+                push_text(kind::STRING, name.as_bytes(), text)
+            }));
+            continue;
+        }
         let Some(column_index) = *slot else {
             cells.push(Cell::absent());
             continue;
